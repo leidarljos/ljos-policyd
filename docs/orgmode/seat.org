@@ -1,6 +1,8 @@
 #+title: In the seat
 #+options: toc:nil num:nil
 
+* In the seat
+
 This crate is one habitat. The seat that sits on it is
 [[https://leidarljos.github.io][ljos]]. Citation is not a merge. Completing a
 session node does not close a ticket.
