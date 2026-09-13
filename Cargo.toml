@@ -1,0 +1,21 @@
+[package]
+name = "ljos-policyd"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+description = "Argv law for the leiðarljós seat. Prints a verdict. Does not reload a pack."
+repository = "https://github.com/leidarljos/ljos-policyd"
+homepage = "https://leidarljos.github.io/handbook/argv/"
+readme = "README.md"
+keywords = ["policy", "argv", "ljos"]
+categories = ["command-line-utilities"]
+
+[[bin]]
+name = "ljos-policyd"
+path = "src/main.rs"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/ljos-policyd-v{ version }-{ target }.tar.gz"
+bin-dir = "ljos-policyd-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
