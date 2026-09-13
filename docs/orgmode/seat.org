@@ -1,0 +1,19 @@
+#+title: In the seat
+#+options: toc:nil num:nil
+
+This crate is one habitat. The seat that sits on it is
+[[https://leidarljos.github.io][ljos]]. Citation is not a merge. Completing a
+session node does not close a ticket.
+
+| Question | Crate | Site |
+|---+---|---|
+| What did the human freeze? | cards (files) | [[https://leidarljos.github.io/handbook/cards/][cards]] |
+| What does this seat know, standing? | packset | [[https://leidarljos.github.io/packset/][packset]] |
+| What did this unit produce? | deedar | [[https://leidarljos.github.io/deedar/][deedar]] |
+| What does this node stand on, and who agrees? | tracker | [[https://vissue.rgoswami.me][tracker site]] |
+| What is this session handing out? | claimdag | [[https://leidarljos.github.io/claimdag/][claimdag]] |
+| Who agrees, weighted? | ljos-consensus | [[https://leidarljos.github.io/consensus/][consensus]] |
+| May this argv run? | ljos-policyd | [[https://leidarljos.github.io/ljos-policyd/][ljos-policyd]] |
+
+=ljos sitting= opens: doctor, cards, due, island, recall, timeline, claim.
+=ljos finish= closes the session node. Walk: [[https://leidarljos.github.io/docs/sit/][Sit]] · [[https://leidarljos.github.io/docs/start/][First write]].

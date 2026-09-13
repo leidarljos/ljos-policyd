@@ -38,6 +38,22 @@ Install
 
 ``exec`` runs the line only if the verdict is allow. A deny exits 2.
 
+First minute
+============
+
+.. code:: console
+
+   $ ljos-policyd check -- ls
+   allow
+   $ ljos-policyd check -- sudo id
+   deny    sudo
+   $ ljos policy -- ls
+   ls
+   allow
+
+The :doc:`tutorial <getting-started>` points the seat at the binary.
+The model is not the gate.
+
 .. toctree::
    :maxdepth: 1
    :caption: Guides
@@ -47,3 +63,4 @@ Install
    howto
    reference
    explanation
+   seat

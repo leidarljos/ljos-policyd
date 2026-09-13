@@ -42,6 +42,21 @@ deny	sudo
 
 =exec= runs the line only if the verdict is allow. A deny exits 2.
 
+* First minute
+
+#+begin_src console
+$ ljos-policyd check -- ls
+allow
+$ ljos-policyd check -- sudo id
+deny	sudo
+$ ljos policy -- ls
+ls
+allow
+#+end_src
+
+The [[file:getting-started.org][tutorial]] points the seat at the binary.
+The model is not the gate.
+
 #+begin_export rst
 .. toctree::
    :maxdepth: 1
@@ -52,4 +67,5 @@ deny	sudo
    howto
    reference
    explanation
+   seat
 #+end_export
