@@ -1,0 +1,63 @@
+Command line
+============
+
+``ljos-policyd check|exec|version -- argv...``
+
+=========== ==========================================================================================================
+Verb        Meaning
+=========== ==========================================================================================================
+``check``   print ``allow`` or ``deny<TAB>reason``; exit 2 on deny
+``exec``    same verdict; on allow, run argv and exit with its status; on deny, print the verdict on stderr and exit 2
+``version`` print ``ljos-policyd <semver>``
+=========== ==========================================================================================================
+
+A leading ``--`` after the verb is optional and is stripped.
+
+Built-in denials
+================
+
+First match wins. The head is the last path component of argv[0].
+
+===================== ====================================================================================================================================
+Reason                When
+===================== ====================================================================================================================================
+``empty argv``        no program
+``sudo``              head is ``sudo`` or ``doas``
+``curl-pipe-shell``   the joined line contains ``curl`` and ``| sh``, ``|sh``, or ``| bash``
+``rm-rf-outside-tmp`` head is ``rm`` or ``rtrash``, the flags include ``-rf`` or ``-fr``, and some non-flag argument is not under ``/tmp`` or ``/var/tmp``
+``git-force-push``    head is ``git``, argv contains ``push``, and argv contains ``--force`` or ``-f``
+===================== ====================================================================================================================================
+
+Anything else is ``allow``.
+
+Environment the seat reads
+==========================
+
+These are not read by this binary. They are how ``ljos`` finds it.
+
+==================== ===========================================
+Variable             Meaning
+==================== ===========================================
+``POLICYD_BIN``      absolute path to this binary
+``POLICYD_REQUIRED`` if set to ``1``, a missing binary is a deny
+==================== ===========================================
+
+Exit statuses
+=============
+
+===== ================================================
+Code  Meaning
+===== ================================================
+0     allow, or ``exec`` of a process that exited 0
+2     deny, missing verb, or empty usage
+127   ``exec`` could not spawn the program
+other ``exec`` of a process that exited with that code
+===== ================================================
+
+What this crate is not
+======================
+
+-  Not a store. Remember and Prefer belong to packset.
+-  Not a pack loader. Reloading a Janet file is not a check.
+-  Not the seat. ``ljos policy`` prints the line and composes this
+   verdict with pack rules.

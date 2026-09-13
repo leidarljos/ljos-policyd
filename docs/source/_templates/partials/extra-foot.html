@@ -1,0 +1,64 @@
+<script>
+(function () {
+  if (!document.getElementById("vi-skip-link")) {
+    var a = document.createElement("a");
+    a.id = "vi-skip-link";
+    a.className = "vi-skip-link";
+    a.href = "#vi-main-content";
+    a.textContent = "Skip to main content";
+    document.body.insertBefore(a, document.body.firstChild);
+  }
+  var main =
+    document.querySelector("main") ||
+    document.querySelector("article.yue") ||
+    document.querySelector("article") ||
+    document.querySelector(".sy-main") ||
+    document.querySelector(".yue");
+  if (main && !document.getElementById("vi-main-content")) {
+    main.id = "vi-main-content";
+    if (!main.hasAttribute("tabindex")) main.setAttribute("tabindex", "-1");
+    if (!main.getAttribute("role")) main.setAttribute("role", "main");
+  }
+  var nav = document.querySelector(".sy-lside nav, .globaltoc, aside.sy-lside");
+  if (nav && !nav.getAttribute("aria-label")) {
+    nav.setAttribute("aria-label", "Documentation");
+  }
+  var rside = document.querySelector(".sy-rside, aside.sy-rside");
+  if (rside && !rside.getAttribute("aria-label")) {
+    rside.setAttribute("aria-label", "On this page");
+  }
+  var search = document.querySelector('form[role="search"], .sy-head form, input[type="search"]');
+  if (search && search.closest("form") && !search.closest("form").getAttribute("aria-label")) {
+    var f = search.tagName === "FORM" ? search : search.closest("form");
+    if (f) f.setAttribute("aria-label", "Search documentation");
+  }
+  document.querySelectorAll("pre [data-line]").forEach(function (span) {
+    var parent = span.parentNode;
+    if (!parent) return;
+    while (span.firstChild) {
+      parent.insertBefore(span.firstChild, span);
+    }
+    parent.removeChild(span);
+  });
+  document.querySelectorAll(
+    ".highlight pre, div[class*='highlight-'] pre, pre.literal-block"
+  ).forEach(function (pre) {
+    pre.style.setProperty("display", "block", "important");
+    pre.style.setProperty("white-space", "pre", "important");
+    pre.querySelectorAll("span").forEach(function (s) {
+      s.style.setProperty("display", "inline", "important");
+      s.style.setProperty("margin", "0", "important");
+      s.style.setProperty("padding", "0", "important");
+      s.style.setProperty("border", "none", "important");
+      s.style.setProperty("line-height", "inherit", "important");
+    });
+  });
+  document.querySelectorAll(".sy-page pre, .highlight pre, pre.literal-block").forEach(function (pre, i) {
+    if (!pre.hasAttribute("tabindex")) pre.setAttribute("tabindex", "0");
+    if (!pre.getAttribute("role")) pre.setAttribute("role", "region");
+    if (!pre.getAttribute("aria-label")) {
+      pre.setAttribute("aria-label", "Code block " + (i + 1));
+    }
+  });
+})();
+</script>

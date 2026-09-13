@@ -1,0 +1,227 @@
+/* leiðarljós pin theme: ink, cream, gold. */
+:root {
+  --ink: #0b0b0a;
+  --cream: #f4f0e6;
+  --gold: #e6a23c;
+  --line: #2a2824;
+  --mute: #b9b3a6;
+  --panel: #141310;
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Charter, Georgia,
+    serif;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, "Liberation Mono",
+    monospace;
+}
+
+html[data-accent-color="gold"] {
+  --accent-9: #e6a23c;
+  --accent-a2: rgba(230, 162, 60, 0.12);
+  --accent-a3: rgba(230, 162, 60, 0.22);
+  --accent-a9: rgba(230, 162, 60, 0.85);
+  --accent-a11: rgba(230, 162, 60, 0.94);
+}
+
+html.dark,
+html[data-theme="dark"] {
+  --sy-c-bg: var(--ink);
+  --sy-c-bg-soft: var(--panel);
+  --sy-c-text: var(--cream);
+  --sy-c-text-weak: var(--mute);
+  --sy-c-link: var(--gold);
+  --sy-c-border: var(--line);
+  --sy-c-foot-background: var(--ink);
+  --yue-c-text: var(--cream);
+  --vi-hero-name: var(--cream);
+  --vi-hero-tag: var(--gold);
+  --vi-hero-copy: var(--mute);
+  --vi-pill-border: #3a3428;
+  --vi-pill-bg: rgba(230, 162, 60, 0.05);
+  --vi-btn-ghost-fg: var(--cream);
+  --vi-focus: var(--gold);
+}
+
+html.light,
+html[data-theme="light"] {
+  --sy-c-bg: var(--cream);
+  --sy-c-bg-soft: #ebe6d8;
+  --sy-c-text: var(--ink);
+  --sy-c-text-weak: #4a4640;
+  --sy-c-link: #9a6410;
+  --sy-c-border: #d4cfc0;
+  --sy-c-foot-background: #ebe6d8;
+  --yue-c-text: var(--ink);
+  --vi-hero-name: var(--ink);
+  --vi-hero-tag: #9a6410;
+  --vi-hero-copy: #4a4640;
+  --vi-pill-border: #c9c0a8;
+  --vi-pill-bg: rgba(230, 162, 60, 0.12);
+  --vi-btn-ghost-fg: var(--ink);
+  --vi-focus: #9a6410;
+}
+
+html,
+body,
+.sy-page,
+.sy-head,
+.sy-lside,
+.globaltoc,
+.sy-foot,
+.sy-rside {
+  font-family: var(--sans) !important;
+}
+
+.sy-page h1,
+.sy-page h2,
+.sy-page h3,
+.sy-page h4,
+.sy-head-brand strong {
+  font-family: var(--serif) !important;
+  letter-spacing: -0.03em;
+}
+
+.sy-page a.reference,
+.globaltoc a:hover,
+.sy-rside a:hover,
+.sy-head a:hover {
+  color: var(--sy-c-link);
+}
+
+.sy-page a.reference {
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+  text-decoration-thickness: 0.08em;
+}
+
+.sy-page a.reference:hover {
+  filter: brightness(1.08);
+  text-decoration-thickness: 0.12em;
+}
+
+:focus-visible {
+  outline: 2px solid var(--vi-focus);
+  outline-offset: 3px;
+}
+
+/* Landing hero */
+.vi-hero {
+  padding: 2.2rem 0 0.4rem;
+}
+.vi-hero-brand {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+.vi-hero-mark {
+  flex: none;
+}
+.vi-hero-name {
+  font-family: var(--serif);
+  font-size: clamp(2.2rem, 5vw, 3.4rem);
+  font-weight: 600;
+  margin: 0;
+  letter-spacing: -0.035em;
+  line-height: 1.05;
+  color: var(--vi-hero-name);
+}
+.vi-hero-tag {
+  font-family: var(--serif);
+  color: var(--vi-hero-tag);
+  font-size: 1.15rem;
+  margin: 0.2rem 0 0;
+}
+.vi-hero-tagline {
+  margin: 1.1rem 0 1.35rem;
+  font-size: 1.15rem;
+  max-width: 40rem;
+  color: var(--vi-hero-copy);
+}
+.vi-hero-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0 0 1.4rem;
+}
+.vi-hero-pills span {
+  border: 1px solid var(--vi-pill-border);
+  background: var(--vi-pill-bg);
+  border-radius: 999px;
+  padding: 0.2rem 0.8rem;
+  font-size: 0.85rem;
+  color: var(--vi-hero-name);
+}
+.vi-hero-pills span::before {
+  content: "";
+  display: inline-block;
+  width: 0.4rem;
+  height: 0.4rem;
+  border-radius: 50%;
+  background: var(--gold);
+  margin-right: 0.4rem;
+  vertical-align: 0.05rem;
+}
+.vi-hero-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.7rem;
+  margin-bottom: 0.4rem;
+}
+.vi-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  padding: 0.58rem 1.1rem;
+  text-decoration: none !important;
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+.vi-btn-gold {
+  background: var(--gold);
+  color: var(--ink) !important;
+}
+.vi-btn-gold:hover {
+  color: var(--ink) !important;
+  filter: brightness(1.06);
+}
+.vi-btn-ghost {
+  border: 1px solid var(--sy-c-border, var(--line));
+  color: var(--vi-btn-ghost-fg) !important;
+}
+.vi-btn-ghost:hover {
+  color: var(--gold) !important;
+  border-color: var(--gold);
+}
+
+/* Wide reference tables scroll rather than pushing the page sideways. */
+.wy-table-responsive,
+div.table-wrapper,
+table.docutils {
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+/* Skip link (injected by extra-foot). */
+.vi-skip-link {
+  position: absolute;
+  left: 0.75rem;
+  top: -4rem;
+  z-index: 10000;
+  padding: 0.55rem 0.9rem;
+  background: var(--gold);
+  color: var(--ink) !important;
+  font-weight: 700;
+  border-radius: 6px;
+  text-decoration: none;
+}
+.vi-skip-link:focus,
+.vi-skip-link:focus-visible {
+  top: 0.75rem;
+  outline: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
