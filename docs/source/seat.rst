@@ -3,7 +3,7 @@
 In the seat
 ===========
 
-This crate is one habitat. The seat that sits on it is
+This crate is argv law, not a store. The seat that sits on it is
 `ljos <https://leidarljos.github.io>`__. Citation is not a merge. Completing a
 session node does not close a ticket.
 
