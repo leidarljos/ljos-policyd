@@ -4,15 +4,18 @@
 A reader who has never used the binary can finish this page with one
 allow, one deny, and an exec that did not run.
 
-* 1. Install and ask
+* 1. Ask with uv
 
 #+begin_src console
-$ cargo binstall ljos-policyd
-$ ljos-policyd version
-ljos-policyd 0.1.0
-$ ljos-policyd check -- ls
+$ uvx ljos-policyd check -- uv run pytest
 allow
+$ uvx ljos-policyd check -- sudo id
+deny	sudo
 #+end_src
+
+=uvx= runs the binary. =uv run= is the line under test. A Janet pack
+can deny more after this verdict; it cannot allow what this binary
+denied.
 
 Nothing is configured. The built-in denials are the whole TCB.
 

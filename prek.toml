@@ -1,0 +1,21 @@
+# Git hooks via prek (https://prek.j178.dev). Install: prek install
+#:schema https://www.schemastore.org/prek.json
+
+exclude = """(?x)(
+    ^target/|
+    ^Cargo\\.lock$
+)"""
+
+[[repos]]
+repo = "builtin"
+hooks = [
+  { id = "trailing-whitespace" },
+  { id = "end-of-file-fixer" },
+  { id = "check-yaml" },
+  { id = "check-toml" },
+]
+
+[[repos]]
+repo = "https://github.com/zizmorcore/zizmor-pre-commit"
+rev = "v1.24.1"
+hooks = [{ id = "zizmor" }]

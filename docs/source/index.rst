@@ -8,7 +8,7 @@
          <p class="vi-hero-tag">May this command line run?</p>
        </div>
      </div>
-     <p class="vi-hero-tagline">Argv law. Prints a verdict. Does not reload a pack. Not a store.</p>
+     <p class="vi-hero-tagline">May this command line run? First deny wins.</p>
      <div class="vi-hero-pills">
        <span>check / exec</span>
        <span>First deny wins</span>
@@ -20,39 +20,38 @@
      </div>
    </div>
 
-One question: may this argv run? The binary prints ``allow`` or ``deny`` and a
-reason. The harness hook and ``ljos policy`` call it when it is on ``PATH``
-(or ``POLICYD_BIN``). Absence is not a deny. Reloading a pack is not a
-check. Writes stay out of this crate.
+First minute
+============
+
+.. code:: console
+
+   $ uvx ljos-policyd check -- uv run pytest
+   allow
+   $ uvx ljos-policyd check -- sudo id
+   deny    sudo
+
+A Janet pack can deny more. It cannot allow what this binary denied.
+
+.. code:: janet
+
+   (defn check [argv]
+     (when (has-prefix? (get argv 0) "sudo")
+       (deny "sudo")))
+
+The seat composes that pack after this verdict: ``ljos policy -- uv run pytest``.
 
 Install
 =======
 
 .. code:: console
 
-   $ cargo binstall ljos-policyd
-   $ ljos-policyd check -- cargo test
+   $ uvx ljos-policyd check -- uv run pytest
    allow
-   $ ljos-policyd check -- sudo id
-   deny    sudo
+   $ cargo binstall ljos-policyd
 
 ``exec`` runs the line only if the verdict is allow. A deny exits 2.
 
-First minute
-============
-
-.. code:: console
-
-   $ ljos-policyd check -- ls
-   allow
-   $ ljos-policyd check -- sudo id
-   deny    sudo
-   $ ljos policy -- ls
-   ls
-   allow
-
-The :doc:`tutorial <getting-started>` points the seat at the binary.
-The model is not the gate.
+The :doc:`tutorial <getting-started>` is the same walk with ``exec`` and ``POLICYD_BIN``.
 
 .. toctree::
    :maxdepth: 1
