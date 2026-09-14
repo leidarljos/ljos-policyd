@@ -16,7 +16,7 @@
      <div class="vi-hero-pills">
        <span>check / exec</span>
        <span>First deny wins</span>
-       <span>The model is not the gate</span>
+       <span>uv first</span>
      </div>
      <div class="vi-hero-actions">
        <a class="vi-btn vi-btn-gold" href="getting-started.html">Get started</a>

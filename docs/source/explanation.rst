@@ -4,7 +4,7 @@ Why a binary and not a prompt
 A model that is asked "may this run?" will sometimes say yes. The
 gate has to be a process that does not read the request as prose.
 This crate is that process: argv in, a one-line verdict out. The
-harness hook calls it. The model is not the gate.
+harness hook calls it. A Janet pack can deny more after this verdict.
 
 First deny wins
 ===============

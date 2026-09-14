@@ -18,7 +18,7 @@ Run only if allowed
 
 .. code:: console
 
-   $ ljos-policyd exec -- cargo test
+   $ ljos-policyd exec -- uv run pytest
 
 Same verdict as ``check``. On allow, ``exec`` replaces itself with the
 named program. On deny it prints the verdict and exits 2.

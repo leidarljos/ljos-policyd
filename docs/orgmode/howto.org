@@ -18,7 +18,7 @@ A deny is exit 2. The hook turns that into a blocked tool call.
 * Run only if allowed
 
 #+begin_src console
-$ ljos-policyd exec -- cargo test
+$ ljos-policyd exec -- uv run pytest
 #+end_src
 
 Same verdict as =check=. On allow, =exec= replaces itself with the
