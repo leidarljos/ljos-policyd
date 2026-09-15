@@ -28,9 +28,14 @@ $ echo $?
 2
 #+end_src
 
-First matching deny wins. The reason is a short token after a tab:
-=sudo=, =curl-pipe-shell=, =rm-rf-outside-tmp=, =git-force-push=, or
-=empty argv=.
+First matching deny wins. The reason is a short token after a tab
+(=sudo=, =curl-pipe-shell=, =git-force-push=, =chmod-setuid=,
+=raw-disk=, …). The typed form is a Cap'n =PolicyDecision=:
+
+#+begin_src console
+$ ljos-policyd capnp -- true | wc -c
+40
+#+end_src
 
 * 3. Exec only on allow
 
