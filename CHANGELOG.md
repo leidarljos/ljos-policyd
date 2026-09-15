@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.2 (2026-09-15)
+
+- README names the `capnp` verb.
+
 ## 0.2.1 (2026-09-15)
 
 - Usage names `check|exec|capnp|version`. A missing or unknown verb

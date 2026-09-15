@@ -21,7 +21,8 @@ deny	sudo
 ```
 
 `ljos-policyd exec -- argv` runs the line only if the verdict is
-allow. A deny exits 2.
+allow. A deny exits 2. `ljos-policyd capnp -- argv` writes a packed
+Cap'n `PolicyDecision`.
 
 The harness hook and `ljos policy` call this binary when it is on
 `PATH` (or `POLICYD_BIN`). The model is not the gate. Absence is not
