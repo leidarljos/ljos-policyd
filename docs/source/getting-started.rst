@@ -27,9 +27,14 @@ Nothing is configured. The built-in denials are the whole TCB.
    $ echo $?
    2
 
-First matching deny wins. The reason is a short token after a tab:
-``sudo``, ``curl-pipe-shell``, ``rm-rf-outside-tmp``, ``git-force-push``, or
-``empty argv``.
+First matching deny wins. The reason is a short token after a tab
+(``sudo``, ``curl-pipe-shell``, ``git-force-push``, ``chmod-setuid``,
+``raw-disk``, …). The typed form is a Cap'n ``PolicyDecision``:
+
+.. code:: console
+
+   $ ljos-policyd capnp -- true | wc -c
+   40
 
 3. Exec only on allow
 =====================
@@ -44,7 +49,7 @@ First matching deny wins. The reason is a short token after a tab:
    $ echo $?
    2
 
-``exec`` prints the deny on stderr and does not spawn the process.
+``exec`` prints the deny on stderr and exits 2. The named program stays unrun.
 
 4. Point the seat at it
 =======================

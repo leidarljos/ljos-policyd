@@ -48,7 +48,7 @@ run unchecked argv.
 Write pack rules beside the TCB
 ===============================
 
-The binary does not load rules. Pack rules are memory:
+Pack rules are memory. The binary prints a verdict:
 
 .. code:: console
 
@@ -58,3 +58,14 @@ The binary does not load rules. Pack rules are memory:
 ``ljos policy`` prints the TCB verdict first, then the pack rule. First
 deny still wins. Edit a pack rule only when argv law itself changes.
 Do not write dates, ticket ids, or sitting notes into it.
+
+Emit the Cap'n verdict
+======================
+
+.. code:: console
+
+   $ ljos-policyd capnp -- true | wc -c
+   40
+
+The hook still reads the text line from ``check``. Libraries read the
+packed ``PolicyDecision``.

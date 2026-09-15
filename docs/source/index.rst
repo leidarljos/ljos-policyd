@@ -10,7 +10,7 @@
      </div>
      <p class="vi-hero-tagline">May this command line run? First deny wins.</p>
      <div class="vi-hero-pills">
-       <span>check / exec</span>
+       <span>check / exec / capnp</span>
        <span>First deny wins</span>
        <span>uv first</span>
      </div>
@@ -30,7 +30,7 @@ First minute
    $ uvx ljos-policyd check -- sudo id
    deny    sudo
 
-A Janet pack can deny more. It cannot allow what this binary denied.
+Typed verdict is Cap'n PolicyDecision (phronesis; Ali Akber Saifee / indynull, HaoZeke). A Janet pack can deny more. It cannot allow what this binary denied.
 
 .. code:: janet
 
