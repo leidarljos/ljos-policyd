@@ -49,7 +49,7 @@ $ echo $?
 2
 #+end_src
 
-=exec= prints the deny on stderr and does not spawn the process.
+=exec= prints the deny on stderr and exits 2. The named program stays unrun.
 
 * 4. Point the seat at it
 

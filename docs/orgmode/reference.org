@@ -48,9 +48,9 @@ These are not read by this binary. They are how =ljos= finds it.
 | 127 | =exec= could not spawn the program |
 | other | =exec= of a process that exited with that code |
 
-* What this crate is not
+* What this crate is
 
-- Not a store. Remember and Prefer belong to packset.
-- Not a pack loader. Reloading a Janet file is not a check.
-- Not the seat. =ljos policy= prints the line and composes this
-  verdict with pack rules.
+- Remember and Prefer stay in packset.
+- A check is the argv verdict. Pack rules stay in packset.
+- =ljos policy= prints the line and composes this verdict with pack
+  rules.

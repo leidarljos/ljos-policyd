@@ -46,7 +46,7 @@ run unchecked argv.
 
 * Write pack rules beside the TCB
 
-The binary does not load rules. Pack rules are memory:
+Pack rules are memory. The binary prints a verdict:
 
 #+begin_src console
 $ ljos rule '*--force*' --verdict deny --why "Never force push."
