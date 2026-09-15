@@ -14,8 +14,7 @@ deny	sudo
 #+end_src
 
 =uvx= runs the binary. =uv run= is the line under test. A Janet pack
-can deny more after this verdict; it cannot allow what this binary
-denied.
+can deny more after this verdict. A pack may only deny more.
 
 Nothing is configured. The built-in denials are the whole TCB.
 
