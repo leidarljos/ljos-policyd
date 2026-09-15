@@ -9,7 +9,7 @@ use ljos_policyd::{encode_decision, check_shell, verdict};
 fn main() {
     let mut args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("usage: ljos-policyd check|exec -- argv...");
+        eprintln!("usage: ljos-policyd check|exec|capnp|version -- argv...");
         process::exit(2);
     }
     let verb = args.remove(0);
@@ -57,7 +57,7 @@ fn main() {
             println!("ljos-policyd {}", env!("CARGO_PKG_VERSION"));
         }
         _ => {
-            eprintln!("usage: ljos-policyd check|exec -- argv...");
+            eprintln!("usage: ljos-policyd check|exec|capnp|version -- argv...");
             process::exit(2);
         }
     }

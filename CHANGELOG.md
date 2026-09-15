@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1 (2026-09-15)
+
+- Usage names `check|exec|capnp|version`. A missing or unknown verb
+  no longer pretends the binary is check and exec only.
+
 ## 0.2.0 (2026-09-15)
 
 - Cap'n `PolicyDecision` / `Decision` / `checkShell(argv)` as the typed
