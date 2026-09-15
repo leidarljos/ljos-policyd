@@ -1,15 +1,16 @@
 Command line
 ============
 
-``ljos-policyd check|exec|version -- argv...``
+``ljos-policyd check|exec|capnp|version -- argv...``
 
-=========== ==========================================================================================================
+=========== ======================================================================================
 Verb        Meaning
-=========== ==========================================================================================================
+=========== ======================================================================================
 ``check``   print ``allow`` or ``deny<TAB>reason``; exit 2 on deny
-``exec``    same verdict; on allow, run argv and exit with its status; on deny, print the verdict on stderr and exit 2
+``capnp``   write a packed Cap'n ``PolicyDecision`` to stdout; exit 2 on deny
+``exec``    same text verdict; on allow, run argv; on deny, print the verdict on stderr and exit 2
 ``version`` print ``ljos-policyd <semver>``
-=========== ==========================================================================================================
+=========== ======================================================================================
 
 A leading ``--`` after the verb is optional and is stripped.
 
@@ -18,17 +19,19 @@ Built-in denials
 
 First match wins. The head is the last path component of argv[0].
 
-===================== ====================================================================================================================================
-Reason                When
-===================== ====================================================================================================================================
-``empty argv``        no program
-``sudo``              head is ``sudo`` or ``doas``
-``curl-pipe-shell``   the joined line contains ``curl`` and ``| sh``, ``|sh``, or ``| bash``
-``rm-rf-outside-tmp`` head is ``rm`` or ``rtrash``, the flags include ``-rf`` or ``-fr``, and some non-flag argument is not under ``/tmp`` or ``/var/tmp``
-``git-force-push``    head is ``git``, argv contains ``push``, and argv contains ``--force`` or ``-f``
-===================== ====================================================================================================================================
+===================== ======================== ==============================
+Token                 Cap'n PolicyReason       When
+===================== ======================== ==============================
+``empty argv``        ``emptyArgv``            no program
+``sudo``              ``shellPrivilegeDenied`` privilege runner
+``curl-pipe-shell``   ``shellRemoteExec``      fetcher piped to a shell
+``rm-rf-outside-tmp`` ``rmRfOutsideTmp``       recursive delete off tmp
+``git-force-push``    ``shellGitDangerous``    force push or force-with-lease
+``chmod-setuid``      ``chmodSetuid``          setuid chmod
+``raw-disk``          ``rawDisk``              dd to a device node, or mkfs
+===================== ======================== ==============================
 
-Anything else is ``allow``.
+Anything else is ``allow``. ``python -c`` is allow. Schema: ``schema/policy.capnp``.
 
 Environment the seat reads
 ==========================
@@ -54,10 +57,10 @@ Code  Meaning
 other ``exec`` of a process that exited with that code
 ===== ================================================
 
-What this crate is not
-======================
+What this crate is
+==================
 
--  Not a store. Remember and Prefer belong to packset.
--  Not a pack loader. Reloading a Janet file is not a check.
--  Not the seat. ``ljos policy`` prints the line and composes this
-   verdict with pack rules.
+-  Remember and Prefer stay in packset.
+-  A check is the argv verdict. Pack rules stay in packset.
+-  ``ljos policy`` prints the line and composes this verdict with pack
+   rules.

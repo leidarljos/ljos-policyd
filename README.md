@@ -1,7 +1,7 @@
 # ljos-policyd
 
 May this command line run? Argv law for the leiðarljós seat. One binary
-prints a verdict. It does not reload a pack. It is not a store.
+prints a verdict. A check is the argv verdict. Remember and Prefer stay in packset.
 
 Docs: https://leidarljos.github.io/ljos-policyd/
 

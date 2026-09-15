@@ -3,7 +3,7 @@
 
 * In the seat
 
-This crate is argv law, not a store. The seat that sits on it is
+This crate is argv law: the command-line verdict. The seat that sits on it is
 [[https://leidarljos.github.io][ljos]]. Citing a deed names it; the bytes stay in deedar. The ticket
 stays open until the tracker closes it.
 
