@@ -1,0 +1,13 @@
+ljos-policyd — notices
+======================
+
+First-party code is MIT (`LICENSE`).
+
+Argv danger classes (privilege runners, remote-exec, git force-push,
+setuid chmod, raw disk) and the Cap'n shape `Decision` /
+`PolicyDecision` / `checkShell(argv : List(Text))` are derived from
+phronesis (Copyright 2026 indynull, HaoZeke; MIT). phronesis is Ali
+Akber Saifee's extract. This crate does not include the seat, model,
+or audio plane, nor Janet packs.
+
+Cap'n Proto is MIT (Sandstorm).

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0 (2026-09-15)
+
+- Cap'n `PolicyDecision` / `Decision` / `checkShell(argv)` as the typed
+  API, derived from phronesis (Ali Akber Saifee / indynull, HaoZeke;
+  MIT). Seat, model, and audio planes stay out.
+- `ljos-policyd capnp -- argv` writes a packed PolicyDecision.
+- 0.1.1 argv classes (privilege, remote-exec, setuid, raw disk, force
+  with lease) are the phronesis shell-danger table, same authors.
+
+
 ## 0.1.1 (2026-09-15)
 
 - Privilege runners include `su`, `pkexec`, `run0`.

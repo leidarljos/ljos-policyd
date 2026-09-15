@@ -1,6 +1,6 @@
 [package]
 name = "ljos-policyd"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"
@@ -11,9 +11,16 @@ readme = "README.md"
 keywords = ["policy", "argv", "ljos"]
 categories = ["command-line-utilities"]
 
+[lib]
+name = "ljos_policyd"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ljos-policyd"
 path = "src/main.rs"
+
+[dependencies]
+capnp = "0.20"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/ljos-policyd-v{ version }-{ target }.tar.gz"

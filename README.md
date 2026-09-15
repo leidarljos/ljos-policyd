@@ -34,3 +34,13 @@ They cannot allow what this binary denied.
 Writes stay out of this crate. Remember and Prefer belong to packset.
 
 The seat that sits is documented at https://leidarljos.github.io.
+
+## Authors
+
+Argv danger classes and the Cap'n `PolicyDecision` / `checkShell(argv)`
+shape come from [phronesis](https://github.com/indynull/phronesis)
+(Ali Akber Saifee / indynull, HaoZeke; MIT). This crate is the argv
+slice as a PATH binary. It does not include the seat, model, or audio
+plane.
+
+See `NOTICE` and `LICENSE`.
