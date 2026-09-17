@@ -24,6 +24,10 @@ deny	sudo
 allow. A deny exits 2. `ljos-policyd capnp -- argv` writes a packed
 Cap'n `PolicyDecision`.
 
+This crate **depends on** [phronesis](https://github.com/leidarljos/phronesis)
+(`links = "phronesis"`). `cargo build` needs `pkg-config --exists phronesis`
+or `PHRONESIS_DIR` pointing at a prefix that contains `lib/libphronesis`.
+
 The harness hook and `ljos policy` call this binary when it is on
 `PATH` (or `POLICYD_BIN`). The model is not the gate. Absence is not
 a deny unless `POLICYD_REQUIRED=1`.

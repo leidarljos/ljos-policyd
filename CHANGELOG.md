@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- The crate `links = "phronesis"`. Builds probe `pkg-config phronesis`
+  or `PHRONESIS_DIR`. The argv table is still in this crate until the
+  check is called through `phronesis_check_shell`.
+
 ## 0.2.2 (2026-09-15)
 
 - README names the `capnp` verb.

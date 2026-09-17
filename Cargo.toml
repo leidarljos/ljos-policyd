@@ -4,12 +4,13 @@ version = "0.2.2"
 edition = "2021"
 license = "MIT"
 rust-version = "1.85"
-description = "Argv law for the leiðarljós seat. Prints a verdict. Does not reload a pack."
+description = "Argv law for the leiðarljós seat. Prints a verdict. Sits on phronesis."
 repository = "https://github.com/leidarljos/ljos-policyd"
 homepage = "https://leidarljos.github.io/ljos-policyd/"
 readme = "README.md"
 keywords = ["policy", "argv", "ljos"]
 categories = ["command-line-utilities"]
+links = "phronesis"
 
 [lib]
 name = "ljos_policyd"
@@ -21,6 +22,12 @@ path = "src/main.rs"
 
 [dependencies]
 capnp = "0.20"
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[package.metadata.phronesis]
+git = "https://github.com/leidarljos/phronesis"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/ljos-policyd-v{ version }-{ target }.tar.gz"
