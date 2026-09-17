@@ -2,10 +2,10 @@
 
 ## Unreleased
 
-- The crate `links = "phronesis"`. Builds probe `pkg-config phronesis`
-  or `PHRONESIS_DIR`. Every check calls `phronesis_check_shell`. When
-  the library is not seated (no pack or workspace), the host argv
-  table is the TCB.
+- `PHRONESIS_DIR` / `pkg-config phronesis` enables `phronesis_check_shell`
+  as the check. Missing library still compiles (host argv table).
+- A seated check binds the host slot to the process cwd and loads the
+  Janet pack from `$PHRONESIS_PREFIX/share/phronesis/policy/shell.janet`.
 
 ## 0.2.2 (2026-09-15)
 

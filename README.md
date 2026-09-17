@@ -25,8 +25,9 @@ allow. A deny exits 2. `ljos-policyd capnp -- argv` writes a packed
 Cap'n `PolicyDecision`.
 
 This crate **depends on** [phronesis](https://github.com/leidarljos/phronesis)
-(`links = "phronesis"`). `cargo build` needs `pkg-config --exists phronesis`
-or `PHRONESIS_DIR` pointing at a prefix that contains `lib/libphronesis`.
+when `PHRONESIS_DIR` or `pkg-config phronesis` is present: every check
+calls `phronesis_check_shell`. Without the library, `cargo build` still
+works and uses the host argv table.
 
 The harness hook and `ljos policy` call this binary when it is on
 `PATH` (or `POLICYD_BIN`). The model is not the gate. Absence is not

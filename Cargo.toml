@@ -25,6 +25,7 @@ capnp = "0.20"
 libc = "0.2"
 
 [build-dependencies]
+cc = "1"
 pkg-config = "0.3"
 
 [package.metadata.phronesis]

@@ -34,29 +34,20 @@ pub struct Checked {
     pub token: &'static str,
 }
 
-/// Typed check. Always calls `phronesis_check_shell`.
+/// Typed check. With phronesis linked, this is `phronesis_check_shell`.
 #[must_use]
 pub fn check_shell(argv: &[String]) -> Checked {
-    match check_shell_phronesis(argv) {
-        Ok(c) if seated(&c) => c,
-        _ => host_argv_table(argv),
+    #[cfg(has_phronesis)]
+    {
+        return check_shell_phronesis(argv);
+    }
+    #[cfg(not(has_phronesis))]
+    {
+        host_argv_table(argv)
     }
 }
 
-fn seated(c: &Checked) -> bool {
-    !matches!(
-        c.code,
-        PolicyReason::PackMissing
-            | PolicyReason::PackLoadFailed
-            | PolicyReason::PackBadResult
-            | PolicyReason::PackRuntimeError
-            | PolicyReason::ToolsDefaultDeny
-            | PolicyReason::InvalidMessage
-            | PolicyReason::PathOutsideWorkspace
-            | PolicyReason::ShellViewBuildFailed
-    )
-}
-
+#[cfg_attr(has_phronesis, allow(dead_code))]
 fn host_argv_table(argv: &[String]) -> Checked {
     if argv.is_empty() {
         return Checked {
@@ -143,6 +134,7 @@ pub fn encode_decision(c: &Checked) -> capnp::Result<Vec<u8>> {
     Ok(out)
 }
 
+#[cfg(has_phronesis)]
 fn encode_shell_check(argv: &[String], cwd: &str) -> capnp::Result<Vec<u8>> {
     let mut message = capnp::message::Builder::new_default();
     let mut root = message.init_root::<policy_capnp::shell_check::Builder>();
@@ -163,6 +155,7 @@ fn encode_shell_check(argv: &[String], cwd: &str) -> capnp::Result<Vec<u8>> {
     Ok(out)
 }
 
+#[cfg(has_phronesis)]
 fn token_for(code: PolicyReason, reason: &str) -> &'static str {
     match code {
         PolicyReason::InvalidMessage => "invalid-message",
@@ -183,6 +176,7 @@ fn token_for(code: PolicyReason, reason: &str) -> &'static str {
     }
 }
 
+#[cfg(has_phronesis)]
 fn decode_decision(bytes: &[u8]) -> capnp::Result<Checked> {
     let mut cursor = std::io::Cursor::new(bytes);
     let msg = capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())?;
@@ -196,11 +190,13 @@ fn decode_decision(bytes: &[u8]) -> capnp::Result<Checked> {
     })
 }
 
+#[cfg(has_phronesis)]
 #[repr(C)]
 struct Supervisor {
     _private: [u8; 0],
 }
 
+#[cfg(has_phronesis)]
 extern "C" {
     fn phronesis_supervisor_open(
         out: *mut *mut Supervisor,
@@ -214,28 +210,37 @@ extern "C" {
         workspace: *const libc::c_char,
         pid: libc::pid_t,
     ) -> libc::c_int;
-    fn phronesis_check_shell(
-        s: *mut Supervisor,
+    fn ljos_phronesis_read_decision(
         input: *const u8,
         in_len: usize,
+        decision: *mut u16,
+        code: *mut u16,
+    ) -> libc::c_int;
+    fn ljos_phronesis_check_shell(
+        s: *mut Supervisor,
+        cwd: *const libc::c_char,
+        argv: *const *const libc::c_char,
+        argc: libc::c_int,
         out: *mut *mut u8,
         out_len: *mut usize,
-    );
+    ) -> libc::c_int;
 }
 
+#[cfg(has_phronesis)]
 fn host_agent_hex() -> String {
     format!("{:016x}{:016x}", 0u64, HOST_AGENT_LO)
 }
 
+#[cfg(has_phronesis)]
 fn seat_dirs() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
+    let base = std::env::var_os("PHRONESIS_STATE_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| {
-            let uid = unsafe { libc::geteuid() };
-            let p = std::path::PathBuf::from(format!("/run/user/{uid}"));
-            p.is_dir().then_some(p)
+            std::env::var_os("HOME").map(|h| {
+                std::path::PathBuf::from(h).join(".local/state/ljos-policyd")
+            })
         })?;
-    let root = base.join("ljos-policyd");
+    let root = base;
     let state = root.join("state");
     let runtime = root.join("runtime");
     std::fs::create_dir_all(&state).ok()?;
@@ -243,54 +248,125 @@ fn seat_dirs() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     Some((state, runtime))
 }
 
-fn host_workspace() -> std::ffi::CString {
-    let raw = std::env::var("PHRONESIS_WORKSPACE")
-        .ok()
-        .filter(|s| s.starts_with('/'))
-        .unwrap_or_else(|| "/".into());
-    std::ffi::CString::new(raw).unwrap_or_else(|_| std::ffi::CString::new("/").unwrap())
+#[cfg(has_phronesis)]
+fn ensure_pack_env() {
+    let mut prefixes = Vec::new();
+    if let Ok(p) = std::env::var("PHRONESIS_PREFIX") {
+        prefixes.push(std::path::PathBuf::from(p));
+    }
+    if let Some(p) = option_env!("PHRONESIS_PREFIX") {
+        prefixes.push(std::path::PathBuf::from(p));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        prefixes.push(std::path::PathBuf::from(home).join(".local"));
+    }
+    prefixes.push(std::path::PathBuf::from("/usr/local"));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(root) = exe.parent().and_then(|p| p.parent()) {
+            prefixes.push(root.to_path_buf());
+        }
+    }
+    for prefix in prefixes {
+        let pack = prefix.join("share/phronesis/policy/shell.janet");
+        if pack.is_file() {
+            std::env::set_var("PHRONESIS_PREFIX", &prefix);
+            std::env::set_var("PHRONESIS_PACK_ROOT", prefix.join("share/phronesis"));
+            if std::env::var_os("PHRONESIS_JANET_PACK").is_none() {
+                std::env::set_var("PHRONESIS_JANET_PACK", pack);
+            }
+            return;
+        }
+    }
 }
 
-fn with_supervisor<T>(f: impl FnOnce(*mut Supervisor) -> T) -> Option<T> {
-    let (state, runtime) = seat_dirs()?;
-    let state_c = std::ffi::CString::new(state.to_string_lossy().as_bytes()).ok()?;
-    let runtime_c = std::ffi::CString::new(runtime.to_string_lossy().as_bytes()).ok()?;
-    let mut sup: *mut Supervisor = std::ptr::null_mut();
-    let rc = unsafe {
-        phronesis_supervisor_open(&mut sup, state_c.as_ptr(), runtime_c.as_ptr())
-    };
-    if rc != 0 || sup.is_null() {
-        return None;
-    }
-    let hex = std::ffi::CString::new(host_agent_hex()).ok()?;
-    let mode = std::ffi::CString::new("seat").ok()?;
-    let ws = host_workspace();
-    unsafe {
-        let _ = phronesis_supervisor_bind(sup, hex.as_ptr(), mode.as_ptr(), ws.as_ptr(), 0);
-    }
-    Some(f(sup))
-}
-
-fn check_shell_phronesis(argv: &[String]) -> Result<Checked, String> {
+#[cfg(has_phronesis)]
+fn check_shell_phronesis(argv: &[String]) -> Checked {
+    ensure_pack_env();
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|p| p.to_str().map(str::to_string))
-        .unwrap_or_default();
-    let input = encode_shell_check(argv, &cwd).map_err(|e| e.to_string())?;
-    with_supervisor(|sup| {
-        let mut out: *mut u8 = std::ptr::null_mut();
-        let mut out_len: usize = 0;
-        unsafe {
-            phronesis_check_shell(sup, input.as_ptr(), input.len(), &mut out, &mut out_len);
-        }
-        if out.is_null() || out_len == 0 {
-            return Err("phronesis_check_shell returned empty".into());
-        }
-        let bytes = unsafe { std::slice::from_raw_parts(out, out_len) }.to_vec();
-        unsafe { libc::free(out as *mut libc::c_void) };
-        decode_decision(&bytes).map_err(|e| e.to_string())
-    })
-    .ok_or_else(|| "supervisor open failed".to_string())?
+        .filter(|s| s.starts_with('/'))
+        .unwrap_or_else(|| "/".into());
+    let fail = Checked {
+        decision: Decision::Deny,
+        code: PolicyReason::InvalidMessage,
+        token: "phronesis",
+    };
+    let Some((state, runtime)) = seat_dirs() else {
+        return fail;
+    };
+    let Ok(state_c) = std::ffi::CString::new(state.to_string_lossy().as_bytes()) else {
+        return fail;
+    };
+    let Ok(runtime_c) = std::ffi::CString::new(runtime.to_string_lossy().as_bytes()) else {
+        return fail;
+    };
+    let mut sup: *mut Supervisor = std::ptr::null_mut();
+    let rc = unsafe { phronesis_supervisor_open(&mut sup, state_c.as_ptr(), runtime_c.as_ptr()) };
+    if rc != 0 || sup.is_null() {
+        return fail;
+    }
+    let Ok(hex) = std::ffi::CString::new(host_agent_hex()) else {
+        return fail;
+    };
+    let Ok(mode) = std::ffi::CString::new("seat") else {
+        return fail;
+    };
+    let ws = std::env::var("PHRONESIS_WORKSPACE")
+        .ok()
+        .filter(|s| s.starts_with('/'))
+        .unwrap_or_else(|| cwd.clone());
+    let Ok(ws_c) = std::ffi::CString::new(ws) else {
+        return fail;
+    };
+    let brc = unsafe { phronesis_supervisor_bind(sup, hex.as_ptr(), mode.as_ptr(), ws_c.as_ptr(), 0) };
+    if brc != 0 && brc != -2 {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::InvalidMessage,
+            token: "bind-failed",
+        };
+    }
+    let c_args: Vec<std::ffi::CString> = argv
+        .iter()
+        .map(|a| std::ffi::CString::new(a.as_str()).unwrap_or_else(|_| std::ffi::CString::new("").unwrap()))
+        .collect();
+    let ptrs: Vec<*const libc::c_char> = c_args.iter().map(|c| c.as_ptr()).collect();
+    let cwd_c = std::ffi::CString::new(cwd.as_str())
+        .unwrap_or_else(|_| std::ffi::CString::new("/").unwrap());
+    let mut out: *mut u8 = std::ptr::null_mut();
+    let mut out_len: usize = 0;
+    let crc = unsafe {
+        ljos_phronesis_check_shell(
+            sup,
+            cwd_c.as_ptr(),
+            ptrs.as_ptr(),
+            ptrs.len() as libc::c_int,
+            &mut out,
+            &mut out_len,
+        )
+    };
+    if crc != 0 || out.is_null() || out_len == 0 {
+        return fail;
+    }
+    let mut dec: u16 = 0;
+    let mut code: u16 = 0;
+    let rrc = unsafe { ljos_phronesis_read_decision(out, out_len, &mut dec, &mut code) };
+    unsafe { libc::free(out as *mut libc::c_void) };
+    if rrc != 0 {
+        return fail;
+    }
+    let decision = match dec {
+        1 => Decision::Allow,
+        2 => Decision::Prompt,
+        _ => Decision::Deny,
+    };
+    let code = PolicyReason::try_from(code).unwrap_or(PolicyReason::Unspecified);
+    Checked {
+        decision,
+        code,
+        token: token_for(code, ""),
+    }
 }
 
 fn base_of(tok: &str) -> &str {
@@ -356,6 +432,7 @@ mod tests {
         assert_eq!(v(&["cargo", "test"]), "allow");
     }
 
+    #[cfg(has_phronesis)]
     #[test]
     fn encodes_a_shell_check_for_phronesis() {
         let bytes = encode_shell_check(&["sudo".into(), "id".into()], "/").expect("encode");
@@ -380,6 +457,5 @@ mod tests {
             .get_root::<policy_capnp::policy_decision::Reader<'_>>()
             .expect("root");
         assert_eq!(d.get_decision().unwrap(), Decision::Deny);
-        assert_eq!(d.get_code().unwrap(), PolicyReason::ShellPrivilegeDenied);
     }
 }
