@@ -3,8 +3,9 @@
 ## Unreleased
 
 - The crate `links = "phronesis"`. Builds probe `pkg-config phronesis`
-  or `PHRONESIS_DIR`. The argv table is still in this crate until the
-  check is called through `phronesis_check_shell`.
+  or `PHRONESIS_DIR`. Every check calls `phronesis_check_shell`. When
+  the library is not seated (no pack or workspace), the host argv
+  table is the TCB.
 
 ## 0.2.2 (2026-09-15)
 
