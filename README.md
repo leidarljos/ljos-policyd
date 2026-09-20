@@ -14,7 +14,7 @@ Docs: https://leidarljos.github.io/ljos-policyd/
 
 ```console
 $ cargo binstall ljos-policyd
-$ ljos-policyd check -- cargo test
+$ ljos-policyd check -- git status
 allow
 $ ljos-policyd check -- sudo id
 deny	sudo
