@@ -79,6 +79,13 @@ body,
   letter-spacing: -0.03em;
 }
 
+.sy-head-brand img {
+  height: 1.85rem;
+  width: auto;
+  max-height: 1.85rem;
+  border-radius: 0.35rem;
+}
+
 .sy-page a.reference,
 .globaltoc a:hover,
 .sy-rside a:hover,

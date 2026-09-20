@@ -25,7 +25,7 @@ exclude_patterns: list[str] = []
 html_theme = "shibuya"
 html_static_path = ["_static"]
 html_favicon = "_static/favicon.svg"
-html_logo = "_static/logo.svg"
+html_logo = "_static/mark.svg"
 html_title = "ljos-policyd"
 html_css_files = ["custom.css"]
 
