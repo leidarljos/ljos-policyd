@@ -86,22 +86,12 @@ fn host_argv_table(argv: &[String]) -> Checked {
             token: "raw-disk",
         };
     }
-    if base == "rm" || base == "rtrash" {
-        if line.contains("-rf") || line.contains("-fr") {
-            let only_tmp = argv.iter().skip(1).filter(|a| !a.starts_with('-')).all(|p| {
-                p == "/tmp"
-                    || p.starts_with("/tmp/")
-                    || p == "/var/tmp"
-                    || p.starts_with("/var/tmp/")
-            });
-            if !only_tmp {
-                return Checked {
-                    decision: Decision::Deny,
-                    code: PolicyReason::ShellDangerousRunner,
-                    token: "rm-rf-outside-tmp",
-                };
-            }
-        }
+    if recursive_delete_off_tmp(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: "rm-rf-outside-tmp",
+        };
     }
     if base == "git"
         && argv.iter().any(|a| a == "push")
@@ -402,6 +392,55 @@ fn remote_exec(argv: &[String]) -> bool {
     fetch && shell
 }
 
+/// Split a hooked line into its commands at shell separators. A token
+/// ending in `;` closes its command.
+fn commands(argv: &[String]) -> Vec<Vec<&str>> {
+    let mut out: Vec<Vec<&str>> = vec![Vec::new()];
+    for a in argv.iter().map(String::as_str) {
+        if matches!(a, ";" | "&&" | "||" | "|" | "&") {
+            out.push(Vec::new());
+            continue;
+        }
+        let closes = a.ends_with(';');
+        let tok = a.trim_end_matches(';');
+        if !tok.is_empty() {
+            out.last_mut().expect("one command").push(tok);
+        }
+        if closes {
+            out.push(Vec::new());
+        }
+    }
+    out.retain(|c| !c.is_empty());
+    out
+}
+
+fn is_redirection(a: &str) -> bool {
+    let rest = a.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+    rest.starts_with('>') || rest.starts_with('<')
+}
+
+/// True when any `rm` or `rtrash` on the line deletes recursively with an
+/// operand outside `/tmp` or `/var/tmp`. Flags and redirections are not
+/// operands; every command on the line is judged.
+fn recursive_delete_off_tmp(argv: &[String]) -> bool {
+    commands(argv).iter().any(|cmd| {
+        let b = base_of(cmd[0]);
+        if b != "rm" && b != "rtrash" {
+            return false;
+        }
+        let recursive = cmd.iter().skip(1).any(|a| {
+            a.starts_with('-') && !a.starts_with("--") && a.contains('r') && a.contains('f')
+        }) || (cmd.iter().any(|a| matches!(*a, "-r" | "-R" | "--recursive"))
+            && cmd.iter().any(|a| matches!(*a, "-f" | "--force")));
+        if !recursive {
+            return false;
+        }
+        !cmd.iter().skip(1).filter(|a| !a.starts_with('-') && !is_redirection(a)).all(|p| {
+            *p == "/tmp" || p.starts_with("/tmp/") || *p == "/var/tmp" || p.starts_with("/var/tmp/")
+        })
+    })
+}
+
 fn setuid_chmod(argv: &[String]) -> bool {
     if base_of(&argv[0]) != "chmod" {
         return false;
@@ -443,6 +482,21 @@ mod tests {
     fn denies_privilege() {
         assert!(v(&["sudo", "id"]).starts_with("deny"));
         assert!(v(&["pkexec", "id"]).starts_with("deny"));
+    }
+
+    #[cfg(not(has_phronesis))]
+    #[test]
+    fn recursive_delete_judges_only_its_own_operands() {
+        assert_eq!(v(&["rtrash", "-rf", "/tmp/a", "/tmp/b", ">/dev/null", "2>&1;", "true"]), "allow");
+        assert_eq!(v(&["rm", "-rf", "/tmp/a", "&&", "echo", "done"]), "allow");
+        assert_eq!(v(&["rm", "-rf", "/tmp/a", "2>/dev/null"]), "allow");
+        assert!(v(&["rm", "-rf", "/tmp/a", "/home/u/x"]).starts_with("deny"));
+        assert!(v(&["rm", "-rf", "/home/u/x", ">/dev/null"]).starts_with("deny"));
+        assert!(v(&["rtrash", "-rf", "$S/head"]).starts_with("deny"));
+        assert!(v(&["rm", "-rf", "/tmp/a;", "rm", "-rf", "/home/u/x"]).starts_with("deny"));
+        assert!(v(&["true", "&&", "rm", "-rf", "/home/u/x"]).starts_with("deny"));
+        assert!(v(&["rm", "-r", "-f", "/home/u/x"]).starts_with("deny"));
+        assert_eq!(v(&["rm", "-r", "/home/u/x"]), "allow");
     }
 
     #[test]
