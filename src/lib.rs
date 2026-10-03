@@ -15,6 +15,7 @@ pub mod policy_capnp;
 use policy_capnp::{Decision, PolicyReason};
 
 /// Slot this CLI binds so checkShell has a workspace root.
+#[cfg(has_phronesis)]
 const HOST_AGENT_LO: u64 = 1;
 
 /// Hook line: `allow` or `deny\t<token>`.
@@ -86,25 +87,23 @@ fn host_argv_table(argv: &[String]) -> Checked {
             token: "raw-disk",
         };
     }
-    if base == "rm" || base == "rtrash" {
-        if line.contains("-rf") || line.contains("-fr") {
-            let only_tmp = argv
-                .iter()
-                .skip(1)
-                .filter(|a| !a.starts_with('-'))
-                .all(|p| {
-                    p == "/tmp"
-                        || p.starts_with("/tmp/")
-                        || p == "/var/tmp"
-                        || p.starts_with("/var/tmp/")
-                });
-            if !only_tmp {
-                return Checked {
-                    decision: Decision::Deny,
-                    code: PolicyReason::ShellDangerousRunner,
-                    token: "rm-rf-outside-tmp",
-                };
-            }
+    if (base == "rm" || base == "rtrash") && (line.contains("-rf") || line.contains("-fr")) {
+        let only_tmp = argv
+            .iter()
+            .skip(1)
+            .filter(|a| !a.starts_with('-'))
+            .all(|p| {
+                p == "/tmp"
+                    || p.starts_with("/tmp/")
+                    || p == "/var/tmp"
+                    || p.starts_with("/var/tmp/")
+            });
+        if !only_tmp {
+            return Checked {
+                decision: Decision::Deny,
+                code: PolicyReason::ShellDangerousRunner,
+                token: "rm-rf-outside-tmp",
+            };
         }
     }
     if base == "git"
@@ -396,8 +395,7 @@ const WRAPPERS: &[&str] = &[
 /// The command a pipeline stage runs: its first word past wrappers,
 /// assignments and their flags, by base name.
 fn command_word(stage: &[String]) -> Option<&str> {
-    let mut words = stage.iter().map(String::as_str);
-    while let Some(w) = words.next() {
+    for w in stage.iter().map(String::as_str) {
         let b = base_of(w);
         if WRAPPERS.contains(&b) || w.starts_with('-') || (w.contains('=') && !w.starts_with('=')) {
             continue;
