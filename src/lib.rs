@@ -15,6 +15,7 @@ pub mod policy_capnp;
 use policy_capnp::{Decision, PolicyReason};
 
 /// Slot this CLI binds so checkShell has a workspace root.
+#[cfg(has_phronesis)]
 const HOST_AGENT_LO: u64 = 1;
 
 /// Hook line: `allow` or `deny\t<token>`.
@@ -381,8 +382,7 @@ const WRAPPERS: &[&str] = &[
 /// The command a pipeline stage runs: its first word past wrappers,
 /// assignments and their flags, by base name.
 fn command_word(stage: &[String]) -> Option<&str> {
-    let mut words = stage.iter().map(String::as_str);
-    while let Some(w) = words.next() {
+    for w in stage.iter().map(String::as_str) {
         let b = base_of(w);
         if WRAPPERS.contains(&b) || w.starts_with('-') || (w.contains('=') && !w.starts_with('=')) {
             continue;
