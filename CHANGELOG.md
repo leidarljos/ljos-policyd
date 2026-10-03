@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `curl-pipe-shell` refuses a download handed to a shell: a fetching stage
+  piped into a shell stage, or a shell running a download through `$( )`,
+  `<( )`, backticks or `-c`. A line that names a download tool and a shell
+  without that (`git fetch`, then `bash build.sh`; a pattern `curl|shell`)
+  is no longer refused.
 - `PHRONESIS_DIR` / `pkg-config phronesis` enables `phronesis_check_shell`
   as the check. Missing library still compiles (host argv table).
 - A seated check binds the host slot to the process cwd and loads the
