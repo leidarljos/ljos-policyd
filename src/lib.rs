@@ -56,7 +56,6 @@ fn host_argv_table(argv: &[String]) -> Checked {
             token: "empty argv",
         };
     }
-    let line = argv.join(" ");
     let base = base_of(&argv[0]);
     if is_privilege(base) || argv.iter().any(|t| is_privilege(base_of(t))) {
         return Checked {

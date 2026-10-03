@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- The recursive-delete rule judges each `rm` or `rtrash` on a hooked line
+  by its own operands. Redirections, separators and later commands no
+  longer count as delete targets, and a second delete after `;`, `&&`,
+  `||` or `|` is judged too.
 - `PHRONESIS_DIR` / `pkg-config phronesis` enables `phronesis_check_shell`
   as the check. Missing library still compiles (host argv table).
 - A seated check binds the host slot to the process cwd and loads the
