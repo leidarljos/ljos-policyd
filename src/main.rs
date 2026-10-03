@@ -4,7 +4,7 @@ use std::env;
 use std::io::{self, Write};
 use std::process::{self, Command};
 
-use ljos_policyd::{encode_decision, check_shell, verdict};
+use ljos_policyd::{check_shell, encode_decision, verdict};
 
 fn main() {
     let mut args: Vec<String> = env::args().skip(1).collect();
