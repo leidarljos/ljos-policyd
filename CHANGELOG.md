@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.3 (2026-10-04)
 
 - `curl-pipe-shell` refuses a download handed to a shell: a fetching stage
   piped into a shell stage, or a shell running a download through `$( )`,
