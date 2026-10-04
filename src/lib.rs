@@ -18,6 +18,17 @@ use policy_capnp::{Decision, PolicyReason};
 #[cfg(has_phronesis)]
 const HOST_AGENT_LO: u64 = 1;
 
+/// Which law this build judges with: `phronesis` when the library was
+/// found at build time (`PHRONESIS_DIR` or `pkg-config phronesis`), else
+/// `host table`, the argv table compiled into this crate.
+#[cfg(has_phronesis)]
+pub const BACKEND: &str = "phronesis";
+/// Which law this build judges with: `phronesis` when the library was
+/// found at build time (`PHRONESIS_DIR` or `pkg-config phronesis`), else
+/// `host table`, the argv table compiled into this crate.
+#[cfg(not(has_phronesis))]
+pub const BACKEND: &str = "host table";
+
 /// Hook line: `allow` or `deny\t<token>`.
 #[must_use]
 pub fn verdict(argv: &[String]) -> String {
@@ -35,11 +46,17 @@ pub struct Checked {
     pub token: &'static str,
 }
 
-/// Typed check. With phronesis linked, this is `phronesis_check_shell`.
+/// Typed check: the table built into this crate, and with phronesis
+/// linked, `phronesis_check_shell` after it. A refusal from the table
+/// stands, so a phronesis build refuses at least what the table does.
 #[must_use]
 pub fn check_shell(argv: &[String]) -> Checked {
     #[cfg(has_phronesis)]
     {
+        let table = host_argv_table(argv);
+        if table.decision != Decision::Allow {
+            return table;
+        }
         return check_shell_phronesis(argv);
     }
     #[cfg(not(has_phronesis))]
@@ -48,7 +65,6 @@ pub fn check_shell(argv: &[String]) -> Checked {
     }
 }
 
-#[cfg_attr(has_phronesis, allow(dead_code))]
 fn host_argv_table(argv: &[String]) -> Checked {
     if argv.is_empty() {
         return Checked {

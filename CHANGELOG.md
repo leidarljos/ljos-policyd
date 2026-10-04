@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.5 (2026-10-04)
+
+- A phronesis build runs the built-in table first and keeps its refusals,
+  so it refuses `rm -rf` outside `/tmp`, setuid `chmod` and raw-disk
+  writes as the table build does; phronesis adds its own refusals after.
+- `ljos-policyd version` names the backend: `phronesis` or `host table`.
+- The README says what is refused, in what order, and how to tell which
+  backend a binary uses.
+
 ## 0.2.4 (2026-10-04)
 
 - The recursive-delete rule judges each `rm` or `rtrash` on a hooked line

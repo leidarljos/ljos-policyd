@@ -54,7 +54,11 @@ fn main() {
             process::exit(status.code().unwrap_or(127));
         }
         "version" | "--version" => {
-            println!("ljos-policyd {}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "ljos-policyd {} ({})",
+                env!("CARGO_PKG_VERSION"),
+                ljos_policyd::BACKEND
+            );
         }
         _ => {
             eprintln!("usage: ljos-policyd check|exec|capnp|version -- argv...");

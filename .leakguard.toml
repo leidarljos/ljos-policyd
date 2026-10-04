@@ -1,0 +1,5 @@
+# This crate runs under AI coding agents and names the runners it serves.
+allow = [
+    "claude",
+    "codex",
+]
