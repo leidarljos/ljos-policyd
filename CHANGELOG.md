@@ -1,11 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.2.4 (2026-10-04)
 
 - The recursive-delete rule judges each `rm` or `rtrash` on a hooked line
   by its own operands. Redirections, separators and later commands no
   longer count as delete targets, and a second delete after `;`, `&&`,
   `||` or `|` is judged too.
+- Everything in 0.2.3, which was published without the line above and is
+  yanked.
+
+## 0.2.3 (2026-10-04, yanked)
+
 - `curl-pipe-shell` refuses a download handed to a shell: a fetching stage
   piped into a shell stage, or a shell running a download through `$( )`,
   `<( )`, backticks or `-c`. A line that names a download tool and a shell

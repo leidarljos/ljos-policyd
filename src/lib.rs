@@ -489,14 +489,22 @@ fn recursive_delete_off_tmp(argv: &[String]) -> bool {
         }
         let recursive = cmd.iter().skip(1).any(|a| {
             a.starts_with('-') && !a.starts_with("--") && a.contains('r') && a.contains('f')
-        }) || (cmd.iter().any(|a| matches!(*a, "-r" | "-R" | "--recursive"))
+        }) || (cmd
+            .iter()
+            .any(|a| matches!(*a, "-r" | "-R" | "--recursive"))
             && cmd.iter().any(|a| matches!(*a, "-f" | "--force")));
         if !recursive {
             return false;
         }
-        !cmd.iter().skip(1).filter(|a| !a.starts_with('-') && !is_redirection(a)).all(|p| {
-            *p == "/tmp" || p.starts_with("/tmp/") || *p == "/var/tmp" || p.starts_with("/var/tmp/")
-        })
+        !cmd.iter()
+            .skip(1)
+            .filter(|a| !a.starts_with('-') && !is_redirection(a))
+            .all(|p| {
+                *p == "/tmp"
+                    || p.starts_with("/tmp/")
+                    || *p == "/var/tmp"
+                    || p.starts_with("/var/tmp/")
+            })
     })
 }
 
@@ -593,7 +601,18 @@ mod tests {
     #[cfg(not(has_phronesis))]
     #[test]
     fn recursive_delete_judges_only_its_own_operands() {
-        assert_eq!(v(&["rtrash", "-rf", "/tmp/a", "/tmp/b", ">/dev/null", "2>&1;", "true"]), "allow");
+        assert_eq!(
+            v(&[
+                "rtrash",
+                "-rf",
+                "/tmp/a",
+                "/tmp/b",
+                ">/dev/null",
+                "2>&1;",
+                "true"
+            ]),
+            "allow"
+        );
         assert_eq!(v(&["rm", "-rf", "/tmp/a", "&&", "echo", "done"]), "allow");
         assert_eq!(v(&["rm", "-rf", "/tmp/a", "2>/dev/null"]), "allow");
         assert!(v(&["rm", "-rf", "/tmp/a", "/home/u/x"]).starts_with("deny"));
