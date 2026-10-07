@@ -153,6 +153,7 @@ td,
 }
 
 .seat-bar {
+  position: relative;
   display: flex;
   flex-wrap: wrap;
   gap: 0 0.15rem;
@@ -163,8 +164,21 @@ td,
   margin: 0 0 0.6rem;
   color: var(--mute);
 }
+.seat-bar::before {
+  content: "";
+  position: absolute;
+  left: 0.7rem;
+  right: 0.7rem;
+  top: 50%;
+  height: 1px;
+  background: var(--gold);
+  opacity: 0.55;
+  pointer-events: none;
+}
 
 .seat-bar a {
+  position: relative;
+  z-index: 1;
   display: inline-flex;
   align-items: center;
   min-height: 44px;
@@ -172,6 +186,14 @@ td,
   color: var(--gold);
   text-decoration: none;
   white-space: nowrap;
+  background: var(--sy-c-bg, var(--ink));
+}
+.seat-bar a[aria-current="page"]::before {
+  content: "";
+  width: 0.55rem;
+  height: 0.85rem;
+  margin-right: 0.4rem;
+  background: url("/pin.svg") center / contain no-repeat;
 }
 
 a:focus-visible {
