@@ -80,7 +80,18 @@ body,
 .sy-head-brand strong {
   font-family: var(--serif) !important;
   letter-spacing: -0.03em;
+  text-wrap: balance;
 }
+.sy-page h1 { font-size: clamp(2.1rem, 5vw, 3.4rem); line-height: 1.08; }
+.sy-page h2 { font-size: clamp(1.45rem, 2.6vw, 1.9rem); line-height: 1.2; }
+.sy-page h3, .sy-page h4 { font-size: 1.2rem; line-height: 1.25; }
+.yue, .vi-hero-tagline {
+  font-size: 1.0625rem;
+  line-height: 1.7;
+  letter-spacing: 0.008em;
+}
+.yue { max-width: 66ch; }
+.yue table, table.docutils { font-variant-numeric: lining-nums tabular-nums; }
 
 .sy-head-brand img {
   height: 1.85rem;
@@ -188,11 +199,12 @@ body::before {
 }
 .vi-hero-name {
   font-family: var(--serif);
-  font-size: clamp(2.2rem, 5vw, 3.4rem);
+  font-size: clamp(2.1rem, 5vw, 3.4rem);
   font-weight: 600;
   margin: 0;
-  letter-spacing: -0.035em;
-  line-height: 1.05;
+  letter-spacing: -0.03em;
+  line-height: 1.08;
+  text-wrap: balance;
   color: var(--vi-hero-name);
 }
 .vi-hero-tag {
