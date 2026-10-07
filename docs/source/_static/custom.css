@@ -1,4 +1,7 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400&family=Source+Sans+3:wght@400;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap");
+
 /* leiðarljós pin theme: ink, cream, gold. */
+
 :root {
   --ink: #0b0b0a;
   --cream: #f4f0e6;
@@ -6,10 +9,10 @@
   --line: #2a2824;
   --mute: #b9b3a6;
   --panel: #141310;
-  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Charter, Georgia,
-    serif;
-  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, "Liberation Mono",
+  --serif: "Source Serif 4", "Iowan Old Style", Palatino, "Palatino Linotype",
+    Charter, Georgia, serif;
+  --sans: "Source Sans 3", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas,
     monospace;
 }
 
@@ -107,6 +110,68 @@ body,
 :focus-visible {
   outline: 2px solid var(--vi-focus);
   outline-offset: 3px;
+}
+
+::selection {
+  background: var(--gold);
+  color: var(--ink);
+}
+
+input,
+textarea {
+  caret-color: var(--gold);
+}
+
+html {
+  scrollbar-color: #3a3428 var(--ink);
+}
+
+code,
+pre,
+kbd,
+samp,
+.highlight {
+  font-family: var(--mono);
+}
+
+p,
+li,
+td,
+.vi-hero-tagline {
+  overflow-wrap: break-word;
+}
+
+.seat-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.85rem;
+  align-items: center;
+  font: 0.82rem/1.4 var(--sans);
+  padding: 0.45rem 0;
+  border-bottom: 1px solid var(--line);
+  margin: 0 0 0.6rem;
+  color: var(--mute);
+}
+
+.seat-bar a {
+  color: var(--gold);
+  text-decoration: none;
+}
+
+.seat-bar a[aria-current="page"] {
+  color: var(--cream);
+}
+
+body::before {
+  content: "";
+  pointer-events: none;
+  position: fixed;
+  inset: -6rem -8rem auto auto;
+  width: min(42vw, 22rem);
+  height: min(42vw, 22rem);
+  opacity: 0.14;
+  background: url("https://leidarljos.github.io/pin.svg") no-repeat center / contain;
+  z-index: 0;
 }
 
 /* Landing hero */
