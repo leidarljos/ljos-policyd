@@ -183,6 +183,11 @@ a:focus-visible {
   color: var(--cream);
 }
 
+html.light .seat-bar a[aria-current="page"],
+html[data-theme="light"] .seat-bar a[aria-current="page"] {
+  color: var(--ink);
+}
+
 body::before {
   content: "";
   pointer-events: none;
