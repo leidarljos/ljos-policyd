@@ -1,21 +1,21 @@
 A reader who has never used the binary can finish this page with one
 allow, one deny, and an exec that did not run.
 
-1. Ask with uv
+1. Ask
 ==============
 
 .. code:: console
 
-   $ uvx ljos-policyd check -- uv run pytest
+   $ ljos-policyd check -- uv run pytest
    allow
-   $ uvx ljos-policyd check -- sudo id
+   $ ljos-policyd check -- sudo id
    deny    sudo
 
-``uvx`` runs the binary. ``uv run`` is the line under test. A Janet pack
+``uv run pytest`` is the line under test. A Janet pack
 can deny more after this verdict; it cannot allow what this binary
 denied.
 
-Nothing is configured. The built-in denials are the whole TCB.
+Nothing is configured. The built-in denials are the whole trusted computing base: nothing else decides.
 
 2. See a deny
 =============
@@ -29,7 +29,7 @@ Nothing is configured. The built-in denials are the whole TCB.
 
 First matching deny wins. The reason is a short token after a tab
 (``sudo``, ``curl-pipe-shell``, ``git-force-push``, ``chmod-setuid``,
-``raw-disk``, …). The typed form is a Cap'n ``PolicyDecision``:
+``raw-disk``, and more). The typed form is a Cap'n ``PolicyDecision``:
 
 .. code:: console
 
@@ -63,7 +63,7 @@ First matching deny wins. The reason is a short token after a tab
    ls
    allow
 
-``ljos policy`` prints the line, then the TCB verdict if the binary
+``ljos policy`` prints the line, then the built-in verdict if the binary
 answered, then any pack rule that matches. ``POLICYD_BIN`` names a
 binary that is not on ``PATH``. ``POLICYD_REQUIRED=1`` is fail-closed:
 a missing binary is then a deny.

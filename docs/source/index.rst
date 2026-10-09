@@ -25,9 +25,9 @@ First minute
 
 .. code:: console
 
-   $ uvx ljos-policyd check -- uv run pytest
+   $ ljos-policyd check -- uv run pytest
    allow
-   $ uvx ljos-policyd check -- sudo id
+   $ ljos-policyd check -- sudo id
    deny    sudo
 
 Typed verdict is Cap'n PolicyDecision (phronesis; Ali Akber Saifee / indynull, HaoZeke). A Janet pack can deny more. It cannot allow what this binary denied.
@@ -45,9 +45,9 @@ Install
 
 .. code:: console
 
-   $ uvx ljos-policyd check -- uv run pytest
-   allow
    $ cargo binstall ljos-policyd
+   $ ljos-policyd check -- uv run pytest
+   allow
 
 ``exec`` runs the line only if the verdict is allow. A deny exits 2.
 

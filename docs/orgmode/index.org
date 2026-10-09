@@ -28,9 +28,9 @@
 * First minute
 
 #+begin_src console
-$ uvx ljos-policyd check -- uv run pytest
+$ ljos-policyd check -- uv run pytest
 allow
-$ uvx ljos-policyd check -- sudo id
+$ ljos-policyd check -- sudo id
 deny	sudo
 #+end_src
 
@@ -47,9 +47,9 @@ The seat composes that pack after this verdict: =ljos policy -- uv run pytest=.
 * Install
 
 #+begin_src console
-$ uvx ljos-policyd check -- uv run pytest
-allow
 $ cargo binstall ljos-policyd
+$ ljos-policyd check -- uv run pytest
+allow
 #+end_src
 
 =exec= runs the line only if the verdict is allow. A deny exits 2.
