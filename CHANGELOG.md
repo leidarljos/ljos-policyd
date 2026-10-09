@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- The explanation says why a model cannot mediate. An unmatched command
+  is an allow. Fail-closed is `POLICYD_REQUIRED`, and it covers a
+  missing binary.
+
 ## 0.2.5 (2026-10-04)
 
 - A phronesis build runs the built-in table first and keeps its refusals,
