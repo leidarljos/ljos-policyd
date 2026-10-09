@@ -10,7 +10,8 @@ A model cannot be the mediator. An agent that can talk its way past
 the check is the threat, and indirect prompt injection shows that
 instructions carried in data change what a model permits (Greshake et
 al., doi:10.48550/arXiv.2302.12173). No matching rule in this table is
-an allow. Saltzer and Schroeder would deny in that case (`Saltzer
+an allow. This table judges the argv it is given. Saltzer and
+Schroeder would deny in that case (`Saltzer
 and Schroeder, 1975 <https://doi.org/10.1109/PROC.1975.9939>`__). This
 table does not. The fail-closed switch is ``POLICYD_REQUIRED=1``, and
 it covers a missing binary. The next layer may deny more. It cannot
