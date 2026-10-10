@@ -14,6 +14,7 @@
 - More git calls that lose work are refused: `git-push-delete` for `push --delete`, `push -d` and an empty-source refspec such as `:main` or `:refs/tags/v1.0`, `git-branch-force-delete` for `branch -D`, `git-reflog-expire` for `reflog expire --expire=now` and `reflog delete`, `git-history-rewrite` for `filter-branch` and `filter-repo`, `git-update-ref-delete` and `git-worktree-force-remove`. `branch -d`, `reflog expire` with a date and `worktree remove` without `--force` stay allowed, and so does `stash drop`, as before.
 - A `-c` on the git line no longer hides what runs. `git -c alias.p='push -f' p` is judged as `git push -f`, an alias that starts with `!` is judged as a shell line, and so is the value of a key git runs as a command, such as `core.sshCommand`, `core.pager` or `credential.helper`.
 - `find -exec rm`, `-execdir rm`, `-ok rm`, and `shred` or `unlink` in their place, meet the same starting-point rule as `find -delete`. `busybox` and `toybox` run the applet after them, so `busybox rm -rf ~/x` meets the `rm` rule.
+- `rm-rf-outside-tmp` allows a recursive delete of a build output directory named as a plain relative path: `node_modules`, `target`, `dist`, `build`, `.venv`, `__pycache__`, `.next` and the other tool caches listed in the source, or a path under one. A path with `..`, `~`, `$`, a glob, an absolute start or a `.` part is still refused, and so is the whole line when a `cd` or `pushd` on it can leave the tree. `rm -rf node_modules` and `rm -rf target/` were refused before.
 
 ## 0.3.0 (2026-10-10)
 

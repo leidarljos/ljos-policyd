@@ -79,7 +79,7 @@ pub fn check_shell(argv: &[String]) -> Checked {
 }
 
 fn host_argv_table(argv: &[String]) -> Checked {
-    host_argv_table_at(argv, 0)
+    host_argv_table_at(argv, 0, leaves_tree(argv, 0))
 }
 
 /// How deep `sh -c` scripts nest before the table stops reading them.
@@ -88,8 +88,10 @@ const MAX_DEPTH: usize = 4;
 /// The table on one argv, then on every command it runs through a wrapper
 /// (`env`, `nice`, `xargs`, ...) or a shell's `-c` script, so `env git push
 /// -f` and `sh -c "git push -f"` meet the same rules as `git push -f`.
-fn host_argv_table_at(argv: &[String], depth: usize) -> Checked {
-    let own = host_argv_rules(argv);
+/// `moved` is true when a `cd` or `pushd` anywhere on the line can leave the
+/// working tree, so a relative path no longer says where a delete lands.
+fn host_argv_table_at(argv: &[String], depth: usize, moved: bool) -> Checked {
+    let own = host_argv_rules(argv, moved);
     if own.decision != Decision::Allow || depth >= MAX_DEPTH {
         return own;
     }
@@ -97,7 +99,7 @@ fn host_argv_table_at(argv: &[String], depth: usize) -> Checked {
         if inner.as_slice() == argv {
             continue;
         }
-        let c = host_argv_table_at(&inner, depth + 1);
+        let c = host_argv_table_at(&inner, depth + 1, moved);
         if c.decision != Decision::Allow {
             return c;
         }
@@ -582,7 +584,7 @@ fn shell_words(script: &str) -> Vec<String> {
     out
 }
 
-fn host_argv_rules(argv: &[String]) -> Checked {
+fn host_argv_rules(argv: &[String], moved: bool) -> Checked {
     if argv.is_empty() {
         return Checked {
             decision: Decision::Deny,
@@ -633,7 +635,7 @@ fn host_argv_rules(argv: &[String]) -> Checked {
             token: Cow::Borrowed("recursive-chmod-chown"),
         };
     }
-    if recursive_delete_off_tmp(argv) {
+    if recursive_delete_off_tmp(argv, moved) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellDangerousRunner,
@@ -1283,10 +1285,12 @@ fn git_configs(argv: &[String]) -> Vec<(String, String)> {
     out
 }
 
-/// The table's verdict on a string git hands to a shell.
+/// The table's verdict on a string git hands to a shell. Git can run it
+/// from another directory, so a relative build output path is not allowed
+/// to pass there.
 fn git_shell_value(value: &str) -> Option<&'static str> {
     let argv = ["sh", "-c", value].map(String::from);
-    let c = host_argv_table_at(&argv, 1);
+    let c = host_argv_table_at(&argv, 1, true);
     // The table's tokens are all static; only phronesis writes its own.
     (c.decision != Decision::Allow).then_some(match c.token {
         Cow::Borrowed(t) => t,
@@ -1565,7 +1569,86 @@ fn climbs(path: &str) -> bool {
     path.split('/').any(|part| part == "..")
 }
 
-fn recursive_delete_off_tmp(argv: &[String]) -> bool {
+/// Directories a build, a package manager or a test run writes and can
+/// write again. A recursive delete of one, named as a plain relative path,
+/// is allowed.
+const BUILD_OUTPUT_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "_build",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".nox",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".turbo",
+    ".parcel-cache",
+    ".angular",
+    ".gradle",
+    "coverage",
+    "htmlcov",
+];
+
+/// A path written out in plain characters that stays below the working
+/// directory: not absolute, no `~`, no `$`, no glob, no `..` and no `.`
+/// part. A leading `./` and a trailing `/` are allowed.
+fn plain_relative(p: &str) -> bool {
+    let mut rest = p;
+    while let Some(r) = rest.strip_prefix("./") {
+        rest = r;
+    }
+    let rest = rest.trim_end_matches('/');
+    !rest.is_empty()
+        && !rest.starts_with('-')
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '@' | '/'))
+        && rest
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+/// A plain relative path inside a build output directory, or the
+/// directory itself: `target/`, `./build`, `web/node_modules`.
+fn build_output(p: &str) -> bool {
+    plain_relative(p) && p.split('/').any(|part| BUILD_OUTPUT_DIRS.contains(&part))
+}
+
+/// A `cd`, `pushd` or `popd` that can leave the working tree: an absolute
+/// target, `~`, `-`, `..`, a variable, or none at all (home).
+fn leaves_tree(argv: &[String], depth: usize) -> bool {
+    let here = commands(argv).iter().any(|cmd| {
+        let b = base_of(cmd[0]);
+        if b == "popd" {
+            return true;
+        }
+        if b != "cd" && b != "pushd" {
+            return false;
+        }
+        match cmd[1..].iter().find(|a| !a.starts_with('-') || **a == "-") {
+            Some(t) => !plain_relative(t),
+            None => true,
+        }
+    });
+    here || (depth < MAX_DEPTH
+        && inner_commands(argv)
+            .iter()
+            .any(|inner| inner.as_slice() != argv && leaves_tree(inner, depth + 1)))
+}
+
+/// True when any `rm` or `rtrash` on the line deletes recursively with an
+/// operand that is neither under `/tmp` or `/var/tmp` nor a build output
+/// directory named as a plain relative path. When the line can `cd` out of
+/// the working tree, only `/tmp` operands pass.
+fn recursive_delete_off_tmp(argv: &[String], moved: bool) -> bool {
     commands(argv).iter().any(|cmd| {
         let b = base_of(cmd[0]);
         if b != "rm" && b != "rtrash" {
@@ -1583,13 +1666,7 @@ fn recursive_delete_off_tmp(argv: &[String]) -> bool {
         !cmd.iter()
             .skip(1)
             .filter(|a| !a.starts_with('-') && !is_redirection(a))
-            .all(|p| {
-                !climbs(p)
-                    && (*p == "/tmp"
-                        || p.starts_with("/tmp/")
-                        || *p == "/var/tmp"
-                        || p.starts_with("/var/tmp/"))
-            })
+            .all(|p| under_tmp(p) || (!moved && build_output(p)))
     })
 }
 
@@ -2078,6 +2155,64 @@ mod tests {
         assert_eq!(v(&["sh", "-c", "rm -rf /tmp/a"]), "allow");
     }
 
+    #[test]
+    fn a_build_output_dir_inside_the_tree_may_be_deleted() {
+        for line in [
+            "rm -rf target/",
+            "rm -rf node_modules",
+            "rm -rf dist",
+            "rm -rf ./build",
+            "rm -rf .venv __pycache__ .next",
+            "rm -fr web/node_modules",
+            "rm -r -f target/debug/incremental",
+            "rm -rf -- .pytest_cache",
+            "rm -rf node_modules /tmp/npm-cache",
+            "cd web && rm -rf node_modules dist",
+            "sh -c 'rm -rf target'",
+            "rtrash -rf build",
+        ] {
+            assert_eq!(verdict(&shell_words(line)), "allow", "{line}");
+        }
+    }
+
+    #[cfg(not(has_phronesis))]
+    #[test]
+    fn a_build_dir_name_does_not_widen_a_delete() {
+        for line in [
+            "rm -rf ../target",
+            "rm -rf /build",
+            "rm -rf target ~",
+            "rm -rf ~/target",
+            "rm -rf target/..",
+            "rm -rf node_modules/../src",
+            "rm -rf ./build/../..",
+            "rm -rf */target",
+            "rm -rf target*",
+            "rm -rf build/*",
+            "rm -rf {build,src}",
+            "rm -rf $HOME/build",
+            "rm -rf ${OUT:-/}/dist",
+            "rm -rf node_modules src",
+            "rm -rf .",
+            "rm -rf ./",
+            "rm -R --force .git",
+            "cd / && rm -rf build",
+            "cd .. && rm -rf target",
+            "cd ~ && rm -rf node_modules",
+            "cd && rm -rf build",
+            "cd - && rm -rf dist",
+            "sh -c 'cd /srv && rm -rf build'",
+            "sh -c 'cd / && rm -rf home'",
+        ] {
+            assert_eq!(
+                verdict(&shell_words(line)),
+                "deny\trm-rf-outside-tmp",
+                "{line}"
+            );
+        }
+    }
+
+    #[cfg(not(has_phronesis))]
     #[test]
     fn a_tmp_path_that_climbs_out_is_outside_tmp() {
         assert!(v(&["rm", "-rf", "/tmp/../home/u"]).starts_with("deny"));
