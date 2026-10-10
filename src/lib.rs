@@ -98,7 +98,11 @@ fn inner_commands(argv: &[String]) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     for cmd in commands(argv) {
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
-        let run = unwrap_wrappers(&owned);
+        let (run, handed) = unwrap_wrappers(&owned);
+        if let Some(script) = handed {
+            out.push(shell_words(script));
+            continue;
+        }
         if run.is_empty() {
             continue;
         }
@@ -164,7 +168,11 @@ const RUNNERS: &[(&str, &[&str])] = &[
 /// The command past any leading assignments and runner words, with each
 /// runner's flags (and their values) taken off. `timeout`, `flock`,
 /// `taskset` and `chrt` also take one positional word before the command.
-fn unwrap_wrappers(cmd: &[String]) -> &[String] {
+///
+/// Some runners take the command as one string a shell splits: `env -S
+/// STRING`, `flock FILE -c STRING` and `watch STRING`. That string comes back
+/// as the second value, to be read as a script.
+fn unwrap_wrappers(cmd: &[String]) -> (&[String], Option<&str>) {
     let mut i = 0;
     while i < cmd.len() {
         let w = cmd[i].as_str();
@@ -176,11 +184,24 @@ fn unwrap_wrappers(cmd: &[String]) -> &[String] {
             break;
         };
         i += 1;
+        if *name == "flock" {
+            if let Some(at) = cmd[i..].iter().position(|a| a == "-c" || a == "--command") {
+                return (&[], cmd.get(i + at + 1).map(String::as_str));
+            }
+        }
         while i < cmd.len() {
             let a = cmd[i].as_str();
             if a == "--" {
                 i += 1;
                 break;
+            }
+            if *name == "env" {
+                if a == "-S" || a == "--split-string" {
+                    return (&[], cmd.get(i + 1).map(String::as_str));
+                }
+                if let Some(v) = a.strip_prefix("--split-string=") {
+                    return (&[], Some(v));
+                }
             }
             if *name == "env" && is_assignment(a) {
                 i += 1;
@@ -190,28 +211,41 @@ fn unwrap_wrappers(cmd: &[String]) -> &[String] {
                 break;
             }
         }
+        if *name == "watch" && i + 1 == cmd.len() {
+            return (&[], Some(cmd[i].as_str()));
+        }
         if matches!(*name, "timeout" | "flock" | "taskset" | "chrt") && i < cmd.len() {
             i += 1;
         }
     }
-    &cmd[i.min(cmd.len())..]
+    (&cmd[i.min(cmd.len())..], None)
 }
 
 /// The script a shell runs with `-c` (or a flag cluster holding `c`, such as
-/// `-lc`), if this command is one.
+/// `-lc`), if this command is one. A `--` after `-c` and the value of an
+/// option such as `-o pipefail` or `--rcfile FILE` are not the script.
 fn shell_script(run: &[String]) -> Option<&str> {
     if !SHELLS.contains(&base_of(run.first()?)) {
         return None;
     }
+    let mut it = run[1..].iter().map(String::as_str);
     let mut takes = false;
-    for a in &run[1..] {
+    while let Some(a) = it.next() {
         if takes {
-            return Some(a.as_str());
+            if a == "--" {
+                continue;
+            }
+            return Some(a);
+        }
+        if !(a.starts_with('-') || a.starts_with('+')) || a.len() < 2 {
+            return None;
         }
         if a.starts_with('-') && !a.starts_with("--") && a[1..].contains('c') {
             takes = true;
-        } else if !a.starts_with('-') && !a.starts_with('+') {
-            return None;
+        } else if matches!(a, "--rcfile" | "--init-file")
+            || (!a.starts_with("--") && a.ends_with(['o', 'O']))
+        {
+            it.next();
         }
     }
     None
@@ -905,6 +939,23 @@ mod tests {
             &["nohup", "/usr/bin/git", "push", "-f"],
             &["true", "&&", "env", "git", "push", "-f"],
             &["bash", "-c", "sh -c 'git push -f'"],
+            &["sh", "-c", "--", "git push -f"],
+            &["bash", "-o", "pipefail", "-c", "git push -f | tee log"],
+            &[
+                "bash",
+                "+O",
+                "extglob",
+                "--rcfile",
+                "/dev/null",
+                "-c",
+                "git push -f",
+            ],
+            &["env", "-S", "git push -f"],
+            &["env", "--split-string=git push -f"],
+            &["flock", "/tmp/lock", "-c", "git push -f"],
+            &["flock", "-w", "5", "-c", "git push -f", "/tmp/lock"],
+            &["watch", "-n", "5", "git push -f"],
+            &["timeout", "30", "bash", "-c", "git push -f"],
         ] {
             assert_eq!(v(argv), "deny\tgit-force-push", "{argv:?}");
         }
@@ -915,6 +966,10 @@ mod tests {
             &["env", "FOO=1", "cargo", "test"],
             &["bash", "-c", "echo 'git push -f is refused'"],
             &["nice", "-n", "10", "cargo", "build"],
+            &["bash", "-o", "pipefail", "script.sh"],
+            &["env", "-S", "cargo test"],
+            &["flock", "/tmp/lock", "cargo", "build"],
+            &["watch", "-n", "5", "git status"],
         ] {
             assert_eq!(v(argv), "allow", "{argv:?}");
         }

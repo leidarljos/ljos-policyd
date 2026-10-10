@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- The table judges every command a line runs through a wrapper or a shell. `env`, `nice`, `nohup`, `time`, `exec`, `command`, `timeout`, `xargs`, `setsid`, `stdbuf`, `ionice` and leading `NAME=value` words are taken off, with their flags, and a shell's `-c` script (`sh -c`, `bash -lc`) is read as its own line. `env git push -f` and `sh -c "git push -f"` were allowed before, and so was every hook that asks this binary.
+- The table judges every command a line runs through a wrapper or a shell. `env`, `nice`, `nohup`, `time`, `exec`, `command`, `timeout`, `xargs`, `setsid`, `stdbuf`, `ionice` and leading `NAME=value` words are taken off, with their flags, and a shell's `-c` script (`sh -c`, `bash -lc`, `sh -c -- SCRIPT`, `bash -o pipefail -c`) is read as its own line. So is the string `env -S`, `flock FILE -c` and `watch` hand to a shell. `env git push -f` and `sh -c "git push -f"` were allowed before, and so was every hook that asks this binary.
 
 ## 0.2.6 (2026-10-10)
 
