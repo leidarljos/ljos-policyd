@@ -1,8 +1,9 @@
 //! Argv law. Typed verdict is Cap'n `PolicyDecision`.
 //!
-//! Every check calls `phronesis_check_shell`. If the library is not
-//! seated (no pack, no workspace), the host argv table this crate
-//! shipped is the TCB.
+//! Every line meets the host argv table built into this crate first. A
+//! phronesis build then hands the line, and every command the table found
+//! inside it, to `phronesis_check_shell` with the pack embedded at build
+//! time. Without phronesis the table alone is the law.
 
 #[allow(dead_code, unused_parens, clippy::all)]
 #[path = "schema/util_capnp.rs"]
@@ -12,7 +13,14 @@ pub mod util_capnp;
 #[path = "schema/policy_capnp.rs"]
 pub mod policy_capnp;
 
+use std::borrow::Cow;
+
 use policy_capnp::{Decision, PolicyReason};
+
+#[cfg(has_phronesis)]
+mod embedded {
+    include!(concat!(env!("OUT_DIR"), "/pack.rs"));
+}
 
 /// Slot this CLI binds so checkShell has a workspace root.
 #[cfg(has_phronesis)]
@@ -29,40 +37,45 @@ pub const BACKEND: &str = "phronesis";
 #[cfg(not(has_phronesis))]
 pub const BACKEND: &str = "host table";
 
-/// Hook line: `allow` or `deny\t<token>`.
+/// Hook line: `allow` or `deny\t<reason>`. The reason is the table's token
+/// or the pack's own text, on one line with no tabs.
 #[must_use]
 pub fn verdict(argv: &[String]) -> String {
     let d = check_shell(argv);
     match d.decision {
         Decision::Allow => "allow".into(),
-        Decision::Deny => format!("deny\t{}", d.token),
-        Decision::Prompt => format!("prompt\t{}", d.token),
+        Decision::Deny => format!("deny\t{}", one_line(&d.token)),
+        Decision::Prompt => format!("prompt\t{}", one_line(&d.token)),
     }
+}
+
+/// The verdict line is split on tabs and read one line at a time, so a
+/// reason keeps neither.
+fn one_line(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 pub struct Checked {
     pub decision: Decision,
     pub code: PolicyReason,
-    pub token: &'static str,
+    /// The table's token (`git-force-push`), or the pack's reason text.
+    pub token: Cow<'static, str>,
 }
 
 /// Typed check: the table built into this crate, and with phronesis
-/// linked, `phronesis_check_shell` after it. A refusal from the table
-/// stands, so a phronesis build refuses at least what the table does.
+/// linked, `phronesis_check_shell` after it on the line and on every
+/// command the table reads inside it. A refusal from the table stands, so
+/// a phronesis build refuses at least what the table does.
 #[must_use]
 pub fn check_shell(argv: &[String]) -> Checked {
+    let table = host_argv_table(argv);
     #[cfg(has_phronesis)]
-    {
-        let table = host_argv_table(argv);
-        if table.decision != Decision::Allow {
-            return table;
-        }
+    if table.decision == Decision::Allow {
         return check_shell_phronesis(argv);
     }
-    #[cfg(not(has_phronesis))]
-    {
-        host_argv_table(argv)
-    }
+    table
 }
 
 fn host_argv_table(argv: &[String]) -> Checked {
@@ -521,7 +534,7 @@ fn host_argv_rules(argv: &[String]) -> Checked {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::InvalidMessage,
-            token: "empty argv",
+            token: Cow::Borrowed("empty argv"),
         };
     }
     let base = base_of(&argv[0]);
@@ -529,49 +542,49 @@ fn host_argv_rules(argv: &[String]) -> Checked {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellPrivilegeDenied,
-            token: "sudo",
+            token: Cow::Borrowed("sudo"),
         };
     }
     if remote_exec(argv) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellRemoteExec,
-            token: "curl-pipe-shell",
+            token: Cow::Borrowed("curl-pipe-shell"),
         };
     }
     if setuid_chmod(argv) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellDangerousRunner,
-            token: "chmod-setuid",
+            token: Cow::Borrowed("chmod-setuid"),
         };
     }
     if raw_disk(argv) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellDangerousRunner,
-            token: "raw-disk",
+            token: Cow::Borrowed("raw-disk"),
         };
     }
     if recursive_delete_off_tmp(argv) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellDangerousRunner,
-            token: "rm-rf-outside-tmp",
+            token: Cow::Borrowed("rm-rf-outside-tmp"),
         };
     }
     if find_delete_off_tmp(argv) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellDangerousRunner,
-            token: "find-delete-outside-tmp",
+            token: Cow::Borrowed("find-delete-outside-tmp"),
         };
     }
     if interpreter_rmtree(argv) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellDangerousRunner,
-            token: "rm-rf-outside-tmp",
+            token: Cow::Borrowed("rm-rf-outside-tmp"),
         };
     }
     // A command word left as `$g` or `${GIT}` could be git: the git rules
@@ -581,14 +594,14 @@ fn host_argv_rules(argv: &[String]) -> Checked {
             return Checked {
                 decision: Decision::Deny,
                 code: PolicyReason::ShellGitDangerous,
-                token,
+                token: Cow::Borrowed(token),
             };
         }
     }
     Checked {
         decision: Decision::Allow,
         code: PolicyReason::Unspecified,
-        token: "allow",
+        token: Cow::Borrowed("allow"),
     }
 }
 
@@ -598,13 +611,13 @@ pub fn encode_decision(c: &Checked) -> capnp::Result<Vec<u8>> {
     let mut root = message.init_root::<policy_capnp::policy_decision::Builder>();
     root.set_decision(c.decision);
     root.set_code(c.code);
-    root.set_reason(c.token);
+    root.set_reason(c.token.as_ref());
     let mut out = Vec::new();
     capnp::serialize::write_message(&mut out, &message)?;
     Ok(out)
 }
 
-#[cfg(has_phronesis)]
+#[cfg(all(has_phronesis, test))]
 fn encode_shell_check(argv: &[String], cwd: &str) -> capnp::Result<Vec<u8>> {
     let mut message = capnp::message::Builder::new_default();
     let mut root = message.init_root::<policy_capnp::shell_check::Builder>();
@@ -623,41 +636,6 @@ fn encode_shell_check(argv: &[String], cwd: &str) -> capnp::Result<Vec<u8>> {
     let mut out = Vec::new();
     capnp::serialize::write_message(&mut out, &message)?;
     Ok(out)
-}
-
-#[cfg(has_phronesis)]
-fn token_for(code: PolicyReason, reason: &str) -> &'static str {
-    match code {
-        PolicyReason::InvalidMessage => "invalid-message",
-        PolicyReason::ShellPrivilegeDenied => "sudo",
-        PolicyReason::ShellRemoteExec => "curl-pipe-shell",
-        PolicyReason::ShellGitDangerous => "git-force-push",
-        PolicyReason::ShellDangerousRunner => "banned-runner",
-        PolicyReason::ShellSecretInArgv => "secret-in-argv",
-        PolicyReason::PythonRequiresUvRun => "python-requires-uv",
-        PolicyReason::PythonDashCDenied => "python-dash-c",
-        PolicyReason::PackMissing => "pack-missing",
-        PolicyReason::ToolsDefaultDeny => "tools-default-deny",
-        _ if !reason.is_empty() => {
-            // Pack-authored text is not 'static; keep a stable token.
-            "phronesis"
-        }
-        _ => "phronesis",
-    }
-}
-
-#[cfg(has_phronesis)]
-fn decode_decision(bytes: &[u8]) -> capnp::Result<Checked> {
-    let mut cursor = std::io::Cursor::new(bytes);
-    let msg = capnp::serialize::read_message(&mut cursor, capnp::message::ReaderOptions::new())?;
-    let d = msg.get_root::<policy_capnp::policy_decision::Reader<'_>>()?;
-    let code = d.get_code()?;
-    let reason = d.get_reason()?.to_str().unwrap_or("");
-    Ok(Checked {
-        decision: d.get_decision()?,
-        code,
-        token: token_for(code, reason),
-    })
 }
 
 #[cfg(has_phronesis)]
@@ -680,11 +658,14 @@ extern "C" {
         workspace: *const libc::c_char,
         pid: libc::pid_t,
     ) -> libc::c_int;
+    fn phronesis_supervisor_close(s: *mut Supervisor);
     fn ljos_phronesis_read_decision(
         input: *const u8,
         in_len: usize,
         decision: *mut u16,
         code: *mut u16,
+        reason: *mut libc::c_char,
+        reason_len: usize,
     ) -> libc::c_int;
     fn ljos_phronesis_check_shell(
         s: *mut Supervisor,
@@ -701,145 +682,306 @@ fn host_agent_hex() -> String {
     format!("{:016x}{:016x}", 0u64, HOST_AGENT_LO)
 }
 
+/// Which embedded entry the seat loads: `shell.janet`, the default law, or
+/// `seat.janet` (the default law plus package and Python rules) when
+/// `LJOS_POLICYD_PACK=seat`.
 #[cfg(has_phronesis)]
-fn seat_dirs() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-    let base = std::env::var_os("PHRONESIS_STATE_DIR")
+fn embedded_entry() -> &'static str {
+    match std::env::var("LJOS_POLICYD_PACK").as_deref() {
+        Ok("seat") => "seat.janet",
+        _ => "shell.janet",
+    }
+}
+
+/// FNV-1a: names the directories the pack and each workspace use.
+#[cfg(has_phronesis)]
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// The hash of the embedded pack, naming the directory it unpacks to.
+#[cfg(has_phronesis)]
+fn pack_hash() -> u64 {
+    let mut all = Vec::new();
+    for (name, body) in embedded::PACK {
+        all.extend_from_slice(name.as_bytes());
+        all.push(0);
+        all.extend_from_slice(body);
+    }
+    fnv1a(&all)
+}
+
+/// True when every embedded file sits under `policy` byte for byte.
+#[cfg(has_phronesis)]
+fn pack_matches(policy: &std::path::Path) -> bool {
+    embedded::PACK
+        .iter()
+        .all(|(name, body)| std::fs::read(policy.join(name)).is_ok_and(|b| b == *body))
+}
+
+/// Unpack the embedded pack to `root/pack-<hash>/share/phronesis/policy`
+/// and return that prefix. A copy already there is used when it matches;
+/// a new one is written beside it and renamed into place.
+#[cfg(has_phronesis)]
+fn unpack_pack(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let name = format!("pack-{:016x}", pack_hash());
+    let prefix = root.join(&name);
+    let rel = std::path::Path::new("share/phronesis/policy");
+    if pack_matches(&prefix.join(rel)) {
+        return Some(prefix);
+    }
+    let tmp = root.join(format!(".{name}.{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join(rel).join("lib")).ok()?;
+    for (file, body) in embedded::PACK {
+        std::fs::write(tmp.join(rel).join(file), body).ok()?;
+    }
+    if prefix.exists() {
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+    if std::fs::rename(&tmp, &prefix).is_err() {
+        // Another check unpacked it first.
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+    pack_matches(&prefix.join(rel)).then_some(prefix)
+}
+
+/// Point phronesis at the embedded pack, unless the caller named a pack
+/// with `PHRONESIS_JANET_PACK` (then its own `PHRONESIS_PACK_ROOT` or
+/// prefix has to be trusted, as phronesis requires).
+#[cfg(has_phronesis)]
+fn ensure_pack_env(root: &std::path::Path) {
+    if std::env::var_os("PHRONESIS_JANET_PACK").is_some() {
+        return;
+    }
+    let Some(prefix) = unpack_pack(root) else {
+        // phronesis then reports packMissing, and the line is refused.
+        return;
+    };
+    let share = prefix.join("share/phronesis");
+    std::env::set_var("PHRONESIS_PREFIX", &prefix);
+    std::env::set_var("PHRONESIS_PACK_ROOT", &share);
+    std::env::set_var(
+        "PHRONESIS_JANET_PACK",
+        share.join("policy").join(embedded_entry()),
+    );
+}
+
+/// `$PHRONESIS_STATE_DIR`, else `~/.local/state/ljos-policyd`, and under
+/// it the `state` and `runtime` directories for `workspace`. phronesis
+/// keeps the first workspace a slot is bound to, so each workspace has
+/// its own pair; one shared pair refused every line outside the first.
+#[cfg(has_phronesis)]
+fn seat_dirs(
+    workspace: &str,
+) -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+    let root = std::env::var_os("PHRONESIS_STATE_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME")
                 .map(|h| std::path::PathBuf::from(h).join(".local/state/ljos-policyd"))
         })?;
-    let root = base;
-    let state = root.join("state");
-    let runtime = root.join("runtime");
+    let seat = root.join(format!("ws-{:016x}", fnv1a(workspace.as_bytes())));
+    let state = seat.join("state");
+    let runtime = seat.join("runtime");
     std::fs::create_dir_all(&state).ok()?;
     std::fs::create_dir_all(&runtime).ok()?;
-    Some((state, runtime))
+    Some((root, state, runtime))
+}
+
+/// A phronesis supervisor bound to the workspace for one hooked line.
+#[cfg(has_phronesis)]
+struct Seat {
+    sup: *mut Supervisor,
+    cwd: std::ffi::CString,
 }
 
 #[cfg(has_phronesis)]
-fn ensure_pack_env() {
-    let mut prefixes = Vec::new();
-    if let Ok(p) = std::env::var("PHRONESIS_PREFIX") {
-        prefixes.push(std::path::PathBuf::from(p));
-    }
-    if let Some(p) = option_env!("PHRONESIS_PREFIX") {
-        prefixes.push(std::path::PathBuf::from(p));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        prefixes.push(std::path::PathBuf::from(home).join(".local"));
-    }
-    prefixes.push(std::path::PathBuf::from("/usr/local"));
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(root) = exe.parent().and_then(|p| p.parent()) {
-            prefixes.push(root.to_path_buf());
-        }
-    }
-    for prefix in prefixes {
-        let pack = prefix.join("share/phronesis/policy/shell.janet");
-        if pack.is_file() {
-            std::env::set_var("PHRONESIS_PREFIX", &prefix);
-            std::env::set_var("PHRONESIS_PACK_ROOT", prefix.join("share/phronesis"));
-            if std::env::var_os("PHRONESIS_JANET_PACK").is_none() {
-                std::env::set_var("PHRONESIS_JANET_PACK", pack);
-            }
-            return;
+impl Drop for Seat {
+    fn drop(&mut self) {
+        if !self.sup.is_null() {
+            unsafe { phronesis_supervisor_close(self.sup) };
         }
     }
 }
 
 #[cfg(has_phronesis)]
-fn check_shell_phronesis(argv: &[String]) -> Checked {
-    ensure_pack_env();
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.to_str().map(str::to_string))
-        .filter(|s| s.starts_with('/'))
-        .unwrap_or_else(|| "/".into());
-    let fail = Checked {
+fn refused(token: &'static str) -> Checked {
+    Checked {
         decision: Decision::Deny,
         code: PolicyReason::InvalidMessage,
-        token: "phronesis",
-    };
-    let Some((state, runtime)) = seat_dirs() else {
-        return fail;
-    };
-    let Ok(state_c) = std::ffi::CString::new(state.to_string_lossy().as_bytes()) else {
-        return fail;
-    };
-    let Ok(runtime_c) = std::ffi::CString::new(runtime.to_string_lossy().as_bytes()) else {
-        return fail;
-    };
-    let mut sup: *mut Supervisor = std::ptr::null_mut();
-    let rc = unsafe { phronesis_supervisor_open(&mut sup, state_c.as_ptr(), runtime_c.as_ptr()) };
-    if rc != 0 || sup.is_null() {
-        return fail;
+        token: Cow::Borrowed(token),
     }
-    let Ok(hex) = std::ffi::CString::new(host_agent_hex()) else {
-        return fail;
-    };
-    let Ok(mode) = std::ffi::CString::new("seat") else {
-        return fail;
-    };
-    let ws = std::env::var("PHRONESIS_WORKSPACE")
-        .ok()
-        .filter(|s| s.starts_with('/'))
-        .unwrap_or_else(|| cwd.clone());
-    let Ok(ws_c) = std::ffi::CString::new(ws) else {
-        return fail;
-    };
-    let brc =
-        unsafe { phronesis_supervisor_bind(sup, hex.as_ptr(), mode.as_ptr(), ws_c.as_ptr(), 0) };
-    if brc != 0 && brc != -2 {
-        return Checked {
-            decision: Decision::Deny,
-            code: PolicyReason::InvalidMessage,
-            token: "bind-failed",
-        };
-    }
-    let c_args: Vec<std::ffi::CString> = argv
-        .iter()
-        .map(|a| {
-            std::ffi::CString::new(a.as_str())
-                .unwrap_or_else(|_| std::ffi::CString::new("").unwrap())
-        })
-        .collect();
-    let ptrs: Vec<*const libc::c_char> = c_args.iter().map(|c| c.as_ptr()).collect();
-    let cwd_c = std::ffi::CString::new(cwd.as_str())
-        .unwrap_or_else(|_| std::ffi::CString::new("/").unwrap());
-    let mut out: *mut u8 = std::ptr::null_mut();
-    let mut out_len: usize = 0;
-    let crc = unsafe {
-        ljos_phronesis_check_shell(
+}
+
+#[cfg(has_phronesis)]
+impl Seat {
+    fn open() -> Result<Self, Checked> {
+        let cwd = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_string))
+            .filter(|s| s.starts_with('/'))
+            .unwrap_or_else(|| "/".into());
+        let fail = || refused("phronesis: seat could not open");
+        let ws = std::env::var("PHRONESIS_WORKSPACE")
+            .ok()
+            .filter(|s| s.starts_with('/'))
+            .unwrap_or_else(|| cwd.clone());
+        let (root, state, runtime) = seat_dirs(&ws).ok_or_else(fail)?;
+        ensure_pack_env(&root);
+        let state_c =
+            std::ffi::CString::new(state.to_string_lossy().as_bytes()).map_err(|_| fail())?;
+        let runtime_c =
+            std::ffi::CString::new(runtime.to_string_lossy().as_bytes()).map_err(|_| fail())?;
+        let mut sup: *mut Supervisor = std::ptr::null_mut();
+        let rc =
+            unsafe { phronesis_supervisor_open(&mut sup, state_c.as_ptr(), runtime_c.as_ptr()) };
+        if rc != 0 || sup.is_null() {
+            return Err(fail());
+        }
+        let seat = Seat {
             sup,
-            cwd_c.as_ptr(),
-            ptrs.as_ptr(),
-            ptrs.len() as libc::c_int,
-            &mut out,
-            &mut out_len,
-        )
+            cwd: std::ffi::CString::new(cwd.as_str()).map_err(|_| fail())?,
+        };
+        let hex = std::ffi::CString::new(host_agent_hex()).map_err(|_| fail())?;
+        let mode = std::ffi::CString::new("seat").map_err(|_| fail())?;
+        let ws_c = std::ffi::CString::new(ws).map_err(|_| fail())?;
+        let brc = unsafe {
+            phronesis_supervisor_bind(seat.sup, hex.as_ptr(), mode.as_ptr(), ws_c.as_ptr(), 0)
+        };
+        if brc != 0 && brc != -2 {
+            return Err(refused("bind-failed"));
+        }
+        Ok(seat)
+    }
+
+    /// One argv through the pack, with the pack's reason text kept.
+    fn check(&self, argv: &[String]) -> Checked {
+        let fail = || refused("phronesis: no decision");
+        let c_args: Vec<std::ffi::CString> = argv
+            .iter()
+            .map(|a| {
+                std::ffi::CString::new(a.as_str())
+                    .unwrap_or_else(|_| std::ffi::CString::new("").unwrap())
+            })
+            .collect();
+        let ptrs: Vec<*const libc::c_char> = c_args.iter().map(|c| c.as_ptr()).collect();
+        let mut out: *mut u8 = std::ptr::null_mut();
+        let mut out_len: usize = 0;
+        let crc = unsafe {
+            ljos_phronesis_check_shell(
+                self.sup,
+                self.cwd.as_ptr(),
+                ptrs.as_ptr(),
+                ptrs.len() as libc::c_int,
+                &mut out,
+                &mut out_len,
+            )
+        };
+        if crc != 0 || out.is_null() || out_len == 0 {
+            if !out.is_null() {
+                unsafe { libc::free(out as *mut libc::c_void) };
+            }
+            return fail();
+        }
+        let mut dec: u16 = 0;
+        let mut code: u16 = 0;
+        let mut reason = [0 as libc::c_char; 512];
+        let rrc = unsafe {
+            ljos_phronesis_read_decision(
+                out,
+                out_len,
+                &mut dec,
+                &mut code,
+                reason.as_mut_ptr(),
+                reason.len(),
+            )
+        };
+        unsafe { libc::free(out as *mut libc::c_void) };
+        if rrc != 0 {
+            return fail();
+        }
+        let decision = match dec {
+            1 => Decision::Allow,
+            2 => Decision::Prompt,
+            _ => Decision::Deny,
+        };
+        let code = PolicyReason::try_from(code).unwrap_or(PolicyReason::Unspecified);
+        let text = unsafe { std::ffi::CStr::from_ptr(reason.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        let token = if decision == Decision::Allow {
+            Cow::Borrowed("allow")
+        } else if text.is_empty() {
+            Cow::Borrowed("phronesis")
+        } else {
+            Cow::Owned(text)
+        };
+        Checked {
+            decision,
+            code,
+            token,
+        }
+    }
+
+    /// The pack on one argv, then on every command the table reads inside
+    /// it (wrappers, `sh -c` scripts, substitutions), the same walk as
+    /// [`host_argv_table_at`].
+    fn check_at(&self, argv: &[String], depth: usize) -> Checked {
+        let own = self.check(argv);
+        if own.decision != Decision::Allow || depth >= MAX_DEPTH {
+            return own;
+        }
+        for inner in inner_commands(argv) {
+            if inner.is_empty() || inner.as_slice() == argv {
+                continue;
+            }
+            let c = self.check_at(&inner, depth + 1);
+            if c.decision != Decision::Allow {
+                return c;
+            }
+        }
+        own
+    }
+}
+
+#[cfg(has_phronesis)]
+type Job = (Vec<String>, std::sync::mpsc::Sender<Checked>);
+
+/// phronesis keeps its Janet VM in the thread that first loaded the pack,
+/// so every check in the process runs on one worker thread.
+#[cfg(has_phronesis)]
+fn check_shell_phronesis(argv: &[String]) -> Checked {
+    static WORKER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<Job>>> =
+        std::sync::OnceLock::new();
+    let worker = WORKER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        std::thread::Builder::new()
+            .name("phronesis".into())
+            .spawn(move || {
+                for (argv, reply) in rx {
+                    let c = match Seat::open() {
+                        Ok(seat) => seat.check_at(&argv, 0),
+                        Err(c) => c,
+                    };
+                    let _ = reply.send(c);
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    });
+    let Some(tx) = worker else {
+        return refused("phronesis: no worker thread");
     };
-    if crc != 0 || out.is_null() || out_len == 0 {
-        return fail;
+    let (reply, answer) = std::sync::mpsc::channel();
+    if tx.send((argv.to_vec(), reply)).is_err() {
+        return refused("phronesis: worker thread gone");
     }
-    let mut dec: u16 = 0;
-    let mut code: u16 = 0;
-    let rrc = unsafe { ljos_phronesis_read_decision(out, out_len, &mut dec, &mut code) };
-    unsafe { libc::free(out as *mut libc::c_void) };
-    if rrc != 0 {
-        return fail;
-    }
-    let decision = match dec {
-        1 => Decision::Allow,
-        2 => Decision::Prompt,
-        _ => Decision::Deny,
-    };
-    let code = PolicyReason::try_from(code).unwrap_or(PolicyReason::Unspecified);
-    Checked {
-        decision,
-        code,
-        token: token_for(code, ""),
-    }
+    answer
+        .recv()
+        .unwrap_or_else(|_| refused("phronesis: no decision"))
 }
 
 fn base_of(tok: &str) -> &str {
@@ -1333,7 +1475,6 @@ mod tests {
         assert!(v(&["pkexec", "id"]).starts_with("deny"));
     }
 
-    #[cfg(not(has_phronesis))]
     #[test]
     fn recursive_delete_judges_only_its_own_operands() {
         assert_eq!(
@@ -1456,7 +1597,6 @@ mod tests {
         assert_eq!(v(&["env", "dd", "if=x", "of=/dev/sda"]), "deny\traw-disk");
     }
 
-    #[cfg(not(has_phronesis))]
     #[test]
     fn a_substitution_in_a_script_does_not_hide_a_force_push() {
         for script in [
@@ -1491,7 +1631,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(has_phronesis))]
     #[test]
     fn a_shell_script_does_not_hide_a_recursive_delete() {
         assert!(v(&["sh", "-c", "rm -rf /home/u/x"]).starts_with("deny"));
@@ -1499,7 +1638,6 @@ mod tests {
         assert_eq!(v(&["sh", "-c", "rm -rf /tmp/a"]), "allow");
     }
 
-    #[cfg(not(has_phronesis))]
     #[test]
     fn a_tmp_path_that_climbs_out_is_outside_tmp() {
         assert!(v(&["rm", "-rf", "/tmp/../home/u"]).starts_with("deny"));
@@ -1545,7 +1683,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(has_phronesis))]
     #[test]
     fn find_delete_judges_its_starting_points() {
         assert_eq!(
@@ -1564,7 +1701,6 @@ mod tests {
         assert_eq!(v(&["find", ".", "-name", "x"]), "allow");
     }
 
-    #[cfg(not(has_phronesis))]
     #[test]
     fn an_inline_program_does_not_hide_a_shell_call_or_a_tree_delete() {
         for (argv, token) in [
@@ -1633,7 +1769,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(has_phronesis))]
     #[test]
     fn a_variable_command_word_does_not_hide_git() {
         for script in [
@@ -1655,7 +1790,6 @@ mod tests {
     /// agent's `sh -c` line, with the verdict the built-in table gives.
     /// Database, cluster and infrastructure teardown and secret reads are a
     /// seat rule's job, not the table's.
-    #[cfg(not(has_phronesis))]
     #[test]
     fn the_launch_comparison_lines() {
         let cases: &[(&str, bool)] = &[
@@ -1706,5 +1840,38 @@ mod tests {
             .get_root::<policy_capnp::policy_decision::Reader<'_>>()
             .expect("root");
         assert_eq!(d.get_decision().unwrap(), Decision::Deny);
+    }
+
+    /// A secret in argv is the pack's rule alone; the refusal carries the
+    /// pack's words, on the line and inside a `sh -c` script.
+    #[cfg(has_phronesis)]
+    #[test]
+    fn the_pack_refuses_with_its_own_reason_inside_scripts_too() {
+        let url = format!(
+            "https://oauth2:{}{}@gitlab.example/x.git",
+            "glpat-", "SecretTokenValue99"
+        );
+        let line = v(&["git", "push", url.as_str()]);
+        assert!(line.starts_with("deny\t"), "{line}");
+        assert_ne!(line, "deny\tphronesis", "reason text dropped");
+        assert!(!line[5..].contains('\t'));
+        let script = format!("git push {url}");
+        assert_eq!(v(&["sh", "-c", script.as_str()]), line);
+        assert_eq!(v(&["env", "FOO=1", "git", "push", url.as_str()]), line);
+        // The embedded pack is the one loaded, and ordinary work passes.
+        let pack = std::env::var("PHRONESIS_JANET_PACK").expect("pack env");
+        assert!(
+            pack.ends_with("/share/phronesis/policy/shell.janet"),
+            "{pack}"
+        );
+        assert!(std::path::Path::new(&pack).is_file());
+        for ok in [
+            &["npm", "test"][..],
+            &["python3", "-c", "print(1)"],
+            &["git", "push", "--force-with-lease", "origin", "x"],
+            &["rm", "-rf", "/tmp/x"],
+        ] {
+            assert_eq!(v(ok), "allow", "{ok:?}");
+        }
     }
 }

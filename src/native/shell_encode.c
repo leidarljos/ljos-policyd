@@ -93,7 +93,7 @@ int ljos_phronesis_check_shell(phronesis_supervisor_t *sup, const char *cwd,
 }
 
 int ljos_phronesis_read_decision(const uint8_t *in, size_t in_len, uint16_t *decision,
-				 uint16_t *code)
+				 uint16_t *code, char *reason, size_t reason_len)
 {
 	struct capn c;
 	struct PolicyDecision d;
@@ -101,6 +101,8 @@ int ljos_phronesis_read_decision(const uint8_t *in, size_t in_len, uint16_t *dec
 
 	if (!in || !in_len || !decision || !code)
 		return -1;
+	if (reason && reason_len)
+		reason[0] = '\0';
 	memset(&c, 0, sizeof(c));
 	if (capn_init_mem(&c, in, in_len, 0) != 0)
 		return -1;
@@ -108,6 +110,15 @@ int ljos_phronesis_read_decision(const uint8_t *in, size_t in_len, uint16_t *dec
 	read_PolicyDecision(&d, root);
 	*decision = (uint16_t)d.decision;
 	*code = (uint16_t)d.code;
+	/* The pack's own words for the decision, cut to fit. */
+	if (reason && reason_len && d.reason.str && d.reason.len > 0) {
+		size_t n = (size_t)d.reason.len;
+
+		if (n > reason_len - 1)
+			n = reason_len - 1;
+		memcpy(reason, d.reason.str, n);
+		reason[n] = '\0';
+	}
 	capn_free(&c);
 	return 0;
 }
