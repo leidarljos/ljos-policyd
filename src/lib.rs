@@ -66,6 +66,243 @@ pub fn check_shell(argv: &[String]) -> Checked {
 }
 
 fn host_argv_table(argv: &[String]) -> Checked {
+    host_argv_table_at(argv, 0)
+}
+
+/// How deep `sh -c` scripts nest before the table stops reading them.
+const MAX_DEPTH: usize = 4;
+
+/// The table on one argv, then on every command it runs through a wrapper
+/// (`env`, `nice`, `xargs`, ...) or a shell's `-c` script, so `env git push
+/// -f` and `sh -c "git push -f"` meet the same rules as `git push -f`.
+fn host_argv_table_at(argv: &[String], depth: usize) -> Checked {
+    let own = host_argv_rules(argv);
+    if own.decision != Decision::Allow || depth >= MAX_DEPTH {
+        return own;
+    }
+    for inner in inner_commands(argv) {
+        if inner.as_slice() == argv {
+            continue;
+        }
+        let c = host_argv_table_at(&inner, depth + 1);
+        if c.decision != Decision::Allow {
+            return c;
+        }
+    }
+    own
+}
+
+/// The commands a line runs once separators are split, wrapper words are
+/// taken off, and a shell's `-c` script is read as its own line.
+fn inner_commands(argv: &[String]) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    for cmd in commands(argv) {
+        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        let (run, handed) = unwrap_wrappers(&owned);
+        if let Some(script) = handed {
+            out.push(shell_words(script));
+            continue;
+        }
+        if run.is_empty() {
+            continue;
+        }
+        if let Some(script) = shell_script(run) {
+            out.push(shell_words(script));
+        } else {
+            out.push(run.to_vec());
+        }
+    }
+    out
+}
+
+/// A `NAME=value` word.
+fn is_assignment(w: &str) -> bool {
+    w.split_once('=').is_some_and(|(k, _)| {
+        !k.is_empty()
+            && !k.starts_with(|c: char| c.is_ascii_digit())
+            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// Words that run the command after them, with the flags of each that take
+/// a separate value.
+const RUNNERS: &[(&str, &[&str])] = &[
+    (
+        "env",
+        &["-u", "--unset", "-C", "--chdir", "-S", "--split-string"],
+    ),
+    ("nice", &["-n", "--adjustment"]),
+    ("nohup", &[]),
+    ("time", &["-f", "--format", "-o", "--output"]),
+    ("exec", &["-a"]),
+    ("command", &[]),
+    ("builtin", &[]),
+    ("setsid", &[]),
+    ("stdbuf", &["-i", "-o", "-e"]),
+    ("ionice", &["-c", "-n", "-p", "-P", "-u"]),
+    ("chrt", &[]),
+    ("taskset", &[]),
+    ("timeout", &["-k", "--kill-after", "-s", "--signal"]),
+    (
+        "xargs",
+        &[
+            "-I",
+            "-i",
+            "-n",
+            "-P",
+            "-L",
+            "-d",
+            "-E",
+            "-a",
+            "-s",
+            "--delimiter",
+            "--max-args",
+            "--max-procs",
+            "--arg-file",
+        ],
+    ),
+    ("watch", &["-n", "--interval", "-d"]),
+    ("flock", &["-w", "--timeout", "-E", "--conflict-exit-code"]),
+];
+
+/// The command past any leading assignments and runner words, with each
+/// runner's flags (and their values) taken off. `timeout`, `flock`,
+/// `taskset` and `chrt` also take one positional word before the command.
+///
+/// Some runners take the command as one string a shell splits: `env -S
+/// STRING`, `flock FILE -c STRING` and `watch STRING`. That string comes back
+/// as the second value, to be read as a script.
+fn unwrap_wrappers(cmd: &[String]) -> (&[String], Option<&str>) {
+    let mut i = 0;
+    while i < cmd.len() {
+        let w = cmd[i].as_str();
+        if is_assignment(w) {
+            i += 1;
+            continue;
+        }
+        let Some((name, valued)) = RUNNERS.iter().find(|(n, _)| *n == base_of(w)) else {
+            break;
+        };
+        i += 1;
+        if *name == "flock" {
+            if let Some(at) = cmd[i..].iter().position(|a| a == "-c" || a == "--command") {
+                return (&[], cmd.get(i + at + 1).map(String::as_str));
+            }
+        }
+        while i < cmd.len() {
+            let a = cmd[i].as_str();
+            if a == "--" {
+                i += 1;
+                break;
+            }
+            if *name == "env" {
+                if a == "-S" || a == "--split-string" {
+                    return (&[], cmd.get(i + 1).map(String::as_str));
+                }
+                if let Some(v) = a.strip_prefix("--split-string=") {
+                    return (&[], Some(v));
+                }
+            }
+            if *name == "env" && is_assignment(a) {
+                i += 1;
+            } else if a.starts_with('-') && a.len() > 1 {
+                i += if valued.contains(&a) { 2 } else { 1 };
+            } else {
+                break;
+            }
+        }
+        if *name == "watch" && i + 1 == cmd.len() {
+            return (&[], Some(cmd[i].as_str()));
+        }
+        if matches!(*name, "timeout" | "flock" | "taskset" | "chrt") && i < cmd.len() {
+            i += 1;
+        }
+    }
+    (&cmd[i.min(cmd.len())..], None)
+}
+
+/// The script a shell runs with `-c` (or a flag cluster holding `c`, such as
+/// `-lc`), if this command is one. A `--` after `-c` and the value of an
+/// option such as `-o pipefail` or `--rcfile FILE` are not the script.
+fn shell_script(run: &[String]) -> Option<&str> {
+    if !SHELLS.contains(&base_of(run.first()?)) {
+        return None;
+    }
+    let mut it = run[1..].iter().map(String::as_str);
+    let mut takes = false;
+    while let Some(a) = it.next() {
+        if takes {
+            if a == "--" {
+                continue;
+            }
+            return Some(a);
+        }
+        if !(a.starts_with('-') || a.starts_with('+')) || a.len() < 2 {
+            return None;
+        }
+        if a.starts_with('-') && !a.starts_with("--") && a[1..].contains('c') {
+            takes = true;
+        } else if matches!(a, "--rcfile" | "--init-file")
+            || (!a.starts_with("--") && a.ends_with(['o', 'O']))
+        {
+            it.next();
+        }
+    }
+    None
+}
+
+/// A script split into words the way a shell would: quotes group, a
+/// backslash escapes the next character outside single quotes, and `;`,
+/// `&&`, `||` and `|` stand as words of their own.
+fn shell_words(script: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut word = false;
+    let (mut single, mut double) = (false, false);
+    let mut chars = script.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if !single => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                    word = true;
+                }
+            }
+            '\'' if !double => {
+                single = !single;
+                word = true;
+            }
+            '"' if !single => {
+                double = !double;
+                word = true;
+            }
+            c if !single && !double && (c.is_whitespace() || matches!(c, ';' | '|' | '&')) => {
+                if word {
+                    out.push(std::mem::take(&mut cur));
+                    word = false;
+                }
+                if matches!(c, ';' | '|' | '&') {
+                    let mut sep = c.to_string();
+                    if chars.peek() == Some(&c) && c != ';' {
+                        sep.push(c);
+                        chars.next();
+                    }
+                    out.push(sep);
+                }
+            }
+            c => {
+                cur.push(c);
+                word = true;
+            }
+        }
+    }
+    if word {
+        out.push(cur);
+    }
+    out
+}
+
+fn host_argv_rules(argv: &[String]) -> Checked {
     if argv.is_empty() {
         return Checked {
             decision: Decision::Deny,
@@ -682,6 +919,69 @@ mod tests {
         ] {
             assert_eq!(v(argv), "allow", "{argv:?}");
         }
+    }
+
+    /// A wrapper or a shell's `-c` script does not hide a
+    /// force push, a raw-disk write or a recursive delete.
+    #[test]
+    fn a_wrapper_or_a_shell_script_does_not_hide_a_force_push() {
+        for argv in [
+            &["env", "git", "push", "-f", "origin", "main"][..],
+            &["env", "-i", "FOO=1", "git", "push", "--force"],
+            &["GIT_TRACE=1", "git", "push", "-f"],
+            &["sh", "-c", "git push -f origin main"],
+            &["bash", "-lc", "cd repo && git push --force"],
+            &["sh", "-c", "env git push -f"],
+            &["command", "git", "push", "-f"],
+            &["nice", "-n", "10", "git", "push", "-f"],
+            &["timeout", "30", "git", "push", "origin", "+main"],
+            &["xargs", "-n", "1", "git", "push", "-f"],
+            &["nohup", "/usr/bin/git", "push", "-f"],
+            &["true", "&&", "env", "git", "push", "-f"],
+            &["bash", "-c", "sh -c 'git push -f'"],
+            &["sh", "-c", "--", "git push -f"],
+            &["bash", "-o", "pipefail", "-c", "git push -f | tee log"],
+            &[
+                "bash",
+                "+O",
+                "extglob",
+                "--rcfile",
+                "/dev/null",
+                "-c",
+                "git push -f",
+            ],
+            &["env", "-S", "git push -f"],
+            &["env", "--split-string=git push -f"],
+            &["flock", "/tmp/lock", "-c", "git push -f"],
+            &["flock", "-w", "5", "-c", "git push -f", "/tmp/lock"],
+            &["watch", "-n", "5", "git push -f"],
+            &["timeout", "30", "bash", "-c", "git push -f"],
+        ] {
+            assert_eq!(v(argv), "deny\tgit-force-push", "{argv:?}");
+        }
+        for argv in [
+            &["env", "git", "push", "origin", "main"][..],
+            &["sh", "-c", "git push origin main"],
+            &["sh", "script.sh", "-c", "git push -f"],
+            &["env", "FOO=1", "cargo", "test"],
+            &["bash", "-c", "echo 'git push -f is refused'"],
+            &["nice", "-n", "10", "cargo", "build"],
+            &["bash", "-o", "pipefail", "script.sh"],
+            &["env", "-S", "cargo test"],
+            &["flock", "/tmp/lock", "cargo", "build"],
+            &["watch", "-n", "5", "git status"],
+        ] {
+            assert_eq!(v(argv), "allow", "{argv:?}");
+        }
+        assert_eq!(v(&["env", "dd", "if=x", "of=/dev/sda"]), "deny\traw-disk");
+    }
+
+    #[cfg(not(has_phronesis))]
+    #[test]
+    fn a_shell_script_does_not_hide_a_recursive_delete() {
+        assert!(v(&["sh", "-c", "rm -rf /home/u/x"]).starts_with("deny"));
+        assert!(v(&["env", "rm", "-rf", "/home/u/x"]).starts_with("deny"));
+        assert_eq!(v(&["sh", "-c", "rm -rf /tmp/a"]), "allow");
     }
 
     #[cfg(not(has_phronesis))]
