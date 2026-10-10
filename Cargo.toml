@@ -35,3 +35,6 @@ git = "https://github.com/leidarljos/phronesis"
 pkg-url = "{ repo }/releases/download/v{ version }/ljos-policyd-v{ version }-{ target }.tar.gz"
 bin-dir = "ljos-policyd-v{ version }-{ target }/{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
+# The release tarball or nothing. A target without one fails here, and
+# `cargo install` builds it from source.
+disabled-strategies = ["quick-install", "compile"]
