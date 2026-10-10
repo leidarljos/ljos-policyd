@@ -31,8 +31,19 @@ The rules are tried in this order, and the first that matches decides.
 | `curl-pipe-shell` | a download piped into a shell (`curl URL \| sh`, `wget -qO- URL \| bash`), or a shell running a download (`bash <(curl ...)`, `sh -c "$(curl ...)"`, `bash -c 'curl ... \| sh'`) | `git fetch` followed by `bash build.sh`; a search pattern naming both; `curl URL \| jq` |
 | `chmod-setuid` | setting the setuid bit | other `chmod` |
 | `raw-disk` | `mkfs`, `dd of=/dev/...` | `dd` to a file |
-| `rm-rf-outside-tmp` | a recursive `rm` or `rtrash` whose own operands reach outside `/tmp` and `/var/tmp`, a `..` in the path included | the same under `/tmp`; a later command on the line that is not a delete |
-| `git-force-push` | `git push` with any `--force` form (`--force-with-lease=REF` too), `-f` in a flag cluster, `--mirror`, or a `+` refspec | an ordinary `git push` |
+| `find-delete-outside-tmp` | `find ... -delete` whose starting points reach outside `/tmp` and `/var/tmp`; no starting point means the current directory | the same under `/tmp`; `find` without `-delete` |
+| `rm-rf-outside-tmp` | a recursive `rm` or `rtrash` whose own operands reach outside `/tmp` and `/var/tmp`, a `..` in the path included; also `python -c`, `node -e`, `ruby -e` or `perl -e` code that calls `shutil.rmtree`, `rmSync(..., {recursive})`, `rm_rf`, `rm_r` or `remove_tree` outside `/tmp` | the same under `/tmp`; a later command on the line that is not a delete |
+| `git-force-push` | `git push` with `--force`, `-f` in a flag cluster, `--mirror`, or a `+` refspec | an ordinary `git push`; `--force-with-lease` in any form and `--force-if-includes`, which the remote refuses when it holds commits you have not fetched |
+| `git-reset-hard` | `git reset --hard` | `--soft`, `--mixed`, `reset FILE` |
+| `git-clean-force` | `git clean` with `-f` (`-fd`, `-fdx`, `--force`) | `git clean -n` |
+| `git-stash-clear` | `git stash clear` | `stash pop`, `list`, `drop` |
+| `git-discard-worktree` | `git checkout -- .` or `git checkout .`, `git restore .` or `:/`, and `git restore` with no path | `checkout BRANCH`, `checkout -- FILE`, `restore FILE`, `restore --patch` |
+
+The git rules also apply when the command word is a variable: `g=git;
+$g push -f` reads `$g` as `git`, and `$GIT reset --hard` with no
+assignment on the line is read as git too. An inline program
+(`python3 -c`, `node -e`, `perl -e`, `ruby -e`) has its `os.system`,
+`subprocess.*`, `execSync` and `system` strings read as shell lines.
 
 A pipeline arrives as one call, its stages separated by a `|` word, so a
 download and the shell it feeds are judged together. ljos sends each
