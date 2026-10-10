@@ -29,6 +29,7 @@ The rules are tried in this order, and the first that matches decides.
 |---|---|---|
 | `sudo` | a privilege runner as any word: `sudo`, `doas`, `su`, `pkexec`, `run0` | a sentence that only mentions one, passed as one quoted word |
 | `curl-pipe-shell` | a download piped into a shell (`curl URL \| sh`, `wget -qO- URL \| bash`), or a shell running a download (`bash <(curl ...)`, `sh -c "$(curl ...)"`, `bash -c 'curl ... \| sh'`) | `git fetch` followed by `bash build.sh`; a search pattern naming both; `curl URL \| jq` |
+| `decoded-pipe-shell` | a decoder's output piped into a shell (`echo ... \| base64 -d \| sh`, `xxd -r ... \| sh`, `zcat x.gz \| bash`), or a shell running a decoder (`bash -c "$(base64 -d f)"`, `sh <(base64 -d f)`) | decoding to a file or into `grep` |
 | `chmod-setuid` | setting the setuid bit | other `chmod` |
 | `raw-disk` | `mkfs` on a device, `dd of=` a block device, `wipefs -a`, `sgdisk`, `sfdisk`, `fdisk`, `parted`, `blkdiscard`, `mkswap` or `shred` on a block device, `cryptsetup luksFormat`, `badblocks -w`, a `>` redirection into a block device | `mkfs` on an image file, `dd` to a file or `/dev/null`, the listing forms (`fdisk -l`, `parted print`, `sfdisk --dump`, `wipefs` without `-a`) |
 | `recursive-chmod-chown` | a recursive `chmod`, `chown`, `chgrp` or `setfacl` from `/`, a home directory or a system tree (`/etc`, `/usr`, `/var`, ...), or a recursive `chmod` to `000`, `a-rwx`, `777` or `o+w` outside `/tmp` | `chmod -R u+w target`, `chown -R $USER ./build`, `chmod -R 700 ~/.ssh` |
@@ -49,6 +50,8 @@ assignment on the line is read as git too. An inline program
 A pipeline arrives as one call, its stages separated by a `|` word, so a
 download and the shell it feeds are judged together. ljos sends each
 pipeline of a line this way: `a && b | c` is two calls, `a` and `b | c`.
+A function definition's body (`f() { ...; }`, `function f { ...; }`) is
+judged as the commands it runs.
 
 ## Two backends: phronesis, or the table built in
 

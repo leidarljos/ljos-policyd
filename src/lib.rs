@@ -395,6 +395,12 @@ fn unwrap_wrappers(cmd: &[String]) -> (&[String], Option<&str>) {
             i += 1;
             continue;
         }
+        if let Some(head) = function_head(&cmd[i..]) {
+            // `f() { git push -f; }`: the body is what runs when `f` is
+            // called, so it is judged as written.
+            i += head;
+            continue;
+        }
         let Some((name, valued)) = RUNNERS.iter().find(|(n, _)| *n == base_of(w)) else {
             break;
         };
@@ -434,6 +440,50 @@ fn unwrap_wrappers(cmd: &[String]) -> (&[String], Option<&str>) {
         }
     }
     (&cmd[i.min(cmd.len())..], None)
+}
+
+/// How many words a function definition's head takes at the front of
+/// `words`: `f(){`, `f() {`, `function f {` and `function f() {`. None
+/// when the words do not open one.
+fn function_head(words: &[String]) -> Option<usize> {
+    let is_name = |n: &str| {
+        !n.is_empty()
+            && n.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+    };
+    let first = words.first()?.as_str();
+    if let Some(name) = first.strip_suffix("(){") {
+        return is_name(name).then_some(1);
+    }
+    if let Some(name) = first.strip_suffix("()") {
+        if !is_name(name) {
+            return None;
+        }
+        return Some(if words.get(1).is_some_and(|w| w == "{") {
+            2
+        } else {
+            1
+        });
+    }
+    if first == "function" {
+        let name = words.get(1)?.as_str();
+        let name = name
+            .strip_suffix("(){")
+            .or_else(|| name.strip_suffix("()"))
+            .unwrap_or(name);
+        if !is_name(name) {
+            return None;
+        }
+        let mut n = 2;
+        if words.get(n).is_some_and(|w| w == "()") {
+            n += 1;
+        }
+        if words.get(n).is_some_and(|w| w == "{") {
+            n += 1;
+        }
+        return Some(n);
+    }
+    None
 }
 
 /// The script a shell runs with `-c` (or a flag cluster holding `c`, such as
@@ -550,6 +600,13 @@ fn host_argv_rules(argv: &[String]) -> Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellRemoteExec,
             token: Cow::Borrowed("curl-pipe-shell"),
+        };
+    }
+    if decoded_exec(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellRemoteExec,
+            token: Cow::Borrowed("decoded-pipe-shell"),
         };
     }
     if setuid_chmod(argv) {
@@ -1076,6 +1133,37 @@ fn remote_exec(argv: &[String]) -> bool {
                 let inner: Vec<String> = w[1].split_whitespace().map(String::from).collect();
                 !inner.is_empty() && remote_exec(&inner)
             }
+        })
+    })
+}
+
+/// Commands that turn text no reader can check into a script: decoders
+/// and decompressors. Their output handed to a shell runs commands the
+/// line never shows.
+const DECODERS: &[&str] = &[
+    "base64", "base32", "basenc", "xxd", "openssl", "uudecode", "gunzip", "zcat", "gzip", "bzcat",
+    "bunzip2", "xzcat", "unxz", "zstdcat", "zstd", "rev",
+];
+
+/// A decoded script handed to a shell: a decoding stage piped into a
+/// shell stage (`echo ... | base64 -d | sh`), or a shell running a decoder
+/// through `$(...)`, `<(...)` or backticks (`bash -c "$(base64 -d f)"`).
+/// The table cannot read what such a script runs, so it is refused, as a
+/// download piped into a shell is.
+fn decoded_exec(argv: &[String]) -> bool {
+    let stages = stages(argv);
+    let decodes = |s: &[String]| command_word(s).is_some_and(|c| DECODERS.contains(&c));
+    let shell = |s: &[String]| command_word(s).is_some_and(|c| SHELLS.contains(&c));
+    if stages.windows(2).any(|w| decodes(&w[0]) && shell(&w[1])) {
+        return true;
+    }
+    stages.iter().filter(|s| shell(s)).any(|s| {
+        s.iter().any(|t| {
+            ["$(", "<(", "`"].iter().any(|open| {
+                DECODERS.iter().any(|d| {
+                    t.contains(&format!("{open}{d} ")) || t.ends_with(&format!("{open}{d}"))
+                })
+            })
         })
     })
 }
@@ -2199,6 +2287,56 @@ mod tests {
             &["chgrp", "-R", "staff", "shared/"],
             &["setfacl", "-R", "-m", "u:ci:rX", "build"],
             &["chown", "u", "/etc/hosts.local"],
+        ] {
+            assert_eq!(v(argv), "allow", "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_decoded_script_handed_to_a_shell_is_refused() {
+        for argv in [
+            &["echo", "Z2l0IHB1c2ggLWYK", "|", "base64", "-d", "|", "sh"][..],
+            &["base64", "-d", "<<<", "cm0gLXJmIH4=", "|", "bash"],
+            &["base64", "--decode", "payload.b64|sh"],
+            &["xxd", "-r", "-p", "hex.txt", "|", "sh"],
+            &["openssl", "base64", "-d", "-in", "x", "|", "bash"],
+            &["zcat", "script.gz", "|", "env", "sh"],
+            &["rev", "x.txt", "|", "sh"],
+            &["bash", "-c", "$(base64 -d payload.b64)"],
+            &["sh", "<(base64 -d payload.b64)"],
+            &["sh", "-c", "echo cm0gLXJmIH4= | base64 -d | sh"],
+        ] {
+            assert_eq!(v(argv), "deny\tdecoded-pipe-shell", "{argv:?}");
+        }
+        for argv in [
+            &["echo", "aGVsbG8=", "|", "base64", "-d"][..],
+            &["base64", "-d", "secret.b64", ">", "out.bin"],
+            &["zcat", "access.log.gz", "|", "grep", "500"],
+            &["gzip", "-d", "data.gz"],
+            &["bash", "build.sh", "--base64"],
+            &["bash", "-c", "echo $(date)"],
+            &["openssl", "rand", "-hex", "16"],
+        ] {
+            assert_eq!(v(argv), "allow", "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_function_body_is_judged_as_written() {
+        for argv in [
+            &["f(){", "git", "push", "-f", "\"$@\""][..],
+            &["f()", "{", "git", "push", "-f"],
+            &["function", "f", "{", "rm", "-rf", "/home/u/x"],
+            &["function", "f()", "{", "git", "push", "--force"],
+            &["sh", "-c", "f(){ git push -f \"$@\"; }; f origin main"],
+            &["bash", "-c", "function f { rm -rf ~/projects; }; f"],
+        ] {
+            assert!(v(argv).starts_with("deny"), "{argv:?}");
+        }
+        for argv in [
+            &["f(){", "echo", "\"$@\""][..],
+            &["sh", "-c", "f(){ cargo test \"$@\"; }; f -q"],
+            &["function", "build", "{", "make", "all"],
         ] {
             assert_eq!(v(argv), "allow", "{argv:?}");
         }
