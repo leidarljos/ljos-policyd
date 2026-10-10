@@ -2175,7 +2175,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(has_phronesis))]
     #[test]
     fn a_build_dir_name_does_not_widen_a_delete() {
         for line in [
@@ -2212,7 +2211,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(has_phronesis))]
     #[test]
     fn a_tmp_path_that_climbs_out_is_outside_tmp() {
         assert!(v(&["rm", "-rf", "/tmp/../home/u"]).starts_with("deny"));
@@ -2323,7 +2321,6 @@ mod tests {
         );
     }
 
-    #[cfg(not(has_phronesis))]
     #[test]
     fn a_multi_call_binary_runs_its_applet() {
         assert_eq!(
@@ -2333,7 +2330,6 @@ mod tests {
         assert_eq!(v(&["busybox", "ls", "-la"]), "allow");
     }
 
-    #[cfg(not(has_phronesis))]
     #[test]
     fn find_delete_judges_its_starting_points() {
         assert_eq!(
@@ -2534,6 +2530,8 @@ mod tests {
             &["python3", "-c", "print(1)"],
             &["git", "push", "--force-with-lease", "origin", "x"],
             &["rm", "-rf", "/tmp/x"],
+            &["rm", "-rf", "target/"],
+            &["mkfs.ext4", "-F", "disk.img"],
         ] {
             assert_eq!(v(ok), "allow", "{ok:?}");
         }
