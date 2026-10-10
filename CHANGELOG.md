@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `git-force-push` refuses every push that can overwrite the remote: a `+` refspec
+  (`git push origin +main`), `--force-with-lease=REF`, `-f` inside a flag
+  cluster such as `-fu`, and `--mirror`. Only the bare words `--force`, `-f`
+  and `--force-with-lease` were refused before.
+- `rm-rf-outside-tmp` reads a `..` in an operand as outside `/tmp`, so
+  `rm -rf /tmp/../home/u` is refused.
 - The explanation says why a model cannot mediate. An unmatched command
   is an allow. Fail-closed is `POLICYD_REQUIRED`, and it covers a
   missing binary.

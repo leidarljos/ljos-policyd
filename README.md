@@ -31,8 +31,8 @@ The rules are tried in this order, and the first that matches decides.
 | `curl-pipe-shell` | a download piped into a shell (`curl URL \| sh`, `wget -qO- URL \| bash`), or a shell running a download (`bash <(curl ...)`, `sh -c "$(curl ...)"`, `bash -c 'curl ... \| sh'`) | `git fetch` followed by `bash build.sh`; a search pattern naming both; `curl URL \| jq` |
 | `chmod-setuid` | setting the setuid bit | other `chmod` |
 | `raw-disk` | `mkfs`, `dd of=/dev/...` | `dd` to a file |
-| `rm-rf-outside-tmp` | a recursive `rm` or `rtrash` whose own operands reach outside `/tmp` and `/var/tmp` | the same under `/tmp`; a later command on the line that is not a delete |
-| `git-force-push` | `git push --force` and its short forms | an ordinary `git push` |
+| `rm-rf-outside-tmp` | a recursive `rm` or `rtrash` whose own operands reach outside `/tmp` and `/var/tmp`, a `..` in the path included | the same under `/tmp`; a later command on the line that is not a delete |
+| `git-force-push` | `git push` with any `--force` form (`--force-with-lease=REF` too), `-f` in a flag cluster, `--mirror`, or a `+` refspec | an ordinary `git push` |
 
 A pipeline arrives as one call, its stages separated by a `|` word, so a
 download and the shell it feeds are judged together. ljos sends each

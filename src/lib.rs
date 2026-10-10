@@ -109,12 +109,7 @@ fn host_argv_table(argv: &[String]) -> Checked {
             token: "rm-rf-outside-tmp",
         };
     }
-    if base == "git"
-        && argv.iter().any(|a| a == "push")
-        && argv
-            .iter()
-            .any(|a| a == "--force" || a == "-f" || a == "--force-with-lease")
-    {
+    if base == "git" && force_push(argv) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellGitDangerous,
@@ -497,6 +492,27 @@ fn is_redirection(a: &str) -> bool {
 /// True when any `rm` or `rtrash` on the line deletes recursively with an
 /// operand outside `/tmp` or `/var/tmp`. Flags and redirections are not
 /// operands; every command on the line is judged.
+/// A `git push` that can overwrite or drop history on the remote: any
+/// `--force` form (`--force-with-lease=REF` included), a short flag cluster
+/// holding `f` (`-fu`), `--mirror`, or a refspec that starts with `+`.
+fn force_push(argv: &[String]) -> bool {
+    let Some(at) = argv.iter().position(|a| a == "push") else {
+        return false;
+    };
+    argv[at + 1..].iter().any(|a| {
+        a.starts_with("--force")
+            || a == "--mirror"
+            || (a.starts_with('-') && !a.starts_with("--") && a.len() > 1 && a[1..].contains('f'))
+            || (a.starts_with('+') && a.len() > 1)
+    })
+}
+
+/// Whether a path names a parent directory anywhere, so a `/tmp/` prefix
+/// says nothing about where it lands.
+fn climbs(path: &str) -> bool {
+    path.split('/').any(|part| part == "..")
+}
+
 fn recursive_delete_off_tmp(argv: &[String]) -> bool {
     commands(argv).iter().any(|cmd| {
         let b = base_of(cmd[0]);
@@ -516,10 +532,11 @@ fn recursive_delete_off_tmp(argv: &[String]) -> bool {
             .skip(1)
             .filter(|a| !a.starts_with('-') && !is_redirection(a))
             .all(|p| {
-                *p == "/tmp"
-                    || p.starts_with("/tmp/")
-                    || *p == "/var/tmp"
-                    || p.starts_with("/var/tmp/")
+                !climbs(p)
+                    && (*p == "/tmp"
+                        || p.starts_with("/tmp/")
+                        || *p == "/var/tmp"
+                        || p.starts_with("/var/tmp/"))
             })
     })
 }
@@ -638,6 +655,41 @@ mod tests {
         assert!(v(&["true", "&&", "rm", "-rf", "/home/u/x"]).starts_with("deny"));
         assert!(v(&["rm", "-r", "-f", "/home/u/x"]).starts_with("deny"));
         assert_eq!(v(&["rm", "-r", "/home/u/x"]), "allow");
+    }
+
+    #[test]
+    fn denies_every_force_push_form() {
+        for argv in [
+            &["git", "push", "--force"][..],
+            &["git", "push", "-f", "origin", "main"],
+            &["git", "push", "-fu", "origin", "main"],
+            &["git", "push", "--force-with-lease"],
+            &["git", "push", "--force-with-lease=main:abc123"],
+            &["git", "push", "--mirror", "backup"],
+            &["git", "push", "origin", "+main"],
+            &["git", "push", "origin", "+HEAD:refs/heads/main"],
+            &["git", "-C", "repo", "push", "--force"],
+        ] {
+            assert_eq!(v(argv), "deny\tgit-force-push", "{argv:?}");
+        }
+        for argv in [
+            &["git", "push"][..],
+            &["git", "push", "-u", "origin", "main"],
+            &["git", "push", "origin", "main:main"],
+            &["git", "push", "--follow-tags"],
+            &["git", "commit", "-m", "+1", "--fixup", "x"],
+            &["git", "log", "--follow", "-f"],
+        ] {
+            assert_eq!(v(argv), "allow", "{argv:?}");
+        }
+    }
+
+    #[cfg(not(has_phronesis))]
+    #[test]
+    fn a_tmp_path_that_climbs_out_is_outside_tmp() {
+        assert!(v(&["rm", "-rf", "/tmp/../home/u"]).starts_with("deny"));
+        assert!(v(&["rm", "-rf", "/tmp/a/../../etc"]).starts_with("deny"));
+        assert_eq!(v(&["rm", "-rf", "/tmp/a..b"]), "allow");
     }
 
     #[test]
