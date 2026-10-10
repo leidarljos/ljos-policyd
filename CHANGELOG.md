@@ -7,6 +7,8 @@
 - phronesis state lives under one directory per workspace, so a check in a second workspace is judged like one in the first. With one shared directory phronesis kept the first workspace and refused every line outside it.
 - `LJOS_POLICYD_PACK=seat` loads phronesis's seat pack, which adds uv-only Python and the package-manager refusals. The default pack no longer has them.
 - The release workflow builds phronesis from source on all four targets, so the release binaries report `(phronesis)`. CI tests a phronesis build beside the table-only one.
+- `raw-disk` covers the other ways to wipe a disk: `wipefs -a`, `sgdisk`, `sfdisk`, `fdisk`, `parted`, `blkdiscard`, `mkswap` and `shred` given a block device, `cryptsetup luksFormat`, `badblocks -w`, and a `>` redirection into a block device. Each tool's listing flags stay allowed. `mkfs` on an image file and `dd of=/dev/null` are no longer refused; only a block device is a disk.
+- `recursive-chmod-chown` refuses a recursive `chmod`, `chown`, `chgrp` or `setfacl` that starts at `/`, a home directory or a system tree, and a recursive `chmod` that removes every permission or gives everyone write. `chmod -R 777 /` and `chown -R nobody ~` were allowed before.
 
 ## 0.3.0 (2026-10-10)
 

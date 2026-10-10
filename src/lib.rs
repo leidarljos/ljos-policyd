@@ -566,6 +566,13 @@ fn host_argv_rules(argv: &[String]) -> Checked {
             token: Cow::Borrowed("raw-disk"),
         };
     }
+    if recursive_mode_change(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: Cow::Borrowed("recursive-chmod-chown"),
+        };
+    }
     if recursive_delete_off_tmp(argv) {
         return Checked {
             decision: Decision::Deny,
@@ -1395,12 +1402,244 @@ fn setuid_chmod(argv: &[String]) -> bool {
     })
 }
 
+/// A block device: a whole disk, a partition, or a mapped or RAID volume.
+/// `/dev/null`, `/dev/zero` and the other character devices are not one.
+fn block_device(path: &str) -> bool {
+    let Some(name) = path.strip_prefix("/dev/") else {
+        return false;
+    };
+    [
+        "sd", "hd", "vd", "xvd", "nvme", "mmcblk", "disk", "md", "dm-", "mapper/", "loop", "rbd",
+        "nbd", "zd",
+    ]
+    .iter()
+    .any(|p| name.starts_with(p))
+}
+
+/// A redirection on the line that writes to a block device: `> /dev/sda`,
+/// `>/dev/sda`, `1>> /dev/nvme0n1`.
+fn writes_block_device(argv: &[String]) -> bool {
+    argv.iter().enumerate().any(|(i, a)| {
+        let rest = a.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+        let Some(target) = rest.strip_prefix('>') else {
+            return false;
+        };
+        let target = target.trim_start_matches(['>', '|']);
+        if target.is_empty() {
+            argv.get(i + 1).is_some_and(|t| block_device(t))
+        } else {
+            block_device(target)
+        }
+    })
+}
+
+/// Tools that rewrite a partition table, a filesystem signature or a whole
+/// block device, each with the flags that only read. Such a tool given a
+/// block device and none of its read-only flags is a write.
+const DISK_WRITERS: &[(&str, &[&str])] = &[
+    ("wipefs", &["-n", "--no-act", "-h", "--help"]),
+    (
+        "sgdisk",
+        &[
+            "-p", "--print", "-v", "--verify", "-i", "--info", "-h", "--help",
+        ],
+    ),
+    (
+        "sfdisk",
+        &[
+            "-l",
+            "--list",
+            "-d",
+            "--dump",
+            "-J",
+            "--json",
+            "-s",
+            "--show-size",
+            "-V",
+            "--verify",
+            "-h",
+            "--help",
+        ],
+    ),
+    ("fdisk", &["-l", "--list", "-h", "--help"]),
+    ("gdisk", &["-l", "-h", "--help"]),
+    ("cfdisk", &["-h", "--help"]),
+    ("parted", &["-l", "--list", "print", "-h", "--help"]),
+    ("blkdiscard", &["-h", "--help"]),
+    ("mkswap", &["-h", "--help"]),
+    ("shred", &["-h", "--help"]),
+    ("badblocks", &[]),
+];
+
+/// A command that overwrites a disk: `mkfs` on a device (or with no target
+/// named), `dd` writing to a block device, a partitioning or wiping tool
+/// on a block device, `cryptsetup` formatting or erasing one, `badblocks
+/// -w`, or a redirection into one. `mkfs.ext4 -F disk.img` formats a file
+/// and `dd of=/dev/null` writes nowhere, so neither is refused.
 fn raw_disk(argv: &[String]) -> bool {
-    let b = base_of(&argv[0]);
-    if b.starts_with("mkfs") {
+    if writes_block_device(argv) {
         return true;
     }
-    b == "dd" && argv.iter().any(|a| a.starts_with("of=/dev/"))
+    let b = base_of(&argv[0]);
+    let operands: Vec<&str> = argv[1..]
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    if b.starts_with("mkfs") {
+        // `mkfs -t xfs DEV`: the value of -t is not the target.
+        let mut targets = Vec::new();
+        let mut skip = false;
+        for a in &argv[1..] {
+            if skip {
+                skip = false;
+            } else if matches!(
+                a.as_str(),
+                "-t" | "--type" | "-L" | "-b" | "-O" | "-E" | "-m"
+            ) {
+                skip = true;
+            } else if !a.starts_with('-') {
+                targets.push(a.as_str());
+            }
+        }
+        return targets.is_empty()
+            || targets
+                .iter()
+                .any(|t| t.starts_with("/dev/") || t.contains('$'));
+    }
+    if b == "dd" {
+        return argv
+            .iter()
+            .filter_map(|a| a.strip_prefix("of="))
+            .any(|t| block_device(t) || t.contains('$'));
+    }
+    if b == "cryptsetup" {
+        return operands
+            .iter()
+            .any(|a| matches!(*a, "luksFormat" | "erase" | "luksErase" | "reencrypt"));
+    }
+    if b == "wipefs"
+        && !argv[1..].iter().any(|a| {
+            matches!(a.as_str(), "--all" | "--offset")
+                || a.starts_with("--offset=")
+                || (a.starts_with('-')
+                    && !a.starts_with("--")
+                    && (a.contains('a') || a.contains('o')))
+        })
+    {
+        // With neither -a nor -o, wipefs only lists the signatures it finds.
+        return false;
+    }
+    if b == "badblocks" {
+        return argv.iter().any(|a| a == "-w") && operands.iter().any(|a| block_device(a));
+    }
+    let Some((_, reads)) = DISK_WRITERS.iter().find(|(n, _)| *n == b) else {
+        return false;
+    };
+    operands.iter().any(|a| block_device(a))
+        && !argv[1..].iter().any(|a| reads.contains(&a.as_str()))
+}
+
+/// Paths a recursive mode or owner change must not start from: the root,
+/// a home directory, and the system trees. A project directory, `.` and
+/// a build tree are not among them.
+fn system_or_home_tree(p: &str) -> bool {
+    let p = p.trim_end_matches('/');
+    if p.is_empty() || climbs(p) {
+        // `/` itself, or a path that climbs out of wherever it starts.
+        return true;
+    }
+    if matches!(p, "~" | "$HOME" | "${HOME}" | "/home" | "/root" | "/Users") {
+        return true;
+    }
+    if let Some(user) = p
+        .strip_prefix("/home/")
+        .or_else(|| p.strip_prefix("/Users/"))
+    {
+        // `/home/u` itself; `/home/u/proj/build` is one project's tree.
+        return !user.contains('/');
+    }
+    [
+        "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/opt", "/srv", "/var", "/sys",
+        "/proc", "/dev", "/System", "/Library", "/private",
+    ]
+    .iter()
+    .any(|root| {
+        (p == *root || p.starts_with(&format!("{root}/")))
+            && !(p == "/var/tmp" || p.starts_with("/var/tmp/"))
+    })
+}
+
+/// A mode that takes every permission away (`000`, `a-rwx`), or gives
+/// everyone write (`777`, `o+w`, `a+w`).
+fn sweeping_mode(m: &str) -> bool {
+    if m.chars().all(|c| c.is_ascii_digit()) && (3..=4).contains(&m.len()) {
+        let digits: Vec<u32> = m.chars().filter_map(|c| c.to_digit(8)).collect();
+        let n = digits.len();
+        let (u, g, o) = (digits[n - 3], digits[n - 2], digits[n - 1]);
+        return (u == 0 && g == 0 && o == 0) || o & 2 != 0;
+    }
+    m.split(',').any(|clause| {
+        let (who, rest) = clause.split_at(clause.find(['+', '-', '=']).unwrap_or(clause.len()));
+        let everyone = who.is_empty() || who.contains('a') || who.contains('o');
+        (everyone && rest.starts_with('+') && rest.contains('w'))
+            || (who.contains('a') || who == "ugo")
+                && rest.starts_with('-')
+                && rest.contains('r')
+                && rest.contains('w')
+                && rest.contains('x')
+    })
+}
+
+/// A recursive `chmod`, `chown`, `chgrp` or `setfacl` that starts at the
+/// root, a home directory or a system tree, or a recursive `chmod` that
+/// takes every permission away or hands everyone write, wherever it starts
+/// outside `/tmp`. `chmod -R u+w target` and `chown -R $USER ./build` stay
+/// allowed.
+fn recursive_mode_change(argv: &[String]) -> bool {
+    commands(argv).iter().any(|cmd| {
+        let b = base_of(cmd[0]);
+        if !matches!(b, "chmod" | "chown" | "chgrp" | "setfacl") {
+            return false;
+        }
+        let recursive = cmd[1..].iter().any(|a| {
+            *a == "--recursive" || (a.starts_with('-') && !a.starts_with("--") && a.contains('R'))
+        });
+        if !recursive {
+            return false;
+        }
+        let words: Vec<&str> = cmd[1..]
+            .iter()
+            .copied()
+            .filter(|a| !a.starts_with('-') || (b == "chmod" && is_mode_word(a)))
+            .collect();
+        // The first word is the mode or owner (setfacl's spec follows -m,
+        // so every word left is a path for it).
+        let (spec, paths) = if b == "setfacl" {
+            (None, &words[..])
+        } else {
+            match words.split_first() {
+                Some((s, rest)) => (Some(*s), rest),
+                None => return false,
+            }
+        };
+        if paths.iter().any(|p| system_or_home_tree(p)) {
+            return true;
+        }
+        b == "chmod"
+            && spec.is_some_and(sweeping_mode)
+            && paths
+                .iter()
+                .any(|p| !(*p == "/tmp" || p.starts_with("/tmp/") || p.starts_with("/var/tmp")))
+    })
+}
+
+/// A chmod mode written with a leading `-`, such as `-w` or `-rwx`.
+fn is_mode_word(a: &str) -> bool {
+    a.len() > 1
+        && a[1..]
+            .chars()
+            .all(|c| matches!(c, 'r' | 'w' | 'x' | 'X' | 's' | 't'))
 }
 
 #[cfg(test)]
@@ -1872,6 +2111,96 @@ mod tests {
             &["rm", "-rf", "/tmp/x"],
         ] {
             assert_eq!(v(ok), "allow", "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn a_disk_is_wiped_by_more_than_dd_and_mkfs() {
+        for argv in [
+            &["dd", "if=/dev/zero", "of=/dev/sda", "bs=1M"][..],
+            &["dd", "of=/dev/nvme0n1p2", "if=disk.img"],
+            &["mkfs.ext4", "/dev/sdb1"],
+            &["mkfs", "-t", "xfs", "/dev/nvme1n1"],
+            &["mkfs.ext4"],
+            &["wipefs", "-a", "/dev/sda"],
+            &["sgdisk", "--zap-all", "/dev/sda"],
+            &["sfdisk", "/dev/sda"],
+            &["fdisk", "/dev/sda"],
+            &["parted", "/dev/sda", "mklabel", "gpt"],
+            &["parted", "-s", "/dev/sda", "rm", "1"],
+            &["blkdiscard", "/dev/nvme0n1"],
+            &["mkswap", "/dev/sdb2"],
+            &["shred", "-n", "1", "/dev/sdc"],
+            &["cryptsetup", "luksFormat", "/dev/sdb"],
+            &["badblocks", "-w", "/dev/sdb"],
+            &["cat", "/dev/zero", ">", "/dev/sda"],
+            &["cat", "disk.img", ">/dev/mmcblk0"],
+            &["echo", "x", "1>", "/dev/xvda"],
+            &["env", "wipefs", "-a", "/dev/sda"],
+            &["sh", "-c", "cat /dev/zero > /dev/sda"],
+        ] {
+            assert_eq!(v(argv), "deny\traw-disk", "{argv:?}");
+        }
+        for argv in [
+            &["mkfs.ext4", "-F", "disk.img"][..],
+            &["dd", "if=/dev/zero", "of=disk.img", "bs=1M", "count=64"],
+            &["dd", "if=/dev/zero", "of=/dev/null", "bs=1M", "count=100"],
+            &["dd", "if=/dev/sda", "of=backup.img"],
+            &["fdisk", "-l"],
+            &["fdisk", "-l", "/dev/sda"],
+            &["parted", "-l"],
+            &["parted", "/dev/sda", "print"],
+            &["sfdisk", "--dump", "/dev/sda"],
+            &["sgdisk", "-p", "/dev/sda"],
+            &["wipefs", "/dev/sda"],
+            &["wipefs", "-n", "-a", "/dev/sda"],
+            &["cryptsetup", "open", "/dev/sdb", "data"],
+            &["badblocks", "/dev/sdb"],
+            &["lsblk"],
+            &["cat", "/dev/urandom", ">", "/tmp/rand.bin"],
+            &["echo", "x", ">", "/dev/null"],
+            &["shred", "-u", "/tmp/old.key"],
+        ] {
+            assert_eq!(v(argv), "allow", "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_recursive_mode_or_owner_change_on_a_home_or_system_tree() {
+        for argv in [
+            &["chmod", "-R", "777", "/"][..],
+            &["chmod", "-R", "777", "~"],
+            &["chmod", "-R", "755", "$HOME"],
+            &["chmod", "-R", "000", "."],
+            &["chmod", "-R", "a-rwx", "projects"],
+            &["chmod", "-R", "go+w", "/etc"],
+            &["chmod", "-R", "o+w", "src"],
+            &["chmod", "--recursive", "777", "/var/lib"],
+            &["chown", "-R", "nobody:nogroup", "/home/u"],
+            &["chown", "-R", "root", "~"],
+            &["chown", "-hR", "u", "/usr/local"],
+            &["chgrp", "-R", "nogroup", "/var/lib/postgresql"],
+            &["setfacl", "-R", "-b", "~"],
+            &["chmod", "-R", "u+w", "/home/u/.."],
+            &["sh", "-c", "chmod -R 777 /"],
+            &["env", "chown", "-R", "x", "/etc"],
+        ] {
+            assert_eq!(v(argv), "deny\trecursive-chmod-chown", "{argv:?}");
+        }
+        for argv in [
+            &["chmod", "-R", "u+w", "target"][..],
+            &["chmod", "-R", "700", "~/.ssh"],
+            &["chmod", "-R", "755", "/home/u/proj/build"],
+            &["chown", "-R", "$USER:$USER", "./build"],
+            &["chmod", "+x", "scripts/release.sh"],
+            &["chmod", "777", "/tmp/sock"],
+            &["chmod", "-R", "777", "/tmp/scratch"],
+            &["chmod", "-R", "g+rX", "docs"],
+            &["chgrp", "-R", "staff", "shared/"],
+            &["setfacl", "-R", "-m", "u:ci:rX", "build"],
+            &["chown", "u", "/etc/hosts.local"],
+        ] {
+            assert_eq!(v(argv), "allow", "{argv:?}");
         }
     }
 }
