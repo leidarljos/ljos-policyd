@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A script the table reads also runs the commands inside its `$(...)`, backticks, `<(...)`, `>(...)` and `( ... )` subshells, nested to four levels, and the table judges each. `eval ARGS` is read as a script, and the command after `if`, `then`, `do`, `{`, `!` and `coproc` is the one judged. A substitution is one word of its command, so a `;` inside it no longer cuts the script. `sh -c 'echo $(git push -f)'` was allowed before. Single quotes and an escaped `$` stay text.
 - `cargo binstall ljos-policyd` builds from source on a target with no release tarball, such as Windows or musl Linux. The `compile` strategy was off, so binstall failed there. cargo-quickinstall stays off.
 - The table judges every command a line runs through a wrapper or a shell. `env`, `nice`, `nohup`, `time`, `exec`, `command`, `timeout`, `xargs`, `setsid`, `stdbuf`, `ionice` and leading `NAME=value` words are taken off, with their flags, and a shell's `-c` script (`sh -c`, `bash -lc`, `sh -c -- SCRIPT`, `bash -o pipefail -c`) is read as its own line. So is the string `env -S`, `flock FILE -c` and `watch` hand to a shell. `env git push -f` and `sh -c "git push -f"` were allowed before, and so was every hook that asks this binary.
 

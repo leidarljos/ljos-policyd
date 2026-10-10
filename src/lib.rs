@@ -100,16 +100,166 @@ fn inner_commands(argv: &[String]) -> Vec<Vec<String>> {
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
         let (run, handed) = unwrap_wrappers(&owned);
         if let Some(script) = handed {
-            out.push(shell_words(script));
+            out.extend(script_lines(script, 0).iter().map(|l| shell_words(l)));
             continue;
         }
         if run.is_empty() {
             continue;
         }
         if let Some(script) = shell_script(run) {
-            out.push(shell_words(script));
+            out.extend(script_lines(script, 0).iter().map(|l| shell_words(l)));
+        } else if base_of(&run[0]) == "eval" {
+            // eval joins its words with spaces and runs that as a script.
+            out.extend(
+                script_lines(&run[1..].join(" "), 0)
+                    .iter()
+                    .map(|l| shell_words(l)),
+            );
         } else {
             out.push(run.to_vec());
+        }
+    }
+    out
+}
+
+/// A script and every line it runs inside itself, outermost first: the
+/// body of each `$(...)`, backtick pair, `<(...)`, `>(...)` and `( ... )`
+/// subshell, read the same way down to [`MAX_DEPTH`] levels. Nothing in
+/// single quotes runs, and an escaped `$` is a dollar sign.
+fn script_lines(script: &str, depth: usize) -> Vec<String> {
+    let mut out = vec![script.to_string()];
+    if depth < MAX_DEPTH {
+        for body in substitutions(script) {
+            out.extend(script_lines(&body, depth + 1));
+        }
+    }
+    out
+}
+
+/// The end of the construct that opens at `chars[i]`: just past the
+/// backtick that closes one, or past the `)` that closes the first `(` at
+/// or after `i`. Quotes, escapes and constructs nested inside count; an
+/// unclosed one runs to the end.
+fn nested_end(chars: &[char], i: usize) -> usize {
+    let n = chars.len();
+    if chars.get(i) == Some(&'`') {
+        let mut j = i + 1;
+        while j < n {
+            match chars[j] {
+                '\\' => j += 2,
+                '`' => return j + 1,
+                _ => j += 1,
+            }
+        }
+        return n;
+    }
+    let Some(open) = (i..n).find(|k| chars[*k] == '(') else {
+        return n;
+    };
+    let mut depth = 0usize;
+    let mut j = open;
+    while j < n {
+        match chars[j] {
+            '\\' => j += 2,
+            '\'' => j = (j + 1..n).find(|k| chars[*k] == '\'').map_or(n, |k| k + 1),
+            '"' => j = double_end(chars, j),
+            '`' => j = nested_end(chars, j),
+            '(' => {
+                depth += 1;
+                j += 1;
+            }
+            ')' => {
+                depth -= 1;
+                j += 1;
+                if depth == 0 {
+                    return j;
+                }
+            }
+            _ => j += 1,
+        }
+    }
+    n
+}
+
+/// Just past the `"` that closes the string opening at `chars[i]`.
+fn double_end(chars: &[char], i: usize) -> usize {
+    let n = chars.len();
+    let mut j = i + 1;
+    while j < n {
+        match chars[j] {
+            '\\' => j += 2,
+            '"' => return j + 1,
+            '$' if chars.get(j + 1) == Some(&'(') => j = nested_end(chars, j),
+            '`' => j = nested_end(chars, j),
+            _ => j += 1,
+        }
+    }
+    n
+}
+
+/// Whether a `(` at `chars[i]` opens a subshell rather than an array
+/// (`x=(a b)`) or a function's `()`.
+fn opens_subshell(chars: &[char], i: usize) -> bool {
+    i == 0 || chars[i - 1].is_whitespace() || matches!(chars[i - 1], ';' | '&' | '|' | '(' | '!')
+}
+
+/// Whether a construct whose body runs as commands opens at `chars[i]`.
+fn opens_nested(chars: &[char], i: usize, double: bool) -> bool {
+    let next = chars.get(i + 1) == Some(&'(');
+    match chars[i] {
+        '$' => next,
+        '`' => true,
+        '<' | '>' => !double && next,
+        '(' => !double && opens_subshell(chars, i),
+        _ => false,
+    }
+}
+
+/// The bodies a script runs one level down: each `$(...)` (and arithmetic
+/// `$((...))`, which can hold one), each backtick pair with `\``, `\\`
+/// and `\$` unescaped, and outside double quotes each `<(...)`, `>(...)`
+/// and subshell.
+fn substitutions(script: &str) -> Vec<String> {
+    let chars: Vec<char> = script.chars().collect();
+    let n = chars.len();
+    let mut out = Vec::new();
+    let mut double = false;
+    let mut i = 0;
+    while i < n {
+        match chars[i] {
+            '\\' => i += 2,
+            '\'' if !double => {
+                i = (i + 1..n).find(|k| chars[*k] == '\'').map_or(n, |k| k + 1);
+            }
+            '"' => {
+                double = !double;
+                i += 1;
+            }
+            _ if opens_nested(&chars, i, double) => {
+                let end = nested_end(&chars, i);
+                let tick = chars[i] == '`';
+                let from = if tick || chars[i] == '(' {
+                    i + 1
+                } else {
+                    i + 2
+                };
+                let closed = end > from && matches!(chars[end - 1], ')' | '`');
+                let to = if closed { end - 1 } else { end };
+                let body: String = chars[from.min(to)..to].iter().collect();
+                let body = if tick {
+                    body.replace("\\\\", "\u{0}")
+                        .replace("\\`", "`")
+                        .replace("\\$", "$")
+                        .replace('\u{0}', "\\")
+                } else {
+                    body
+                };
+                if !body.trim().is_empty() {
+                    out.push(body);
+                }
+                i = end;
+            }
+            _ => i += 1,
         }
     }
     out
@@ -162,6 +312,18 @@ const RUNNERS: &[(&str, &[&str])] = &[
         ],
     ),
     ("watch", &["-n", "--interval", "-d"]),
+    // Shell keywords that open or continue a compound command: the
+    // command after them is the one that runs.
+    ("!", &[]),
+    ("{", &[]),
+    ("if", &[]),
+    ("then", &[]),
+    ("else", &[]),
+    ("elif", &[]),
+    ("while", &[]),
+    ("until", &[]),
+    ("do", &[]),
+    ("coproc", &[]),
     ("flock", &["-w", "--timeout", "-E", "--conflict-exit-code"]),
 ];
 
@@ -255,17 +417,29 @@ fn shell_script(run: &[String]) -> Option<&str> {
 /// backslash escapes the next character outside single quotes, and `;`,
 /// `&&`, `||` and `|` stand as words of their own.
 fn shell_words(script: &str) -> Vec<String> {
+    let chars: Vec<char> = script.chars().collect();
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut word = false;
     let (mut single, mut double) = (false, false);
-    let mut chars = script.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
         match c {
+            _ if !single && opens_nested(&chars, i - 1, double) => {
+                // A substitution or subshell is one piece of its word; its
+                // body is read on its own by `script_lines`.
+                let end = nested_end(&chars, i - 1);
+                cur.extend(&chars[i - 1..end]);
+                word = true;
+                i = end;
+            }
             '\\' if !single => {
-                if let Some(n) = chars.next() {
-                    cur.push(n);
+                if let Some(n) = chars.get(i) {
+                    cur.push(*n);
                     word = true;
+                    i += 1;
                 }
             }
             '\'' if !double => {
@@ -283,9 +457,9 @@ fn shell_words(script: &str) -> Vec<String> {
                 }
                 if matches!(c, ';' | '|' | '&') {
                     let mut sep = c.to_string();
-                    if chars.peek() == Some(&c) && c != ';' {
+                    if chars.get(i) == Some(&c) && c != ';' {
                         sep.push(c);
-                        chars.next();
+                        i += 1;
                     }
                     out.push(sep);
                 }
@@ -974,6 +1148,41 @@ mod tests {
             assert_eq!(v(argv), "allow", "{argv:?}");
         }
         assert_eq!(v(&["env", "dd", "if=x", "of=/dev/sda"]), "deny\traw-disk");
+    }
+
+    #[cfg(not(has_phronesis))]
+    #[test]
+    fn a_substitution_in_a_script_does_not_hide_a_force_push() {
+        for script in [
+            "echo $(git push -f)",
+            "echo \"$(git push -f)\"",
+            "echo `git push -f`",
+            "echo `echo \\`git push -f\\``",
+            "echo $(echo $(echo $(git push -f)))",
+            "echo $(true; git push -f) done",
+            "cat <(git push -f)",
+            "(cd repo; git push -f)",
+            "if true; then git push -f; fi",
+            "{ git push -f; }",
+            "eval 'git push -f'",
+            "x=$(git push -f)",
+        ] {
+            assert_eq!(v(&["sh", "-c", script]), "deny\tgit-force-push", "{script}");
+        }
+        assert_eq!(v(&["eval", "git", "push", "-f"]), "deny\tgit-force-push");
+        assert_eq!(
+            v(&["env", "-S", "echo $(git push -f)"]),
+            "deny\tgit-force-push"
+        );
+        for script in [
+            "echo '$(git push -f)'",
+            "echo \\$(git push -f)",
+            "echo \"(git push -f)\"",
+            "echo $(echo git push -f)",
+            "x=(git push -f)",
+        ] {
+            assert_eq!(v(&["sh", "-c", script]), "allow", "{script}");
+        }
     }
 
     #[cfg(not(has_phronesis))]
