@@ -378,6 +378,9 @@ const RUNNERS: &[(&str, &[&str])] = &[
     ("do", &[]),
     ("coproc", &[]),
     ("flock", &["-w", "--timeout", "-E", "--conflict-exit-code"]),
+    // Multi-call binaries run the applet named after them.
+    ("busybox", &[]),
+    ("toybox", &[]),
 ];
 
 /// The command past any leading assignments and runner words, with each
@@ -1242,23 +1245,128 @@ fn whole_tree(p: &str) -> bool {
     matches!(p, "." | "./" | ":/" | ":" | "*" | "-A")
 }
 
-/// A git call that throws away work no commit holds: a force push,
-/// `reset --hard` (or `--merge`/`--keep` are fine), `clean` with `-f`,
-/// `stash clear`, `checkout` of the whole tree, or `restore` of the whole
-/// tree or with no path at all.
+/// Config keys whose value git runs as a command.
+const GIT_COMMAND_KEYS: &[&str] = &[
+    "core.sshcommand",
+    "core.pager",
+    "core.editor",
+    "core.fsmonitor",
+    "core.askpass",
+    "sequence.editor",
+    "diff.external",
+    "gpg.program",
+    "credential.helper",
+];
+
+/// The `-c KEY=VALUE` pairs given before git's subcommand, key lowercased.
+fn git_configs(argv: &[String]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i < argv.len() {
+        let a = argv[i].as_str();
+        if a == "-c" {
+            if let Some((k, val)) = argv.get(i + 1).and_then(|kv| kv.split_once('=')) {
+                out.push((
+                    k.to_ascii_lowercase(),
+                    val.trim_matches(['"', '\'']).to_string(),
+                ));
+            }
+            i += 2;
+        } else if matches!(a, "-C" | "--git-dir" | "--work-tree" | "--namespace") {
+            i += 2;
+        } else if a.starts_with('-') {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// The table's verdict on a string git hands to a shell.
+fn git_shell_value(value: &str) -> Option<&'static str> {
+    let argv = ["sh", "-c", value].map(String::from);
+    let c = host_argv_table_at(&argv, 1);
+    // The table's tokens are all static; only phronesis writes its own.
+    (c.decision != Decision::Allow).then_some(match c.token {
+        Cow::Borrowed(t) => t,
+        Cow::Owned(_) => "git-shell-value",
+    })
+}
+
+/// A refspec or flag on `git push` that deletes a remote ref: `--delete`,
+/// `-d` in a short cluster, or a refspec with an empty source (`:main`).
+fn push_delete(rest: &[String]) -> bool {
+    rest.iter().any(|a| {
+        a == "--delete"
+            || (a.starts_with('-') && !a.starts_with("--") && a[1..].contains('d'))
+            || (a.starts_with(':') && a.len() > 1)
+    })
+}
+
+/// A git call that throws away work no commit holds: a force push, a
+/// remote ref delete, `reset --hard` (or `--merge`/`--keep` are fine),
+/// `clean` with `-f`, `stash clear`, `branch -D`, `reflog expire`
+/// to now, `filter-branch`, `update-ref -d`, `worktree remove --force`,
+/// `checkout` of the whole tree, or `restore` of the whole tree or with no
+/// path at all. An alias given with `-c alias.NAME=...` is judged as what
+/// it runs, and so is a `-c` value git runs as a command.
 fn git_dangerous(argv: &[String]) -> Option<&'static str> {
     if force_push(argv) {
         return Some("git-force-push");
     }
+    let configs = git_configs(argv);
+    for (k, val) in &configs {
+        if GIT_COMMAND_KEYS.contains(&k.as_str()) {
+            if let Some(token) = git_shell_value(val.trim_start_matches('!')) {
+                return Some(token);
+            }
+        }
+    }
     let (sub, rest) = git_subcommand(argv)?;
+    if let Some((_, val)) = configs
+        .iter()
+        .find(|(k, _)| k.strip_prefix("alias.") == Some(&sub.to_ascii_lowercase()))
+    {
+        if let Some(script) = val.strip_prefix('!') {
+            return git_shell_value(script);
+        }
+        let mut expanded = vec!["git".to_string()];
+        expanded.extend(shell_words(val));
+        expanded.extend(rest.iter().cloned());
+        if expanded.get(1).map(String::as_str) != Some(sub) {
+            return git_dangerous(&expanded);
+        }
+    }
     let short = |c: char| {
         rest.iter()
             .any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains(c))
     };
+    let has = |f: &str| rest.iter().any(|a| a == f);
     match sub {
-        "reset" if rest.iter().any(|a| a == "--hard") => Some("git-reset-hard"),
-        "clean" if short('f') || rest.iter().any(|a| a == "--force") => Some("git-clean-force"),
+        "push" if push_delete(rest) => Some("git-push-delete"),
+        "reset" if has("--hard") => Some("git-reset-hard"),
+        "clean" if short('f') || has("--force") => Some("git-clean-force"),
         "stash" if rest.first().is_some_and(|a| a == "clear") => Some("git-stash-clear"),
+        "branch" if short('D') || (has("--delete") && (has("--force") || short('f'))) => {
+            Some("git-branch-force-delete")
+        }
+        "reflog"
+            if rest.first().is_some_and(|a| a == "delete")
+                || (rest.first().is_some_and(|a| a == "expire")
+                    && rest.iter().any(|a| {
+                        a.starts_with("--expire") && (a.ends_with("=now") || a.ends_with("=all"))
+                    })) =>
+        {
+            Some("git-reflog-expire")
+        }
+        "filter-branch" | "filter-repo" => Some("git-history-rewrite"),
+        "update-ref" if short('d') => Some("git-update-ref-delete"),
+        "worktree"
+            if rest.first().is_some_and(|a| a == "remove") && (short('f') || has("--force")) =>
+        {
+            Some("git-worktree-force-remove")
+        }
         "checkout" => {
             let after = rest
                 .iter()
@@ -1292,11 +1400,16 @@ fn under_tmp(p: &str) -> bool {
         && (p == "/tmp" || p.starts_with("/tmp/") || p == "/var/tmp" || p.starts_with("/var/tmp/"))
 }
 
-/// `find ... -delete` whose starting points are not all under `/tmp`. With
-/// no starting point find walks the current directory.
+/// `find ... -delete`, or `-exec rm` (also `-execdir`, `-ok`, `shred`,
+/// `unlink`), whose starting points are not all under `/tmp`. With no
+/// starting point find walks the current directory.
 fn find_delete_off_tmp(argv: &[String]) -> bool {
     commands(argv).iter().any(|cmd| {
-        if base_of(cmd[0]) != "find" || !cmd.contains(&"-delete") {
+        let exec_delete = cmd.windows(2).any(|w| {
+            matches!(w[0], "-exec" | "-execdir" | "-ok" | "-okdir")
+                && matches!(base_of(w[1]), "rm" | "shred" | "unlink")
+        });
+        if base_of(cmd[0]) != "find" || !(cmd.contains(&"-delete") || exec_delete) {
             return false;
         }
         let starts: Vec<&&str> = cmd[1..]
@@ -1989,6 +2102,36 @@ mod tests {
                 "git-discard-worktree",
             ),
             (&["git", "restore", "--staged"], "git-discard-worktree"),
+            (&["git", "branch", "-D", "topic"], "git-branch-force-delete"),
+            (
+                &["git", "branch", "--delete", "--force", "topic"],
+                "git-branch-force-delete",
+            ),
+            (
+                &["git", "reflog", "expire", "--expire=now", "--all"],
+                "git-reflog-expire",
+            ),
+            (
+                &["git", "filter-branch", "--tree-filter", "true", "HEAD"],
+                "git-history-rewrite",
+            ),
+            (
+                &["git", "update-ref", "-d", "refs/heads/main"],
+                "git-update-ref-delete",
+            ),
+            (
+                &["git", "worktree", "remove", "--force", "../wt"],
+                "git-worktree-force-remove",
+            ),
+            (
+                &["git", "push", "origin", "--delete", "main"],
+                "git-push-delete",
+            ),
+            (&["git", "push", "origin", ":main"], "git-push-delete"),
+            (
+                &["git", "push", "origin", ":refs/tags/v1.0"],
+                "git-push-delete",
+            ),
         ] {
             assert_eq!(v(argv), format!("deny\t{token}"), "{argv:?}");
         }
@@ -2005,11 +2148,57 @@ mod tests {
             &["git", "restore", "src/a.rs"],
             &["git", "restore", "-s", "HEAD~1", "src/a.rs"],
             &["git", "restore", "--patch"],
+            &["git", "stash", "drop", "stash@{0}"],
+            &["git", "branch", "-d", "topic"],
+            &["git", "branch", "--delete", "topic"],
+            &["git", "reflog", "expire", "--expire=90.days.ago"],
+            &["git", "reflog", "show"],
+            &["git", "update-ref", "refs/heads/x", "HEAD"],
+            &["git", "worktree", "remove", "../wt"],
+            &["git", "push", "origin", "main:main"],
+            &["git", "push", "origin", "HEAD:refs/heads/topic"],
+            &["git", "push", "--dry-run", "origin", "main"],
         ] {
             assert_eq!(v(argv), "allow", "{argv:?}");
         }
     }
 
+    #[test]
+    fn git_config_on_the_line_does_not_hide_what_runs() {
+        assert_eq!(
+            v(&["git", "-c", "alias.p=push -f", "p", "origin", "main"]),
+            "deny\tgit-force-push"
+        );
+        assert_eq!(
+            v(&["git", "-c", "alias.wipe=!rm -rf ~/projects", "wipe"]),
+            "deny\trm-rf-outside-tmp"
+        );
+        assert_eq!(
+            v(&["git", "-c", "core.sshCommand=rm -rf ~", "fetch"]),
+            "deny\trm-rf-outside-tmp"
+        );
+        assert_eq!(v(&["git", "-c", "alias.st=status", "st"]), "allow");
+        assert_eq!(
+            v(&["git", "-c", "core.sshCommand=ssh -i key", "fetch"]),
+            "allow"
+        );
+        assert_eq!(
+            v(&["git", "-c", "alias.push=push", "push", "origin", "main"]),
+            "allow"
+        );
+    }
+
+    #[cfg(not(has_phronesis))]
+    #[test]
+    fn a_multi_call_binary_runs_its_applet() {
+        assert_eq!(
+            v(&["busybox", "rm", "-rf", "/home/u/projects"]),
+            "deny\trm-rf-outside-tmp"
+        );
+        assert_eq!(v(&["busybox", "ls", "-la"]), "allow");
+    }
+
+    #[cfg(not(has_phronesis))]
     #[test]
     fn find_delete_judges_its_starting_points() {
         assert_eq!(
@@ -2026,6 +2215,19 @@ mod tests {
         );
         assert_eq!(v(&["find", "/tmp/x", "-name", "*.o", "-delete"]), "allow");
         assert_eq!(v(&["find", ".", "-name", "x"]), "allow");
+        assert_eq!(
+            v(&["find", "/", "-name", "*.log", "-exec", "rm", "-f", "{}", "+"]),
+            "deny\tfind-delete-outside-tmp"
+        );
+        assert_eq!(
+            v(&["find", ".", "-execdir", "/bin/rm", "{}", ";"]),
+            "deny\tfind-delete-outside-tmp"
+        );
+        assert_eq!(
+            v(&["find", "/tmp/build", "-exec", "rm", "{}", "+"]),
+            "allow"
+        );
+        assert_eq!(v(&["find", ".", "-exec", "grep", "x", "{}", "+"]), "allow");
     }
 
     #[test]

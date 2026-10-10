@@ -33,17 +33,27 @@ The rules are tried in this order, and the first that matches decides.
 | `chmod-setuid` | setting the setuid bit | other `chmod` |
 | `raw-disk` | `mkfs` on a device, `dd of=` a block device, `wipefs -a`, `sgdisk`, `sfdisk`, `fdisk`, `parted`, `blkdiscard`, `mkswap` or `shred` on a block device, `cryptsetup luksFormat`, `badblocks -w`, a `>` redirection into a block device | `mkfs` on an image file, `dd` to a file or `/dev/null`, the listing forms (`fdisk -l`, `parted print`, `sfdisk --dump`, `wipefs` without `-a`) |
 | `recursive-chmod-chown` | a recursive `chmod`, `chown`, `chgrp` or `setfacl` from `/`, a home directory or a system tree (`/etc`, `/usr`, `/var`, ...), or a recursive `chmod` to `000`, `a-rwx`, `777` or `o+w` outside `/tmp` | `chmod -R u+w target`, `chown -R $USER ./build`, `chmod -R 700 ~/.ssh` |
-| `find-delete-outside-tmp` | `find ... -delete` whose starting points reach outside `/tmp` and `/var/tmp`; no starting point means the current directory | the same under `/tmp`; `find` without `-delete` |
+| `find-delete-outside-tmp` | `find ... -delete`, or `-exec`, `-execdir` or `-ok` running `rm`, `shred` or `unlink`, whose starting points reach outside `/tmp` and `/var/tmp`; no starting point means the current directory | the same under `/tmp`; `find` without a delete; `find -exec grep` |
 | `rm-rf-outside-tmp` | a recursive `rm` or `rtrash` whose own operands reach outside `/tmp` and `/var/tmp`, a `..` in the path included; also `python -c`, `node -e`, `ruby -e` or `perl -e` code that calls `shutil.rmtree`, `rmSync(..., {recursive})`, `rm_rf`, `rm_r` or `remove_tree` outside `/tmp` | the same under `/tmp`; a later command on the line that is not a delete |
 | `git-force-push` | `git push` with `--force`, `-f` in a flag cluster, `--mirror`, or a `+` refspec | an ordinary `git push`; `--force-with-lease` in any form and `--force-if-includes`, which the remote refuses when it holds commits you have not fetched |
 | `git-reset-hard` | `git reset --hard` | `--soft`, `--mixed`, `reset FILE` |
 | `git-clean-force` | `git clean` with `-f` (`-fd`, `-fdx`, `--force`) | `git clean -n` |
 | `git-stash-clear` | `git stash clear` | `stash pop`, `list`, `drop` |
 | `git-discard-worktree` | `git checkout -- .` or `git checkout .`, `git restore .` or `:/`, and `git restore` with no path | `checkout BRANCH`, `checkout -- FILE`, `restore FILE`, `restore --patch` |
+| `git-push-delete` | `git push --delete`, `-d` in a flag cluster, or a refspec with an empty source (`:main`, `:refs/tags/v1.0`) | `push origin main:main`, `push --dry-run` |
+| `git-branch-force-delete` | `git branch -D`, `--delete --force` | `branch -d`, which refuses an unmerged branch |
+| `git-reflog-expire` | `git reflog expire` with `--expire=now` or `=all`, `git reflog delete` | `reflog expire` with a date, `reflog show` |
+| `git-history-rewrite` | `git filter-branch`, `git filter-repo` | `git rebase` |
+| `git-update-ref-delete` | `git update-ref -d` | `update-ref REF VALUE` |
+| `git-worktree-force-remove` | `git worktree remove --force` | `worktree remove` without `--force`, which refuses a dirty tree |
 
 The git rules also apply when the command word is a variable: `g=git;
 $g push -f` reads `$g` as `git`, and `$GIT reset --hard` with no
-assignment on the line is read as git too. An inline program
+assignment on the line is read as git too. A `-c alias.NAME=...` on the
+line is judged as what the alias runs, and the value of a `-c` key git
+runs as a command (`core.sshCommand`, `core.pager`, `credential.helper`,
+...) is judged as a shell line. `busybox` and `toybox` run the applet
+after them. An inline program
 (`python3 -c`, `node -e`, `perl -e`, `ruby -e`) has its `os.system`,
 `subprocess.*`, `execSync` and `system` strings read as shell lines.
 

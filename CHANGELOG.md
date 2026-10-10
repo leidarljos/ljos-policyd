@@ -11,6 +11,9 @@
 - `recursive-chmod-chown` refuses a recursive `chmod`, `chown`, `chgrp` or `setfacl` that starts at `/`, a home directory or a system tree, and a recursive `chmod` that removes every permission or gives everyone write. `chmod -R 777 /` and `chown -R nobody ~` were allowed before.
 - `decoded-pipe-shell` refuses a decoder's output handed to a shell: `base64 -d`, `xxd -r`, `openssl base64 -d`, `zcat`, `rev` and the other decoders piped into `sh` or `bash`, or run inside a shell's `$(...)`, `<(...)` or backticks. `echo ... | base64 -d | sh` was allowed before; the table cannot read what such a script runs.
 - A function definition's body is judged: `f(){ git push -f; }; f` and `function f { rm -rf ~/x; }` were allowed before.
+- More git calls that lose work are refused: `git-push-delete` for `push --delete`, `push -d` and an empty-source refspec such as `:main` or `:refs/tags/v1.0`, `git-branch-force-delete` for `branch -D`, `git-reflog-expire` for `reflog expire --expire=now` and `reflog delete`, `git-history-rewrite` for `filter-branch` and `filter-repo`, `git-update-ref-delete` and `git-worktree-force-remove`. `branch -d`, `reflog expire` with a date and `worktree remove` without `--force` stay allowed, and so does `stash drop`, as before.
+- A `-c` on the git line no longer hides what runs. `git -c alias.p='push -f' p` is judged as `git push -f`, an alias that starts with `!` is judged as a shell line, and so is the value of a key git runs as a command, such as `core.sshCommand`, `core.pager` or `credential.helper`.
+- `find -exec rm`, `-execdir rm`, `-ok rm`, and `shred` or `unlink` in their place, meet the same starting-point rule as `find -delete`. `busybox` and `toybox` run the applet after them, so `busybox rm -rf ~/x` meets the `rm` rule.
 
 ## 0.3.0 (2026-10-10)
 
