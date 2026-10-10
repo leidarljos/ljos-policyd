@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.6 (2026-10-10)
 
 - `git-force-push` refuses every push that can overwrite the remote: a `+` refspec
   (`git push origin +main`), `--force-with-lease=REF`, `-f` inside a flag
