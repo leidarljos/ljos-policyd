@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- The table judges every command a line runs through a wrapper or a shell. `env`, `nice`, `nohup`, `time`, `exec`, `command`, `timeout`, `xargs`, `setsid`, `stdbuf`, `ionice` and leading `NAME=value` words are taken off, with their flags, and a shell's `-c` script (`sh -c`, `bash -lc`) is read as its own line. `env git push -f` and `sh -c "git push -f"` were allowed before, and so was every hook that asks this binary.
+
 ## 0.2.6 (2026-10-10)
 
 - `git-force-push` refuses every push that can overwrite the remote: a `+` refspec
