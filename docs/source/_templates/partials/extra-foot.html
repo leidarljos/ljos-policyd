@@ -1,5 +1,14 @@
 <script>
 (function () {
+  var cur = document.querySelector(".ll-strip ul [aria-current]");
+  if (cur) {
+    var ul = cur.closest("ul");
+    var keep = function () {
+      ul.scrollLeft = Math.max(0, cur.offsetLeft - ul.offsetLeft - ul.clientWidth / 2 + cur.offsetWidth / 2);
+    };
+    keep();
+    if (document.fonts && document.fonts.ready) document.fonts.ready.then(keep);
+  }
   if (!document.getElementById("vi-skip-link")) {
     var a = document.createElement("a");
     a.id = "vi-skip-link";

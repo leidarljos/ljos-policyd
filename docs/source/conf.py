@@ -39,8 +39,10 @@ html_context = {
 
 html_theme_options = {
     "accent_color": "gold",
-    "color_mode": "dark",
+    "color_mode": "auto",
     "dark_code": True,
+    "open_in_chatgpt": False,
+    "open_in_claude": False,
     "github_url": "https://github.com/leidarljos/ljos-policyd",
     "nav_links": [
         {"title": "Get started", "url": "getting-started"},

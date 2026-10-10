@@ -1,260 +1,396 @@
-@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400&family=Source+Sans+3:wght@400;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap");
-
-/* leiðarljós pin theme: ink, cream, gold. */
+/* leiðarljós theme for the Shibuya project docs.
+   One file, the same in every crate. The tokens are the ones in
+   leidarljos.github.io/site.css and DESIGN.md: a paper scheme (cream page,
+   ink type) and a desk scheme (ink page, cream type), one gold accent.
+   Shibuya sets html.light or html.dark from localStorage._theme, the key
+   the main site's scheme switch also writes, so one choice holds across
+   every page under leidarljos.github.io. */
 
 :root {
-  --ink: #0b0b0a;
-  --cream: #f4f0e6;
-  --gold: #e6a23c;
-  --line: #2a2824;
-  --mute: #b9b3a6;
-  --panel: #141310;
-  --serif: "Source Serif 4", "Iowan Old Style", Palatino, "Palatino Linotype",
+  /* Brand constants. Rules below use the role tokens, not these. */
+  --ll-ink: #0b0b0a;
+  --ll-cream: #f4f0e6;
+  --ll-gold: #e6a23c;
+
+  --ll-serif: "Source Serif 4", "Iowan Old Style", Palatino, "Palatino Linotype",
     Charter, Georgia, serif;
-  --sans: "Source Sans 3", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas,
+  --ll-sans: "Source Sans 3", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --ll-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas,
     monospace;
+
+  --sy-f-text: var(--ll-sans);
+  --sy-f-heading: var(--ll-serif);
+  --sy-f-mono: var(--ll-mono);
+}
+
+/* Paper scheme. Also the static default, before the head script runs. */
+:root,
+html.light {
+  --ll-bg: #f6f2e8;
+  --ll-fg: #15130f;
+  --ll-fg-2: #2a2620;
+  --ll-accent: #7f520b;      /* gold as text on paper, 6.0:1 */
+  --ll-accent-soft: #b07a22; /* hover borders, not text */
+  --ll-line: #ddd5c3;
+  --ll-line-2: #c8bda5;
+  --ll-mute: #47423a;
+  --ll-mute-2: #5c564b;
+  --ll-panel: #efe9dc;
+  --ll-panel-2: #e7e0d0;
+  --ll-pin-opacity: 0.2;
+}
+
+/* Desk scheme. */
+html.dark {
+  --ll-bg: #0b0b0a;
+  --ll-fg: #f4f0e6;
+  --ll-fg-2: #e8e2d4;
+  --ll-accent: #e6a23c;
+  --ll-accent-soft: #9a6410;
+  --ll-line: #2a2824;
+  --ll-line-2: #3a3428;
+  --ll-mute: #b9b3a6;
+  --ll-mute-2: #8d877b;
+  --ll-panel: #141310;
+  --ll-panel-2: #1a1814;
+  --ll-pin-opacity: 0.16;
+}
+
+/* Map the role tokens onto Shibuya's own. */
+:root,
+html.light,
+html.dark {
+  --sy-c-background: var(--ll-bg);
+  --sy-c-background-contrast: var(--ll-fg);
+  --sy-c-background-dropback: color-mix(in srgb, var(--ll-bg) 85%, transparent);
+  --sy-c-surface: var(--ll-panel);
+  --sy-c-overlay: color-mix(in srgb, var(--ll-ink) 40%, transparent);
+  --sy-c-text: var(--ll-mute);
+  --sy-c-light: var(--ll-mute);
+  --sy-c-bold: var(--ll-fg);
+  --sy-c-heading: var(--ll-fg);
+  --sy-c-link: var(--ll-fg);
+  --sy-c-link-hover: var(--ll-accent);
+  --sy-c-divider: var(--ll-line);
+  --sy-c-border: var(--ll-line-2);
+  --sy-c-foot-background: var(--ll-bg);
+  --sy-c-foot-text: var(--ll-mute);
+  --sy-c-foot-divider: var(--ll-line);
+  --yue-c-text: var(--ll-mute);
+  --yue-c-heading: var(--ll-fg);
+  --yue-c-bold: var(--ll-fg);
+  --yue-c-link: var(--ll-fg);
+  --yue-c-code: var(--ll-fg);
 }
 
 html[data-accent-color="gold"] {
-  --accent-9: #e6a23c;
-  --accent-a2: rgba(230, 162, 60, 0.12);
-  --accent-a3: rgba(230, 162, 60, 0.22);
-  --accent-a9: rgba(230, 162, 60, 0.85);
-  --accent-a11: rgba(230, 162, 60, 0.94);
-}
-
-html.dark,
-html[data-theme="dark"] {
-  --sy-c-bg: var(--ink);
-  --sy-c-bg-soft: var(--panel);
-  --sy-c-text: var(--cream);
-  --sy-c-text-weak: var(--mute);
-  --sy-c-link: var(--gold);
-  --sy-c-border: var(--line);
-  --sy-c-foot-background: var(--ink);
-  --yue-c-text: var(--cream);
-  --vi-hero-name: var(--cream);
-  --vi-hero-tag: var(--gold);
-  --vi-hero-copy: var(--mute);
-  --vi-pill-border: #3a3428;
-  --vi-pill-bg: rgba(230, 162, 60, 0.05);
-  --vi-btn-ghost-fg: var(--cream);
-  --vi-focus: var(--gold);
-}
-
-html.light,
-html[data-theme="light"] {
-  --sy-c-bg: var(--cream);
-  --sy-c-bg-soft: #ebe6d8;
-  --sy-c-text: var(--ink);
-  --sy-c-text-weak: #4a4640;
-  --sy-c-link: #9a6410;
-  --sy-c-border: #d4cfc0;
-  --sy-c-foot-background: #ebe6d8;
-  --yue-c-text: var(--ink);
-  --vi-hero-name: var(--ink);
-  --vi-hero-tag: #9a6410;
-  --vi-hero-copy: #4a4640;
-  --vi-pill-border: #c9c0a8;
-  --vi-pill-bg: rgba(230, 162, 60, 0.12);
-  --vi-btn-ghost-fg: var(--ink);
-  --vi-focus: #9a6410;
+  --accent-9: var(--ll-gold);
+  --accent-10: #eeb257;
+  --accent-11: var(--ll-accent);
+  --accent-12: var(--ll-fg);
+  --accent-contrast: var(--ll-ink);
+  --accent-a2: color-mix(in srgb, var(--ll-gold) 8%, transparent);
+  --accent-a3: color-mix(in srgb, var(--ll-gold) 16%, transparent);
+  --accent-a4: color-mix(in srgb, var(--ll-gold) 22%, transparent);
+  --accent-a9: var(--ll-gold);
+  --accent-a11: var(--ll-accent);
 }
 
 html,
-body,
-.sy-page,
-.sy-head,
-.sy-lside,
-.globaltoc,
-.sy-foot,
-.sy-rside {
-  font-family: var(--sans) !important;
+body {
+  background: var(--ll-bg);
+  color: var(--ll-mute);
 }
 
-.sy-page h1,
-.sy-page h2,
-.sy-page h3,
-.sy-page h4,
-.sy-head-brand strong {
-  font-family: var(--serif) !important;
+html { scrollbar-color: var(--ll-line-2) var(--ll-bg); }
+::selection { background: var(--ll-gold); color: var(--ll-ink); }
+input, textarea { caret-color: var(--ll-accent); }
+
+/* Type: Source Serif 4 for headings, Source Sans 3 for reading, IBM Plex
+   Mono for commands, as DESIGN.md records. */
+body,
+.sy-head,
+.sy-lside,
+.sy-rside,
+.sy-foot {
+  font-family: var(--ll-sans);
+}
+
+.sy-main h1,
+.sy-main h2,
+.sy-main h3,
+.sy-main h4,
+.yue h1,
+.yue h2,
+.yue h3,
+.yue h4 {
+  font-family: var(--ll-serif);
+  font-weight: 600;
   letter-spacing: -0.03em;
+  color: var(--ll-fg);
   text-wrap: balance;
 }
-.sy-page h1 { font-size: clamp(2.1rem, 5vw, 3.4rem); line-height: 1.08; }
-.sy-page h2 { font-size: clamp(1.45rem, 2.6vw, 1.9rem); line-height: 1.2; }
-.sy-page h3, .sy-page h4 { font-size: 1.2rem; line-height: 1.25; }
-.yue, .vi-hero-tagline {
+.yue h1 { font-size: clamp(2.2rem, 5vw, 3.2rem); line-height: 1.08; }
+.yue h2 { font-size: clamp(1.45rem, 2.6vw, 1.9rem); line-height: 1.2; }
+.yue h3 { font-size: 1.2rem; line-height: 1.25; letter-spacing: -0.01em; }
+.yue h4 { font-size: 1.05rem; line-height: 1.3; letter-spacing: 0; }
+
+.yue {
   font-size: 1.0625rem;
   line-height: 1.7;
   letter-spacing: 0.008em;
+  max-width: 66ch;
 }
-.yue { max-width: 66ch; }
+.yue strong, .yue b { color: var(--ll-fg); }
 .yue table, table.docutils { font-variant-numeric: lining-nums tabular-nums; }
 
+code, pre, kbd, samp, .highlight { font-family: var(--ll-mono); }
+.yue :not(pre) > code,
+.yue code.literal {
+  font-size: 0.86em;
+  color: var(--ll-fg);
+  background: var(--ll-panel-2);
+  border: 1px solid var(--ll-line);
+  border-radius: 2px;
+  padding: 0.05em 0.3em;
+}
+
+p, li, td, .vi-hero-tagline { overflow-wrap: break-word; }
+
+/* Links: the text color, underlined; gold marks hover and the current page,
+   as on the main site. Gold does not recolor running text. */
+.yue a,
+.sy-main a.reference {
+  color: var(--ll-fg);
+  text-decoration: underline;
+  text-decoration-color: var(--ll-line-2);
+  text-underline-offset: 0.18em;
+  text-decoration-thickness: 1px;
+  border-bottom: 0;
+}
+.yue a:hover,
+.sy-main a.reference:hover {
+  color: var(--ll-accent);
+  text-decoration-color: currentColor;
+  text-decoration-thickness: 2px;
+}
+.yue a:has(> code) { text-decoration-color: var(--ll-line-2); }
+
+/* Side navigation reads as a list, not a row of gold links. */
+.globaltoc a,
+.sy-rside a,
+.localtoc a {
+  color: var(--ll-mute);
+  text-decoration: none;
+}
+.globaltoc a:hover,
+.sy-rside a:hover,
+.localtoc a:hover,
+.sy-head a:hover {
+  color: var(--ll-accent);
+}
+.globaltoc a.current,
+.globaltoc li.current > a,
+.localtoc li.active > a,
+.sy-head-links a[aria-current="page"] {
+  color: var(--ll-accent);
+}
+
+/* The project header keeps Shibuya's layout, in the site's ground and line. */
+.sy-head {
+  background: var(--sy-c-background-dropback);
+  border-bottom: 1px solid var(--ll-line);
+}
 .sy-head-brand img {
   height: 1.85rem;
   width: auto;
   max-height: 1.85rem;
-  border-radius: 0.35rem;
+  border-radius: 6px;
 }
-
-.sy-page a.reference,
-.globaltoc a:hover,
-.sy-rside a:hover,
-.sy-head a:hover {
-  color: var(--sy-c-link);
+.sy-head-brand strong { font-family: var(--ll-serif); font-weight: 600; }
+.searchbox input,
+.sy-head .searchbox {
+  background: var(--ll-panel);
+  border-color: var(--ll-line);
+  border-radius: 4px;
+  color: var(--ll-fg);
 }
+.searchbox input::placeholder { color: var(--ll-mute-2); }
 
-.sy-page a.reference {
-  text-decoration: underline;
-  text-underline-offset: 0.18em;
-  text-decoration-thickness: 0.08em;
-}
-
-.sy-page a.reference:hover {
-  filter: brightness(1.08);
-  text-decoration-thickness: 0.12em;
-}
-
-:focus-visible {
-  outline: 2px solid var(--vi-focus);
+/* Focus: 2px gold outline, 3px offset, everywhere. */
+:focus-visible,
+a:focus-visible,
+button:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--ll-accent);
   outline-offset: 3px;
 }
 
-::selection {
-  background: var(--gold);
-  color: var(--ink);
+/* Terminal surfaces stay ink in both schemes (Shibuya's dark_code). */
+.yue pre,
+.highlight pre,
+pre.literal-block {
+  border-radius: 2px;
+  border: 1px solid #2a2824;
 }
 
-input,
-textarea {
-  caret-color: var(--gold);
+/* Admonitions: a flat plate with a 1px line, no colored side tab. */
+.yue .admonition,
+.yue div.admonition {
+  background: var(--ll-panel);
+  border: 1px solid var(--ll-line);
+  border-radius: 8px;
+  box-shadow: none;
+  padding: 0.9rem 1.15rem;
+}
+.yue .admonition-title,
+.yue p.admonition-title {
+  font-family: var(--ll-serif);
+  font-weight: 600;
+  color: var(--ll-fg);
+  background: transparent;
 }
 
-html {
-  scrollbar-color: #3a3428 var(--ink);
+/* Tables: hairlines, cells inset from the edge. */
+.yue table,
+table.docutils {
+  display: block;
+  overflow-x: auto;
+  max-width: 100%;
+  border-collapse: collapse;
 }
-
-code,
-pre,
-kbd,
-samp,
-.highlight {
-  font-family: var(--mono);
-}
-
-p,
-li,
-td,
-.vi-hero-tagline {
-  overflow-wrap: break-word;
-}
-
-.seat-bar {
-  position: relative;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0 0.15rem;
-  align-items: center;
-  font: 0.95rem/1.3 var(--sans);
+.yue div.table-wrapper,
+div.table-wrapper {
+  overflow-x: auto;
+  max-width: 100%;
+  border: 0;
   padding: 0;
-  border-bottom: 1px solid var(--line);
-  margin: 0 0 0.6rem;
-  color: var(--mute);
 }
-.seat-bar::before {
-  content: "";
-  position: absolute;
-  left: 0.7rem;
-  right: 0.7rem;
-  top: 50%;
-  height: 1px;
-  background: var(--gold);
-  opacity: 0.55;
-  pointer-events: none;
+.yue th,
+.yue td {
+  padding: 0.45rem 0.75rem;
+  border-bottom: 1px solid var(--ll-line);
+}
+.yue th {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--ll-fg);
+  text-align: left;
 }
 
-.seat-bar a {
+/* The site strip: one row over every crate's docs, as the main site's nav. */
+.ll-strip {
   position: relative;
-  z-index: 1;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem 1rem;
+  padding: 0 max(1rem, calc((100% - 90rem) / 2));
+  border-bottom: 1px solid var(--ll-line);
+  background: var(--ll-bg);
+  font: 400 0.92rem/1.3 var(--ll-sans);
+}
+.ll-strip a {
   display: inline-flex;
   align-items: center;
+  gap: 0.4rem;
   min-height: 44px;
-  padding: 0 0.7rem;
-  color: var(--gold);
+  color: var(--ll-mute);
   text-decoration: none;
   white-space: nowrap;
-  background: var(--sy-c-bg, var(--ink));
 }
-.seat-bar a[aria-current="page"]::before {
-  content: "";
-  width: 0.55rem;
-  height: 0.85rem;
-  margin-right: 0.4rem;
-  background: url("/pin.svg") center / contain no-repeat;
+.ll-strip a:hover { color: var(--ll-accent); }
+.ll-strip .ll-brand {
+  flex: none;
+  font: 600 1.05rem/1 var(--ll-serif);
+  letter-spacing: -0.01em;
+  color: var(--ll-fg);
+}
+.ll-strip .ll-brand img { width: 1.15rem; height: 1.15rem; }
+.ll-strip ul {
+  display: flex;
+  align-items: center;
+  gap: 0 0.95rem;
+  margin: 0;
+  padding: 0 0 0 1rem;
+  list-style: none;
+  border-left: 1px solid var(--ll-line);
+  overflow-x: auto;
+  scrollbar-width: none;
+  min-width: 0;
+}
+.ll-strip ul::-webkit-scrollbar { display: none; }
+.ll-strip ul img {
+  width: 1.1rem;
+  height: 1.1rem;
+ 
+}
+.ll-strip a[aria-current="page"] {
+  color: var(--ll-fg);
+  font-weight: 600;
+  box-shadow: inset 0 -2px 0 var(--ll-gold);
+}
+.ll-strip .ll-site {
+  margin-left: auto;
+  display: flex;
+  gap: 0 1rem;
+  flex: none;
+}
+@media (max-width: 720px) {
+  .ll-strip .ll-site { display: none; }
+  .ll-strip ul {
+    mask-image: linear-gradient(to right, #000 calc(100% - 2rem), transparent);
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 2rem), transparent);
+  }
+  .ll-strip ul { padding-left: 0.75rem; }
+  .ll-strip ul img { display: none; }
 }
 
-a:focus-visible {
-  outline: 2px solid var(--gold);
-  outline-offset: 3px;
-}
-
-.seat-bar a[aria-current="page"] {
-  color: var(--cream);
-}
-
-html.light .seat-bar a[aria-current="page"],
-html[data-theme="light"] .seat-bar a[aria-current="page"] {
-  color: var(--ink);
-}
-
+/* The pin watermark, as on the main site: fixed, behind the page, clear of
+   the header and its search box. */
 body::before {
   content: "";
   pointer-events: none;
   position: fixed;
-  inset: -6rem -8rem auto auto;
+  bottom: -5rem;
+  right: -8rem;
   width: min(42vw, 22rem);
   height: min(42vw, 22rem);
-  opacity: 0.14;
+  opacity: var(--ll-pin-opacity);
   background: url("https://leidarljos.github.io/pin.svg") no-repeat center / contain;
   z-index: 0;
 }
+.sy-page, .sy-foot, .ll-strip { position: relative; z-index: 1; }
+@media (max-width: 1100px) { body::before { display: none; } }
 
-/* Landing hero */
-.vi-hero {
-  padding: 2.2rem 0 0.4rem;
-}
-.vi-hero-brand {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-}
-.vi-hero-mark {
-  flex: none;
-}
+/* Landing hero. */
+.vi-hero { padding: 2.2rem 0 0.4rem; }
+.vi-hero-brand { display: flex; align-items: center; gap: 1rem; }
+.vi-hero-mark { flex: none; border-radius: 8px; }
 .vi-hero-name {
-  font-family: var(--serif);
+  font-family: var(--ll-serif);
   font-size: clamp(2.1rem, 5vw, 3.4rem);
   font-weight: 600;
   margin: 0;
   letter-spacing: -0.03em;
   line-height: 1.08;
   text-wrap: balance;
-  color: var(--vi-hero-name);
+  color: var(--ll-fg);
 }
 .vi-hero-tag {
-  font-family: var(--serif);
-  color: var(--vi-hero-tag);
-  font-size: 1.15rem;
-  margin: 0.2rem 0 0;
+  font-family: var(--ll-serif);
+  font-weight: 600;
+  color: var(--ll-accent);
+  font-size: 0.95rem;
+  margin: 0.35rem 0 0;
 }
 .vi-hero-tagline {
   margin: 1.1rem 0 1.35rem;
-  font-size: 1.15rem;
+  font-family: var(--ll-serif);
+  font-size: clamp(1.15rem, 2vw, 1.3rem);
+  line-height: 1.45;
   max-width: 40rem;
-  color: var(--vi-hero-copy);
+  color: var(--ll-fg-2);
 }
 .vi-hero-pills {
   display: flex;
@@ -263,22 +399,11 @@ body::before {
   margin: 0 0 1.4rem;
 }
 .vi-hero-pills span {
-  border: 1px solid var(--vi-pill-border);
-  background: var(--vi-pill-bg);
+  border: 1px solid var(--ll-line-2);
   border-radius: 999px;
-  padding: 0.2rem 0.8rem;
+  padding: 0.25rem 0.8rem;
   font-size: 0.85rem;
-  color: var(--vi-hero-name);
-}
-.vi-hero-pills span::before {
-  content: "";
-  display: inline-block;
-  width: 0.4rem;
-  height: 0.4rem;
-  border-radius: 50%;
-  background: var(--gold);
-  margin-right: 0.4rem;
-  vertical-align: 0.05rem;
+  color: var(--ll-fg);
 }
 .vi-hero-actions {
   display: flex;
@@ -290,36 +415,73 @@ body::before {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 8px;
-  padding: 0.58rem 1.1rem;
+  min-height: 44px;
+  border-radius: 4px;
+  padding: 0.7rem 1.2rem;
   text-decoration: none !important;
-  font-weight: 600;
-  font-size: 0.95rem;
+  font: 600 0.98rem/1.2 var(--ll-sans);
 }
 .vi-btn-gold {
-  background: var(--gold);
-  color: var(--ink) !important;
+  background: var(--ll-gold);
+  color: var(--ll-ink) !important;
 }
-.vi-btn-gold:hover {
-  color: var(--ink) !important;
-  filter: brightness(1.06);
-}
+.vi-btn-gold:hover { color: var(--ll-ink) !important; filter: brightness(1.06); }
 .vi-btn-ghost {
-  border: 1px solid var(--sy-c-border, var(--line));
-  color: var(--vi-btn-ghost-fg) !important;
+  border: 1px solid var(--ll-line-2);
+  color: var(--ll-fg) !important;
 }
 .vi-btn-ghost:hover {
-  color: var(--gold) !important;
-  border-color: var(--gold);
+  color: var(--ll-accent) !important;
+  border-color: var(--ll-accent-soft);
 }
 
-/* Wide reference tables scroll rather than pushing the page sideways. */
-.wy-table-responsive,
-div.table-wrapper,
-table.docutils {
-  display: block;
-  overflow-x: auto;
-  max-width: 100%;
+/* The shared footer: the seven crates, then the analytics line. */
+.ll-foot {
+  border-top: 1px solid var(--ll-line);
+  margin-top: 3rem;
+  padding: 1.6rem 1rem 1.75rem;
+  color: var(--ll-mute);
+  font: 400 0.88rem/1.4 var(--ll-sans);
+  background: var(--ll-bg);
+}
+.ll-foot a { color: var(--ll-mute); }
+.ll-foot-line a { text-decoration: underline; text-underline-offset: 0.18em; }
+.ll-foot-line span { display: inline-flex; align-items: center; gap: 0.35em; }
+.ll-foot-reserved {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 0.5rem 1.25rem;
+  margin-top: 0.9rem;
+}
+.ll-foot-reserved .sy-foot-socials a { color: var(--ll-mute); }
+.ll-foot-reserved .sy-foot-socials a:hover { color: var(--ll-accent); }
+.ll-foot a:hover { color: var(--ll-accent); }
+.ll-foot-tools {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.25rem 1.1rem;
+  margin: 0 0 0.9rem;
+  padding: 0;
+  list-style: none;
+}
+.ll-foot-tools a {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  min-height: 44px;
+  text-decoration: none;
+}
+.ll-foot-tools img { width: 1.1rem; height: 1.1rem; }
+.ll-foot-tools a[aria-current="page"] { color: var(--ll-fg); font-weight: 600; }
+.ll-foot-line {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.35rem 1.25rem;
+  margin: 0;
 }
 
 /* Skip link (injected by extra-foot). */
@@ -329,20 +491,15 @@ table.docutils {
   top: -4rem;
   z-index: 10000;
   padding: 0.55rem 0.9rem;
-  background: var(--gold);
-  color: var(--ink) !important;
+  background: var(--ll-gold);
+  color: var(--ll-ink) !important;
   font-weight: 700;
-  border-radius: 6px;
+  border-radius: 4px;
   text-decoration: none;
 }
 .vi-skip-link:focus,
-.vi-skip-link:focus-visible {
-  top: 0.75rem;
-  outline: none;
-}
+.vi-skip-link:focus-visible { top: 0.75rem; outline: none; }
 
 @media (prefers-reduced-motion: reduce) {
-  html {
-    scroll-behavior: auto;
-  }
+  html { scroll-behavior: auto; }
 }
