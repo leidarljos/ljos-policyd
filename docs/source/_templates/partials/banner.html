@@ -1,0 +1,13 @@
+{%- set ll_tools = ["ljos", "packset", "deedar", "vissue", "claimdag", "consensus", "ljos-policyd"] -%}
+<nav class="ll-strip" aria-label="leiðarljós">
+  <a class="ll-brand" href="https://leidarljos.github.io/"><img src="https://leidarljos.github.io/icon.svg" alt="" width="18" height="18">leiðarljós</a>
+  <ul>
+    {%- for t in ll_tools %}
+    <li><a href="https://leidarljos.github.io/{{ t }}/"{% if t == project %} aria-current="page"{% endif %}><img src="https://leidarljos.github.io/marks/{{ t }}.svg" alt="" width="18" height="18">{{ t }}</a></li>
+    {%- endfor %}
+  </ul>
+  <span class="ll-site">
+    <a href="https://leidarljos.github.io/docs/">Docs</a>
+    <a href="https://leidarljos.github.io/handbook/">Handbook</a>
+  </span>
+</nav>
