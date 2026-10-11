@@ -3,13 +3,19 @@ name: release
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and publish (for example v0.4.0)
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 env:
   # The phronesis release every tarball links, built from source per target.
-  PHRONESIS_REF: v0.2.0
+  PHRONESIS_REF: v0.2.1
 
 jobs:
   build:
@@ -27,7 +33,22 @@ jobs:
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     steps:
+      # A manual run builds a tag that is already on the remote. Checkout of a
+      # branch name would succeed, and the release step must not invent a tag.
+      - name: The tag already exists
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          gh api --silent "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}"
       - uses: actions/checkout@v4
+        if: github.event_name != 'workflow_dispatch'
+      - uses: actions/checkout@v4
+        if: github.event_name == 'workflow_dispatch'
+        with:
+          ref: ${{ inputs.tag }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -48,9 +69,12 @@ jobs:
           cross=()
           if [ -n "${{ matrix.cross }}" ]; then
             # Intel macOS from the arm runner; Rosetta runs the test binaries.
+            # c-capnproto's meson project is C and C++. Without cpp here,
+            # that subproject stops the configure.
             cat > "$RUNNER_TEMP/cross.ini" <<'INI'
           [binaries]
           c = ['clang', '-arch', 'x86_64']
+          cpp = ['clang++', '-arch', 'x86_64']
           ar = 'ar'
           strip = 'strip'
           [host_machine]
@@ -88,12 +112,21 @@ jobs:
           ! "$GITHUB_WORKSPACE/$bin" check -- git push --force origin main
       - run: |
           set -eu
-          name="ljos-policyd-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          # A tag push names the archive from the pushed tag. A manual run
+          # names it from the tag input; GITHUB_REF_NAME is the branch then.
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$RELEASE_TAG"
+          else
+            tag="$GITHUB_REF_NAME"
+          fi
+          name="ljos-policyd-${tag}-${{ matrix.target }}"
           mkdir -p "dist/$name"
           cp target/${{ matrix.target }}/release/ljos-policyd "dist/$name/"
           cp README.md LICENSE* "dist/$name/" 2>/dev/null || true
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
@@ -110,7 +143,26 @@ jobs:
       # A release opened in the browser already has its notes; this line goes
       # after them instead of replacing them.
       - uses: softprops/action-gh-release@v2
+        if: github.event_name != 'workflow_dispatch'
         with:
+          files: dist/*
+          append_body: true
+          body: Argv law. Prints allow or deny. Links phronesis ${{ env.PHRONESIS_REF }}.
+      - name: The tag already exists
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -eu
+          gh api --silent "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}"
+      # tag_name selects the release. The tag is already on the remote, so
+      # opening the release does not create or move it.
+      - name: Upload the assets to the tag's release
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
           files: dist/*
           append_body: true
           body: Argv law. Prints allow or deny. Links phronesis ${{ env.PHRONESIS_REF }}.
