@@ -1,0 +1,35 @@
+{
+  "detector": {
+    "ignoreRules": [
+      "cream-palette"
+    ],
+    "ignoreFiles": [
+      "build/_static/shibuya.css",
+      "build/_static/basic.css",
+      "build/_static/pygments.css",
+      "build/_sphinx_design_static/**",
+      "build/_static/copybutton.css",
+      "build/_static/sphinx-design.min.css"
+    ],
+    "ignoreValues": [
+      {
+        "rule": "cramped-padding",
+        "value": "*",
+        "files": [
+          "build/**"
+        ],
+        "createdAt": "2026-10-10T21:30:00.000Z",
+        "reason": "Shibuya's header, edit link, table wrapper and copy button. The cells and buttons inside carry their own padding, which the static check does not see."
+      },
+      {
+        "rule": "em-dash-overuse",
+        "value": "*",
+        "files": [
+          "build/**"
+        ],
+        "createdAt": "2026-10-10T21:30:00.000Z",
+        "reason": "Doubled hyphens on these pages are command flags in the specimens."
+      }
+    ]
+  }
+}
