@@ -107,7 +107,10 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # A release opened in the browser already has its notes; this line goes
+      # after them instead of replacing them.
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+          append_body: true
           body: Argv law. Prints allow or deny. Links phronesis ${{ env.PHRONESIS_REF }}.
