@@ -25,6 +25,44 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
 
+  phronesis:
+    name: test with phronesis linked
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Until phronesis v0.2.0 is tagged, main carries the installed schema C
+      # and the default pack this build embeds.
+      PHRONESIS_REF: main
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build capnproto pkg-config
+      - name: Build phronesis
+        run: |
+          set -eu
+          git clone --depth 1 --branch "$PHRONESIS_REF" \
+            https://github.com/leidarljos/phronesis "$RUNNER_TEMP/phronesis"
+          cd "$RUNNER_TEMP/phronesis"
+          meson setup build --prefix="$RUNNER_TEMP/phronesis-prefix" -Dtests=disabled
+          meson compile -C build
+          meson install -C build
+          echo "PHRONESIS_DIR=$RUNNER_TEMP/phronesis-prefix" >> "$GITHUB_ENV"
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+        env:
+          PHRONESIS_STATE_DIR: ${{ runner.temp }}/policyd-state
+      - name: Static link, phronesis backend
+        run: |
+          set -eu
+          cargo build --locked --release
+          target/release/ljos-policyd version | grep -q '(phronesis)'
+          ! readelf -d target/release/ljos-policyd | grep -E 'RPATH|RUNPATH'
+          ! ldd target/release/ljos-policyd | grep -E 'phronesis|capnp'
+
   licenses:
     name: cargo deny check licenses
     runs-on: ubuntu-latest
