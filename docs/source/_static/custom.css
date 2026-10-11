@@ -1,7 +1,7 @@
 /* leiðarljós theme for the Shibuya project docs.
    One file, the same in every crate. The tokens are the ones in
    leidarljos.github.io/site.css and DESIGN.md: a paper scheme (cream page,
-   ink type) and a desk scheme (ink page, cream type), one gold accent.
+   ink type) and a desk scheme (warm dark page, cream type), one gold accent.
    Shibuya sets html.light or html.dark from localStorage._theme, the key
    the main site's scheme switch also writes, so one choice holds across
    every page under leidarljos.github.io. */
@@ -42,18 +42,23 @@ html.light {
 
 /* Desk scheme. */
 html.dark {
-  --ll-bg: #0b0b0a;
+  --ll-bg: #33302a;
   --ll-fg: #f4f0e6;
   --ll-fg-2: #e8e2d4;
   --ll-accent: #e6a23c;
   --ll-accent-soft: #9a6410;
-  --ll-line: #2a2824;
-  --ll-line-2: #3a3428;
+  --ll-line: #514e47;
+  --ll-line-2: #645b48;
   --ll-mute: #b9b3a6;
-  --ll-mute-2: #8d877b;
-  --ll-panel: #141310;
-  --ll-panel-2: #1a1814;
+  --ll-mute-2: #aea89b;
+  --ll-panel: #3a3630;
+  --ll-panel-2: #3f3c36;
   --ll-pin-opacity: 0.16;
+  --syntax-dark-comment: #9da7b1;
+  --syntax-dark-comment-hashbang: #9da7b1;
+  --syntax-dark-comment-multiline: #9da7b1;
+  --syntax-dark-comment-single: #9da7b1;
+  --syntax-dark-comment-special: #9da7b1;
 }
 
 /* Map the role tokens onto Shibuya's own. */
@@ -233,6 +238,10 @@ pre.literal-block {
   border-radius: 2px;
   border: 1px solid #2a2824;
 }
+/* On the desk the hairline follows the page's line token. */
+html.dark .yue pre,
+html.dark .highlight pre,
+html.dark pre.literal-block { border-color: var(--ll-line); }
 
 /* Admonitions: a flat plate with a 1px line, no colored side tab. */
 .yue .admonition,
