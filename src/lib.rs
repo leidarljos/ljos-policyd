@@ -79,7 +79,7 @@ pub fn check_shell(argv: &[String]) -> Checked {
 }
 
 fn host_argv_table(argv: &[String]) -> Checked {
-    host_argv_table_at(argv, 0)
+    host_argv_table_at(argv, 0, leaves_tree(argv, 0))
 }
 
 /// How deep `sh -c` scripts nest before the table stops reading them.
@@ -88,8 +88,10 @@ const MAX_DEPTH: usize = 4;
 /// The table on one argv, then on every command it runs through a wrapper
 /// (`env`, `nice`, `xargs`, ...) or a shell's `-c` script, so `env git push
 /// -f` and `sh -c "git push -f"` meet the same rules as `git push -f`.
-fn host_argv_table_at(argv: &[String], depth: usize) -> Checked {
-    let own = host_argv_rules(argv);
+/// `moved` is true when a `cd` or `pushd` anywhere on the line can leave the
+/// working tree, so a relative path no longer says where a delete lands.
+fn host_argv_table_at(argv: &[String], depth: usize, moved: bool) -> Checked {
+    let own = host_argv_rules(argv, moved);
     if own.decision != Decision::Allow || depth >= MAX_DEPTH {
         return own;
     }
@@ -97,7 +99,7 @@ fn host_argv_table_at(argv: &[String], depth: usize) -> Checked {
         if inner.as_slice() == argv {
             continue;
         }
-        let c = host_argv_table_at(&inner, depth + 1);
+        let c = host_argv_table_at(&inner, depth + 1, moved);
         if c.decision != Decision::Allow {
             return c;
         }
@@ -378,6 +380,9 @@ const RUNNERS: &[(&str, &[&str])] = &[
     ("do", &[]),
     ("coproc", &[]),
     ("flock", &["-w", "--timeout", "-E", "--conflict-exit-code"]),
+    // Multi-call binaries run the applet named after them.
+    ("busybox", &[]),
+    ("toybox", &[]),
 ];
 
 /// The command past any leading assignments and runner words, with each
@@ -393,6 +398,12 @@ fn unwrap_wrappers(cmd: &[String]) -> (&[String], Option<&str>) {
         let w = cmd[i].as_str();
         if is_assignment(w) {
             i += 1;
+            continue;
+        }
+        if let Some(head) = function_head(&cmd[i..]) {
+            // `f() { git push -f; }`: the body is what runs when `f` is
+            // called, so it is judged as written.
+            i += head;
             continue;
         }
         let Some((name, valued)) = RUNNERS.iter().find(|(n, _)| *n == base_of(w)) else {
@@ -434,6 +445,50 @@ fn unwrap_wrappers(cmd: &[String]) -> (&[String], Option<&str>) {
         }
     }
     (&cmd[i.min(cmd.len())..], None)
+}
+
+/// How many words a function definition's head takes at the front of
+/// `words`: `f(){`, `f() {`, `function f {` and `function f() {`. None
+/// when the words do not open one.
+fn function_head(words: &[String]) -> Option<usize> {
+    let is_name = |n: &str| {
+        !n.is_empty()
+            && n.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+    };
+    let first = words.first()?.as_str();
+    if let Some(name) = first.strip_suffix("(){") {
+        return is_name(name).then_some(1);
+    }
+    if let Some(name) = first.strip_suffix("()") {
+        if !is_name(name) {
+            return None;
+        }
+        return Some(if words.get(1).is_some_and(|w| w == "{") {
+            2
+        } else {
+            1
+        });
+    }
+    if first == "function" {
+        let name = words.get(1)?.as_str();
+        let name = name
+            .strip_suffix("(){")
+            .or_else(|| name.strip_suffix("()"))
+            .unwrap_or(name);
+        if !is_name(name) {
+            return None;
+        }
+        let mut n = 2;
+        if words.get(n).is_some_and(|w| w == "()") {
+            n += 1;
+        }
+        if words.get(n).is_some_and(|w| w == "{") {
+            n += 1;
+        }
+        return Some(n);
+    }
+    None
 }
 
 /// The script a shell runs with `-c` (or a flag cluster holding `c`, such as
@@ -529,7 +584,7 @@ fn shell_words(script: &str) -> Vec<String> {
     out
 }
 
-fn host_argv_rules(argv: &[String]) -> Checked {
+fn host_argv_rules(argv: &[String], moved: bool) -> Checked {
     if argv.is_empty() {
         return Checked {
             decision: Decision::Deny,
@@ -552,6 +607,13 @@ fn host_argv_rules(argv: &[String]) -> Checked {
             token: Cow::Borrowed("curl-pipe-shell"),
         };
     }
+    if decoded_exec(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellRemoteExec,
+            token: Cow::Borrowed("decoded-pipe-shell"),
+        };
+    }
     if setuid_chmod(argv) {
         return Checked {
             decision: Decision::Deny,
@@ -566,7 +628,14 @@ fn host_argv_rules(argv: &[String]) -> Checked {
             token: Cow::Borrowed("raw-disk"),
         };
     }
-    if recursive_delete_off_tmp(argv) {
+    if recursive_mode_change(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: Cow::Borrowed("recursive-chmod-chown"),
+        };
+    }
+    if recursive_delete_off_tmp(argv, moved) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellDangerousRunner,
@@ -1073,6 +1142,37 @@ fn remote_exec(argv: &[String]) -> bool {
     })
 }
 
+/// Commands that turn text no reader can check into a script: decoders
+/// and decompressors. Their output handed to a shell runs commands the
+/// line never shows.
+const DECODERS: &[&str] = &[
+    "base64", "base32", "basenc", "xxd", "openssl", "uudecode", "gunzip", "zcat", "gzip", "bzcat",
+    "bunzip2", "xzcat", "unxz", "zstdcat", "zstd", "rev",
+];
+
+/// A decoded script handed to a shell: a decoding stage piped into a
+/// shell stage (`echo ... | base64 -d | sh`), or a shell running a decoder
+/// through `$(...)`, `<(...)` or backticks (`bash -c "$(base64 -d f)"`).
+/// The table cannot read what such a script runs, so it is refused, as a
+/// download piped into a shell is.
+fn decoded_exec(argv: &[String]) -> bool {
+    let stages = stages(argv);
+    let decodes = |s: &[String]| command_word(s).is_some_and(|c| DECODERS.contains(&c));
+    let shell = |s: &[String]| command_word(s).is_some_and(|c| SHELLS.contains(&c));
+    if stages.windows(2).any(|w| decodes(&w[0]) && shell(&w[1])) {
+        return true;
+    }
+    stages.iter().filter(|s| shell(s)).any(|s| {
+        s.iter().any(|t| {
+            ["$(", "<(", "`"].iter().any(|open| {
+                DECODERS.iter().any(|d| {
+                    t.contains(&format!("{open}{d} ")) || t.ends_with(&format!("{open}{d}"))
+                })
+            })
+        })
+    })
+}
+
 /// Split a hooked line into its commands at shell separators. A token
 /// ending in `;` closes its command.
 fn commands(argv: &[String]) -> Vec<Vec<&str>> {
@@ -1147,23 +1247,130 @@ fn whole_tree(p: &str) -> bool {
     matches!(p, "." | "./" | ":/" | ":" | "*" | "-A")
 }
 
-/// A git call that throws away work no commit holds: a force push,
-/// `reset --hard` (or `--merge`/`--keep` are fine), `clean` with `-f`,
-/// `stash clear`, `checkout` of the whole tree, or `restore` of the whole
-/// tree or with no path at all.
+/// Config keys whose value git runs as a command.
+const GIT_COMMAND_KEYS: &[&str] = &[
+    "core.sshcommand",
+    "core.pager",
+    "core.editor",
+    "core.fsmonitor",
+    "core.askpass",
+    "sequence.editor",
+    "diff.external",
+    "gpg.program",
+    "credential.helper",
+];
+
+/// The `-c KEY=VALUE` pairs given before git's subcommand, key lowercased.
+fn git_configs(argv: &[String]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i < argv.len() {
+        let a = argv[i].as_str();
+        if a == "-c" {
+            if let Some((k, val)) = argv.get(i + 1).and_then(|kv| kv.split_once('=')) {
+                out.push((
+                    k.to_ascii_lowercase(),
+                    val.trim_matches(['"', '\'']).to_string(),
+                ));
+            }
+            i += 2;
+        } else if matches!(a, "-C" | "--git-dir" | "--work-tree" | "--namespace") {
+            i += 2;
+        } else if a.starts_with('-') {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// The table's verdict on a string git hands to a shell. Git can run it
+/// from another directory, so a relative build output path is not allowed
+/// to pass there.
+fn git_shell_value(value: &str) -> Option<&'static str> {
+    let argv = ["sh", "-c", value].map(String::from);
+    let c = host_argv_table_at(&argv, 1, true);
+    // The table's tokens are all static; only phronesis writes its own.
+    (c.decision != Decision::Allow).then_some(match c.token {
+        Cow::Borrowed(t) => t,
+        Cow::Owned(_) => "git-shell-value",
+    })
+}
+
+/// A refspec or flag on `git push` that deletes a remote ref: `--delete`,
+/// `-d` in a short cluster, or a refspec with an empty source (`:main`).
+fn push_delete(rest: &[String]) -> bool {
+    rest.iter().any(|a| {
+        a == "--delete"
+            || (a.starts_with('-') && !a.starts_with("--") && a[1..].contains('d'))
+            || (a.starts_with(':') && a.len() > 1)
+    })
+}
+
+/// A git call that throws away work no commit holds: a force push, a
+/// remote ref delete, `reset --hard` (or `--merge`/`--keep` are fine),
+/// `clean` with `-f`, `stash clear`, `branch -D`, `reflog expire`
+/// to now, `filter-branch`, `update-ref -d`, `worktree remove --force`,
+/// `checkout` of the whole tree, or `restore` of the whole tree or with no
+/// path at all. An alias given with `-c alias.NAME=...` is judged as what
+/// it runs, and so is a `-c` value git runs as a command.
 fn git_dangerous(argv: &[String]) -> Option<&'static str> {
     if force_push(argv) {
         return Some("git-force-push");
     }
+    let configs = git_configs(argv);
+    for (k, val) in &configs {
+        if GIT_COMMAND_KEYS.contains(&k.as_str()) {
+            if let Some(token) = git_shell_value(val.trim_start_matches('!')) {
+                return Some(token);
+            }
+        }
+    }
     let (sub, rest) = git_subcommand(argv)?;
+    if let Some((_, val)) = configs
+        .iter()
+        .find(|(k, _)| k.strip_prefix("alias.") == Some(&sub.to_ascii_lowercase()))
+    {
+        if let Some(script) = val.strip_prefix('!') {
+            return git_shell_value(script);
+        }
+        let mut expanded = vec!["git".to_string()];
+        expanded.extend(shell_words(val));
+        expanded.extend(rest.iter().cloned());
+        if expanded.get(1).map(String::as_str) != Some(sub) {
+            return git_dangerous(&expanded);
+        }
+    }
     let short = |c: char| {
         rest.iter()
             .any(|a| a.starts_with('-') && !a.starts_with("--") && a[1..].contains(c))
     };
+    let has = |f: &str| rest.iter().any(|a| a == f);
     match sub {
-        "reset" if rest.iter().any(|a| a == "--hard") => Some("git-reset-hard"),
-        "clean" if short('f') || rest.iter().any(|a| a == "--force") => Some("git-clean-force"),
+        "push" if push_delete(rest) => Some("git-push-delete"),
+        "reset" if has("--hard") => Some("git-reset-hard"),
+        "clean" if short('f') || has("--force") => Some("git-clean-force"),
         "stash" if rest.first().is_some_and(|a| a == "clear") => Some("git-stash-clear"),
+        "branch" if short('D') || (has("--delete") && (has("--force") || short('f'))) => {
+            Some("git-branch-force-delete")
+        }
+        "reflog"
+            if rest.first().is_some_and(|a| a == "delete")
+                || (rest.first().is_some_and(|a| a == "expire")
+                    && rest.iter().any(|a| {
+                        a.starts_with("--expire") && (a.ends_with("=now") || a.ends_with("=all"))
+                    })) =>
+        {
+            Some("git-reflog-expire")
+        }
+        "filter-branch" | "filter-repo" => Some("git-history-rewrite"),
+        "update-ref" if short('d') => Some("git-update-ref-delete"),
+        "worktree"
+            if rest.first().is_some_and(|a| a == "remove") && (short('f') || has("--force")) =>
+        {
+            Some("git-worktree-force-remove")
+        }
         "checkout" => {
             let after = rest
                 .iter()
@@ -1197,11 +1404,16 @@ fn under_tmp(p: &str) -> bool {
         && (p == "/tmp" || p.starts_with("/tmp/") || p == "/var/tmp" || p.starts_with("/var/tmp/"))
 }
 
-/// `find ... -delete` whose starting points are not all under `/tmp`. With
-/// no starting point find walks the current directory.
+/// `find ... -delete`, or `-exec rm` (also `-execdir`, `-ok`, `shred`,
+/// `unlink`), whose starting points are not all under `/tmp`. With no
+/// starting point find walks the current directory.
 fn find_delete_off_tmp(argv: &[String]) -> bool {
     commands(argv).iter().any(|cmd| {
-        if base_of(cmd[0]) != "find" || !cmd.contains(&"-delete") {
+        let exec_delete = cmd.windows(2).any(|w| {
+            matches!(w[0], "-exec" | "-execdir" | "-ok" | "-okdir")
+                && matches!(base_of(w[1]), "rm" | "shred" | "unlink")
+        });
+        if base_of(cmd[0]) != "find" || !(cmd.contains(&"-delete") || exec_delete) {
             return false;
         }
         let starts: Vec<&&str> = cmd[1..]
@@ -1357,7 +1569,86 @@ fn climbs(path: &str) -> bool {
     path.split('/').any(|part| part == "..")
 }
 
-fn recursive_delete_off_tmp(argv: &[String]) -> bool {
+/// Directories a build, a package manager or a test run writes and can
+/// write again. A recursive delete of one, named as a plain relative path,
+/// is allowed.
+const BUILD_OUTPUT_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "_build",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".nox",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".turbo",
+    ".parcel-cache",
+    ".angular",
+    ".gradle",
+    "coverage",
+    "htmlcov",
+];
+
+/// A path written out in plain characters that stays below the working
+/// directory: not absolute, no `~`, no `$`, no glob, no `..` and no `.`
+/// part. A leading `./` and a trailing `/` are allowed.
+fn plain_relative(p: &str) -> bool {
+    let mut rest = p;
+    while let Some(r) = rest.strip_prefix("./") {
+        rest = r;
+    }
+    let rest = rest.trim_end_matches('/');
+    !rest.is_empty()
+        && !rest.starts_with('-')
+        && rest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+' | '@' | '/'))
+        && rest
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+/// A plain relative path inside a build output directory, or the
+/// directory itself: `target/`, `./build`, `web/node_modules`.
+fn build_output(p: &str) -> bool {
+    plain_relative(p) && p.split('/').any(|part| BUILD_OUTPUT_DIRS.contains(&part))
+}
+
+/// A `cd`, `pushd` or `popd` that can leave the working tree: an absolute
+/// target, `~`, `-`, `..`, a variable, or none at all (home).
+fn leaves_tree(argv: &[String], depth: usize) -> bool {
+    let here = commands(argv).iter().any(|cmd| {
+        let b = base_of(cmd[0]);
+        if b == "popd" {
+            return true;
+        }
+        if b != "cd" && b != "pushd" {
+            return false;
+        }
+        match cmd[1..].iter().find(|a| !a.starts_with('-') || **a == "-") {
+            Some(t) => !plain_relative(t),
+            None => true,
+        }
+    });
+    here || (depth < MAX_DEPTH
+        && inner_commands(argv)
+            .iter()
+            .any(|inner| inner.as_slice() != argv && leaves_tree(inner, depth + 1)))
+}
+
+/// True when any `rm` or `rtrash` on the line deletes recursively with an
+/// operand that is neither under `/tmp` or `/var/tmp` nor a build output
+/// directory named as a plain relative path. When the line can `cd` out of
+/// the working tree, only `/tmp` operands pass.
+fn recursive_delete_off_tmp(argv: &[String], moved: bool) -> bool {
     commands(argv).iter().any(|cmd| {
         let b = base_of(cmd[0]);
         if b != "rm" && b != "rtrash" {
@@ -1375,13 +1666,7 @@ fn recursive_delete_off_tmp(argv: &[String]) -> bool {
         !cmd.iter()
             .skip(1)
             .filter(|a| !a.starts_with('-') && !is_redirection(a))
-            .all(|p| {
-                !climbs(p)
-                    && (*p == "/tmp"
-                        || p.starts_with("/tmp/")
-                        || *p == "/var/tmp"
-                        || p.starts_with("/var/tmp/"))
-            })
+            .all(|p| under_tmp(p) || (!moved && build_output(p)))
     })
 }
 
@@ -1395,12 +1680,244 @@ fn setuid_chmod(argv: &[String]) -> bool {
     })
 }
 
+/// A block device: a whole disk, a partition, or a mapped or RAID volume.
+/// `/dev/null`, `/dev/zero` and the other character devices are not one.
+fn block_device(path: &str) -> bool {
+    let Some(name) = path.strip_prefix("/dev/") else {
+        return false;
+    };
+    [
+        "sd", "hd", "vd", "xvd", "nvme", "mmcblk", "disk", "md", "dm-", "mapper/", "loop", "rbd",
+        "nbd", "zd",
+    ]
+    .iter()
+    .any(|p| name.starts_with(p))
+}
+
+/// A redirection on the line that writes to a block device: `> /dev/sda`,
+/// `>/dev/sda`, `1>> /dev/nvme0n1`.
+fn writes_block_device(argv: &[String]) -> bool {
+    argv.iter().enumerate().any(|(i, a)| {
+        let rest = a.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+        let Some(target) = rest.strip_prefix('>') else {
+            return false;
+        };
+        let target = target.trim_start_matches(['>', '|']);
+        if target.is_empty() {
+            argv.get(i + 1).is_some_and(|t| block_device(t))
+        } else {
+            block_device(target)
+        }
+    })
+}
+
+/// Tools that rewrite a partition table, a filesystem signature or a whole
+/// block device, each with the flags that only read. Such a tool given a
+/// block device and none of its read-only flags is a write.
+const DISK_WRITERS: &[(&str, &[&str])] = &[
+    ("wipefs", &["-n", "--no-act", "-h", "--help"]),
+    (
+        "sgdisk",
+        &[
+            "-p", "--print", "-v", "--verify", "-i", "--info", "-h", "--help",
+        ],
+    ),
+    (
+        "sfdisk",
+        &[
+            "-l",
+            "--list",
+            "-d",
+            "--dump",
+            "-J",
+            "--json",
+            "-s",
+            "--show-size",
+            "-V",
+            "--verify",
+            "-h",
+            "--help",
+        ],
+    ),
+    ("fdisk", &["-l", "--list", "-h", "--help"]),
+    ("gdisk", &["-l", "-h", "--help"]),
+    ("cfdisk", &["-h", "--help"]),
+    ("parted", &["-l", "--list", "print", "-h", "--help"]),
+    ("blkdiscard", &["-h", "--help"]),
+    ("mkswap", &["-h", "--help"]),
+    ("shred", &["-h", "--help"]),
+    ("badblocks", &[]),
+];
+
+/// A command that overwrites a disk: `mkfs` on a device (or with no target
+/// named), `dd` writing to a block device, a partitioning or wiping tool
+/// on a block device, `cryptsetup` formatting or erasing one, `badblocks
+/// -w`, or a redirection into one. `mkfs.ext4 -F disk.img` formats a file
+/// and `dd of=/dev/null` writes nowhere, so neither is refused.
 fn raw_disk(argv: &[String]) -> bool {
-    let b = base_of(&argv[0]);
-    if b.starts_with("mkfs") {
+    if writes_block_device(argv) {
         return true;
     }
-    b == "dd" && argv.iter().any(|a| a.starts_with("of=/dev/"))
+    let b = base_of(&argv[0]);
+    let operands: Vec<&str> = argv[1..]
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    if b.starts_with("mkfs") {
+        // `mkfs -t xfs DEV`: the value of -t is not the target.
+        let mut targets = Vec::new();
+        let mut skip = false;
+        for a in &argv[1..] {
+            if skip {
+                skip = false;
+            } else if matches!(
+                a.as_str(),
+                "-t" | "--type" | "-L" | "-b" | "-O" | "-E" | "-m"
+            ) {
+                skip = true;
+            } else if !a.starts_with('-') {
+                targets.push(a.as_str());
+            }
+        }
+        return targets.is_empty()
+            || targets
+                .iter()
+                .any(|t| t.starts_with("/dev/") || t.contains('$'));
+    }
+    if b == "dd" {
+        return argv
+            .iter()
+            .filter_map(|a| a.strip_prefix("of="))
+            .any(|t| block_device(t) || t.contains('$'));
+    }
+    if b == "cryptsetup" {
+        return operands
+            .iter()
+            .any(|a| matches!(*a, "luksFormat" | "erase" | "luksErase" | "reencrypt"));
+    }
+    if b == "wipefs"
+        && !argv[1..].iter().any(|a| {
+            matches!(a.as_str(), "--all" | "--offset")
+                || a.starts_with("--offset=")
+                || (a.starts_with('-')
+                    && !a.starts_with("--")
+                    && (a.contains('a') || a.contains('o')))
+        })
+    {
+        // With neither -a nor -o, wipefs only lists the signatures it finds.
+        return false;
+    }
+    if b == "badblocks" {
+        return argv.iter().any(|a| a == "-w") && operands.iter().any(|a| block_device(a));
+    }
+    let Some((_, reads)) = DISK_WRITERS.iter().find(|(n, _)| *n == b) else {
+        return false;
+    };
+    operands.iter().any(|a| block_device(a))
+        && !argv[1..].iter().any(|a| reads.contains(&a.as_str()))
+}
+
+/// Paths a recursive mode or owner change must not start from: the root,
+/// a home directory, and the system trees. A project directory, `.` and
+/// a build tree are not among them.
+fn system_or_home_tree(p: &str) -> bool {
+    let p = p.trim_end_matches('/');
+    if p.is_empty() || climbs(p) {
+        // `/` itself, or a path that climbs out of wherever it starts.
+        return true;
+    }
+    if matches!(p, "~" | "$HOME" | "${HOME}" | "/home" | "/root" | "/Users") {
+        return true;
+    }
+    if let Some(user) = p
+        .strip_prefix("/home/")
+        .or_else(|| p.strip_prefix("/Users/"))
+    {
+        // `/home/u` itself; `/home/u/proj/build` is one project's tree.
+        return !user.contains('/');
+    }
+    [
+        "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/opt", "/srv", "/var", "/sys",
+        "/proc", "/dev", "/System", "/Library", "/private",
+    ]
+    .iter()
+    .any(|root| {
+        (p == *root || p.starts_with(&format!("{root}/")))
+            && !(p == "/var/tmp" || p.starts_with("/var/tmp/"))
+    })
+}
+
+/// A mode that takes every permission away (`000`, `a-rwx`), or gives
+/// everyone write (`777`, `o+w`, `a+w`).
+fn sweeping_mode(m: &str) -> bool {
+    if m.chars().all(|c| c.is_ascii_digit()) && (3..=4).contains(&m.len()) {
+        let digits: Vec<u32> = m.chars().filter_map(|c| c.to_digit(8)).collect();
+        let n = digits.len();
+        let (u, g, o) = (digits[n - 3], digits[n - 2], digits[n - 1]);
+        return (u == 0 && g == 0 && o == 0) || o & 2 != 0;
+    }
+    m.split(',').any(|clause| {
+        let (who, rest) = clause.split_at(clause.find(['+', '-', '=']).unwrap_or(clause.len()));
+        let everyone = who.is_empty() || who.contains('a') || who.contains('o');
+        (everyone && rest.starts_with('+') && rest.contains('w'))
+            || (who.contains('a') || who == "ugo")
+                && rest.starts_with('-')
+                && rest.contains('r')
+                && rest.contains('w')
+                && rest.contains('x')
+    })
+}
+
+/// A recursive `chmod`, `chown`, `chgrp` or `setfacl` that starts at the
+/// root, a home directory or a system tree, or a recursive `chmod` that
+/// takes every permission away or hands everyone write, wherever it starts
+/// outside `/tmp`. `chmod -R u+w target` and `chown -R $USER ./build` stay
+/// allowed.
+fn recursive_mode_change(argv: &[String]) -> bool {
+    commands(argv).iter().any(|cmd| {
+        let b = base_of(cmd[0]);
+        if !matches!(b, "chmod" | "chown" | "chgrp" | "setfacl") {
+            return false;
+        }
+        let recursive = cmd[1..].iter().any(|a| {
+            *a == "--recursive" || (a.starts_with('-') && !a.starts_with("--") && a.contains('R'))
+        });
+        if !recursive {
+            return false;
+        }
+        let words: Vec<&str> = cmd[1..]
+            .iter()
+            .copied()
+            .filter(|a| !a.starts_with('-') || (b == "chmod" && is_mode_word(a)))
+            .collect();
+        // The first word is the mode or owner (setfacl's spec follows -m,
+        // so every word left is a path for it).
+        let (spec, paths) = if b == "setfacl" {
+            (None, &words[..])
+        } else {
+            match words.split_first() {
+                Some((s, rest)) => (Some(*s), rest),
+                None => return false,
+            }
+        };
+        if paths.iter().any(|p| system_or_home_tree(p)) {
+            return true;
+        }
+        b == "chmod"
+            && spec.is_some_and(sweeping_mode)
+            && paths
+                .iter()
+                .any(|p| !(*p == "/tmp" || p.starts_with("/tmp/") || p.starts_with("/var/tmp")))
+    })
+}
+
+/// A chmod mode written with a leading `-`, such as `-w` or `-rwx`.
+fn is_mode_word(a: &str) -> bool {
+    a.len() > 1
+        && a[1..]
+            .chars()
+            .all(|c| matches!(c, 'r' | 'w' | 'x' | 'X' | 's' | 't'))
 }
 
 #[cfg(test)]
@@ -1639,6 +2156,62 @@ mod tests {
     }
 
     #[test]
+    fn a_build_output_dir_inside_the_tree_may_be_deleted() {
+        for line in [
+            "rm -rf target/",
+            "rm -rf node_modules",
+            "rm -rf dist",
+            "rm -rf ./build",
+            "rm -rf .venv __pycache__ .next",
+            "rm -fr web/node_modules",
+            "rm -r -f target/debug/incremental",
+            "rm -rf -- .pytest_cache",
+            "rm -rf node_modules /tmp/npm-cache",
+            "cd web && rm -rf node_modules dist",
+            "sh -c 'rm -rf target'",
+            "rtrash -rf build",
+        ] {
+            assert_eq!(verdict(&shell_words(line)), "allow", "{line}");
+        }
+    }
+
+    #[test]
+    fn a_build_dir_name_does_not_widen_a_delete() {
+        for line in [
+            "rm -rf ../target",
+            "rm -rf /build",
+            "rm -rf target ~",
+            "rm -rf ~/target",
+            "rm -rf target/..",
+            "rm -rf node_modules/../src",
+            "rm -rf ./build/../..",
+            "rm -rf */target",
+            "rm -rf target*",
+            "rm -rf build/*",
+            "rm -rf {build,src}",
+            "rm -rf $HOME/build",
+            "rm -rf ${OUT:-/}/dist",
+            "rm -rf node_modules src",
+            "rm -rf .",
+            "rm -rf ./",
+            "rm -R --force .git",
+            "cd / && rm -rf build",
+            "cd .. && rm -rf target",
+            "cd ~ && rm -rf node_modules",
+            "cd && rm -rf build",
+            "cd - && rm -rf dist",
+            "sh -c 'cd /srv && rm -rf build'",
+            "sh -c 'cd / && rm -rf home'",
+        ] {
+            assert_eq!(
+                verdict(&shell_words(line)),
+                "deny\trm-rf-outside-tmp",
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
     fn a_tmp_path_that_climbs_out_is_outside_tmp() {
         assert!(v(&["rm", "-rf", "/tmp/../home/u"]).starts_with("deny"));
         assert!(v(&["rm", "-rf", "/tmp/a/../../etc"]).starts_with("deny"));
@@ -1662,6 +2235,36 @@ mod tests {
                 "git-discard-worktree",
             ),
             (&["git", "restore", "--staged"], "git-discard-worktree"),
+            (&["git", "branch", "-D", "topic"], "git-branch-force-delete"),
+            (
+                &["git", "branch", "--delete", "--force", "topic"],
+                "git-branch-force-delete",
+            ),
+            (
+                &["git", "reflog", "expire", "--expire=now", "--all"],
+                "git-reflog-expire",
+            ),
+            (
+                &["git", "filter-branch", "--tree-filter", "true", "HEAD"],
+                "git-history-rewrite",
+            ),
+            (
+                &["git", "update-ref", "-d", "refs/heads/main"],
+                "git-update-ref-delete",
+            ),
+            (
+                &["git", "worktree", "remove", "--force", "../wt"],
+                "git-worktree-force-remove",
+            ),
+            (
+                &["git", "push", "origin", "--delete", "main"],
+                "git-push-delete",
+            ),
+            (&["git", "push", "origin", ":main"], "git-push-delete"),
+            (
+                &["git", "push", "origin", ":refs/tags/v1.0"],
+                "git-push-delete",
+            ),
         ] {
             assert_eq!(v(argv), format!("deny\t{token}"), "{argv:?}");
         }
@@ -1678,9 +2281,53 @@ mod tests {
             &["git", "restore", "src/a.rs"],
             &["git", "restore", "-s", "HEAD~1", "src/a.rs"],
             &["git", "restore", "--patch"],
+            &["git", "stash", "drop", "stash@{0}"],
+            &["git", "branch", "-d", "topic"],
+            &["git", "branch", "--delete", "topic"],
+            &["git", "reflog", "expire", "--expire=90.days.ago"],
+            &["git", "reflog", "show"],
+            &["git", "update-ref", "refs/heads/x", "HEAD"],
+            &["git", "worktree", "remove", "../wt"],
+            &["git", "push", "origin", "main:main"],
+            &["git", "push", "origin", "HEAD:refs/heads/topic"],
+            &["git", "push", "--dry-run", "origin", "main"],
         ] {
             assert_eq!(v(argv), "allow", "{argv:?}");
         }
+    }
+
+    #[test]
+    fn git_config_on_the_line_does_not_hide_what_runs() {
+        assert_eq!(
+            v(&["git", "-c", "alias.p=push -f", "p", "origin", "main"]),
+            "deny\tgit-force-push"
+        );
+        assert_eq!(
+            v(&["git", "-c", "alias.wipe=!rm -rf ~/projects", "wipe"]),
+            "deny\trm-rf-outside-tmp"
+        );
+        assert_eq!(
+            v(&["git", "-c", "core.sshCommand=rm -rf ~", "fetch"]),
+            "deny\trm-rf-outside-tmp"
+        );
+        assert_eq!(v(&["git", "-c", "alias.st=status", "st"]), "allow");
+        assert_eq!(
+            v(&["git", "-c", "core.sshCommand=ssh -i key", "fetch"]),
+            "allow"
+        );
+        assert_eq!(
+            v(&["git", "-c", "alias.push=push", "push", "origin", "main"]),
+            "allow"
+        );
+    }
+
+    #[test]
+    fn a_multi_call_binary_runs_its_applet() {
+        assert_eq!(
+            v(&["busybox", "rm", "-rf", "/home/u/projects"]),
+            "deny\trm-rf-outside-tmp"
+        );
+        assert_eq!(v(&["busybox", "ls", "-la"]), "allow");
     }
 
     #[test]
@@ -1699,6 +2346,19 @@ mod tests {
         );
         assert_eq!(v(&["find", "/tmp/x", "-name", "*.o", "-delete"]), "allow");
         assert_eq!(v(&["find", ".", "-name", "x"]), "allow");
+        assert_eq!(
+            v(&["find", "/", "-name", "*.log", "-exec", "rm", "-f", "{}", "+"]),
+            "deny\tfind-delete-outside-tmp"
+        );
+        assert_eq!(
+            v(&["find", ".", "-execdir", "/bin/rm", "{}", ";"]),
+            "deny\tfind-delete-outside-tmp"
+        );
+        assert_eq!(
+            v(&["find", "/tmp/build", "-exec", "rm", "{}", "+"]),
+            "allow"
+        );
+        assert_eq!(v(&["find", ".", "-exec", "grep", "x", "{}", "+"]), "allow");
     }
 
     #[test]
@@ -1870,8 +2530,150 @@ mod tests {
             &["python3", "-c", "print(1)"],
             &["git", "push", "--force-with-lease", "origin", "x"],
             &["rm", "-rf", "/tmp/x"],
+            &["rm", "-rf", "target/"],
+            &["mkfs.ext4", "-F", "disk.img"],
         ] {
             assert_eq!(v(ok), "allow", "{ok:?}");
+        }
+    }
+
+    #[test]
+    fn a_disk_is_wiped_by_more_than_dd_and_mkfs() {
+        for argv in [
+            &["dd", "if=/dev/zero", "of=/dev/sda", "bs=1M"][..],
+            &["dd", "of=/dev/nvme0n1p2", "if=disk.img"],
+            &["mkfs.ext4", "/dev/sdb1"],
+            &["mkfs", "-t", "xfs", "/dev/nvme1n1"],
+            &["mkfs.ext4"],
+            &["wipefs", "-a", "/dev/sda"],
+            &["sgdisk", "--zap-all", "/dev/sda"],
+            &["sfdisk", "/dev/sda"],
+            &["fdisk", "/dev/sda"],
+            &["parted", "/dev/sda", "mklabel", "gpt"],
+            &["parted", "-s", "/dev/sda", "rm", "1"],
+            &["blkdiscard", "/dev/nvme0n1"],
+            &["mkswap", "/dev/sdb2"],
+            &["shred", "-n", "1", "/dev/sdc"],
+            &["cryptsetup", "luksFormat", "/dev/sdb"],
+            &["badblocks", "-w", "/dev/sdb"],
+            &["cat", "/dev/zero", ">", "/dev/sda"],
+            &["cat", "disk.img", ">/dev/mmcblk0"],
+            &["echo", "x", "1>", "/dev/xvda"],
+            &["env", "wipefs", "-a", "/dev/sda"],
+            &["sh", "-c", "cat /dev/zero > /dev/sda"],
+        ] {
+            assert_eq!(v(argv), "deny\traw-disk", "{argv:?}");
+        }
+        for argv in [
+            &["mkfs.ext4", "-F", "disk.img"][..],
+            &["dd", "if=/dev/zero", "of=disk.img", "bs=1M", "count=64"],
+            &["dd", "if=/dev/zero", "of=/dev/null", "bs=1M", "count=100"],
+            &["dd", "if=/dev/sda", "of=backup.img"],
+            &["fdisk", "-l"],
+            &["fdisk", "-l", "/dev/sda"],
+            &["parted", "-l"],
+            &["parted", "/dev/sda", "print"],
+            &["sfdisk", "--dump", "/dev/sda"],
+            &["sgdisk", "-p", "/dev/sda"],
+            &["wipefs", "/dev/sda"],
+            &["wipefs", "-n", "-a", "/dev/sda"],
+            &["cryptsetup", "open", "/dev/sdb", "data"],
+            &["badblocks", "/dev/sdb"],
+            &["lsblk"],
+            &["cat", "/dev/urandom", ">", "/tmp/rand.bin"],
+            &["echo", "x", ">", "/dev/null"],
+            &["shred", "-u", "/tmp/old.key"],
+        ] {
+            assert_eq!(v(argv), "allow", "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_recursive_mode_or_owner_change_on_a_home_or_system_tree() {
+        for argv in [
+            &["chmod", "-R", "777", "/"][..],
+            &["chmod", "-R", "777", "~"],
+            &["chmod", "-R", "755", "$HOME"],
+            &["chmod", "-R", "000", "."],
+            &["chmod", "-R", "a-rwx", "projects"],
+            &["chmod", "-R", "go+w", "/etc"],
+            &["chmod", "-R", "o+w", "src"],
+            &["chmod", "--recursive", "777", "/var/lib"],
+            &["chown", "-R", "nobody:nogroup", "/home/u"],
+            &["chown", "-R", "root", "~"],
+            &["chown", "-hR", "u", "/usr/local"],
+            &["chgrp", "-R", "nogroup", "/var/lib/postgresql"],
+            &["setfacl", "-R", "-b", "~"],
+            &["chmod", "-R", "u+w", "/home/u/.."],
+            &["sh", "-c", "chmod -R 777 /"],
+            &["env", "chown", "-R", "x", "/etc"],
+        ] {
+            assert_eq!(v(argv), "deny\trecursive-chmod-chown", "{argv:?}");
+        }
+        for argv in [
+            &["chmod", "-R", "u+w", "target"][..],
+            &["chmod", "-R", "700", "~/.ssh"],
+            &["chmod", "-R", "755", "/home/u/proj/build"],
+            &["chown", "-R", "$USER:$USER", "./build"],
+            &["chmod", "+x", "scripts/release.sh"],
+            &["chmod", "777", "/tmp/sock"],
+            &["chmod", "-R", "777", "/tmp/scratch"],
+            &["chmod", "-R", "g+rX", "docs"],
+            &["chgrp", "-R", "staff", "shared/"],
+            &["setfacl", "-R", "-m", "u:ci:rX", "build"],
+            &["chown", "u", "/etc/hosts.local"],
+        ] {
+            assert_eq!(v(argv), "allow", "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_decoded_script_handed_to_a_shell_is_refused() {
+        for argv in [
+            &["echo", "Z2l0IHB1c2ggLWYK", "|", "base64", "-d", "|", "sh"][..],
+            &["base64", "-d", "<<<", "cm0gLXJmIH4=", "|", "bash"],
+            &["base64", "--decode", "payload.b64|sh"],
+            &["xxd", "-r", "-p", "hex.txt", "|", "sh"],
+            &["openssl", "base64", "-d", "-in", "x", "|", "bash"],
+            &["zcat", "script.gz", "|", "env", "sh"],
+            &["rev", "x.txt", "|", "sh"],
+            &["bash", "-c", "$(base64 -d payload.b64)"],
+            &["sh", "<(base64 -d payload.b64)"],
+            &["sh", "-c", "echo cm0gLXJmIH4= | base64 -d | sh"],
+        ] {
+            assert_eq!(v(argv), "deny\tdecoded-pipe-shell", "{argv:?}");
+        }
+        for argv in [
+            &["echo", "aGVsbG8=", "|", "base64", "-d"][..],
+            &["base64", "-d", "secret.b64", ">", "out.bin"],
+            &["zcat", "access.log.gz", "|", "grep", "500"],
+            &["gzip", "-d", "data.gz"],
+            &["bash", "build.sh", "--base64"],
+            &["bash", "-c", "echo $(date)"],
+            &["openssl", "rand", "-hex", "16"],
+        ] {
+            assert_eq!(v(argv), "allow", "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_function_body_is_judged_as_written() {
+        for argv in [
+            &["f(){", "git", "push", "-f", "\"$@\""][..],
+            &["f()", "{", "git", "push", "-f"],
+            &["function", "f", "{", "rm", "-rf", "/home/u/x"],
+            &["function", "f()", "{", "git", "push", "--force"],
+            &["sh", "-c", "f(){ git push -f \"$@\"; }; f origin main"],
+            &["bash", "-c", "function f { rm -rf ~/projects; }; f"],
+        ] {
+            assert!(v(argv).starts_with("deny"), "{argv:?}");
+        }
+        for argv in [
+            &["f(){", "echo", "\"$@\""][..],
+            &["sh", "-c", "f(){ cargo test \"$@\"; }; f -q"],
+            &["function", "build", "{", "make", "all"],
+        ] {
+            assert_eq!(v(argv), "allow", "{argv:?}");
         }
     }
 }
