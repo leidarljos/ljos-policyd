@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.4.0 (2026-10-11)
+
 - A phronesis build links phronesis 0.2 and the Cap'n Proto C runtime statically, with no runtime path, and embeds phronesis's default pack. The binary runs on a host with no phronesis install. `build.rs` finds the library under `lib`, `lib64` or `lib/<multiarch>`, and the `pkg-config` route compiles the ShellCheck shim as the `PHRONESIS_DIR` route does.
 - phronesis judges every command the table reads inside a line (past wrappers, inside `sh -c` scripts and substitutions), not only the outer line. Its refusal prints the pack's reason after the tab; every phronesis refusal used to read `banned-runner`.
 - phronesis state lives under one directory per workspace, so a check in a second workspace is judged like one in the first. With one shared directory phronesis kept the first workspace and refused every line outside it.
