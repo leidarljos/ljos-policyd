@@ -161,6 +161,9 @@ fn inner_commands(argv: &[String]) -> Vec<Vec<String>> {
         if run.is_empty() {
             continue;
         }
+        if let Some(inside) = container_command(run) {
+            out.push(inside);
+        }
         if let Some(script) = shell_script(run) {
             out.extend(script_lines(script, 0).iter().map(|l| shell_words(l)));
         } else if base_of(&run[0]) == "eval" {
@@ -654,6 +657,27 @@ fn host_argv_rules(argv: &[String], moved: bool) -> Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellDangerousRunner,
             token: Cow::Borrowed("rm-rf-outside-tmp"),
+        };
+    }
+    if deletes_a_root_tree(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: Cow::Borrowed("rm-rf-outside-tmp"),
+        };
+    }
+    if moves_into_dev_null(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: Cow::Borrowed("mv-to-dev-null"),
+        };
+    }
+    if mirror_deletes_a_root_tree(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: Cow::Borrowed("rsync-delete-root-tree"),
         };
     }
     // A command word left as `$g` or `${GIT}` could be git: the git rules
@@ -1988,10 +2012,37 @@ fn recursive_mode_change(argv: &[String]) -> bool {
             .copied()
             .filter(|a| !a.starts_with('-') || (b == "chmod" && is_mode_word(a)))
             .collect();
-        // The first word is the mode or owner (setfacl's spec follows -m,
-        // so every word left is a path for it).
+        // The first word is the mode or owner. setfacl's spec is the value
+        // of a flag such as -m, so its paths are the words left past those.
+        let acl_paths: Vec<&str> = if b == "setfacl" {
+            let mut out = Vec::new();
+            let mut skip = false;
+            for a in &cmd[1..] {
+                if skip {
+                    skip = false;
+                } else if matches!(
+                    *a,
+                    "-m" | "--modify"
+                        | "-M"
+                        | "--modify-file"
+                        | "-x"
+                        | "--remove"
+                        | "-X"
+                        | "--remove-file"
+                        | "--set"
+                        | "--set-file"
+                ) {
+                    skip = true;
+                } else if !a.starts_with('-') {
+                    out.push(*a);
+                }
+            }
+            out
+        } else {
+            Vec::new()
+        };
         let (spec, paths) = if b == "setfacl" {
-            (None, &words[..])
+            (None, &acl_paths[..])
         } else {
             match words.split_first() {
                 Some((s, rest)) => (Some(*s), rest),
@@ -2001,12 +2052,262 @@ fn recursive_mode_change(argv: &[String]) -> bool {
         if paths.iter().any(|p| system_or_home_tree(p)) {
             return true;
         }
-        b == "chmod"
-            && spec.is_some_and(sweeping_mode)
+        let sweeping = if b == "setfacl" {
+            sweeping_acl(&cmd[1..])
+        } else {
+            b == "chmod" && spec.is_some_and(sweeping_mode)
+        };
+        sweeping
             && paths
                 .iter()
                 .any(|p| !(*p == "/tmp" || p.starts_with("/tmp/") || p.starts_with("/var/tmp")))
     })
+}
+
+/// A `setfacl` that strips every entry (`-b`, `-k` and their long forms)
+/// or hands everyone write through `-m o::w` or `-m other:rwx`.
+fn sweeping_acl(args: &[&str]) -> bool {
+    let strips = args.iter().any(|a| {
+        matches!(*a, "--remove-all" | "--remove-default")
+            || (a.starts_with('-') && !a.starts_with("--") && (a.contains('b') || a.contains('k')))
+    });
+    let everyone_writes = args.windows(2).any(|w| {
+        matches!(w[0], "-m" | "--modify" | "-M" | "--set")
+            && w[1].split(',').any(|e| {
+                let mut parts = e.splitn(3, ':');
+                let (who, _, perms) = (parts.next(), parts.next(), parts.next());
+                matches!(who, Some("o" | "other")) && perms.is_some_and(|p| p.contains('w'))
+            })
+    });
+    strips || everyone_writes
+}
+
+/// Commands that send a path to the trash; the trash keeps it only until
+/// it is emptied, and a whole tree there is still gone from where it ran.
+const TRASHERS: &[&str] = &["rtrash", "trash", "trash-put", "gtrash", "rmtrash"];
+
+/// A recursive `rm` (with or without `-f`), or a trash command, given the
+/// root, a home directory or a system tree. `rm -r /etc` and `rtrash -r
+/// /etc` were allowed because only `-rf` counted as recursive.
+fn deletes_a_root_tree(argv: &[String]) -> bool {
+    commands(argv).iter().any(|cmd| {
+        let b = base_of(cmd[0]);
+        let gio = b == "gio" && cmd.get(1) == Some(&"trash");
+        let recursive = cmd[1..].iter().any(|a| {
+            *a == "--recursive"
+                || (a.starts_with('-')
+                    && !a.starts_with("--")
+                    && (a.contains('r') || a.contains('R')))
+        });
+        if !(gio || TRASHERS.contains(&b) || (b == "rm" && recursive)) {
+            return false;
+        }
+        let from = usize::from(gio) + 1;
+        cmd[from..]
+            .iter()
+            .filter(|a| !a.starts_with('-') && !is_redirection(a))
+            .any(|p| !under_tmp(p) && system_or_home_tree(p))
+    })
+}
+
+/// `mv SRC... /dev/null`, or `mv -t /dev/null SRC...`: the sources are
+/// gone, as with `rm`, and nothing reads them back.
+fn moves_into_dev_null(argv: &[String]) -> bool {
+    commands(argv).iter().any(|cmd| {
+        if base_of(cmd[0]) != "mv" {
+            return false;
+        }
+        let target_flag = cmd
+            .windows(2)
+            .any(|w| matches!(w[0], "-t" | "--target-directory") && w[1] == "/dev/null")
+            || cmd.contains(&"--target-directory=/dev/null");
+        let operands: Vec<&&str> = cmd[1..]
+            .iter()
+            .filter(|a| !a.starts_with('-') && !is_redirection(a))
+            .collect();
+        target_flag || (operands.len() >= 2 && operands.last().is_some_and(|t| **t == "/dev/null"))
+    })
+}
+
+/// An `rsync` with a `--delete` flag whose local destination is the root,
+/// a home directory or a system tree: whatever the source lacks is
+/// deleted there, and an empty source deletes it all.
+fn mirror_deletes_a_root_tree(argv: &[String]) -> bool {
+    commands(argv).iter().any(|cmd| {
+        if base_of(cmd[0]) != "rsync" || !cmd.iter().any(|a| a.starts_with("--delete")) {
+            return false;
+        }
+        let operands: Vec<&&str> = cmd[1..]
+            .iter()
+            .filter(|a| !a.starts_with('-') && !is_redirection(a))
+            .collect();
+        operands.len() >= 2
+            && operands.last().is_some_and(|d| {
+                let remote = d.split('/').next().is_some_and(|head| head.contains(':'));
+                !remote && !under_tmp(d) && system_or_home_tree(d)
+            })
+    })
+}
+
+/// Container runners whose `run` takes `-v HOST:PATH` bind mounts.
+const CONTAINER_RUNNERS: &[&str] = &["docker", "podman", "nerdctl"];
+
+/// Flags of `docker run` that take a separate value.
+const CONTAINER_VALUED: &[&str] = &[
+    "-v",
+    "--volume",
+    "--mount",
+    "-e",
+    "--env",
+    "--env-file",
+    "-w",
+    "--workdir",
+    "--name",
+    "-p",
+    "--publish",
+    "--network",
+    "--net",
+    "-u",
+    "--user",
+    "-l",
+    "--label",
+    "--platform",
+    "-h",
+    "--hostname",
+    "--entrypoint",
+    "-m",
+    "--memory",
+    "--cpus",
+    "--add-host",
+    "--device",
+    "--cap-add",
+    "--cap-drop",
+    "--security-opt",
+    "--ulimit",
+    "--tmpfs",
+    "--pull",
+    "--restart",
+    "--log-driver",
+    "--log-opt",
+    "--shm-size",
+    "--ipc",
+    "--pid",
+    "--userns",
+    "--gpus",
+    "--volumes-from",
+    "--dns",
+    "--expose",
+    "--label-file",
+    "--cidfile",
+    "--stop-signal",
+];
+
+/// The command a `docker run` (or `podman`, `nerdctl`) runs, with each path
+/// under a bind mount written as the host path it lands on. A path in no
+/// mount is inside the container's own disk, so it is written as a path
+/// under `/tmp` and the table lets it go. `None` when nothing is mounted
+/// from the host or no argument lands in a mount.
+fn container_command(run: &[String]) -> Option<Vec<String>> {
+    if !CONTAINER_RUNNERS.contains(&base_of(run.first()?)) {
+        return None;
+    }
+    let mut i = 1;
+    if run.get(i).map(String::as_str) == Some("container") {
+        i += 1;
+    }
+    if run.get(i).map(String::as_str) != Some("run") {
+        return None;
+    }
+    i += 1;
+    let mut mounts: Vec<(String, String)> = Vec::new();
+    let mut entry: Option<String> = None;
+    while i < run.len() {
+        let a = run[i].as_str();
+        let (flag, value) = match a.split_once('=') {
+            Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+            _ => (a, None),
+        };
+        if !flag.starts_with('-') {
+            break;
+        }
+        let value = match value {
+            Some(v) => Some(v),
+            None if CONTAINER_VALUED.contains(&flag) => {
+                i += 1;
+                run.get(i).cloned()
+            }
+            None => None,
+        };
+        if let Some(v) = value {
+            if matches!(flag, "-v" | "--volume") {
+                let mut parts = v.splitn(3, ':');
+                if let (Some(h), Some(c)) = (parts.next(), parts.next()) {
+                    mounts.push((h.to_string(), c.to_string()));
+                }
+            } else if flag == "--mount" {
+                let field = |names: &[&str]| {
+                    v.split(',').find_map(|kv| {
+                        let (k, val) = kv.split_once('=')?;
+                        names.contains(&k).then(|| val.to_string())
+                    })
+                };
+                if field(&["type"]).as_deref() == Some("bind") {
+                    if let (Some(h), Some(c)) = (
+                        field(&["source", "src"]),
+                        field(&["target", "dst", "destination"]),
+                    ) {
+                        mounts.push((h, c));
+                    }
+                }
+            } else if flag == "--entrypoint" {
+                entry = Some(v);
+            }
+        }
+        i += 1;
+    }
+    // A named volume (`-v data:/data`) is not a host path.
+    mounts.retain(|(h, c)| {
+        c.starts_with('/')
+            && (h.starts_with('/')
+                || h.starts_with('~')
+                || h.starts_with('$')
+                || h.starts_with('.')
+                || h.starts_with('`'))
+    });
+    if mounts.is_empty() || i >= run.len() {
+        return None;
+    }
+    let host = |h: &str| match h {
+        "$(pwd)" | "`pwd`" | "$PWD" | "${PWD}" => ".".to_string(),
+        _ => h.trim_end_matches('/').to_string(),
+    };
+    let mut landed = false;
+    let mut out: Vec<String> = entry.into_iter().collect();
+    for a in &run[i + 1..] {
+        let mapped = mounts.iter().find_map(|(h, c)| {
+            let c = c.trim_end_matches('/');
+            let rest = a.strip_prefix(c)?;
+            (rest.is_empty() || rest.starts_with('/')).then(|| {
+                let h = host(h);
+                if rest.is_empty() {
+                    h
+                } else if h == "." {
+                    format!(".{rest}")
+                } else {
+                    format!("{h}{rest}")
+                }
+            })
+        });
+        match mapped {
+            Some(m) => {
+                landed = true;
+                out.push(m);
+            }
+            None if a.starts_with('/') => out.push(format!("/tmp/container{a}")),
+            None => out.push(a.clone()),
+        }
+    }
+    landed.then_some(out)
 }
 
 /// A chmod mode written with a leading `-`, such as `-w` or `-rwx`.
@@ -2846,6 +3147,73 @@ mod tests {
             &["function", "build", "{", "make", "all"],
         ] {
             assert_eq!(v(argv), "allow", "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_tree_deleted_another_way_is_refused() {
+        for (argv, token) in [
+            (&["rtrash", "-r", "/etc"][..], "rm-rf-outside-tmp"),
+            (&["rm", "-r", "/etc"], "rm-rf-outside-tmp"),
+            (&["trash-put", "~"], "rm-rf-outside-tmp"),
+            (&["gio", "trash", "/home/u"], "rm-rf-outside-tmp"),
+            (&["mv", "~/projects", "/dev/null"], "mv-to-dev-null"),
+            (&["mv", "-t", "/dev/null", "src"], "mv-to-dev-null"),
+            (
+                &["rsync", "-a", "--delete", "empty/", "~/"],
+                "rsync-delete-root-tree",
+            ),
+            (
+                &["rsync", "-a", "--delete-after", "x/", "/etc/"],
+                "rsync-delete-root-tree",
+            ),
+            (
+                &["setfacl", "-R", "-b", "~/projects"],
+                "recursive-chmod-chown",
+            ),
+            (
+                &["setfacl", "-R", "-m", "o::rwx", "./src"],
+                "recursive-chmod-chown",
+            ),
+        ] {
+            assert_eq!(v(argv), format!("deny\t{token}"), "{argv:?}");
+        }
+        for argv in [
+            &["rtrash", "target"][..],
+            &["rtrash", "-r", "/tmp/x"],
+            &["rm", "-r", "./old"],
+            &["mv", "a.txt", "b.txt"],
+            &["mv", "/dev/null", "x"],
+            &["rsync", "-a", "--delete", "build/", "host:/var/www/"],
+            &["rsync", "-a", "--delete", "build/", "/mnt/backup/build/"],
+            &["rsync", "-a", "src/", "~/"],
+            &["setfacl", "-R", "-m", "u:ci:rx", "./build"],
+            &["setfacl", "-R", "-b", "/tmp/x"],
+        ] {
+            assert_eq!(v(argv), "allow", "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_delete_through_a_bind_mount_lands_on_the_host() {
+        let line = |s: &str| verdict(&shell_words(s));
+        for l in [
+            "docker run --rm -v $HOME:/h alpine rm -rf /h/projects",
+            "podman run -it --volume /home/u:/w:z busybox rm -rf /w",
+            "docker run --mount type=bind,source=/etc,target=/e alpine rm -rf /e",
+            "docker container run -v ~:/root/home --entrypoint rm alpine -rf /root/home/x",
+        ] {
+            assert!(line(l).starts_with("deny"), "{l}");
+        }
+        for l in [
+            "docker run --rm alpine rm -rf /app/build",
+            "docker run --rm -v data:/data alpine rm -rf /data",
+            "docker run --rm -v $(pwd):/src -w /src rust cargo build",
+            "docker run --rm -v $HOME:/h alpine ls /h",
+            "docker run --rm -v /tmp/out:/out alpine rm -rf /out",
+            "docker ps -a",
+        ] {
+            assert_eq!(line(l), "allow", "{l}");
         }
     }
 }
