@@ -642,7 +642,7 @@ fn host_argv_rules(argv: &[String], moved: bool) -> Checked {
             token: Cow::Borrowed("rm-rf-outside-tmp"),
         };
     }
-    if find_delete_off_tmp(argv) {
+    if find_delete_off_tmp(argv, moved) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellDangerousRunner,
@@ -1406,8 +1406,10 @@ fn under_tmp(p: &str) -> bool {
 
 /// `find ... -delete`, or `-exec rm` (also `-execdir`, `-ok`, `shred`,
 /// `unlink`), whose starting points are not all under `/tmp`. With no
-/// starting point find walks the current directory.
-fn find_delete_off_tmp(argv: &[String]) -> bool {
+/// starting point find walks the current directory. A cleanup of files a
+/// tool writes again ([`regenerable_cleanup`]) inside the working tree is
+/// allowed, unless the line can `cd` out of the tree first.
+fn find_delete_off_tmp(argv: &[String], moved: bool) -> bool {
     commands(argv).iter().any(|cmd| {
         let exec_delete = cmd.windows(2).any(|w| {
             matches!(w[0], "-exec" | "-execdir" | "-ok" | "-okdir")
@@ -1416,12 +1418,87 @@ fn find_delete_off_tmp(argv: &[String]) -> bool {
         if base_of(cmd[0]) != "find" || !(cmd.contains(&"-delete") || exec_delete) {
             return false;
         }
-        let starts: Vec<&&str> = cmd[1..]
+        let starts: Vec<&str> = cmd[1..]
             .iter()
             .take_while(|a| !a.starts_with('-') && !matches!(**a, "(" | "!" | "\\("))
+            .copied()
             .collect();
-        starts.is_empty() || !starts.iter().all(|p| under_tmp(p))
+        if !starts.is_empty() && starts.iter().all(|p| under_tmp(p)) {
+            return false;
+        }
+        moved || !regenerable_cleanup(&starts, &cmd[1 + starts.len()..])
     })
+}
+
+/// Names a compiler, an interpreter, an editor or a desktop writes and
+/// writes again: bytecode, objects, patch leftovers, editor swap files and
+/// folder metadata. A `find -name` cleanup of these loses no work.
+const REGENERABLE_NAMES: &[&str] = &[
+    "*.pyc",
+    "*.pyo",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "*.o",
+    "*.obj",
+    "*.class",
+    "*.gcda",
+    "*.gcno",
+    "*.orig",
+    "*.rej",
+    "*.swp",
+    "*.swo",
+    "*~",
+    ".DS_Store",
+    "._*",
+    "Thumbs.db",
+    "desktop.ini",
+];
+
+/// A `find` cleanup inside the working tree: every starting point is `.`
+/// or a plain relative path outside `.git`, and every name test names a
+/// file in [`REGENERABLE_NAMES`], with at least one. An `-o`, a `!`, a
+/// `-not` or a group can turn a name test around, so none passes.
+/// `find . -delete` has no name test and `find . -name '*.rs' -delete`
+/// names source, so both stay refused.
+fn regenerable_cleanup(starts: &[&str], expr: &[&str]) -> bool {
+    let in_tree = |p: &&str| {
+        let p = p.trim_end_matches('/');
+        (p == "." || plain_relative(p)) && !p.split('/').any(|part| part == ".git")
+    };
+    if !starts.iter().all(in_tree) {
+        return false;
+    }
+    if expr.iter().any(|a| {
+        matches!(
+            *a,
+            "-o" | "-or" | "!" | "-not" | "," | "(" | ")" | "\\(" | "\\)"
+        )
+    }) {
+        return false;
+    }
+    let mut named = 0;
+    for w in expr.windows(2) {
+        match w[0] {
+            "-name" | "-iname" => {
+                if !REGENERABLE_NAMES.contains(&w[1]) {
+                    return false;
+                }
+                named += 1;
+            }
+            "-path" | "-ipath" | "-wholename" => {
+                let parts: Vec<&str> = w[1].split('/').filter(|p| *p != "*" && *p != ".").collect();
+                if parts.is_empty() || !parts.iter().all(|p| REGENERABLE_NAMES.contains(p)) {
+                    return false;
+                }
+                named += 1;
+            }
+            "-regex" | "-iregex" | "-lname" | "-ilname" => return false,
+            _ => {}
+        }
+    }
+    named > 0
 }
 
 /// Interpreters that take a program as an argument, with the flag for it.
@@ -1622,6 +1699,25 @@ fn build_output(p: &str) -> bool {
     plain_relative(p) && p.split('/').any(|part| BUILD_OUTPUT_DIRS.contains(&part))
 }
 
+/// Scratch directories a project keeps at its top for throwaway output.
+const SCRATCH_DIRS: &[&str] = &["tmp", ".tmp", "temp"];
+
+/// A plain relative path under a scratch directory at the top of the
+/// tree, or the directory itself: `tmp/`, `./tmp/test-output`. A scratch
+/// name deeper down (`src/tmp`) says nothing about what the path holds.
+fn scratch(p: &str) -> bool {
+    let mut rest = p;
+    while let Some(r) = rest.strip_prefix("./") {
+        rest = r;
+    }
+    plain_relative(p)
+        && rest
+            .split('/')
+            .next()
+            .is_some_and(|first| SCRATCH_DIRS.contains(&first))
+        && !rest.split('/').any(|part| part == ".git")
+}
+
 /// A `cd`, `pushd` or `popd` that can leave the working tree: an absolute
 /// target, `~`, `-`, `..`, a variable, or none at all (home).
 fn leaves_tree(argv: &[String], depth: usize) -> bool {
@@ -1645,9 +1741,10 @@ fn leaves_tree(argv: &[String], depth: usize) -> bool {
 }
 
 /// True when any `rm` or `rtrash` on the line deletes recursively with an
-/// operand that is neither under `/tmp` or `/var/tmp` nor a build output
-/// directory named as a plain relative path. When the line can `cd` out of
-/// the working tree, only `/tmp` operands pass.
+/// operand that is neither under `/tmp` or `/var/tmp`, nor a build output
+/// directory or a top-level scratch directory ([`SCRATCH_DIRS`]) named as a
+/// plain relative path. When the line can `cd` out of the working tree,
+/// only `/tmp` operands pass.
 fn recursive_delete_off_tmp(argv: &[String], moved: bool) -> bool {
     commands(argv).iter().any(|cmd| {
         let b = base_of(cmd[0]);
@@ -1666,7 +1763,7 @@ fn recursive_delete_off_tmp(argv: &[String], moved: bool) -> bool {
         !cmd.iter()
             .skip(1)
             .filter(|a| !a.starts_with('-') && !is_redirection(a))
-            .all(|p| under_tmp(p) || (!moved && build_output(p)))
+            .all(|p| under_tmp(p) || (!moved && (build_output(p) || scratch(p))))
     })
 }
 
@@ -2359,6 +2456,81 @@ mod tests {
             "allow"
         );
         assert_eq!(v(&["find", ".", "-exec", "grep", "x", "{}", "+"]), "allow");
+    }
+
+    #[test]
+    fn a_cleanup_of_regenerable_files_inside_the_tree_is_allowed() {
+        for line in [
+            "find . -name '*.pyc' -delete",
+            "find . -name .DS_Store -delete",
+            "find . -name '.DS_Store' -delete",
+            "find ./src -type f -name '*.orig' -delete",
+            "find . -type d -name __pycache__ -exec rm -rf {} +",
+            "find . -path '*/__pycache__/*' -delete",
+            "find . -maxdepth 2 -iname '*~' -delete",
+            "find build/obj -name '*.o' -delete",
+            "rm -rf ./tmp/test-output",
+            "rm -rf tmp/",
+            "rm -rf .tmp/cache temp",
+            "sh -c 'find . -name \"*.pyc\" -delete'",
+        ] {
+            assert_eq!(verdict(&shell_words(line)), "allow", "{line}");
+        }
+    }
+
+    #[test]
+    fn a_name_filter_does_not_widen_a_find_delete() {
+        for line in [
+            "find . -delete",
+            "find . -type f -name '*.rs' -delete",
+            "find . -name '*' -delete",
+            "find ~ -name '*.pyc' -delete",
+            "find ~ -type f -name '*.bak' -delete",
+            "find / -name '*.log' -delete",
+            "find /srv -name '*.pyc' -delete",
+            "find .. -name '*.pyc' -delete",
+            "find ../other -name '*.pyc' -delete",
+            "find $HOME -name '*.pyc' -delete",
+            "find .git -name '*.orig' -delete",
+            "find . ! -name '*.pyc' -delete",
+            "find . -not -name '*.pyc' -delete",
+            "find . -name '*.pyc' -o -delete",
+            "find . -name '*.pyc' -o -name '*.rs' -delete",
+            "find . -regex '.*' -delete",
+            "find . -path ./src -delete",
+            "find . -path '*' -delete",
+            "cd / && find . -name '*.pyc' -delete",
+            "cd ~ && find . -name .DS_Store -delete",
+        ] {
+            assert_eq!(
+                verdict(&shell_words(line)),
+                "deny\tfind-delete-outside-tmp",
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scratch_dir_name_does_not_widen_a_delete() {
+        for line in [
+            "rm -rf ./src",
+            "rm -rf src/tmp",
+            "rm -rf tmp/../src",
+            "rm -rf ../tmp",
+            "rm -rf ~/tmp",
+            "rm -rf tmp ~",
+            "rm -rf tmp/*",
+            "rm -rf tmp/.git",
+            "rm -rf tmpfiles",
+            "cd / && rm -rf tmp",
+            "cd ~ && rm -rf .tmp",
+        ] {
+            assert_eq!(
+                verdict(&shell_words(line)),
+                "deny\trm-rf-outside-tmp",
+                "{line}"
+            );
+        }
     }
 
     #[test]

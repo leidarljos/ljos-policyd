@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `find-delete-outside-tmp` allows a cleanup of files a tool writes again inside the tree, such as `find . -name '*.pyc' -delete` and `find . -name .DS_Store -delete`. Every starting point is `.` or a plain relative path outside `.git`, and every `-name`, `-iname` or `-path` test names bytecode, objects, patch leftovers, editor swap files or folder metadata from the list in the source. `find . -delete`, `find . -name '*.rs' -delete`, a home, absolute or `..` start, an `-o`, `!` or `-not` in the expression, and a line whose `cd` can leave the tree are still refused.
+- `rm-rf-outside-tmp` allows a recursive delete of a top-level scratch directory named as a plain relative path, `tmp`, `.tmp` or `temp`, or a path under one, such as `rm -rf ./tmp/test-output`. `rm -rf ./src`, `src/tmp`, `tmp/../src` and `tmp/.git` are still refused.
+- Both need phronesis 0.2.1 or later in a phronesis build, whose default pack makes the same two allowances; phronesis 0.2.0 still refuses these lines after the table allows them.
+
 ## 0.4.0 (2026-10-11)
 
 - A phronesis build links phronesis 0.2 and the Cap'n Proto C runtime statically, with no runtime path, and embeds phronesis's default pack. The binary runs on a host with no phronesis install. `build.rs` finds the library under `lib`, `lib64` or `lib/<multiarch>`, and the `pkg-config` route compiles the ShellCheck shim as the `PHRONESIS_DIR` route does.
