@@ -86,7 +86,8 @@ fn compile_shim(includes: &[PathBuf], cdir: &Path) {
     cc.compile("ljos_shell_encode");
 }
 
-/// Copy the installed pack (`shell.janet`, `seat.janet`, `lib/*.janet`)
+/// Copy the installed pack (`shell.janet`, `seat.janet`, their `.jimage`
+/// images, `lib/*.janet`)
 /// into OUT_DIR and write `pack.rs`, a table of embedded files.
 fn embed_pack(packdir: &Path) {
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -94,7 +95,9 @@ fn embed_pack(packdir: &Path) {
     let _ = std::fs::remove_dir_all(&dst);
     std::fs::create_dir_all(dst.join("lib")).unwrap();
     let mut files: Vec<String> = Vec::new();
-    for entry in ["shell.janet", "seat.janet"] {
+    // An entry's `.jimage` is its compiled image, which phronesis loads in
+    // place of compiling the sources when it matches them.
+    for entry in ["shell.janet", "seat.janet", "shell.jimage", "seat.jimage"] {
         let src = packdir.join(entry);
         if src.is_file() {
             std::fs::copy(&src, dst.join(entry)).unwrap();
