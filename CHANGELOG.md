@@ -1,6 +1,10 @@
 # Changelog
 
+<!-- towncrier release notes start -->
+
 ## Unreleased
+
+## 0.4.1 (2026-10-13)
 
 - A phronesis build embeds the compiled images phronesis installs beside its packs (`shell.jimage`, `seat.jimage`) and unpacks them with the sources. phronesis then loads the law from the image and skips the Janet boot image and compiler, so an allowed line takes about 2.3 ms instead of 7.3 ms. With a phronesis that ships no images, the build embeds only the sources and phronesis compiles them as before.
 - A line that runs a task runner is judged on what the target runs. `make <target>` reads the Makefile in the working directory (or the one `-C` and `-f` name) and follows the target's prerequisites up to eight levels; `npm run`, `pnpm`, `yarn` and a bare `npm <script>` read the `scripts` of `package.json`, with its `pre` and `post` scripts; `just` and `cargo make` read their recipe files. Each recipe line is judged by the table and phronesis, so `make clean-all` whose recipe runs `rm -rf ~` and `npm run nuke` whose script runs `rm -rf ~/` are refused, and `make test` and `npm run build` still run. A missing or unreadable file leaves the verdict as before. Files are read in-process and cached by mtime and size; nothing is spawned.
