@@ -13,6 +13,8 @@ pub mod util_capnp;
 #[path = "schema/policy_capnp.rs"]
 pub mod policy_capnp;
 
+mod scripts;
+
 use std::borrow::Cow;
 
 use policy_capnp::{Decision, PolicyReason};
@@ -70,12 +72,66 @@ pub struct Checked {
 /// a phronesis build refuses at least what the table does.
 #[must_use]
 pub fn check_shell(argv: &[String]) -> Checked {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    check_shell_in(argv, &cwd, 0)
+}
+
+/// How many runner levels deep (`make a` whose recipe runs `npm run b`)
+/// script targets are read before the line is judged as written.
+const SCRIPT_DEPTH: usize = 3;
+
+/// [`check_shell`] with the working directory a task runner would read its
+/// file from. An allowed line that runs `make`, `npm run`, `just` or
+/// `cargo make` is then judged again on each command the target's recipe
+/// runs, so `make clean-all` is refused when its recipe would be.
+fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Checked {
     let table = host_argv_table(argv);
     #[cfg(has_phronesis)]
-    if table.decision == Decision::Allow {
-        return check_shell_phronesis(argv);
+    let table = if table.decision == Decision::Allow {
+        check_shell_phronesis(argv)
+    } else {
+        table
+    };
+    if table.decision != Decision::Allow || depth >= SCRIPT_DEPTH {
+        return table;
+    }
+    let mut runs = Vec::new();
+    runner_commands(argv, 0, &mut runs);
+    for run in runs {
+        for line in scripts::resolved(&run, cwd) {
+            let sh = ["sh".to_string(), "-c".to_string(), line.clone()];
+            let c = check_shell_in(&sh, cwd, depth + 1);
+            if c.decision != Decision::Allow {
+                return Checked {
+                    decision: c.decision,
+                    code: c.code,
+                    token: Cow::Owned(format!("{} runs `{}`: {}", run.join(" "), line, c.token)),
+                };
+            }
+        }
     }
     table
+}
+
+/// Every simple command the line runs, wrappers off: the line split on
+/// its separators, then each `-c` script, `eval` and wrapper inside it,
+/// down to [`MAX_DEPTH`].
+fn runner_commands(argv: &[String], depth: usize, out: &mut Vec<Vec<String>>) {
+    for cmd in commands(argv) {
+        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        let run = unwrap_wrappers(&owned).0.to_vec();
+        if !run.is_empty() && !out.contains(&run) {
+            out.push(run);
+        }
+    }
+    if depth >= MAX_DEPTH {
+        return;
+    }
+    for inner in inner_commands(argv) {
+        if inner.as_slice() != argv {
+            runner_commands(&inner, depth + 1, out);
+        }
+    }
 }
 
 fn host_argv_table(argv: &[String]) -> Checked {
@@ -2324,6 +2380,86 @@ mod tests {
 
     fn v(xs: &[&str]) -> String {
         verdict(&xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
+    }
+
+    fn in_dir(name: &str, file: &str, body: &str, xs: &[&str]) -> Decision {
+        let d = std::env::temp_dir().join(format!("policyd-lib-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&d).expect("dir");
+        std::fs::write(d.join(file), body).expect("write");
+        let argv: Vec<String> = xs.iter().map(|s| (*s).to_string()).collect();
+        check_shell_in(&argv, &d, 0).decision
+    }
+
+    const MAKEFILE: &str = "test:\n\tcargo test\nclean:\n\trm -rf target\nclean-all: clean\n\trm -rf $(HOME)/.cache ~ \nHOME_DIR = ~\n";
+    const PACKAGE: &str = r#"{"scripts":{"build":"tsc -p .","nuke":"rm -rf ~/ && echo gone","deploy":"git push --force origin main"}}"#;
+
+    #[test]
+    fn refuses_a_make_target_whose_recipe_is_refused() {
+        assert_eq!(
+            in_dir("d198", "Makefile", MAKEFILE, &["make", "clean-all"]),
+            Decision::Deny
+        );
+        assert_eq!(
+            in_dir(
+                "d198b",
+                "Makefile",
+                MAKEFILE,
+                &["bash", "-c", "true && make clean-all"]
+            ),
+            Decision::Deny
+        );
+    }
+
+    #[test]
+    fn allows_a_safe_make_target() {
+        assert_eq!(
+            in_dir("mtest", "Makefile", MAKEFILE, &["make", "test"]),
+            Decision::Allow
+        );
+        assert_eq!(
+            in_dir("mclean", "Makefile", MAKEFILE, &["make", "clean"]),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn refuses_a_package_script_whose_command_is_refused() {
+        assert_eq!(
+            in_dir("d199", "package.json", PACKAGE, &["npm", "run", "nuke"]),
+            Decision::Deny
+        );
+        assert_eq!(
+            in_dir("d199b", "package.json", PACKAGE, &["pnpm", "nuke"]),
+            Decision::Deny
+        );
+        assert_eq!(
+            in_dir("d199c", "package.json", PACKAGE, &["yarn", "run", "deploy"]),
+            Decision::Deny
+        );
+    }
+
+    #[test]
+    fn allows_a_safe_package_script() {
+        assert_eq!(
+            in_dir("nbuild", "package.json", PACKAGE, &["npm", "run", "build"]),
+            Decision::Allow
+        );
+        assert_eq!(
+            in_dir("ninst", "package.json", PACKAGE, &["npm", "install"]),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn keeps_todays_verdict_without_the_file() {
+        assert_eq!(
+            in_dir("none", "README", "", &["make", "clean-all"]),
+            Decision::Allow
+        );
+        assert_eq!(
+            in_dir("none2", "README", "", &["npm", "run", "nuke"]),
+            Decision::Allow
+        );
     }
 
     #[test]
