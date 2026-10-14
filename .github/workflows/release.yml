@@ -16,8 +16,8 @@ permissions:
 
 env:
   # The phronesis release every tarball links, built from source per target.
-  # v0.2.1 carries the -Werror fix for the generated schema C on newer clang.
-  PHRONESIS_REF: ${{ inputs.phronesis_ref || 'v0.2.1' }}
+  # v0.2.2 carries the -Werror fix for the generated schema C on newer clang.
+  PHRONESIS_REF: ${{ inputs.phronesis_ref || 'v0.2.2' }}
 
 jobs:
   build:
