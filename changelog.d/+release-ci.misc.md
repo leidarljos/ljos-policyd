@@ -1,0 +1,1 @@
+Release binaries link phronesis v0.2.1, whose generated schema C builds under `-Werror` on current macOS clang. The Intel macOS cross file names a C++ compiler, which c-capnproto's meson build now asks for. A manual run of the release workflow builds every target on a branch and publishes nothing; only a `v*` tag publishes.
