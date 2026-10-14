@@ -3,13 +3,21 @@ name: release
 on:
   push:
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  # Runs the build jobs on a branch without publishing a release.
+  workflow_dispatch:
+    inputs:
+      phronesis_ref:
+        description: phronesis tag or branch to link (default below)
+        required: false
+        default: ""
 
 permissions:
   contents: write
 
 env:
   # The phronesis release every tarball links, built from source per target.
-  PHRONESIS_REF: v0.2.0
+  # v0.2.2 carries the -Werror fix for the generated schema C on newer clang.
+  PHRONESIS_REF: ${{ inputs.phronesis_ref || 'v0.2.2' }}
 
 jobs:
   build:
@@ -51,6 +59,7 @@ jobs:
             cat > "$RUNNER_TEMP/cross.ini" <<'INI'
           [binaries]
           c = ['clang', '-arch', 'x86_64']
+          cpp = ['clang++', '-arch', 'x86_64']
           ar = 'ar'
           strip = 'strip'
           [host_machine]
@@ -100,6 +109,7 @@ jobs:
           path: dist/*.tar.gz*
   release:
     needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
