@@ -4,6 +4,18 @@
 
 ## Unreleased
 
+## 0.4.3 (2026-10-17)
+
+### Fixes
+
+- The crate version reads 0.4.3, so `ljos-policyd --version` and the binstall archive name match the release tag; the v0.4.2 archives still called themselves 0.4.1.
+
+## 0.4.2 (2026-10-14)
+
+### Miscellaneous
+
+- Release binaries link phronesis v0.2.2, whose generated schema C builds under `-Werror` on current macOS clang. The Intel macOS cross file names a C++ compiler, which c-capnproto's meson build now asks for. A manual run of the release workflow builds every target on a branch and publishes nothing; only a `v*` tag publishes.
+
 ## 0.4.1 (2026-10-13)
 
 - A phronesis build embeds the compiled images phronesis installs beside its packs (`shell.jimage`, `seat.jimage`) and unpacks them with the sources. phronesis then loads the law from the image and skips the Janet boot image and compiler, so an allowed line takes about 2.3 ms instead of 7.3 ms. With a phronesis that ships no images, the build embeds only the sources and phronesis compiles them as before.
