@@ -870,44 +870,111 @@ fn pack_matches(policy: &std::path::Path) -> bool {
         .all(|(name, body)| std::fs::read(policy.join(name)).is_ok_and(|b| b == *body))
 }
 
+/// Holds an exclusive `flock` on the state directory for the duration of
+/// a pack swap. The kernel drops the lock when this file is closed.
+#[cfg(has_phronesis)]
+struct PackSwapLock {
+    file: std::fs::File,
+}
+
+#[cfg(has_phronesis)]
+impl PackSwapLock {
+    fn acquire(root: &std::path::Path) -> Option<Self> {
+        use std::os::fd::AsRawFd;
+        std::fs::create_dir_all(root).ok()?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(root.join(".pack-swap.lock"))
+            .ok()?;
+        // SAFETY: `file` is open. flock uses that descriptor and does not
+        // touch the rest of the process.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if rc != 0 {
+            return None;
+        }
+        Some(Self { file })
+    }
+}
+
+#[cfg(has_phronesis)]
+impl Drop for PackSwapLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+/// A private directory name for one unpack. The pid keeps concurrent
+/// processes apart; the counter keeps two attempts in one process apart.
+#[cfg(has_phronesis)]
+fn unique_pack_tmp(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    root.join(format!(".{name}.{}.{n}", std::process::id()))
+}
+
 /// Unpack the embedded pack to `root/pack-<hash>/share/phronesis/policy`
-/// and return that prefix. A copy already there is used when it matches;
-/// a new one is written beside it and renamed into place.
+/// and return that prefix. A pack of the same content hash already there
+/// is kept. Otherwise the bytes are written to a private directory and
+/// renamed into place while an flock is held. The live directory is never
+/// removed: another check may be reading it.
 #[cfg(has_phronesis)]
 fn unpack_pack(root: &std::path::Path) -> Option<std::path::PathBuf> {
     let name = format!("pack-{:016x}", pack_hash());
     let prefix = root.join(&name);
     let rel = std::path::Path::new("share/phronesis/policy");
-    if pack_matches(&prefix.join(rel)) {
+    let policy = prefix.join(rel);
+    if pack_matches(&policy) {
         return Some(prefix);
     }
-    let tmp = root.join(format!(".{name}.{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(tmp.join(rel).join("lib")).ok()?;
+    let _lock = PackSwapLock::acquire(root)?;
+    if pack_matches(&policy) {
+        return Some(prefix);
+    }
+    let tmp = unique_pack_tmp(root, &name);
+    let tmp_policy = tmp.join(rel);
+    if std::fs::create_dir_all(tmp_policy.join("lib")).is_err() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return None;
+    }
     for (file, body) in embedded::PACK {
-        std::fs::write(tmp.join(rel).join(file), body).ok()?;
+        if std::fs::write(tmp_policy.join(file), body).is_err() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return None;
+        }
     }
-    if prefix.exists() {
-        let _ = std::fs::remove_dir_all(&prefix);
+    // A pack of this hash may have appeared while the private copy was
+    // written. Keep that one; do not replace a directory a check may be
+    // reading.
+    if pack_matches(&policy) {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Some(prefix);
     }
+    // Rename onto an absent path is atomic. An existing directory is left
+    // where it is, even when this rename fails.
     if std::fs::rename(&tmp, &prefix).is_err() {
-        // Another check unpacked it first.
         let _ = std::fs::remove_dir_all(&tmp);
     }
-    pack_matches(&prefix.join(rel)).then_some(prefix)
+    pack_matches(&policy).then_some(prefix)
 }
 
 /// Point phronesis at the embedded pack, unless the caller named a pack
 /// with `PHRONESIS_JANET_PACK` (then its own `PHRONESIS_PACK_ROOT` or
-/// prefix has to be trusted, as phronesis requires).
+/// prefix has to be trusted, as phronesis requires). False when the
+/// embedded pack could not be published.
 #[cfg(has_phronesis)]
-fn ensure_pack_env(root: &std::path::Path) {
+fn ensure_pack_env(root: &std::path::Path) -> bool {
     if std::env::var_os("PHRONESIS_JANET_PACK").is_some() {
-        return;
+        return true;
     }
     let Some(prefix) = unpack_pack(root) else {
-        // phronesis then reports packMissing, and the line is refused.
-        return;
+        return false;
     };
     let share = prefix.join("share/phronesis");
     std::env::set_var("PHRONESIS_PREFIX", &prefix);
@@ -916,6 +983,7 @@ fn ensure_pack_env(root: &std::path::Path) {
         "PHRONESIS_JANET_PACK",
         share.join("policy").join(embedded_entry()),
     );
+    true
 }
 
 /// `$PHRONESIS_STATE_DIR`, else `~/.local/state/ljos-policyd`, and under
@@ -965,6 +1033,20 @@ fn refused(token: &'static str) -> Checked {
     }
 }
 
+/// Host decisions for a pack that is missing or could not be loaded.
+/// Those carry an empty reason string.
+#[cfg(has_phronesis)]
+fn pack_load_failed(code: PolicyReason) -> bool {
+    matches!(
+        code,
+        PolicyReason::PackMissing
+            | PolicyReason::PackLoadFailed
+            | PolicyReason::PackRuntimeError
+            | PolicyReason::PackBadResult
+            | PolicyReason::PackPathInvalid
+    )
+}
+
 #[cfg(has_phronesis)]
 impl Seat {
     fn open() -> Result<Self, Checked> {
@@ -979,7 +1061,9 @@ impl Seat {
             .filter(|s| s.starts_with('/'))
             .unwrap_or_else(|| cwd.clone());
         let (root, state, runtime) = seat_dirs(&ws).ok_or_else(fail)?;
-        ensure_pack_env(&root);
+        if !ensure_pack_env(&root) {
+            return Err(refused("pack-unavailable"));
+        }
         let state_c =
             std::ffi::CString::new(state.to_string_lossy().as_bytes()).map_err(|_| fail())?;
         let runtime_c =
@@ -997,9 +1081,22 @@ impl Seat {
         let hex = std::ffi::CString::new(host_agent_hex()).map_err(|_| fail())?;
         let mode = std::ffi::CString::new("seat").map_err(|_| fail())?;
         let ws_c = std::ffi::CString::new(ws).map_err(|_| fail())?;
-        let brc = unsafe {
+        let mut brc = unsafe {
             phronesis_supervisor_bind(seat.sup, hex.as_ptr(), mode.as_ptr(), ws_c.as_ptr(), 0)
         };
+        // Several checks in one workspace bind one slot. phronesis writes it
+        // through a shared temporary name, so a torn read comes back as
+        // -4 (IO). The slot is already seated once the write lands
+        // (-2, exists); try again until then.
+        let mut tries = 0u64;
+        while brc == -4 && tries < 20 {
+            let pause = 200 + (u64::from(std::process::id()) % 32) * 50 + tries * 100;
+            std::thread::sleep(std::time::Duration::from_micros(pause));
+            brc = unsafe {
+                phronesis_supervisor_bind(seat.sup, hex.as_ptr(), mode.as_ptr(), ws_c.as_ptr(), 0)
+            };
+            tries += 1;
+        }
         if brc != 0 && brc != -2 {
             return Err(refused("bind-failed"));
         }
@@ -1063,6 +1160,10 @@ impl Seat {
             .into_owned();
         let token = if decision == Decision::Allow {
             Cow::Borrowed("allow")
+        } else if text.is_empty() && pack_load_failed(code) {
+            // The host leaves the reason empty when the pack did not load.
+            // A bare `deny` is not a reason a caller can tell from a rule.
+            Cow::Borrowed("pack-unavailable")
         } else if text.is_empty() {
             Cow::Borrowed("phronesis")
         } else {
