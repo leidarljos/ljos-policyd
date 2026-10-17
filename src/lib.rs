@@ -956,6 +956,63 @@ impl Drop for Seat {
     }
 }
 
+/// The code's name as the schema spells it, in kebab case.
+#[must_use]
+pub fn code_name(code: PolicyReason) -> &'static str {
+    match code {
+        PolicyReason::Unspecified => "unspecified",
+        PolicyReason::ToolsDefaultDeny => "tools-default-deny",
+        PolicyReason::PathOutsideWorkspace => "path-outside-workspace",
+        PolicyReason::PathUnderWorkspaceAllow => "path-under-workspace-allow",
+        PolicyReason::InvalidMessage => "invalid-message",
+        PolicyReason::FieldTooLong => "field-too-long",
+        PolicyReason::DenyAll => "deny-all",
+        PolicyReason::HighRiskPrompt => "high-risk-prompt",
+        PolicyReason::SeatBoardAllow => "seat-board-allow",
+        PolicyReason::ModelStartAllow => "model-start-allow",
+        PolicyReason::MissingToolAction => "missing-tool-action",
+        PolicyReason::UnknownSeatAction => "unknown-seat-action",
+        PolicyReason::PackMissing => "pack-missing",
+        PolicyReason::PackLoadFailed => "pack-load-failed",
+        PolicyReason::PackRuntimeError => "pack-runtime-error",
+        PolicyReason::PackBadResult => "pack-bad-result",
+        PolicyReason::ShellViewBuildFailed => "shell-view-build-failed",
+        PolicyReason::PythonRequiresUvRun => "python-requires-uv-run",
+        PolicyReason::PythonDashCDenied => "python-dash-c-denied",
+        PolicyReason::PythonMissingPep723 => "python-missing-pep723",
+        PolicyReason::ShellExecAllow => "shell-exec-allow",
+        PolicyReason::PackReloaded => "pack-reloaded",
+        PolicyReason::PackPathInvalid => "pack-path-invalid",
+        PolicyReason::ShellDangerousRunner => "shell-dangerous-runner",
+        PolicyReason::ShellRemoteExec => "shell-remote-exec",
+        PolicyReason::ShellPrivilegeDenied => "shell-privilege-denied",
+        PolicyReason::ShellGitDangerous => "shell-git-dangerous",
+        PolicyReason::ShellSecretInArgv => "shell-secret-in-argv",
+        PolicyReason::PathSensitiveDeny => "path-sensitive-deny",
+        PolicyReason::SecretExportDenied => "secret-export-denied",
+        PolicyReason::AudioMicOpenDeny => "audio-mic-open-deny",
+        PolicyReason::AudioListenArmPrompt => "audio-listen-arm-prompt",
+        PolicyReason::AudioAlwaysListenDeny => "audio-always-listen-deny",
+        PolicyReason::AudioNetworkSttDeny => "audio-network-stt-deny",
+        PolicyReason::AudioInjectDeny => "audio-inject-deny",
+        PolicyReason::AudioFixtureAllow => "audio-fixture-allow",
+        PolicyReason::AudioUnknownAction => "audio-unknown-action",
+    }
+}
+
+/// The verdict token for a pack decision: the code's name, then the pack's
+/// own reason text when it wrote one, as `path-outside-workspace: path
+/// outside workspace`. A pack that wrote no text still names its code.
+#[must_use]
+pub fn token_for(code: PolicyReason, reason: &str) -> String {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        code_name(code).to_string()
+    } else {
+        format!("{}: {reason}", code_name(code))
+    }
+}
+
 #[cfg(has_phronesis)]
 fn refused(token: &'static str) -> Checked {
     Checked {
@@ -1063,10 +1120,8 @@ impl Seat {
             .into_owned();
         let token = if decision == Decision::Allow {
             Cow::Borrowed("allow")
-        } else if text.is_empty() {
-            Cow::Borrowed("phronesis")
         } else {
-            Cow::Owned(text)
+            Cow::Owned(token_for(code, &text))
         };
         Checked {
             decision,
