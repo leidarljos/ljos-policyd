@@ -1,4 +1,5 @@
 #+title: Getting started
+#+description: Ask the binary, see a deny, run a program only on allow, and point the seat at it.
 #+options: toc:nil num:nil
 
 A reader who has never used the binary can finish this page with one

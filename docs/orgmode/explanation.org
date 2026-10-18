@@ -1,4 +1,5 @@
 #+title: Explanation
+#+description: Why the gate reads the command's words, and why the first deny wins.
 #+options: toc:nil num:nil
 
 * Why a binary and not a prompt

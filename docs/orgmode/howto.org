@@ -1,4 +1,5 @@
 #+title: How-to
+#+description: Check a line from a hook, run it only when allowed, and fail closed when the binary is missing.
 #+options: toc:nil num:nil
 
 * Check a line from a hook

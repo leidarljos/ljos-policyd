@@ -9,7 +9,7 @@ Verb        Meaning
 ``check``   print ``allow`` or ``deny<TAB>reason``; exit 2 on deny
 ``capnp``   write a packed Cap'n ``PolicyDecision`` to stdout; exit 2 on deny
 ``exec``    same text verdict; on allow, run argv; on deny, print the verdict on stderr and exit 2
-``version`` print ``ljos-policyd <semver>``
+``version`` print ``ljos-policyd <semver> (phronesis)`` or ``ljos-policyd <semver> (host table)``
 =========== ======================================================================================
 
 A leading ``--`` after the verb is optional and is stripped.
@@ -19,19 +19,45 @@ Built-in denials
 
 First match wins. The head is the last path component of argv[0].
 
-===================== ======================== ==============================
+===================== ======================== ============================
 Token                 Cap'n PolicyReason       When
-===================== ======================== ==============================
+===================== ======================== ============================
 ``empty argv``        ``emptyArgv``            no program
 ``sudo``              ``shellPrivilegeDenied`` privilege runner
 ``curl-pipe-shell``   ``shellRemoteExec``      fetcher piped to a shell
 ``rm-rf-outside-tmp`` ``rmRfOutsideTmp``       recursive delete off tmp
-``git-force-push``    ``shellGitDangerous``    force push or force-with-lease
+``git-force-push``    ``shellGitDangerous``    force push
 ``chmod-setuid``      ``chmodSetuid``          setuid chmod
 ``raw-disk``          ``rawDisk``              dd to a device node, or mkfs
-===================== ======================== ==============================
+===================== ======================== ============================
 
 Anything else is ``allow``. ``python -c`` is allow. Schema: ``schema/policy.capnp``.
+
+Argument limits
+===============
+
+A phronesis build hands each word to the pack whole. phronesis 0.2.3
+keeps a word of up to 128 KiB (131072 bytes) and up to 32768 words. A
+Cap'n command body over 512 KiB (524288 bytes) is refused before the
+word count is checked. Past a limit the answer is ``field-too-long`` and
+the host's reason:
+
+======================================= =====================================================
+Past                                    Answer
+======================================= =====================================================
+a word longer than 131072 bytes         ``field-too-long: argv word exceeds 131072 bytes``
+more than 32768 words                   ``field-too-long: argv count exceeds 32768``
+a command body longer than 524288 bytes ``field-too-long: command body exceeds 524288 bytes``
+======================================= =====================================================
+
+A blank reason is the name alone, ``field-too-long``. The limits are
+``PHRONESIS_SHELL_WORD_MAX`` and ``PHRONESIS_SHELL_ARGV_MAX`` in phronesis
+``src/internal.h``, and ``PHRONESIS_CAPNP_MAX_BODY`` in phronesis
+``include/phronesis/supervisor.h``. phronesis 0.2.3 sets them to 131072,
+32768 and 524288 and writes the reason strings above. This binary names
+the code and keeps the reason. Release binaries link phronesis 0.2.3.
+A build without the library uses the host table and does not apply
+these limits.
 
 Environment the seat reads
 ==========================

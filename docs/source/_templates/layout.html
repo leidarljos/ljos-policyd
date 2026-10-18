@@ -1,0 +1,34 @@
+{%- extends "base.html" -%}
+
+{%- if meta and meta.dark_code == "true" -%}
+  {% set dark_code = True %}
+{%- elif theme_dark_code -%}
+  {% set dark_code = True %}
+{%- else -%}
+  {% set dark_code = False %}
+{%- endif -%}
+
+{%- block extrahead -%}
+  {{ super() }}
+  {% include "components/meta-opengraph.html" %}
+{%- endblock -%}
+
+{%- block document -%}
+  {%- include "partials/banner.html" -%}
+  {%- block header -%}
+    {% include "partials/site-head.html" with context %}
+  {%- endblock -%}
+
+  <div class="sy-container mx-auto body">
+    <main class="sy-content mx-auto pt-12 px-6 xl:px-12 break-words">
+      <article class="yue{% if dark_code %} dark-code{% endif %}" role="main">
+        {% block body %}{% endblock %}
+      </article>
+      {% block afterarticle %}{% endblock %}
+    </main>
+  </div>
+
+  {%- block footer -%}
+    {% include "partials/site-foot.html" with context %}
+  {%- endblock -%}
+{%- endblock -%}

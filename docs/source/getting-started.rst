@@ -2,7 +2,7 @@ A reader who has never used the binary can finish this page with one
 allow, one deny, and an exec that did not run.
 
 1. Ask
-==============
+======
 
 .. code:: console
 
@@ -12,8 +12,7 @@ allow, one deny, and an exec that did not run.
    deny    sudo
 
 ``uv run pytest`` is the line under test. A Janet pack
-can deny more after this verdict; it cannot allow what this binary
-denied.
+can deny more after this verdict. A pack may only deny more.
 
 Nothing is configured. The built-in denials are the whole trusted computing base: nothing else decides.
 

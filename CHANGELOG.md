@@ -4,6 +4,17 @@
 
 ## Unreleased
 
+## 0.4.4 (2026-10-18)
+
+### Features
+
+- A phronesis refusal reads as the code's name, then the pack's own text (`path-outside-workspace: path outside workspace`). A pack that wrote no text still names its code instead of the bare word `phronesis`.
+
+### Fixes
+
+- Concurrent checks that share a state directory no longer unset the embedded pack. Each check used to delete `pack-<hash>` and rename its own copy into place, so the one that lost the race loaded nothing and answered `deny` with an empty reason (`deny\tphronesis`) for a harmless line such as `git add slug.py test_slug.py`. The pack is now written to a private directory and renamed into place while a lock is held, a pack of the same content hash that is already there is left as it is, and a seat that still cannot load its pack answers `deny\tpack-unavailable`. Checks in one workspace retry a torn read of the shared seat slot instead of answering `bind-failed`.
+- A long argument is judged on what it says. A word of 512 bytes or more was refused before the pack read it, so `echo` of a long program was denied with no reason of its own. Release and test builds link phronesis v0.2.3, which keeps each word up to 128 KiB and up to 32768 words. Past those limits, or a command body over 512 KiB, the line is `field-too-long` and the host's reason, as in `field-too-long: argv word exceeds 131072 bytes`.
+
 ## 0.4.3 (2026-10-17)
 
 ### Fixes

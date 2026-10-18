@@ -30,7 +30,7 @@ First minute
    $ ljos-policyd check -- sudo id
    deny    sudo
 
-Typed verdict is Cap'n PolicyDecision (phronesis; Ali Akber Saifee / indynull, HaoZeke). A Janet pack can deny more. It cannot allow what this binary denied.
+Typed verdict is Cap'n PolicyDecision (phronesis; Ali Akber Saifee / indynull, HaoZeke). A Janet pack can deny more. A pack may only deny more.
 
 .. code:: janet
 

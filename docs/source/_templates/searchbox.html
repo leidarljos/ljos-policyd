@@ -1,0 +1,7 @@
+{%- if pathto('search') != '#' -%}
+<form class="searchbox flex items-center" action="{{ pathto('search') }}" method="get" role="search">
+  <label class="ll-sr-only" for="ll-search">{{ _('Search') }}</label>
+  <input id="ll-search" type="text" name="q" placeholder="{{ _('Search') }}" />
+  <kbd>/</kbd>
+</form>
+{%- endif -%}

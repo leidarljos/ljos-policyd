@@ -1,4 +1,5 @@
 #+title: In the seat
+#+description: Where argv law sits among the leiðarljós crates.
 #+options: toc:nil num:nil
 
 * In the seat
