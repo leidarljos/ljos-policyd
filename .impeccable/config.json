@@ -1,0 +1,35 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "side-tab",
+        "value": "*",
+        "files": [
+          "docs/build/_static/shibuya.css"
+        ],
+        "createdAt": "2026-10-18T19:55:17.566Z",
+        "reason": "Vendored Shibuya stylesheet. The 4px left borders belong to admonitions, version notes and highlighted blockquotes. custom.css draws admonitions as a 1px box, and no page has a version note or a highlighted blockquote."
+      },
+      {
+        "rule": "border-accent-on-rounded",
+        "value": "*",
+        "files": [
+          "docs/build/_static/shibuya.css"
+        ],
+        "createdAt": "2026-10-18T19:55:17.568Z",
+        "reason": "Vendored Shibuya stylesheet. The 3px rule belongs to captions of ghost tables, and no page has one."
+      },
+      {
+        "rule": "cream-palette",
+        "value": "*",
+        "files": [
+          "docs/build/*.html"
+        ],
+        "createdAt": "2026-10-18T19:55:17.585Z",
+        "reason": "The page ground is the leiðarljós paper, #f6f2e8, from DESIGN.md and leidarljos.github.io/site.css. The org site ignores this rule for the same ground."
+      }
+    ]
+  }
+}

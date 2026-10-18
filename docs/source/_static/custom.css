@@ -302,7 +302,7 @@ table.docutils {
 div.table-wrapper {
   overflow-x: auto;
   max-width: 100%;
-  border: 0;
+  border: none;
   padding: 0;
 }
 .yue th,
@@ -542,3 +542,19 @@ body::before {
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
 }
+
+/* Insets as plain lengths. Shibuya draws these boxes with padding-inline,
+   padding-block and max(env(safe-area-inset-*), ...); the values below are
+   the same boxes. The viewport tag has no viewport-fit=cover, so the
+   safe-area insets are 0 and max() picks the length. The header inner keeps
+   its fixed height and centres its row, so the block padding moves nothing. */
+.sy-head-inner {
+  padding: 0.25rem 1rem 0.25rem 1.5rem;
+}
+@media (min-width: 768px) {
+  .sy-head-inner { padding-right: 1.5rem; }
+}
+#copy-page-trigger > button.js-copy { padding: 0.25rem 0.75rem; }
+#copy-page-trigger > button.js-menu { padding: 0.25rem 0.5rem; }
+/* Under the repository card the edit link has no rule above it. */
+.repo-stats + .edit-this-page { border-top: none; }

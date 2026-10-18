@@ -28,7 +28,6 @@ version = "0.4.4"
 extensions = [
     "sphinx.ext.mathjax",
     "sphinx_copybutton",
-    "sphinx_design",
 ]
 
 templates_path = ["_templates"]
