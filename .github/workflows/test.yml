@@ -30,9 +30,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # Until phronesis v0.2.0 is tagged, main carries the installed schema C
-      # and the default pack this build embeds.
-      PHRONESIS_REF: main
+      # The tag the release links, so a test and a release build sit on the
+      # same phronesis. v0.2.3 keeps a shell word up to 128 KiB.
+      PHRONESIS_REF: v0.2.3
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

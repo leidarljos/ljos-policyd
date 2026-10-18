@@ -66,7 +66,7 @@ judged as the commands it runs.
 ## Two backends: phronesis, or the table built in
 
 When the [phronesis](https://github.com/leidarljos/phronesis) library
-(0.2 or later) is found at build time (`PHRONESIS_DIR`, or `pkg-config
+(0.2.3 or later) is found at build time (`PHRONESIS_DIR`, or `pkg-config
 phronesis`), every check runs the table above and then
 `phronesis_check_shell`, on the line and on each command the table found
 inside it: past `env`, `nice` and the other wrappers, inside `sh -c`
@@ -76,8 +76,11 @@ library the crate still builds and uses the table alone.
 
 The build links phronesis and the Cap'n Proto C runtime statically and
 embeds phronesis's default pack, so the binary needs no phronesis install
-and keeps no path from the machine that built it. On first use it writes
-the pack under `$PHRONESIS_STATE_DIR` (default
+and keeps no path from the machine that built it. A word is handed to the
+pack whole, up to 128 KiB, and a line may carry up to 32768 words. Past
+either limit, or a command body over 512 KiB, the line is `field-too-long`
+and the reason, such as `field-too-long: argv word exceeds 131072 bytes`.
+On first use it writes the pack under `$PHRONESIS_STATE_DIR` (default
 `~/.local/state/ljos-policyd`) and loads it from there. The default pack
 refuses what the table refuses and also secrets written into the argv (a
 token in a URL or a header). `LJOS_POLICYD_PACK=seat` loads the seat pack

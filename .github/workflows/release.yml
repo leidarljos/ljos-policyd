@@ -16,8 +16,9 @@ permissions:
 
 env:
   # The phronesis release every tarball links, built from source per target.
-  # v0.2.2 carries the -Werror fix for the generated schema C on newer clang.
-  PHRONESIS_REF: ${{ inputs.phronesis_ref || 'v0.2.2' }}
+  # v0.2.3 keeps a shell word up to 128 KiB and up to 32768 words, and a
+  # longer word, count, or command body is fieldTooLong with a reason.
+  PHRONESIS_REF: ${{ inputs.phronesis_ref || 'v0.2.3' }}
 
 jobs:
   build:

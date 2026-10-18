@@ -1079,9 +1079,10 @@ fn named_token(name: &str, reason: &str) -> String {
     }
 }
 
-/// The verdict token for a pack decision: the code's name, then the pack's
-/// own reason text when it wrote one, as `path-outside-workspace: path
-/// outside workspace`. A pack that wrote no text still names its code.
+/// The verdict token for a pack decision: the code's name, then the reason
+/// text when one was written, as `path-outside-workspace: path outside
+/// workspace` and `field-too-long: argv word exceeds 131072 bytes`. A
+/// decision that wrote no text still names its code.
 #[must_use]
 pub fn token_for(code: PolicyReason, reason: &str) -> String {
     named_token(code_name(code), reason)
@@ -1166,7 +1167,7 @@ impl Seat {
         Ok(seat)
     }
 
-    /// One argv through the pack, with the pack's reason text kept.
+    /// One argv through the pack, with the decision's reason text kept.
     fn check(&self, argv: &[String]) -> Checked {
         let fail = || refused("phronesis: no decision");
         let c_args: Vec<std::ffi::CString> = argv
@@ -2628,6 +2629,92 @@ mod tests {
     #[test]
     fn allows_cargo() {
         assert_eq!(v(&["cargo", "test"]), "allow");
+    }
+
+    /// `fieldTooLong` with a reason is the named line `field-too-long` and
+    /// that reason. A blank reason is the name alone, as for every code.
+    #[test]
+    fn field_too_long_names_the_code_and_keeps_the_reason() {
+        assert_eq!(
+            token_for(PolicyReason::FieldTooLong, "argv word exceeds 131072 bytes"),
+            "field-too-long: argv word exceeds 131072 bytes"
+        );
+        assert_eq!(
+            token_for(PolicyReason::FieldTooLong, "argv count exceeds 32768"),
+            "field-too-long: argv count exceeds 32768"
+        );
+        assert_eq!(
+            token_for(
+                PolicyReason::FieldTooLong,
+                "command body exceeds 524288 bytes"
+            ),
+            "field-too-long: command body exceeds 524288 bytes"
+        );
+        assert_eq!(token_for(PolicyReason::FieldTooLong, ""), "field-too-long");
+        assert_eq!(
+            token_for(PolicyReason::FieldTooLong, "   "),
+            "field-too-long"
+        );
+    }
+
+    /// A word is judged on what it says. 511 bytes is the last length the
+    /// old path slot accepted; 512, 4 KiB and 64 KiB used to be refused
+    /// before the pack read them.
+    #[cfg(has_phronesis)]
+    #[test]
+    fn a_long_argument_is_judged_on_its_content() {
+        for n in [511, 512, 4 * 1024, 64 * 1024] {
+            let arg = "a".repeat(n);
+            assert_eq!(arg.len(), n);
+            assert_eq!(v(&["echo", &arg]), "allow", "{n}");
+        }
+    }
+
+    /// The marker is the tail of the word, so a cut at the old 512-byte
+    /// slot drops it from a 512-byte word, and a cut at 64 KiB drops it
+    /// from the longer ones. Either cut would allow the line.
+    #[cfg(has_phronesis)]
+    #[test]
+    fn a_long_argument_that_carries_a_secret_is_still_refused() {
+        let marker = "glpat-";
+        for n in [512, 4 * 1024, 64 * 1024] {
+            let arg = format!("{}{marker}", "a".repeat(n - marker.len()));
+            assert_eq!(arg.len(), n);
+            assert!(arg.ends_with(marker));
+            let line = v(&["echo", &arg]);
+            assert!(
+                line.starts_with("deny\tshell-secret-in-argv: "),
+                "{n}: {line}"
+            );
+            assert_ne!(line, "deny\tphronesis", "{n}");
+            assert_ne!(line, "deny\tfield-too-long", "{n}");
+        }
+    }
+
+    /// A few hundred paths, and a few thousand, are an ordinary command.
+    /// The old cap was 256 words.
+    #[cfg(has_phronesis)]
+    #[test]
+    fn many_words_are_judged_on_the_line() {
+        for n in [300, 5000] {
+            let mut argv = Vec::with_capacity(n);
+            argv.push("echo".to_string());
+            argv.resize(n, "f".to_string());
+            assert_eq!(argv.len(), n);
+            assert_eq!(verdict(&argv), "allow", "{n}");
+        }
+    }
+
+    /// One byte past 128 KiB is the host's `fieldTooLong` and its reason,
+    /// named on the line. The reason is the library's, not a stand-in.
+    #[cfg(has_phronesis)]
+    #[test]
+    fn an_argument_past_the_word_limit_names_field_too_long() {
+        let arg = "a".repeat(128 * 1024 + 1);
+        assert_eq!(
+            verdict(&[String::from("echo"), arg]),
+            "deny\tfield-too-long: argv word exceeds 131072 bytes"
+        );
     }
 
     #[cfg(has_phronesis)]
