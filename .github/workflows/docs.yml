@@ -23,8 +23,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: sudo apt-get install -y --no-install-recommends pandoc librsvg2-bin python3-pil
-      - run: python3 docs/scripts/og_image.py
+      - run: |
+          echo "ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true" | sudo debconf-set-selections
+          sudo apt-get install -y --no-install-recommends pandoc ttf-mscorefonts-installer
+      - run: bash .github/render-og-png.sh
       - run: bash docs/scripts/export_org_to_rst.sh
       - run: python -m pip install -q -r docs/requirements.txt
       - run: sphinx-build -b html -n -W docs/source docs/build

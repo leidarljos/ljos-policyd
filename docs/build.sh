@@ -13,7 +13,7 @@ SRC="$ROOT/docs/source"
 BUILD="$ROOT/docs/build"
 
 echo "==> og image"
-python3 "$ROOT/docs/scripts/og_image.py"
+bash "$ROOT/.github/render-og-png.sh"
 
 echo "==> 1/3 export org → rst"
 bash "$ROOT/docs/scripts/export_org_to_rst.sh"
