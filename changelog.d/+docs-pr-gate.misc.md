@@ -1,0 +1,1 @@
+A pull request into develop or main that touches the docs now exports the org sources, builds the site with Sphinx `-n -W`, and runs impeccable 4.5.2 on the built pages against `.impeccable/config.json`. Any finding fails the run. A pull request never publishes the site.

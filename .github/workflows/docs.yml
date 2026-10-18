@@ -3,7 +3,11 @@ name: docs
 on:
   push:
     branches: [main]
-    paths: ["docs/**", ".github/workflows/docs.yml"]
+    paths: ["docs/**", ".github/workflows/docs.yml", ".impeccable/**"]
+  # A pull request builds the docs and checks them; it never publishes.
+  pull_request:
+    branches: [main, develop]
+    paths: ["docs/**", ".github/workflows/docs.yml", ".impeccable/**"]
   workflow_dispatch:
 
 permissions:
@@ -11,8 +15,9 @@ permissions:
   pages: write
   id-token: write
 
+# A pull request runs in its own group, so it cannot cancel a deploy.
 concurrency:
-  group: pages
+  group: ${{ github.event_name == 'pull_request' && format('docs-{0}', github.ref) || 'pages' }}
   cancel-in-progress: true
 
 jobs:
@@ -30,14 +35,22 @@ jobs:
       - run: bash docs/scripts/export_org_to_rst.sh
       - run: python -m pip install -q -r docs/requirements.txt
       - run: sphinx-build -b html -n -W docs/source docs/build
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Exit 2 on any finding the .impeccable config does not ignore.
+      - run: npx -y impeccable@4.5.2 detect docs/build
       - uses: actions/configure-pages@v5
+        if: github.event_name != 'pull_request'
         with:
           enablement: true
       - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request'
         with:
           path: docs/build
   deploy:
     needs: build
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
