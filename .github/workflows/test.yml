@@ -40,7 +40,7 @@ jobs:
           components: clippy
       - run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build capnproto pkg-config
+          sudo apt-get install -y meson ninja-build capnproto pkg-config binutils
       - name: Build phronesis
         run: |
           set -eu

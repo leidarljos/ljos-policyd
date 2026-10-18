@@ -43,10 +43,10 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y meson ninja-build capnproto pkg-config
+          sudo apt-get install -y meson ninja-build capnproto pkg-config binutils
       - name: Build tools (macOS)
         if: runner.os == 'macOS'
-        run: brew install meson ninja capnp pkg-config
+        run: brew install meson ninja capnp pkg-config binutils
       - name: Build phronesis ${{ env.PHRONESIS_REF }}
         run: |
           set -eu

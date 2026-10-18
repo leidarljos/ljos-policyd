@@ -1228,6 +1228,14 @@ impl Seat {
             // Name that failure as a code is named, so the line is
             // `pack-unavailable` and never a bare `deny`.
             Cow::Owned(named_token("pack-unavailable", &text))
+        } else if code == PolicyReason::FieldTooLong && text.trim().is_empty() {
+            // The host used to leave this reason empty, and an empty
+            // phronesis reason was printed as the bare word `phronesis`.
+            // Name the code and say why.
+            Cow::Owned(named_token(
+                code_name(code),
+                "a field is too long for the law to read",
+            ))
         } else {
             Cow::Owned(token_for(code, &text))
         };
@@ -2628,6 +2636,50 @@ mod tests {
     #[test]
     fn allows_cargo() {
         assert_eq!(v(&["cargo", "test"]), "allow");
+    }
+
+    /// A word is judged on what it says. 511 bytes is the last length the
+    /// old path slot accepted; 512, 4 KiB and 64 KiB used to be refused
+    /// before the pack read them.
+    #[test]
+    fn a_long_argument_is_judged_on_its_content() {
+        for n in [511, 512, 4 * 1024, 64 * 1024] {
+            let arg = "a".repeat(n);
+            assert_eq!(arg.len(), n);
+            assert_eq!(v(&["echo", &arg]), "allow", "{n}");
+        }
+    }
+
+    /// The marker is the tail of the word, so a cut at the old 512-byte
+    /// slot drops the hyphen of a 512-byte word, and a cut at 64 KiB of
+    /// body drops it from the longer ones. Either cut would allow the line.
+    #[cfg(has_phronesis)]
+    #[test]
+    fn a_long_argument_that_carries_a_secret_is_still_refused() {
+        let marker = "glpat-";
+        for n in [512, 4 * 1024, 64 * 1024] {
+            let arg = format!("{}{marker}", "a".repeat(n - marker.len()));
+            assert_eq!(arg.len(), n);
+            assert!(arg.ends_with(marker));
+            let line = v(&["echo", &arg]);
+            assert!(
+                line.starts_with("deny\tshell-secret-in-argv: "),
+                "{n}: {line}"
+            );
+            assert_ne!(line, "deny\tphronesis", "{n}");
+        }
+    }
+
+    /// One byte past ARG_MAX (128 KiB, the ceiling in shell_encode.c) is a
+    /// named code and a reason, never a bare `phronesis`.
+    #[cfg(has_phronesis)]
+    #[test]
+    fn an_argument_past_arg_max_names_field_too_long() {
+        let arg = "a".repeat(128 * 1024 + 1);
+        assert_eq!(
+            v(&["echo", &arg]),
+            "deny\tfield-too-long: a field is too long for the law to read"
+        );
     }
 
     #[cfg(has_phronesis)]

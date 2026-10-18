@@ -52,7 +52,82 @@ fn multiarch() -> Option<String> {
     Some(format!("{arch}-linux-{suffix}"))
 }
 
+/// Tools that can weaken a symbol in a static archive. GNU `objcopy`
+/// rewrites ELF. `llvm-objcopy` (and Xcode's, via `xcrun`) rewrites
+/// Mach-O, which Homebrew binutils does not.
+fn objcopy_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut push = |p: PathBuf| {
+        if p.is_file() && !out.contains(&p) {
+            out.push(p);
+        }
+    };
+    if let Some(p) = std::env::var_os("OBJCOPY") {
+        push(PathBuf::from(p));
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            for name in ["objcopy", "llvm-objcopy", "gobjcopy"] {
+                push(dir.join(name));
+            }
+        }
+    }
+    if let Ok(xc) = std::process::Command::new("xcrun")
+        .args(["--find", "llvm-objcopy"])
+        .output()
+    {
+        if xc.status.success() {
+            let p = String::from_utf8_lossy(&xc.stdout);
+            push(PathBuf::from(p.trim()));
+        }
+    }
+    out
+}
+
+/// The installed archive refuses a word of 512 bytes and a Cap'n body of
+/// 64 KiB. Weaken those two symbols so `shell_encode.c` supplies them.
+/// The other members of the archive are unchanged. Each tool is tried on
+/// a fresh copy; the first that accepts the archive wins.
+fn patch_phronesis_archive(libdir: &Path) -> PathBuf {
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("patched-phronesis");
+    std::fs::create_dir_all(&out).unwrap();
+    let src = libdir.join("libphronesis.a");
+    let dst = out.join("libphronesis.a");
+    let cands = objcopy_candidates();
+    if cands.is_empty() {
+        panic!(
+            "objcopy not found (need objcopy, llvm-objcopy, or gobjcopy) to patch {}",
+            src.display()
+        );
+    }
+    let mut errors = Vec::new();
+    for objcopy in &cands {
+        std::fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {}: {e}", src.display()));
+        let status = std::process::Command::new(objcopy)
+            .args([
+                "--weaken-symbol=phronesis_check_shell",
+                "--weaken-symbol=phronesis_build_shell_view",
+            ])
+            .arg(&dst)
+            .status();
+        match status {
+            Ok(s) if s.success() => return out,
+            Ok(s) => errors.push(format!("{} exited {s}", objcopy.display())),
+            Err(e) => errors.push(format!("{}: {e}", objcopy.display())),
+        }
+    }
+    panic!(
+        "could not weaken phronesis symbols in {}: {}",
+        src.display(),
+        errors.join("; ")
+    );
+}
+
 fn link_static(libdir: &Path) {
+    let patched = patch_phronesis_archive(libdir);
+    // The patched archive is first, so -lphronesis is that one. capnp
+    // still comes from the install prefix.
+    println!("cargo:rustc-link-search=native={}", patched.display());
     println!("cargo:rustc-link-search=native={}", libdir.display());
     for lib in STATIC_LIBS {
         println!("cargo:rustc-link-lib=static={lib}");
