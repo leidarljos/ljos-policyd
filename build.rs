@@ -85,7 +85,7 @@ fn compile_shim(includes: &[PathBuf], cdir: &Path) {
         let f = cdir.join(name);
         if !f.is_file() {
             panic!(
-                "phronesis: {} missing; install phronesis 0.2.4 or later",
+                "phronesis: {} missing; install phronesis 0.2.5 or later",
                 f.display()
             );
         }
@@ -154,7 +154,7 @@ fn from_prefix(dir: &Path) -> bool {
 
 fn from_pkg_config() -> bool {
     let Ok(lib) = pkg_config::Config::new()
-        .atleast_version("0.2.4")
+        .atleast_version("0.2.5")
         .statik(true)
         .cargo_metadata(false)
         .probe("phronesis")

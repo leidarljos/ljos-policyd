@@ -3117,15 +3117,17 @@ mod tests {
 
     /// The marker is the tail of the word, so a cut at the old 512-byte
     /// slot drops it from a 512-byte word, and a cut at 64 KiB drops it
-    /// from the longer ones. Either cut would allow the line.
+    /// from the longer ones. Either cut would allow the line. The slash
+    /// is the token boundary and the last byte is the payload: a prefix
+    /// with nothing after it is not a credential.
     #[cfg(has_phronesis)]
     #[test]
     fn a_long_argument_that_carries_a_secret_is_still_refused() {
-        let marker = "glpat-";
+        let marker = format!("/{}{}", "glpat-", "B");
         for n in [512, 4 * 1024, 64 * 1024] {
             let arg = format!("{}{marker}", "a".repeat(n - marker.len()));
             assert_eq!(arg.len(), n);
-            assert!(arg.ends_with(marker));
+            assert!(arg.ends_with(&marker));
             let line = v(&["echo", &arg]);
             assert!(
                 line.starts_with("deny\tshell-secret-in-argv: "),
@@ -3133,6 +3135,8 @@ mod tests {
             );
             assert_ne!(line, "deny\tphronesis", "{n}");
             assert_ne!(line, "deny\tfield-too-long", "{n}");
+            let cut = &arg[..n - 1];
+            assert_eq!(v(&["echo", cut]), "allow", "{n} cut");
         }
     }
 

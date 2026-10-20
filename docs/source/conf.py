@@ -22,8 +22,8 @@ _GENERATED = {
 project = "ljos-policyd"
 copyright = "2026, Rohit Goswami"
 author = "Rohit Goswami"
-release = "0.4.5"
-version = "0.4.5"
+release = "0.4.6"
+version = "0.4.6"
 
 extensions = [
     "sphinx.ext.mathjax",

@@ -4,6 +4,16 @@
 
 ## Unreleased
 
+## 0.4.6 (2026-10-20)
+
+### Fixes
+
+- The C shim builds with installed schemas that represent `List(Text)` as a bare pointer as well as schemas that use a typed pointer list. Both forms encode the same argument-list message.
+
+### Miscellaneous
+
+- ljos-policyd links phronesis 0.2.5 or later. The shell secret check matches a vendor prefix only at a token boundary, so `git commit -m 'fix task-creation'`, `cat disk-usage.rs` and `git checkout risk-notes` are allowed. A `curl -H` header that carries an `sk-proj-` bearer key is still `shell-secret-in-argv`.
+
 ## 0.4.5 (2026-10-20)
 
 ### Fixes
