@@ -24,10 +24,10 @@ Token                 Cap'n PolicyReason       When
 ===================== ======================== ============================
 ``empty argv``        ``emptyArgv``            no program
 ``sudo``              ``shellPrivilegeDenied`` privilege runner
-``curl-pipe-shell``   ``shellRemoteExec``      fetcher piped to a shell
+``curl-pipe-shell``   ``shellRemoteExec``      a download run as a program
 ``rm-rf-outside-tmp`` ``rmRfOutsideTmp``       recursive delete off tmp
-``git-force-push``    ``shellGitDangerous``    force push
-``chmod-setuid``      ``chmodSetuid``          setuid chmod
+``git-force-push``    ``shellGitDangerous``    force push or guarded lease
+``chmod-setuid``      ``chmodSetuid``          setuid or setgid mode
 ``raw-disk``          ``rawDisk``              dd to a device node, or mkfs
 ===================== ======================== ============================
 
