@@ -4,6 +4,24 @@
 
 ## Unreleased
 
+## 0.4.5 (2026-10-20)
+
+### Fixes
+
+- The table let seven destructive lines through. A download piped into `python3`, `perl`, `ruby` or `node`, or into a shell through a later stage such as `tee`, now reads as `curl-pipe-shell`, as does `source <(curl ...)`, `. <(curl ...)`, `eval "$(curl ...)"` and a file that `curl -o` or `wget` saves and a later command on the line runs. `chmod` with a leading-zero or setgid mode (`04755`, `2755`, `g+s`) and `install -m 4755` read as `chmod-setuid`. A `git push --force-with-lease` onto `main`, `master` or `develop`, or one that names no branch (no refspec, `HEAD`, a wildcard, `--all`), now reads as `git-force-push`, which ljos turns into a question for the person. A lease push onto any other branch stays allowed, as do `curl URL | python3 -m json.tool`, `curl -o FILE URL`, `chmod 0755` and `git push -u origin BRANCH`.
+
+### Documentation
+
+- The README sample of `ljos-policyd version` prints 0.4.4, the current release.
+- The docs site no longer loads sphinx-design, which no page used. custom.css states the insets of the header, the copy-page buttons and the edit link as plain lengths, with no change on screen. `.impeccable/config.json` records the detector ignores for the vendored theme stylesheet, command flags in code, and the house paper colour, each with its reason.
+- The reference names the phronesis 0.2.3 limits: a word up to 128 KiB, up to 32768 words, and a Cap'n command body of 512 KiB. Past a limit the answer is `field-too-long` and the host's reason.
+
+### Miscellaneous
+
+- A pull request into develop or main that touches the docs now exports the org sources, builds the site with Sphinx `-n -W`, and runs impeccable 4.5.2 on the built pages against `.impeccable/config.json`. Any finding fails the run. A pull request never publishes the site.
+- Each release archive gets a GitHub build attestation from the release workflow, so `gh attestation verify` and the ljos installer can check that this repository built it. Releases before this one have none, and the installer counts them as not published. The release notes line now says what the program does in plain words.
+- ljos-policyd links phronesis 0.2.4 or later. Built against 0.2.3, the phronesis law matched `+s` anywhere in a chmod word, so `chmod 644 README+s.md` was refused as a setuid mode and `denies_a_setuid_or_setgid_mode` failed; 0.2.4 reads `+s` only as a mode clause.
+
 ## 0.4.4 (2026-10-18)
 
 ### Features

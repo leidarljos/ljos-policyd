@@ -1,1 +1,0 @@
-The docs site no longer loads sphinx-design, which no page used. custom.css states the insets of the header, the copy-page buttons and the edit link as plain lengths, with no change on screen. `.impeccable/config.json` records the detector ignores for the vendored theme stylesheet, command flags in code, and the house paper colour, each with its reason.

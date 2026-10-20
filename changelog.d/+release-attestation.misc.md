@@ -1,1 +1,0 @@
-Each release archive gets a GitHub build attestation from the release workflow, so `gh attestation verify` and the ljos installer can check that this repository built it. Releases before this one have none, and the installer counts them as not published. The release notes line now says what the program does in plain words.
