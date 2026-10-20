@@ -31,8 +31,9 @@ jobs:
     timeout-minutes: 30
     env:
       # The tag the release links, so a test and a release build sit on the
-      # same phronesis. v0.2.3 keeps a shell word up to 128 KiB.
-      PHRONESIS_REF: v0.2.3
+      # same phronesis. v0.2.4 reads `+s` only as a mode, so `chmod 644
+      # README+s.md` is not a setuid mode; 0.2.3 matched the substring.
+      PHRONESIS_REF: v0.2.4
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

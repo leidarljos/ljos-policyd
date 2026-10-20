@@ -1,0 +1,1 @@
+ljos-policyd links phronesis 0.2.4 or later. Built against 0.2.3, the phronesis law matched `+s` anywhere in a chmod word, so `chmod 644 README+s.md` was refused as a setuid mode and `denies_a_setuid_or_setgid_mode` failed; 0.2.4 reads `+s` only as a mode clause.

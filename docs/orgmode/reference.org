@@ -50,7 +50,7 @@ A blank reason is the name alone, =field-too-long=. The limits are
 =src/internal.h=, and =PHRONESIS_CAPNP_MAX_BODY= in phronesis
 =include/phronesis/supervisor.h=. phronesis 0.2.3 sets them to 131072,
 32768 and 524288 and writes the reason strings above. This binary names
-the code and keeps the reason. Release binaries link phronesis 0.2.3.
+the code and keeps the reason. Release binaries link phronesis 0.2.4.
 A build without the library uses the host table and does not apply
 these limits.
 

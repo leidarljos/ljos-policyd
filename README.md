@@ -66,7 +66,7 @@ judged as the commands it runs.
 ## Two backends: phronesis, or the table built in
 
 When the [phronesis](https://github.com/leidarljos/phronesis) library
-(0.2.3 or later) is found at build time (`PHRONESIS_DIR`, or `pkg-config
+(0.2.4 or later) is found at build time (`PHRONESIS_DIR`, or `pkg-config
 phronesis`), every check runs the table above and then
 `phronesis_check_shell`, on the line and on each command the table found
 inside it: past `env`, `nice` and the other wrappers, inside `sh -c`
