@@ -21,7 +21,7 @@ name = "ljos-policyd"
 path = "src/main.rs"
 
 [dependencies]
-capnp = "0.20"
+capnp = "0.27"
 libc = "0.2"
 
 [build-dependencies]

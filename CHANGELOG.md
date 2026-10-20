@@ -9,6 +9,7 @@
 ### Fixes
 
 - The C shim builds with installed schemas that represent `List(Text)` as a bare pointer as well as schemas that use a typed pointer list. Both forms encode the same argument-list message.
+- The Cap'n runtime is capnp 0.27. capnp 0.20.6 exposes unsound `constant::Reader::get` and `StructSchema::new` (RUSTSEC-2025-0143). The checked-in schema code is regenerated with capnpc 0.27.0.
 
 ### Miscellaneous
 
