@@ -13,6 +13,10 @@ on:
 
 permissions:
   contents: write
+  # The build attestations: a signed statement that this workflow built
+  # each archive, which `gh attestation verify` and the ljos installer check.
+  id-token: write
+  attestations: write
 
 env:
   # The phronesis release every tarball links, built from source per target.
@@ -119,10 +123,15 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # A signed statement that this workflow built each archive, which
+      # `gh attestation verify` and the ljos installer check.
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz
       # A release opened in the browser already has its notes; this line goes
       # after them instead of replacing them.
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
           append_body: true
-          body: Argv law. Prints allow or deny. Links phronesis ${{ env.PHRONESIS_REF }}.
+          body: Checks a shell command line and prints allow or deny. Links phronesis ${{ env.PHRONESIS_REF }}.
