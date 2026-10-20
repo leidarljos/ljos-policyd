@@ -76,7 +76,9 @@ library the crate still builds and uses the table alone.
 
 The build links phronesis and the Cap'n Proto C runtime statically and
 embeds phronesis's default pack, so the binary needs no phronesis install
-and keeps no path from the machine that built it. A word is handed to the
+and keeps no path from the machine that built it. The C shim follows the
+installed schema's bare-pointer or typed-list representation of `List(Text)`
+without changing the wire message. A word is handed to the
 pack whole, up to 128 KiB, and a line may carry up to 32768 words. Past
 either limit, or a command body over 512 KiB, the line is `field-too-long`
 and the reason, such as `field-too-long: argv word exceeds 131072 bytes`.

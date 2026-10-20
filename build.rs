@@ -70,6 +70,14 @@ fn link_static(libdir: &Path) {
 fn compile_shim(includes: &[PathBuf], cdir: &Path) {
     let mut cc = cc::Build::new();
     cc.file("src/native/shell_encode.c").include(cdir);
+    let header = std::fs::read_to_string(cdir.join("policy.capnp.h"))
+        .expect("phronesis: installed policy.capnp.h is required");
+    if header
+        .lines()
+        .any(|line| line.split_whitespace().eq(["capn_ptr", "argv;"]))
+    {
+        cc.define("LJOS_ARGV_RAW_POINTER", None);
+    }
     for inc in includes {
         cc.include(inc);
     }

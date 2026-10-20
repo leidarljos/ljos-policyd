@@ -75,7 +75,11 @@ int ljos_phronesis_check_shell(phronesis_supervisor_t *sup, const char *cwd,
 	list = capn_new_ptr_list(capn_root(&c).seg, argc);
 	for (i = 0; i < argc; i++)
 		capn_set_text(list, i, ctext(argv[i] ? argv[i] : ""));
+#ifdef LJOS_ARGV_RAW_POINTER
+	sc.argv = list;
+#else
 	sc.argv.p = list;
+#endif
 	root = new_ShellCheck(capn_root(&c).seg);
 	write_ShellCheck(&sc, root);
 	if (capn_setp(capn_root(&c), 0, root.p) != 0) {
