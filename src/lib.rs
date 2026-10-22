@@ -1461,6 +1461,31 @@ fn written_text(owned: &[String], heredoc: Option<&str>) -> Option<String> {
     }
 }
 
+/// The delimiter a command's `<<` opens. `<<WORD` carries it. `<<` and
+/// `<<-` use the next word. A here-string (`<<<`) is not one. Quotes
+/// around the name are not part of it.
+fn opened_heredoc<'a>(cmd: &[&'a str]) -> Option<&'a str> {
+    let mut i = 0;
+    while i < cmd.len() {
+        let w = cmd[i];
+        let Some(rest) = w.strip_prefix("<<").filter(|d| !d.starts_with('<')) else {
+            i += 1;
+            continue;
+        };
+        let rest = rest.trim_start_matches('-');
+        let rest = rest.strip_prefix('\\').unwrap_or(rest);
+        if rest.is_empty() {
+            return cmd.get(i + 1).copied().map(unquote_delim);
+        }
+        return Some(unquote_delim(rest));
+    }
+    None
+}
+
+fn unquote_delim(w: &str) -> &str {
+    w.trim_matches('\'').trim_matches('"')
+}
+
 /// The text of each command's here-document, when every word of it is
 /// literal: the commands after it, up to the one that is its delimiter.
 /// With it, which commands are lines of a here-document something other
@@ -1476,13 +1501,9 @@ fn heredoc_bodies(cmds: &[(Vec<&str>, &str)]) -> (Vec<Option<String>>, Vec<bool>
     let mut texts = vec![None; cmds.len()];
     let mut data = vec![false; cmds.len()];
     for (i, (cmd, _)) in cmds.iter().enumerate() {
-        let Some(delim) = cmd
-            .iter()
-            .find_map(|w| w.strip_prefix("<<").filter(|d| !d.starts_with('<')))
-        else {
+        let Some(delim) = opened_heredoc(cmd) else {
             continue;
         };
-        let delim = delim.trim_start_matches('-');
         let Some(len) = cmds[i + 1..]
             .iter()
             .position(|(c, _)| c.as_slice() == [delim])
@@ -5116,6 +5137,11 @@ fn shell_words(script: &str) -> Vec<String> {
     let mut word = false;
     let (mut single, mut double) = (false, false);
     let mut i = 0;
+    // Here-documents opened on the command just finished, read from the
+    // next line. A body is not the script that follows it: a quote in
+    // help text would otherwise swallow the rest of the file.
+    let mut pending: std::collections::VecDeque<(String, bool)> = std::collections::VecDeque::new();
+    let mut want_delim: Option<bool> = None;
     while i < chars.len() {
         let c = chars[i];
         i += 1;
@@ -5175,11 +5201,17 @@ fn shell_words(script: &str) -> Vec<String> {
             }
             c if !single && !double && (c.is_whitespace() || matches!(c, ';' | '|' | '&')) => {
                 if word {
-                    out.push(closed_word(std::mem::take(&mut cur)));
+                    finish_word(
+                        std::mem::take(&mut cur),
+                        &mut out,
+                        &mut pending,
+                        &mut want_delim,
+                    );
                     word = false;
                 }
                 if matches!(c, '\n' | '\r') {
                     out.push(";".to_string());
+                    take_heredoc_bodies(&chars, &mut i, &mut out, &mut pending);
                     continue;
                 }
                 if matches!(c, ';' | '|' | '&') {
@@ -5198,9 +5230,106 @@ fn shell_words(script: &str) -> Vec<String> {
         }
     }
     if word {
-        out.push(closed_word(cur));
+        finish_word(cur, &mut out, &mut pending, &mut want_delim);
     }
+    take_heredoc_bodies(&chars, &mut i, &mut out, &mut pending);
     out
+}
+
+/// Record a finished word, and a here-document it opens. `<<WORD` names
+/// the delimiter. `<<` and `<<-` alone take the next word as the name.
+fn finish_word(
+    w: String,
+    out: &mut Vec<String>,
+    pending: &mut std::collections::VecDeque<(String, bool)>,
+    want_delim: &mut Option<bool>,
+) {
+    let w = closed_word(w);
+    if let Some(tabs) = want_delim.take() {
+        let name = heredoc_name(&w);
+        pending.push_back((name, tabs));
+        out.push(w);
+        return;
+    }
+    if let Some((delim, tabs)) = heredoc_operator(&w) {
+        if delim.is_empty() {
+            *want_delim = Some(tabs);
+        } else {
+            pending.push_back((delim, tabs));
+        }
+    }
+    out.push(w);
+}
+
+/// The delimiter `<<` / `<<-` names, and whether a leading tab is
+/// stripped (`<<-`). An empty name is the next word.
+fn heredoc_operator(w: &str) -> Option<(String, bool)> {
+    let rest = w.strip_prefix("<<")?;
+    if rest.starts_with('<') {
+        return None;
+    }
+    let tabs = rest.starts_with('-');
+    let rest = rest.trim_start_matches('-');
+    let rest = rest.strip_prefix('\\').unwrap_or(rest);
+    Some((heredoc_name(rest), tabs))
+}
+
+fn heredoc_name(w: &str) -> String {
+    unquote_delim(w).to_string()
+}
+
+/// Read each pending here-document from the raw lines at `i`. The body
+/// is tokenized on its own, so a quote in it stops at the delimiter
+/// line. The delimiter is then a word of its own, which is how
+/// [`heredoc_bodies`] finds the body.
+fn take_heredoc_bodies(
+    chars: &[char],
+    i: &mut usize,
+    out: &mut Vec<String>,
+    pending: &mut std::collections::VecDeque<(String, bool)>,
+) {
+    while let Some((delim, tabs)) = pending.pop_front() {
+        let mut body = String::new();
+        loop {
+            if *i >= chars.len() {
+                break;
+            }
+            let start = *i;
+            while *i < chars.len() && !matches!(chars[*i], '\n' | '\r') {
+                *i += 1;
+            }
+            let raw: String = chars[start..*i].iter().collect();
+            if *i < chars.len() {
+                if chars[*i] == '\r' && chars.get(*i + 1) == Some(&'\n') {
+                    *i += 2;
+                } else {
+                    *i += 1;
+                }
+            }
+            let line = if tabs {
+                raw.trim_start_matches('\t').to_string()
+            } else {
+                raw
+            };
+            if line == delim {
+                break;
+            }
+            body.push_str(&line);
+            body.push('\n');
+        }
+        if !body.is_empty() {
+            let words = shell_words(&body);
+            let open = words
+                .last()
+                .is_none_or(|w| !matches!(w.as_str(), ";" | "&&" | "||" | "|" | "&"));
+            out.extend(words);
+            if open {
+                out.push(";".to_string());
+            }
+        }
+        out.push(delim);
+        out.push(";".to_string());
+    }
 }
 
 /// A word [`shell_words`] closes. A bare separator is a word of its own,
@@ -13667,5 +13796,38 @@ hash -r 2> /dev/null
         let c = at("echo start > \"$LOG\"; sh ./configure");
         assert_eq!(c.decision, Decision::Deny, "{}", c.token);
         assert!(c.token.contains("write to a literal path"), "{}", c.token);
+    }
+
+    /// A quote in a here-document ends at the delimiter line. It must
+    /// not hide a command that comes after the document.
+    #[test]
+    fn a_quote_in_a_heredoc_does_not_hide_the_next_command() {
+        let root = startup_root("heredocquote");
+        std::fs::write(root.join("Makefile"), "all:\n\techo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "cat <<EOF\necho 'unclosed\nEOF\ngit push -f origin\n",
+            "cat <<'EOF'\necho 'unclosed\nEOF\ngit push -f origin\n",
+            "cat <<_ACEOF\nhelp `ticks` and 'quotes\n_ACEOF\ngit push -f origin\n",
+            "cat <<-EOF\n\techo 'unclosed\n\tEOF\ngit push -f origin\n",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert_eq!(c.token, "git-force-push", "{line}: {}", c.token);
+        }
+        for line in [
+            "cat <<EOF\necho 'unclosed\nEOF\necho ok\n",
+            "cat <<'EOF'\necho 'unclosed\nEOF\nmake\n",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for line in [
+            "bash <<EOF\ngit push -f\nEOF",
+            "bash <<EOF\nrm -rf /etc\nEOF",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+        }
     }
 }
