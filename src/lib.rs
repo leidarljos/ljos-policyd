@@ -6942,6 +6942,7 @@ fn feed_allows() -> Checked {
 }
 
 /// How `xargs` or `parallel` turns the text it reads into arguments.
+#[derive(Clone)]
 struct FeedSplit {
     /// `Blank` is the default. `-0` is a NUL. `-d` is one character.
     /// A replace string takes whole lines.
@@ -7394,11 +7395,24 @@ fn xargs_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Op
             found.ok()
         } else if opaque {
             None
+        } else if let Some(p) = producer {
+            if let Some(t) = producer_text(&ended[p].0) {
+                Some(split_feed(&t, &spec))
+            } else if spec.nul {
+                nul_name_inputs(&ended[p].0)
+            } else {
+                None
+            }
         } else {
-            producer.and_then(|p| producer_text(&ended[p].0).map(|t| split_feed(&t, &spec)))
+            None
         };
         let Some(inputs) = shown else {
-            return Some(operand_unshown());
+            // The operand is missing. Refuse only when a stand-in for it
+            // would be refused: otherwise the verdict does not turn on it.
+            if fed_probe_denies(&template, &spec, moved, bound) {
+                return Some(operand_unshown());
+            }
+            continue;
         };
         if spec.replace.is_some() && inputs.is_empty() {
             continue;
@@ -7423,11 +7437,171 @@ fn find_slot(w: &str) -> bool {
         .any(|t| w.contains(t))
 }
 
-/// `find -exec` and `-execdir` substitute a path the line does not list.
+/// Paths `find` walks. Global options (`-L`, `-D`) come first. With none,
+/// find walks `.`.
+fn find_starts(cmd: &[String]) -> Vec<String> {
+    let mut i = 1;
+    while i < cmd.len() {
+        match cmd[i].as_str() {
+            "-H" | "-L" | "-P" => i += 1,
+            "-D" => i += 2,
+            s if s.starts_with("-O") => i += 1,
+            _ => break,
+        }
+    }
+    let mut starts = Vec::new();
+    while i < cmd.len() {
+        let a = cmd[i].as_str();
+        if a.starts_with('-') || matches!(a, "(" | "!" | "\\(") {
+            break;
+        }
+        starts.push(a.to_string());
+        i += 1;
+    }
+    starts
+}
+
+fn find_expr(cmd: &[String]) -> Vec<&str> {
+    let mut i = 1;
+    while i < cmd.len() {
+        match cmd[i].as_str() {
+            "-H" | "-L" | "-P" => i += 1,
+            "-D" => i += 2,
+            s if s.starts_with("-O") => i += 1,
+            _ => break,
+        }
+    }
+    while i < cmd.len() {
+        let a = cmd[i].as_str();
+        if a.starts_with('-') || matches!(a, "(" | "!" | "\\(") {
+            break;
+        }
+        i += 1;
+    }
+    cmd[i..].iter().map(String::as_str).collect()
+}
+
+fn subst_slot(w: &str, path: &str) -> String {
+    let mut w = w.to_string();
+    for tok in ["{//}", "{.}", "{/}", "{%}", "{#}", "{}"] {
+        w = w.replace(tok, path);
+    }
+    w
+}
+
+fn subst_find_with(payload: &[String], path: &str) -> Vec<String> {
+    payload
+        .iter()
+        .enumerate()
+        .map(|(n, w)| {
+            if n == 0 {
+                w.clone()
+            } else {
+                subst_slot(w, path)
+            }
+        })
+        .collect()
+}
+
+/// Words one fed operand can be. A command these all leave allowed does
+/// not change its verdict when the operand is missing.
+const FED_FILLS: &[&str] = &[
+    "/",
+    "~",
+    ".",
+    "..",
+    "/etc",
+    "-rf",
+    "--force",
+    "-delete",
+    "--hard",
+    "of=/dev/sda",
+];
+
+/// Extra operands a blank-separated feed can append from one record.
+const FED_TAILS: &[&[&str]] = &[
+    &["-rf", "/"],
+    &["/", "/dev/null"],
+    &["4755", "/"],
+    &["-R", "777", "/"],
+    &["-R", "root", "/"],
+    &["--delete", "/", "/"],
+];
+
+fn rules_deny(cmd: &[String], moved: bool, bound: &Scratch) -> Option<Checked> {
+    benign_denial(cmd, &[], moved, bound)
+}
+
+/// `true` when some stand-in for the missing operand is refused.
+fn fed_probe_denies(template: &[String], spec: &FeedSplit, moved: bool, bound: &Scratch) -> bool {
+    let mut one = spec.clone();
+    if one.replace.is_none() {
+        one.group = Some(1);
+    }
+    let fills: Vec<String> = FED_FILLS.iter().map(|s| (*s).to_string()).collect();
+    for cmd in feed_invocations(template, &fills, &one) {
+        if rules_deny(&cmd, moved, bound).is_some() {
+            return true;
+        }
+    }
+    if spec.replace.is_none() && !spec.nul {
+        for tail in FED_TAILS {
+            let mut cmd = template.to_vec();
+            cmd.extend(tail.iter().map(|s| (*s).to_string()));
+            if rules_deny(&cmd, moved, bound).is_some() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `find -print0` names its start paths, unsplit. `git ls-files -z`
+/// names paths in the tree, which `.` stands in for.
+fn nul_name_inputs(cmd: &[String]) -> Option<Vec<String>> {
+    let owned = split_env_strings(cmd).into_owned();
+    let run = unwrap_wrappers(&owned).0.to_vec();
+    let head = base_of(run.first()?);
+    if head == "find" && run.iter().any(|w| w == "-print0") {
+        let starts = find_starts(&run);
+        return Some(if starts.is_empty() {
+            vec![".".into()]
+        } else {
+            starts
+        });
+    }
+    if head == "git" {
+        let (sub, rest) = git_subcommand(&run)?;
+        let nul = rest.iter().any(|a| {
+            a == "-z"
+                || a == "--null"
+                || (a.starts_with('-') && !a.starts_with("--") && a.contains('z'))
+        });
+        if sub == "ls-files" && nul {
+            return Some(vec![".".into()]);
+        }
+    }
+    None
+}
+
+/// `find -exec` substitutes a path find walks. `{}` is one of those
+/// start paths (`.` when find is given none). A cleanup of regenerable
+/// names is that name, not the directory find started in.
 fn find_feed(argv: &[String], moved: bool, bound: &Scratch) -> Option<Checked> {
     for cmd in ended_owned(argv) {
         let owned = split_env_strings(&cmd.0).into_owned();
         let run = unwrap_wrappers(&owned).0.to_vec();
+        if run.first().is_none_or(|w| base_of(w) != "find") {
+            continue;
+        }
+        let starts = find_starts(&run);
+        let paths: Vec<String> = if starts.is_empty() {
+            vec![".".into()]
+        } else {
+            starts.clone()
+        };
+        let start_refs: Vec<&str> = starts.iter().map(String::as_str).collect();
+        let regen = regenerable_cleanup(&start_refs, &find_expr(&run));
         for payload in find_payloads(&run) {
             if payload_unshown(&payload) || !payload.iter().any(|w| find_slot(w)) {
                 continue;
@@ -7439,7 +7613,27 @@ fn find_feed(argv: &[String], moved: bool, bound: &Scratch) -> Option<Checked> {
             if let Some(c) = benign_denial(&benign, &[], moved, bound) {
                 return Some(c);
             }
-            return Some(operand_unshown());
+            let mut denied = None;
+            for path in &paths {
+                let concrete = subst_find_with(&payload, path);
+                if let Some(c) = rules_deny(&concrete, moved, bound) {
+                    denied = Some(c);
+                    break;
+                }
+            }
+            let Some(c) = denied else {
+                continue;
+            };
+            let cleaner = payload
+                .first()
+                .is_some_and(|h| matches!(base_of(h), "rm" | "shred" | "unlink"));
+            if regen && cleaner {
+                let named = subst_find_with(&payload, "__pycache__");
+                if rules_deny(&named, moved, bound).is_none() {
+                    continue;
+                }
+            }
+            return Some(c);
         }
     }
     None
@@ -7993,14 +8187,9 @@ fn read_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Opt
         used = true;
         // The last `read` in this shell is the value. An earlier one is gone.
         let hit = hits.iter().max_by_key(|h| h.at).expect("a hit");
-        let Some(vals) = &hit.values else {
-            shown = None;
-            break;
-        };
         let name = &hit.name;
         if hits.iter().any(|h| h.name != *name) {
-            shown = None;
-            break;
+            return Some(operand_unshown());
         }
         let ifs = shell_ifs(&ended, &shells, use_at);
         let mut benign = Vec::new();
@@ -8019,38 +8208,72 @@ fn read_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Opt
                 return Some(c);
             }
         }
+        let Some(vals) = &hit.values else {
+            if read_unshown_denies(&run, name, &ifs, moved, bound) {
+                return Some(operand_unshown());
+            }
+            continue;
+        };
         let mut lines = Vec::new();
-        let mut ok = true;
         for value in vals {
             let mut line = Vec::new();
             for (c, sep) in &ended {
                 for w in c {
                     match expand_read_word(w, name, value, &ifs) {
                         Some(parts) => line.extend(parts),
-                        None => ok = false,
+                        None => return Some(operand_unshown()),
                     }
                 }
                 if !sep.is_empty() {
                     line.push(sep.clone());
                 }
             }
-            if !ok {
-                break;
-            }
             lines.push(line);
         }
-        shown = ok.then_some(lines);
+        shown = Some(lines);
         break;
     }
     if !used {
         return None;
     }
     let Some(lines) = shown else {
-        // The variable is the operand. A stand-in under `/tmp` is not a
-        // denial, and the real value is not on the line.
-        return Some(operand_unshown());
+        // Every unshown value was probed, and none of them was refused.
+        return None;
     };
     judge_lines(&lines, depth, moved, bound).or_else(|| Some(feed_allows()))
+}
+
+/// `true` when a value stdin might have given `name` is refused. A quoted
+/// expansion is one word. An unquoted one can be several.
+fn read_unshown_denies(
+    run: &[String],
+    name: &str,
+    ifs: &str,
+    moved: bool,
+    bound: &Scratch,
+) -> bool {
+    let mut values: Vec<String> = FED_FILLS.iter().map(|s| (*s).to_string()).collect();
+    let unquoted = run
+        .iter()
+        .any(|w| expands(w, name) && !(w.starts_with('"') && w.ends_with('"')));
+    if unquoted {
+        for tail in FED_TAILS {
+            values.push(tail.join(" "));
+        }
+    }
+    for value in &values {
+        let mut line = Vec::new();
+        for w in run {
+            match expand_read_word(w, name, value, ifs) {
+                Some(parts) => line.extend(parts),
+                None => return true,
+            }
+        }
+        if rules_deny(&line, moved, bound).is_some() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Arguments a command is handed from `xargs`, `parallel`, `find -exec`
@@ -17051,7 +17274,7 @@ hash -r 2> /dev/null
         );
         assert_eq!(
             v(&["find", "/tmp/build", "-exec", "rm", "{}", "+"]),
-            "deny\toperand-unshown"
+            "allow"
         );
         assert_eq!(v(&["find", ".", "-exec", "grep", "x", "{}", "+"]), "allow");
     }
@@ -18171,6 +18394,41 @@ hash -r 2> /dev/null
         assert_eq!(v("xargs git checkout --"), "deny\toperand-unshown");
     }
 
+    /// `{}` in `find -exec` is a path find walks, and `-print0 | xargs -0`
+    /// keeps those names whole. A missing operand is refused only when
+    /// some value it could take is refused. `make -L` is
+    /// `--check-symlink-times`.
+    #[test]
+    fn a_fed_name_under_the_tree_is_that_tree() {
+        let v = |s: &str| verdict(&shell_words(s));
+        for line in [
+            "find . -name '*.o' -exec rm {} +",
+            "find . -name '*.o' -exec rm -f {} \\;",
+            "find build -name '*.o' -exec rm -f {} +",
+            "find /tmp/build -name '*.o' -exec rm {} +",
+            "find . -type d -name __pycache__ -exec rm -rf {} +",
+            "find . -name '*.tmp' -print0 | xargs -0 rm -f",
+            "git ls-files -z '*.sh' | xargs -0 chmod +x",
+            "find . -name '*.sh' -exec chmod +x {} +",
+            "ls *.txt | xargs -I{} cp {} backup/",
+            "ls *.txt | xargs -I{} mv {} {}.bak",
+            "cat files.txt | while read f; do cp \"$f\" /tmp/; done",
+            "printf '/tmp/../'",
+        ] {
+            assert_eq!(v(line), "allow", "{line}");
+        }
+        assert_eq!(v("find . | xargs rm -f"), "deny\toperand-unshown");
+        assert_eq!(v("find . -delete"), "deny\tfind-delete-outside-tmp");
+        let d = std::env::temp_dir().join(format!("policyd-lib-{}-make-L", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("Makefile"), "all:\n\techo ok\n").unwrap();
+        for line in ["make -L", "make --check-symlink-times"] {
+            let c = check_shell_in(&shell_words(line), &d, 0);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+    }
+
     /// Words `xargs`, `parallel`, `find -exec` or `read` add are part of
     /// the command. A `printf` or `echo` that shows them is that command.
     /// A word the line does not show can be any operand or flag, so a
@@ -18207,24 +18465,17 @@ hash -r 2> /dev/null
         );
         for s in [
             "find . -name '*.o' | xargs rm -f",
-            "find . -print0 | xargs -0 rm -f",
             "xargs rm -rf",
             "xargs -n 1 git clean",
             "xargs -0 rm -rf",
             "parallel rm -rf ::: \"$x\"",
             "parallel rm -rf :::: files",
-            "find . -name '*.pyc' -exec rm -rf {} +",
             "find . -execdir rm -rf {} +",
             "while read x; do rm -rf \"$x\"; done",
             "cat list | xargs rm -f",
             "xargs -a list rm -rf",
-            "xargs rmdir",
-            "xargs unlink",
-            "xargs shred",
             "xargs dd",
-            "xargs truncate",
             "xargs mv",
-            "xargs cp",
             "xargs chmod",
             "xargs chown",
         ] {
@@ -18242,10 +18493,17 @@ hash -r 2> /dev/null
             "xargs grep pattern",
             "xargs cat",
             "xargs wc -l",
+            "xargs rmdir",
+            "xargs unlink",
+            "xargs shred",
+            "xargs truncate",
+            "xargs cp",
             "printf '/tmp/a.o\\n' | xargs rm -rf",
             "printf '%s\\n' /tmp/a /tmp/b | xargs rm -rf",
             "printf '/tmp/a\\n' | while read x; do rm -rf \"$x\"; done",
             "printf '/tmp/a\\n' | xargs -I{} rm -rf {}",
+            "find . -print0 | xargs -0 rm -f",
+            "find . -name '*.pyc' -exec rm -rf {} +",
             "xargs git status",
             "find . -exec grep x {} +",
             "find . -exec echo {} \\;",
@@ -18439,8 +18697,6 @@ hash -r 2> /dev/null
             "find . -exec {} \\;",
             "find . -exec \"$cmd\" \\;",
             "find . -execdir {} +",
-            "find . -name '*.pyc' -exec rm -rf {} +",
-            "find /tmp/build -exec rm {} +",
             "parallel ::: \"$cmd\"",
             "parallel :::: cmds.txt",
         ] {
@@ -18450,6 +18706,8 @@ hash -r 2> /dev/null
         for s in [
             "find . -exec echo {} \\;",
             "find . -exec grep x {} +",
+            "find . -name '*.pyc' -exec rm -rf {} +",
+            "find /tmp/build -exec rm {} +",
             "parallel echo hi",
             "parallel -j 4 echo hi ::: a b",
             "xargs echo hi",
@@ -19083,9 +19341,14 @@ hash -r 2> /dev/null
                 c.token
             );
         }
+        // `{}` is `.`, so `mv` writes `ok.sh` and the `sh` after it runs that write.
         let c = at("find . -exec mv {} ok.sh \\; ; sh ok.sh");
         assert_eq!(c.decision, Decision::Deny, "{}", c.token);
-        assert_eq!(c.token, "operand-unshown");
+        assert!(
+            c.token.starts_with("script-written-on-line: ") && c.token.contains("ok.sh"),
+            "{}",
+            c.token
+        );
         for line in [
             "git status && sh ok.sh",
             "git -C . log; sh ok.sh",

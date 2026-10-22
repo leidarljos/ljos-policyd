@@ -456,8 +456,8 @@ fn apply_short(
         let c = chars[n];
         n += 1;
         match c {
-            'b' | 'B' | 'd' | 'h' | 'i' | 'k' | 'm' | 'n' | 'p' | 'q' | 'r' | 'R' | 's' | 'S'
-            | 't' | 'v' | 'w' => {}
+            'b' | 'B' | 'd' | 'h' | 'i' | 'k' | 'L' | 'm' | 'n' | 'p' | 'q' | 'r' | 'R' | 's'
+            | 'S' | 't' | 'v' | 'w' => {}
             // These choose which recipes run. The letter is enough; the
             // operand does not have to be read to refuse them.
             'e' | 'E' | 'o' | 'W' => return Err(MAKE_FLAG_TOKEN),
@@ -1567,6 +1567,8 @@ mod tests {
             "ks -j2 --jobserver-auth=3,4 --no-print-directory",
             "w --trace",
             "--tr",
+            "L",
+            "--check-symlink-times",
             "--no-silent",
             "--max-load=2",
             "--jobserver-style=pipe",
