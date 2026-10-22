@@ -4874,6 +4874,28 @@ mod tests {
         }
     }
 
+    /// Arithmetic runs in this shell, so `((HOME=5))` or `$((HOME=5))`
+    /// leaves `HOME` untracked.
+    #[test]
+    fn an_arithmetic_assignment_loses_home() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "HOME={dir}; ((HOME=5)); cd ~ && make test",
+            "HOME={dir}; (( HOME += 1 )); cd ~ && make test",
+            "HOME={dir}; echo $((HOME=5)); cd ~ && make test",
+            "unset CDPATH; ((CDPATH=1)); cd project && make test",
+        ] {
+            let c = entering("arith", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        let c = entering(
+            "arith",
+            &files,
+            "HOME={dir}; ((n=1)); echo $((n+1)); cd ~ && make test",
+        );
+        assert_eq!(c.decision, Decision::Allow);
+    }
+
     /// `$PWD` in a value names the one directory the line is in, unless
     /// the line sets `PWD` itself.
     #[test]
