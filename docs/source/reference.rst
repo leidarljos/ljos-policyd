@@ -94,7 +94,9 @@ whose action is one of those or a ``cd``, ``pushd`` or ``popd``, since a
 ``DEBUG`` trap runs before each command; after one ``HOME``, ``CDPATH`` and
 ``PWD`` are not followed either. A ``source`` or ``.`` of a literal path to
 a regular file the guard can read, whose text does none of that, leaves
-the line where it was.
+the line where it was. The text is read with the aliases the line
+defined before the ``source`` expanded, as the shell that sources it
+reads it.
 Raw newlines and carriage returns split script commands, and ``$'...'``
 ANSI-C quoted words are decoded before the line is judged.
 

@@ -227,7 +227,10 @@ fn runner_commands(
     // A later call of one leaves the line untracked; a definition the
     // line never calls does not.
     let mut risky: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // The aliases the line has defined, which a file it sources sees.
+    let mut aliases = Vec::new();
     for (cmd, end) in ended_commands(argv) {
+        aliases.extend(alias_defs(&cmd));
         if after == "&" {
             (here, old, pushed, vars) = list.clone();
             failed.clear();
@@ -314,7 +317,7 @@ fn runner_commands(
                 [d] if !is_untracked(d) => Some(d.as_path()),
                 _ => None,
             };
-            let loses = match sourced(&cmd, dir) {
+            let loses = match sourced(&cmd, dir, &aliases) {
                 Sourced::Keeps(names) => {
                     risky.extend(names);
                     false
@@ -586,9 +589,11 @@ impl Vars {
 /// somewhere else: the text this does not read may set `PWD`.
 fn writes_pwd(argv: &[String], cwd: &std::path::Path) -> bool {
     let mut moved = false;
+    let mut aliases = Vec::new();
     for cmd in commands(argv) {
+        aliases.extend(alias_defs(&cmd));
         if let Some(path) = literal_source_path(&cmd) {
-            if !sourced_keeps(&path, cwd, moved) {
+            if !sourced_keeps(&path, cwd, moved, &aliases) {
                 return true;
             }
         } else if bare_unseen(&cmd) {
@@ -615,7 +620,12 @@ fn writes_pwd(argv: &[String], cwd: &std::path::Path) -> bool {
 /// Whether `source` or `.` of the literal `path` leaves `PWD` as it was.
 /// A relative path after a command that may have moved the shell names a
 /// file this check cannot place, so it may set `PWD`.
-fn sourced_keeps(path: &str, cwd: &std::path::Path, moved: bool) -> bool {
+fn sourced_keeps(
+    path: &str,
+    cwd: &std::path::Path,
+    moved: bool,
+    aliases: &[(String, String)],
+) -> bool {
     let rel = std::path::Path::new(path);
     if moved && !rel.is_absolute() {
         return false;
@@ -625,7 +635,7 @@ fn sourced_keeps(path: &str, cwd: &std::path::Path, moved: bool) -> bool {
     } else {
         cwd.join(rel)
     };
-    read_regular_nofollow(&full).is_some_and(|t| scan_script(&t).keeps)
+    read_regular_nofollow(&full).is_some_and(|t| scan_script(&t, aliases).keeps)
 }
 
 /// Whether the word `w` names the variable `name` other than to read it
@@ -683,7 +693,7 @@ enum Sourced {
 /// read from the one directory the line is in. Several directories, a
 /// path the line does not show, or a file that is not a regular file the
 /// guard can open, lose the line.
-fn sourced(cmd: &[&str], cwd: Option<&std::path::Path>) -> Sourced {
+fn sourced(cmd: &[&str], cwd: Option<&std::path::Path>, aliases: &[(String, String)]) -> Sourced {
     let Some(path) = literal_source_path(cmd) else {
         return Sourced::No;
     };
@@ -693,7 +703,7 @@ fn sourced(cmd: &[&str], cwd: Option<&std::path::Path>) -> Sourced {
     let Some(text) = read_regular_nofollow(&cwd.join(path)) else {
         return Sourced::Loses;
     };
-    let scan = scan_script(&text);
+    let scan = scan_script(&text, aliases);
     if scan.keeps {
         Sourced::Keeps(scan.risky)
     } else {
@@ -779,15 +789,17 @@ fn read_regular_nofollow(path: &std::path::Path) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
-/// Whether the script `text` leaves the shell where it was, and which of
-/// its functions may not, when called.
+/// Whether the script `text`, read by a shell that holds `aliases`,
+/// leaves the shell where it was, and which of its functions may not,
+/// when called.
 struct ScriptScan {
     keeps: bool,
     risky: std::collections::HashSet<String>,
 }
 
-fn scan_script(text: &str) -> ScriptScan {
+fn scan_script(text: &str, aliases: &[(String, String)]) -> ScriptScan {
     let words = shell_words(text);
+    let words = expand_aliases_with(&words, &mut aliases.to_vec());
     let mut funcs = std::collections::HashMap::new();
     let top = split_functions(&words, &mut funcs);
     let mut memo = std::collections::HashMap::new();
@@ -1636,7 +1648,15 @@ fn inner_commands_at(argv: &[String]) -> Vec<(usize, Vec<String>)> {
 /// body the line does not show (`$`, a backquote) becomes a command word
 /// it does not show.
 fn expand_aliases(argv: &[String]) -> Cow<'_, [String]> {
-    let mut aliases: Vec<(String, String)> = Vec::new();
+    expand_aliases_with(argv, &mut Vec::new())
+}
+
+/// [`expand_aliases`] in a shell that already holds `aliases`. The ones
+/// `argv` defines are added to it.
+fn expand_aliases_with<'a>(
+    argv: &'a [String],
+    aliases: &mut Vec<(String, String)>,
+) -> Cow<'a, [String]> {
     let mut out = Vec::new();
     let mut changed = false;
     for (cmd, end) in ended_commands(argv) {
@@ -1661,15 +1681,7 @@ fn expand_aliases(argv: &[String]) -> Cow<'_, [String]> {
             words.extend(rest.drain(1..));
             rest = words;
         }
-        if let Some((w, defs)) = peel_cd_command_word(&cmd[front..]).split_first() {
-            if base_of(w) == "alias" {
-                aliases.extend(
-                    defs.iter()
-                        .filter_map(|d| d.split_once('='))
-                        .map(|(n, b)| (n.to_string(), b.to_string())),
-                );
-            }
-        }
+        aliases.extend(alias_defs(&cmd));
         out.extend(cmd[..front].iter().map(|s| (*s).to_string()));
         out.extend(rest);
         out.extend((!end.is_empty()).then(|| end.to_string()));
@@ -1678,6 +1690,22 @@ fn expand_aliases(argv: &[String]) -> Cow<'_, [String]> {
         Cow::Owned(out)
     } else {
         Cow::Borrowed(argv)
+    }
+}
+
+/// The `(name, body)` pairs `cmd` defines when it is `alias`.
+fn alias_defs(cmd: &[&str]) -> Vec<(String, String)> {
+    let front = (0..cmd.len())
+        .take_while(|&i| is_assignment(cmd[i]) || keyword_at(cmd, i))
+        .count();
+    let front = front + case_head(&cmd[front..]);
+    match peel_cd_command_word(&cmd[front..]).split_first() {
+        Some((w, defs)) if base_of(w) == "alias" => defs
+            .iter()
+            .filter_map(|d| d.split_once('='))
+            .map(|(n, b)| (n.to_string(), b.to_string()))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
