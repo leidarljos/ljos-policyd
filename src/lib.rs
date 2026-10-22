@@ -217,7 +217,7 @@ fn runner_commands(
     let mut after = ";";
     let mut ran_in = Vec::new();
     // `$PWD` follows the line's directory unless the line sets it.
-    let pwd_set = argv.iter().any(|w| may_set(w, "PWD"));
+    let pwd_set = argv.iter().any(|w| may_set(w, "PWD")) || writes_pwd(argv);
     // With `shopt -s lastpipe` anywhere on the line, the last stage of a
     // pipeline may run in this shell.
     let lastpipe =
@@ -444,12 +444,17 @@ fn runner_commands(
 
 /// The `CDPATH` and `HOME` a command on the line sees: `None` where one is
 /// unset, and a value with `$` in it, which names no directory, where the
-/// line does not show it.
+/// line does not show it. `pwd` is read only by [`writes_pwd`], to see
+/// whether a command writes `PWD`.
 #[derive(Clone)]
 struct Vars {
     cdpath: Option<String>,
     home: Option<String>,
+    pwd: Option<String>,
 }
+
+/// The variables [`Vars`] holds.
+const VAR_NAMES: [&str; 3] = ["CDPATH", "HOME", "PWD"];
 
 impl Vars {
     fn from_env() -> Self {
@@ -457,6 +462,7 @@ impl Vars {
         Vars {
             cdpath: var("CDPATH"),
             home: var("HOME"),
+            pwd: None,
         }
     }
 
@@ -464,6 +470,7 @@ impl Vars {
         match name {
             "CDPATH" => Some(&mut self.cdpath),
             "HOME" => Some(&mut self.home),
+            "PWD" => Some(&mut self.pwd),
             _ => None,
         }
     }
@@ -490,11 +497,10 @@ impl Vars {
     /// other than to read it (`$NAME`, `${NAME}`), or sets by default
     /// (`${NAME:=value}`).
     fn lose(&mut self, w: &str) {
-        if may_set(w, "CDPATH") {
-            self.cdpath = Some("$".into());
-        }
-        if may_set(w, "HOME") {
-            self.home = Some("$".into());
+        for name in VAR_NAMES {
+            if may_set(w, name) {
+                self.lose_target(name);
+            }
         }
     }
 
@@ -510,7 +516,7 @@ impl Vars {
     /// Leave each variable the word `w` sets by default (`${NAME:=value}`,
     /// `${NAME=value}`) not shown.
     fn lose_default(&mut self, w: &str) {
-        for name in ["CDPATH", "HOME"] {
+        for name in VAR_NAMES {
             if w.contains(&format!("${{{name}:=")) || w.contains(&format!("${{{name}=")) {
                 self.lose_target(name);
             }
@@ -528,6 +534,20 @@ impl Vars {
             self.home = Some("$".into());
         }
     }
+}
+
+/// Whether a command on the line may write `PWD` in the shell that runs
+/// it, by the rules [`set_vars`] follows for `HOME`.
+fn writes_pwd(argv: &[String]) -> bool {
+    commands(argv).iter().any(|cmd| {
+        let mut probe = Vars {
+            cdpath: None,
+            home: None,
+            pwd: Some(UNTRACKED.into()),
+        };
+        set_vars(cmd, &mut probe);
+        probe.pwd.as_deref() != Some(UNTRACKED)
+    })
 }
 
 /// Whether the word `w` names the variable `name` other than to read it
