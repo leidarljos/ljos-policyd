@@ -283,7 +283,10 @@ fn runner_commands(
             continue;
         }
         if b == "popd" {
-            let args = operands(&words[1..]);
+            let mut args = operands(&words[1..]);
+            if let Some(end) = args.iter().position(|a| *a == "--") {
+                args.truncate(end);
+            }
             let index = args.iter().copied().find(|a| stack_index(a));
             let stack: Vec<_> = std::iter::once((here.clone(), true))
                 .chain(pushed.iter().rev().cloned())
