@@ -5420,6 +5420,24 @@ fn is_plain_subshell(w: &str) -> bool {
     w.starts_with('(') && w.ends_with(')') && !w.starts_with("((")
 }
 
+/// The body of a plain subshell that is this command, after assignments
+/// and keywords (`!`, `time`). A parenthesized word that is only an
+/// argument is not one: quotes have already been stripped, and
+/// `echo "(git push -f)"` must not run.
+fn command_subshell(run: &[String]) -> Option<Vec<String>> {
+    let refs: Vec<&str> = run.iter().map(String::as_str).collect();
+    let words = operands(&refs);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    let w = *words.get(front)?;
+    if !is_plain_subshell(w) {
+        return None;
+    }
+    let body = subshell_body(w);
+    (!body.is_empty()).then_some(body)
+}
+
 /// Whether `w` is a command substitution or backticks whose stdout is
 /// discarded, so the word it would run in this shell is empty.
 fn injects_no_command(w: &str) -> bool {
@@ -6725,6 +6743,13 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
                         out.extend(script_lines(&text, 0).iter().map(|l| (i, shell_words(l))));
                     }
                 }
+            }
+            // `( ... )` as the command is one word. Its body runs, and it
+            // sees the values this shell already holds. An argument that
+            // only looks like one (`echo "(git push -f)"`) does not, and
+            // `((...))` is arithmetic.
+            if let Some(body) = command_subshell(run) {
+                out.push((i, body));
             }
             out.push((i, run.to_vec()));
         }
@@ -19589,10 +19614,26 @@ hash -r 2> /dev/null
             v("x=/; ( printf '/tmp/a\\n' | read x ); rm -rf \"$x\""),
             "deny\trm-rf-outside-tmp"
         );
-        assert_eq!(
-            v("x=/; ( printf '/tmp/a\\n' | read x; rm -rf \"$x\" )"),
-            "allow"
-        );
+        // The rm is inside the subshell, and the read there is a pipeline
+        // stage, so it does not replace the `/` this shell holds.
+        for line in [
+            "x=/; ( printf '/tmp/a\\n' | read x; rm -rf \"$x\" )",
+            "x=/tmp/a; ( rm -rf / )",
+        ] {
+            assert_eq!(v(line), "deny\trm-rf-outside-tmp", "{line}");
+            let bash = vec!["bash".into(), "-c".into(), line.to_string()];
+            assert_eq!(verdict(&bash), "deny\trm-rf-outside-tmp", "bash -c {line}");
+        }
+        // A value this shell holds is the one the body uses. A read that
+        // runs in the subshell assigns there.
+        for line in [
+            "x=/tmp/a; ( rm -rf \"$x\" )",
+            "( read x <<< /tmp/a; rm -rf \"$x\" )",
+        ] {
+            assert_eq!(v(line), "allow", "{line}");
+            let bash = vec!["bash".into(), "-c".into(), line.to_string()];
+            assert_eq!(verdict(&bash), "allow", "bash -c {line}");
+        }
         for line in [
             "x=/; time { printf '/tmp/a\\n' | read x; }; rm -rf \"$x\"",
             "x=/; ! { printf '/tmp/a\\n' | read x; }; rm -rf \"$x\"",
