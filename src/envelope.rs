@@ -2149,11 +2149,16 @@ pair left right
         ] {
             assert!(denied(to, unicode, ""), "{to}");
         }
-        let label = "address x@b\u{FC}cher.fastmail.com\n";
-        for to in ["b\u{FC}cher+x@fastmail.com", "x@xn--bcher-kva.fastmail.com"] {
+        // The tag's skeleton has to be at least three characters. `x`
+        // would refuse the file before the user label is folded.
+        let label = "address shop@b\u{FC}cher.fastmail.com\n";
+        for to in [
+            "b\u{FC}cher+shop@fastmail.com",
+            "shop@xn--bcher-kva.fastmail.com",
+        ] {
             assert!(denied(to, label, ""), "{to}");
         }
-        assert!(!denied("bucher+x@fastmail.com", label, ""));
+        assert!(!denied("bucher+shop@fastmail.com", label, ""));
         let dotted = "alias example.test + dots subdomain\n";
         for deny in [
             "address jdoe@example.test\n",
