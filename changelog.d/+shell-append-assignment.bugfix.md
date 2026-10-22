@@ -1,0 +1,1 @@
+A `NAME+=value` word is read as an assignment, as the shell and `env` read it, so it no longer hides the command after it: `FOO+=1 git push -f origin main` and `env A+=1 git push --force` were allowed, `FOO+=1 make clean-all` did not read the Makefile, and `FOO+=1 cd project && make clean-all` read the Makefile where the line started instead of in `project`.

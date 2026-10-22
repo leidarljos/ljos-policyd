@@ -18,6 +18,8 @@ Built-in denials
 ================
 
 First match wins. The head is the last path component of argv[0].
+Leading assignments, ``NAME=value`` or ``NAME+=value``, and runner words
+such as ``env``, ``nice`` and ``timeout`` come off first.
 
 ===================== ======================== ============================
 Token                 Cap'n PolicyReason       When
@@ -41,10 +43,17 @@ The recipe comes from the file the runner reads, in the directory it
 runs in: the working directory, the one a ``cd`` or ``pushd`` earlier on
 the line enters, the one ``env -C`` names for the command it runs, or
 the one the runner's own ``-C``, ``--prefix`` or ``--cwd`` names.
+``env`` reads its flags as GNU ``env`` does: short ones cluster
+(``-iC DIR``, ``-uVAR -C DIR``) and a long one may be cut to a prefix that
+names only it (``--ch DIR``), so these move the command as ``-C DIR``
+does, and ``-iS STRING`` is read as ``-S STRING``.
 Leading words that still run ``cd`` in this shell (``command``,
 ``builtin``, ``if``, ``while``, ``{`` and the other control keywords)
-are peeled before this check, and a redirection among the words of a
+are peeled before this check, as are assignments among them
+(``if FOO=1 cd dir``), and a redirection among the words of a
 ``cd`` or ``pushd`` names neither the directory nor a ``pushd`` stack index.
+One that closes a descriptor (``2>&-``, ``<&-``) is a whole word, so the
+word after it is the target.
 
 ============================================ ==============================================================================================
 Runner                                       File read
@@ -64,7 +73,29 @@ ANSI-C quoted words are decoded before the line is judged.
 
 A ``cd`` or ``pushd`` to a relative path whose first part is not ``.`` or
 ``..`` may enter that path under any ``CDPATH`` entry, so the runner after
-it is also read in each entry that holds the path.
+it is also read in each entry that holds the path. A ``CDPATH`` set in
+front of the ``cd`` (``CDPATH=dir cd x``), or of the shell that runs it, is
+the one searched, as is one the line sets before it, alone or with
+``export``, ``declare`` and the like (``export CDPATH=dir; cd x``), unless a
+pipeline stage, a subshell or a list sent to the background set it.
+One set where it may not run, past a ``&&`` or ``||``, is searched along
+with the one before it. Another word that may set it (``read CDPATH``,
+``${CDPATH:=dir}``, or an assignment in front of a special builtin such
+as ``:``), or an entry with ``$``, a backquote or ``~`` in it, names no
+directory the line shows, so a runner after the ``cd`` is refused.
+
+``HOME`` is followed the same way: a bare ``cd`` enters the one set in
+front of it (``HOME=dir cd``) or earlier on the line (``export HOME=dir;
+cd``), and ``~`` expands from the one set before the command. A ``HOME``
+that may hold either of two values, or one the line does not show
+(``HOME=$(mktemp -d) cd``), leaves the runner after the ``cd`` refused.
+
+``pushd`` and ``popd`` follow the directory stack. ``pushd -n`` stacks its
+directory without entering it, ``pushd +N`` and ``-N`` enter the entry they
+bring to the top, and a bare ``popd`` enters the entry under the top,
+while ``popd -n``, ``popd +N`` and ``popd -N`` drop an entry and stay. An
+index that counts past a ``pushd`` that may have failed may name any
+directory on the stack.
 
 The line goes on past a ``cd`` that may fail, so the runner after it is
 read in each directory the line may be in, up to sixteen. A ``cd`` into a
