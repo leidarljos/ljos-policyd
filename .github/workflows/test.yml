@@ -2,7 +2,7 @@ name: test
 
 on:
   push:
-    branches: [main, develop, '*-2026*']
+    branches: ['**']
   pull_request:
 
 permissions:
