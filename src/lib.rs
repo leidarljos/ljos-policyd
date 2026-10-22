@@ -5434,6 +5434,27 @@ mod tests {
         );
     }
 
+    /// A `#` that starts a word comments out the rest of its line.
+    #[test]
+    fn a_comment_runs_nothing() {
+        assert_eq!(
+            shell_words("a # b ; c\nd e#f '#g' \\#h"),
+            ["a", ";", "d", "e#f", "#g", "#h"]
+        );
+        for line in [
+            "true # ; cd safe\nmake clean-all",
+            "true #; cd safe\nmake clean-all",
+        ] {
+            assert_eq!(leaving("comment", line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "true '#'; cd safe && make clean-all",
+            "true a#b; cd safe && make clean-all",
+        ] {
+            assert_eq!(leaving("comment", line), Decision::Allow, "{line}");
+        }
+    }
+
     /// A quoted or escaped `;`, `&&` or `|` is an argument, not a separator.
     #[test]
     fn a_quoted_separator_is_an_argument() {
