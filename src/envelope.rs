@@ -1072,16 +1072,17 @@ fn normalize_local(raw: &str) -> Option<String> {
     Some(lower)
 }
 
-/// A deny-file or pack-law domain. `None` when the value is not a
-/// hostname after IDNA. A star, a colon or a slash is not a hostname,
-/// so the line would load and then match no real recipient. A domain
-/// rule already covers its subdomains, so a wildcard is not another
-/// way to write it.
+/// A deny-file or pack-law domain. `None` when a recipient domain could
+/// not be written the same way, or the value is not a hostname after
+/// IDNA. A star, a colon, a slash or a dotted quad would load and then
+/// match no real recipient. A domain rule already covers its
+/// subdomains, so a wildcard is not another way to write it.
 fn rule_domain(raw: &str) -> Option<String> {
     if raw.chars().any(forbidden_in_domain) {
         return None;
     }
-    let ascii = normalize_domain(raw)?;
+    let bare = mail::parse_domain(raw).ok()?;
+    let ascii = normalize_domain(&bare)?;
     if ascii.chars().any(forbidden_in_domain) || !is_hostname(&ascii) {
         return None;
     }
@@ -1758,6 +1759,11 @@ From: other@example.test\r\n";
             ("", "deny-domain example.test:25\n", 1, ":25"),
             ("", "deny-domain example.test/path\n", 1, "/path"),
             ("", "#\n\ndeny-domain *\n", 3, "*"),
+            ("domain 192.0.2.1\n", "", 1, "192.0.2.1"),
+            ("domain 0x7f.example.test\n", "", 1, "0x7f"),
+            ("", "deny-domain 192.0.2.1\n", 1, "192.0.2.1"),
+            ("", "# note\ndeny-domain 0177.example.test\n", 2, "0177"),
+            ("address john@192.0.2.1\n", "", 1, "192.0.2.1"),
             ("address *john@example.test\n", "", 1, "*john"),
             ("address john@*.example.test\n", "", 1, "*."),
             ("address \"*john\"@example.test\n", "", 1, "*john"),
