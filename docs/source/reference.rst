@@ -245,13 +245,19 @@ part, one ``subaddress`` separator, and anything after the
 separator. The separators are the ``subaddress`` line, or ``+-=``
 when the line is omitted. ``.``, ``@``, ``%`` and ``!`` are not
 separators. An ``address`` rule is also compared by skeleton:
-NFKC, case folded, with every ``.``, ``_``, ``-``, ``+`` and ``=``
-removed and nothing cut. A recipient whose skeleton starts with
+NFKC, case folded twice, with a combining dot above and every
+``.``, ``_``, ``-``, ``+`` and ``=`` removed and nothing cut.
+The second fold turns capital sharp s into ss, and dropping the
+dot makes İ and i one skeleton. A recipient whose skeleton starts with
 the rule's skeleton, at the rule's domain or one in the same
 alias family, is refused, and so is one the folding below
 refuses. This over-blocks on purpose: a rule for ``john`` also
 refuses ``johnny`` and ``jo.hn-x``, so a provider that ignores a
 character no family lists cannot deliver a denied mailbox.
+An address rule whose skeleton is empty or shorter than three
+characters refuses the deny file. The error names the line and
+not the address. A deny file that does not load refuses every
+send.
 A provider alias family folds both the rule and the
 recipient, and adds its separators to the ``subaddress`` line on
 its domains. ``gmail.com`` and ``googlemail.com`` are one
@@ -360,7 +366,7 @@ Code                                     When
 ``config-invalid``                       the config is missing a key or names an unknown one
 ``identity-invalid``                     the configured identity is not one mailbox
 ``deny-file-unreadable``                 the deny file cannot be read
-``deny-file-invalid``                    a deny-file line is not one of the known kinds
+``deny-file-invalid``                    a deny-file line is not a known kind, or an address skeleton is shorter than three characters
 ``pack-law-unreadable``                  the pack-law file cannot be read
 ``pack-law-invalid``                     the pack-law file has a line other than deny-domain
 ======================================== ======================================================
