@@ -1,0 +1,1 @@
+Job, output and diagnostic make options (`-j`, `-O`, `--jobserver-auth`, `--trace`, `--no-print-directory`) no longer close the makefile read as `make-flags-unshown`. A long option make only diagnoses is the same. `-e`, `-o`, `-W`, `--what-if` and `--eval` still close it, and `-f`, `-C` and `-I` still name the makefile.

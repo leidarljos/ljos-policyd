@@ -287,6 +287,9 @@ fn apply_make_words(
                     }
                 }
                 LongOpt::Reject => return Err(MAKE_FLAG_TOKEN),
+                // A long option make only diagnoses does not name a file
+                // or a recipe. The value, if it wrote one, is not read.
+                LongOpt::Skip => {}
                 LongOpt::Value => {
                     let arg = if let Some(value) = inline {
                         value.to_string()
@@ -339,6 +342,8 @@ enum LongOpt {
     Value,
     Optional,
     Reject,
+    /// Not a file, a directory, or a recipe. Make prints a diagnostic.
+    Skip,
 }
 
 fn long_option(name: &str) -> Result<LongOpt, &'static str> {
@@ -347,6 +352,7 @@ fn long_option(name: &str) -> Result<LongOpt, &'static str> {
         | "version"
         | "silent"
         | "quiet"
+        | "no-silent"
         | "keep-going"
         | "stop"
         | "no-keep-going"
@@ -363,15 +369,22 @@ fn long_option(name: &str) -> Result<LongOpt, &'static str> {
         | "no-builtin-variables"
         | "print-directory"
         | "no-print-directory"
+        | "check-symlink-times"
+        | "trace" => LongOpt::Flag,
+        "file" | "makefile" | "directory" | "include-dir" => LongOpt::Value,
+        "jobs" | "load-average" | "max-load" | "output-sync" | "debug" | "jobserver-auth"
+        | "jobserver-fds" | "jobserver-style" | "shuffle" => LongOpt::Optional,
+        "eval"
         | "environment-overrides"
-        | "check-symlink-times" => LongOpt::Flag,
-        "file" | "makefile" | "directory" | "include-dir" | "assume-old" | "assume-new"
-        | "old-file" | "new-file" | "what-if" => LongOpt::Value,
-        "jobs" | "load-average" | "output-sync" | "debug" | "jobserver-auth" | "jobserver-fds" => {
-            LongOpt::Optional
-        }
-        "eval" => LongOpt::Reject,
-        _ => return Err(MAKE_FLAG_TOKEN),
+        | "assume-old"
+        | "assume-new"
+        | "old-file"
+        | "new-file"
+        | "what-if" => LongOpt::Reject,
+        // A long name this table does not know is the diagnostic make
+        // prints for it. It does not name a makefile. A short letter
+        // `apply_short` does not know is still refused.
+        _ => LongOpt::Skip,
     })
 }
 
@@ -413,9 +426,12 @@ fn apply_short(
         let c = chars[n];
         n += 1;
         match c {
-            'b' | 'B' | 'd' | 'e' | 'h' | 'i' | 'k' | 'm' | 'n' | 'p' | 'q' | 'r' | 'R' | 's'
-            | 'S' | 't' | 'v' | 'w' => {}
-            'C' | 'f' | 'I' | 'o' | 'O' | 'W' => {
+            'b' | 'B' | 'd' | 'h' | 'i' | 'k' | 'm' | 'n' | 'p' | 'q' | 'r' | 'R' | 's' | 'S'
+            | 't' | 'v' | 'w' => {}
+            // These choose which recipes run. The letter is enough; the
+            // operand does not have to be read to refuse them.
+            'e' | 'E' | 'o' | 'W' => return Err(MAKE_FLAG_TOKEN),
+            'C' | 'f' | 'I' | 'O' => {
                 let arg = if n < chars.len() {
                     chars[n..].iter().collect()
                 } else {
@@ -1511,12 +1527,58 @@ mod tests {
             recipes(&argv(&["make", "--include-dir", "inc", "clean-all"]), &d),
             ["rm -rf /opt"]
         );
-        assert!(matches!(
-            resolved(
-                &argv(&["make", "MAKEFLAGS=--not-a-real-flag", "clean-all"]),
-                &d
-            ),
-            Recipes::Closed("make-flags-unshown")
-        ));
+        // Job, output and diagnostic flags do not choose a makefile.
+        // Make's own complaint about a long name it does not know is the
+        // same: the recipe is the one in this directory. A flag that
+        // changes which recipes run, or a short letter with no meaning
+        // here, is not that recipe.
+        std::fs::write(d.join("Makefile"), "clean-all:\n\techo main\n").unwrap();
+        for flags in [
+            "--not-a-real-flag",
+            "--not-a-real-flag=1",
+            " -j8 --jobserver-auth=fifo:/tmp/x -Otarget",
+            "w -j8 -Otarget --jobserver-auth=3,4",
+            "ks -j2 --jobserver-auth=3,4 --no-print-directory",
+            "w --trace",
+            "--no-silent",
+            "--max-load=2",
+            "--jobserver-style=pipe",
+            "--shuffle",
+        ] {
+            assert_eq!(
+                recipes(
+                    &argv(&["make", &format!("MAKEFLAGS={flags}"), "clean-all"]),
+                    &d
+                ),
+                ["echo main"],
+                "{flags}"
+            );
+        }
+        for flags in [
+            "-e",
+            "e",
+            "--environment-overrides",
+            "-ofoo",
+            "--old-file=foo",
+            "--assume-old=foo",
+            "-Wfoo",
+            "--what-if=foo",
+            "--new-file=foo",
+            "--assume-new=foo",
+            "--eval=$(info hi)",
+            "-E$(info hi)",
+            "-Z",
+        ] {
+            assert!(
+                matches!(
+                    resolved(
+                        &argv(&["make", &format!("MAKEFLAGS={flags}"), "clean-all"]),
+                        &d
+                    ),
+                    Recipes::Closed("make-flags-unshown")
+                ),
+                "{flags}"
+            );
+        }
     }
 }
