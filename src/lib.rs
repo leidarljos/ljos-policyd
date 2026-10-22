@@ -7472,48 +7472,245 @@ fn temp_fed_marks(argv: &[String]) -> Vec<String> {
     out
 }
 
-/// Names a `read` takes from a `printf` or `echo` of paths under `/tmp`.
-/// A name that also has an unshown read is not one of them.
-fn shown_temp_reads(argv: &[String]) -> Vec<String> {
-    let ended = ended_owned(argv);
-    let mut good = Vec::new();
-    let mut bad = Vec::new();
-    for (i, (cmd, _)) in ended.iter().enumerate() {
-        let owned = split_env_strings(cmd).into_owned();
-        let run = unwrap_wrappers(&owned).0;
-        let refs: Vec<&str> = run.iter().map(String::as_str).collect();
-        let tail: Vec<String> = command_after_keywords(&refs)
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        if !tail
-            .first()
-            .is_some_and(|w| matches!(base_of(w), "read" | "mapfile" | "readarray"))
-        {
-            continue;
+/// Which compound a command word opens or closes. `do` and `then` are
+/// the body, not another compound.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Nest {
+    Loop,
+    If,
+    Case,
+    Brace,
+    Paren,
+}
+
+fn nest_event(cmd: &[String]) -> Option<(bool, Nest)> {
+    let w = cmd.iter().map(String::as_str).find(|w| !is_assignment(w))?;
+    Some(match w {
+        "while" | "until" | "for" | "select" => (true, Nest::Loop),
+        "if" => (true, Nest::If),
+        "case" => (true, Nest::Case),
+        "{" => (true, Nest::Brace),
+        "(" => (true, Nest::Paren),
+        "done" => (false, Nest::Loop),
+        "fi" => (false, Nest::If),
+        "esac" => (false, Nest::Case),
+        "}" => (false, Nest::Brace),
+        ")" => (false, Nest::Paren),
+        _ => return None,
+    })
+}
+
+fn nest_bump(kind: Nest, open: bool, depth: &mut [i32; 5]) {
+    let i = match kind {
+        Nest::Loop => 0,
+        Nest::If => 1,
+        Nest::Case => 2,
+        Nest::Brace => 3,
+        Nest::Paren => 4,
+    };
+    if open {
+        depth[i] += 1;
+    } else if depth[i] > 0 {
+        depth[i] -= 1;
+    }
+}
+
+/// The command that closes the compound `ended[i]` opens, or `i` when
+/// it is a simple command. The scan stays inside `[i, hi)`.
+fn compound_end(ended: &[(Vec<String>, String)], i: usize, hi: usize) -> usize {
+    let Some((true, kind)) = nest_event(&ended[i].0) else {
+        return i;
+    };
+    let mut depth = [0; 5];
+    nest_bump(kind, true, &mut depth);
+    for (j, cmd) in ended.iter().enumerate().take(hi).skip(i + 1) {
+        if let Some((open, k)) = nest_event(&cmd.0) {
+            nest_bump(k, open, &mut depth);
         }
-        let names = read_var_names(&tail);
-        let text = if let Some(p) = i.checked_sub(1).filter(|&p| ended[p].1 == "|") {
-            producer_text(&ended[p].0)
-        } else {
-            here_string(cmd)
-        };
-        let temp = text.is_some_and(|t| {
-            let lines: Vec<&str> = t
-                .split('\n')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect();
-            !lines.is_empty() && lines.iter().copied().all(under_tmp)
-        });
-        if temp {
-            good.extend(names);
-        } else {
-            bad.extend(names);
+        if depth.iter().all(|d| *d == 0) {
+            return j;
         }
     }
+    hi.saturating_sub(1)
+}
+
+/// The shell each command writes. A pipeline stage is its own shell.
+/// The last stage is this shell only after `lastpipe` may be on. A
+/// `(...)` group and a command ended by `&` are their own shell too.
+/// The body of `while` stays in the shell that runs the `while`.
+fn command_shells(ended: &[(Vec<String>, String)]) -> Vec<u32> {
+    let n = ended.len();
+    let mut shells = vec![0u32; n];
+    let mut lastpipe = vec![false; n];
+    let mut on = false;
+    for (i, (cmd, _)) in ended.iter().enumerate() {
+        lastpipe[i] = on;
+        let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        if may_set_lastpipe(&refs) {
+            on = true;
+        }
+    }
+    let mut next = 1u32;
+    walk_shells(ended, 0, n, 0, &mut shells, &mut next, &lastpipe);
+    shells
+}
+
+fn walk_shells(
+    ended: &[(Vec<String>, String)],
+    lo: usize,
+    hi: usize,
+    shell: u32,
+    shells: &mut [u32],
+    next: &mut u32,
+    lastpipe: &[bool],
+) {
+    let mut i = lo;
+    while i < hi {
+        let end = compound_end(ended, i, hi).min(hi.saturating_sub(1));
+        let sep_before = if i > lo { ended[i - 1].1.as_str() } else { "" };
+        let sep_after = ended[end].1.as_str();
+        let in_pipe = sep_before == "|" || sep_after == "|";
+        let last = in_pipe && sep_after != "|";
+        let paren = nest_event(&ended[i].0).is_some_and(|(open, k)| open && k == Nest::Paren);
+        let fresh = paren || sep_after == "&" || (in_pipe && !(last && lastpipe[i]));
+        let stage = if fresh {
+            let id = *next;
+            *next += 1;
+            id
+        } else {
+            shell
+        };
+        shells[i] = stage;
+        if end > i {
+            shells[end] = stage;
+            if i + 1 < end {
+                walk_shells(ended, i + 1, end, stage, shells, next, lastpipe);
+            }
+        }
+        i = end + 1;
+    }
+}
+
+/// A `read` at `set_at` is the value a later command sees. It has to
+/// run in that command's shell, and before it. The last stage of a
+/// pipeline is a subshell until `lastpipe` is on, so it does not.
+fn read_reaches(shells: &[u32], set_at: usize, use_at: usize) -> bool {
+    set_at < use_at && shells.get(set_at) == shells.get(use_at)
+}
+
+struct ReadHit {
+    name: String,
+    /// One string per line the producer wrote. `None` when that text
+    /// is not on the line.
+    values: Option<Vec<String>>,
+    at: usize,
+}
+
+fn read_command(cmd: &[String]) -> Option<Vec<String>> {
+    let owned = split_env_strings(cmd).into_owned();
+    let run = unwrap_wrappers(&owned).0;
+    let refs: Vec<&str> = run.iter().map(String::as_str).collect();
+    let tail: Vec<String> = command_after_keywords(&refs)
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    tail.first()
+        .is_some_and(|w| matches!(base_of(w), "read" | "mapfile" | "readarray"))
+        .then_some(tail)
+}
+
+fn read_text(ended: &[(Vec<String>, String)], i: usize, cmd: &[String]) -> Option<String> {
+    if let Some(p) = i.checked_sub(1).filter(|&p| ended[p].1 == "|") {
+        producer_text(&ended[p].0)
+    } else {
+        here_string(cmd)
+    }
+}
+
+fn read_lines(text: &str) -> Vec<String> {
+    let mut lines: Vec<String> = text
+        .split('\n')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn read_hits(ended: &[(Vec<String>, String)]) -> Vec<ReadHit> {
+    let mut out = Vec::new();
+    for (i, (cmd, _)) in ended.iter().enumerate() {
+        let Some(tail) = read_command(cmd) else {
+            continue;
+        };
+        let values = read_text(ended, i, cmd).map(|t| read_lines(&t));
+        for name in read_var_names(&tail) {
+            out.push(ReadHit {
+                name,
+                values: values.clone(),
+                at: i,
+            });
+        }
+    }
+    out
+}
+
+/// Names a `read` takes from a `printf` or `echo` of paths under `/tmp`,
+/// when that `read` runs in the same shell and before the use, and the
+/// names a reaching `read` sets to something else. A name a later
+/// command still holds from an earlier assignment is in neither.
+fn shown_temp_reads(argv: &[String]) -> (Vec<String>, Vec<String>) {
+    let ended = ended_owned(argv);
+    let shells = command_shells(&ended);
+    let hits = read_hits(&ended);
+    let mut good = Vec::new();
+    let mut bad = Vec::new();
+    let mut uncovered = false;
+    for (use_at, (cmd, _)) in ended.iter().enumerate() {
+        let owned = split_env_strings(cmd).into_owned();
+        let run = unwrap_wrappers(&owned).0.to_vec();
+        if !fed_sensitive(&run) {
+            continue;
+        }
+        let names: Vec<String> = hits
+            .iter()
+            .map(|h| h.name.clone())
+            .filter(|n| run.iter().any(|w| expands(w, n)))
+            .collect();
+        let mut seen = Vec::new();
+        for name in names {
+            if seen.iter().any(|s| s == &name) {
+                continue;
+            }
+            seen.push(name.clone());
+            let reaching = hits
+                .iter()
+                .filter(|h| h.name == name && read_reaches(&shells, h.at, use_at));
+            let Some(hit) = reaching.max_by_key(|h| h.at) else {
+                // This use still has the assignment. A temp from another
+                // shell must not cover it.
+                uncovered = true;
+                continue;
+            };
+            let temp = hit
+                .values
+                .as_ref()
+                .is_some_and(|lines| !lines.is_empty() && lines.iter().all(|l| under_tmp(l)));
+            if temp {
+                good.push(name);
+            } else {
+                bad.push(name);
+            }
+        }
+    }
+    if uncovered {
+        good.clear();
+    }
     good.retain(|n| !bad.iter().any(|b| b == n));
-    good
+    bad.retain(|n| good.iter().all(|g| g != n));
+    (good, bad)
 }
 
 fn read_var_names(run: &[String]) -> Vec<String> {
@@ -7542,67 +7739,41 @@ fn word_replaced(word: &str, name: &str, value: &str) -> Option<String> {
 
 /// `while read x; do rm -rf "$x"; done`. A `printf` or `echo` piped into
 /// the `read`, or a here-string, is the value. Anything else is not.
+/// The `read` counts only when it runs in the same shell, before the
+/// command that expands the name.
 fn read_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Option<Checked> {
     let ended = ended_owned(argv);
-    let mut fed: Vec<(String, Option<Vec<String>>)> = Vec::new();
-    for (i, (cmd, _)) in ended.iter().enumerate() {
-        let owned = split_env_strings(cmd).into_owned();
-        let run = unwrap_wrappers(&owned).0;
-        if !run
-            .first()
-            .is_some_and(|w| matches!(base_of(w), "read" | "mapfile" | "readarray"))
-        {
-            continue;
-        }
-        let text = if let Some(p) = i.checked_sub(1).filter(|&p| ended[p].1 == "|") {
-            producer_text(&ended[p].0)
-        } else {
-            here_string(cmd)
-        };
-        let lines = text.map(|t| {
-            let mut lines: Vec<String> = t
-                .split('\n')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if lines.is_empty() {
-                lines.push(String::new());
-            }
-            lines
-        });
-        for name in read_var_names(run) {
-            fed.push((name, lines.clone()));
-        }
-    }
+    let shells = command_shells(&ended);
+    let fed = read_hits(&ended);
     if fed.is_empty() {
         return None;
     }
     let mut used = false;
     let mut shown: Option<Vec<Vec<String>>> = None;
-    for (cmd, _) in &ended {
+    for (use_at, (cmd, _)) in ended.iter().enumerate() {
         let owned = split_env_strings(cmd).into_owned();
         let run = unwrap_wrappers(&owned).0.to_vec();
-        if run
-            .first()
-            .is_some_and(|w| matches!(base_of(w), "read" | "mapfile" | "readarray"))
-            || !fed_sensitive(&run)
-        {
+        if read_command(cmd).is_some() || !fed_sensitive(&run) {
             continue;
         }
-        let hits: Vec<&(String, Option<Vec<String>>)> = fed
+        let hits: Vec<&ReadHit> = fed
             .iter()
-            .filter(|(n, _)| run.iter().any(|w| expands(w, n)))
+            .filter(|h| {
+                read_reaches(&shells, h.at, use_at) && run.iter().any(|w| expands(w, &h.name))
+            })
             .collect();
         if hits.is_empty() {
             continue;
         }
         used = true;
-        let (name, vals) = &hits[0];
-        let Some(vals) = vals else {
+        // The last `read` in this shell is the value. An earlier one is gone.
+        let hit = hits.iter().max_by_key(|h| h.at).expect("a hit");
+        let Some(vals) = &hit.values else {
             shown = None;
             break;
         };
-        if hits.len() != 1 {
+        let name = &hit.name;
+        if hits.iter().any(|h| h.name != *name) {
             shown = None;
             break;
         }
@@ -11858,8 +12029,13 @@ impl Scratch {
             }
         }
         // `read x` from a `printf` of `/tmp/...` holds that path. The pack
-        // still sees `$x`, and its older rule refuses the name.
-        for name in shown_temp_reads(argv) {
+        // still sees `$x`, and its older rule refuses the name. A `read`
+        // in another shell does not, and neither does one that comes later.
+        let (temps, other) = shown_temp_reads(argv);
+        for name in other {
+            self.poison(&name);
+        }
+        for name in temps {
             // `read` poisons the name: stdin is not an assignment. The
             // producer on this line is the value, so the poison is wrong.
             self.vars.insert(name, Some(Hold::Temp));
@@ -17560,6 +17736,28 @@ hash -r 2> /dev/null
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
         assert_everyday_allowed(&root);
+    }
+
+    /// A `read` counts only in the shell that runs it, and only for a
+    /// command after it. A pipeline stage is a subshell until `lastpipe`.
+    #[test]
+    fn a_read_in_another_shell_keeps_the_earlier_value() {
+        let v = |s: &str| verdict(&shell_words(s));
+        for line in [
+            "x=/; printf '/tmp/a\\n' | read x; rm -rf \"$x\"",
+            "x=/; rm -rf \"$x\"; read x <<< /tmp/a",
+            "x=/; printf '/tmp/a\\n' | while read x; do :; done; rm -rf \"$x\"",
+        ] {
+            assert_eq!(v(line), "deny\trm-rf-outside-tmp", "{line}");
+        }
+        assert_eq!(
+            v("printf '/tmp/a\\n' | while read x; do rm -rf \"$x\"; done"),
+            "allow"
+        );
+        assert_eq!(
+            v("shopt -s lastpipe; x=/; printf '/tmp/a\\n' | read x; rm -rf \"$x\""),
+            "allow"
+        );
     }
 
     /// Words `xargs`, `parallel`, `find -exec` or `read` add are part of
