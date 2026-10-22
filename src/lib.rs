@@ -142,7 +142,10 @@ fn runner_commands(
         }
         let piped = after == "|" || end == "|";
         after = end;
-        let b = base_of(cmd[0]);
+        // An assignment in front of a builtin is set for that command
+        // alone: `FOO=1 cd dir` still moves the shell.
+        let words = &cmd[cmd.iter().take_while(|w| is_assignment(w)).count()..];
+        let b = words.first().map_or("", |w| base_of(w));
         if piped && matches!(b, "cd" | "pushd" | "popd") {
             continue;
         }
@@ -151,7 +154,7 @@ fn runner_commands(
             continue;
         }
         if b == "cd" || b == "pushd" {
-            if let Some(to) = entered(&cmd[1..], &dir, b == "pushd") {
+            if let Some(to) = entered(&words[1..], &dir, b == "pushd") {
                 let from = std::mem::replace(&mut dir, to);
                 if b == "pushd" {
                     pushed.push(from);
@@ -3638,6 +3641,25 @@ mod tests {
         for line in ["cd safe && make clean-all", "cd safe && make clean-all &"] {
             assert_eq!(leaving("bg-cd", line), Decision::Allow, "{line}");
         }
+    }
+
+    /// An assignment in front of `cd`, `pushd` or `popd` does not hide it.
+    #[test]
+    fn follows_a_cd_behind_an_assignment() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "FOO=1 cd project && make clean-all",
+            "A=1 B=2 pushd project && make clean-all",
+        ] {
+            let c = entering("assign-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        let c = entering(
+            "assign-cd",
+            &files,
+            "pushd project && FOO=1 popd && make clean-all",
+        );
+        assert_eq!(c.decision, Decision::Allow);
     }
 
     #[test]
