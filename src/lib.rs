@@ -553,6 +553,12 @@ struct Shell {
     /// Literal values a variable used as a command word may hold. `\0`
     /// means one branch left it unset, so the word may be anything.
     cmd_values: std::collections::HashMap<String, Vec<String>>,
+    /// What an expansion in an `eval` name is proven to be. A value the
+    /// line does not show is absent: the name may hold a command.
+    names: std::collections::HashMap<String, NameProof>,
+    /// `names` as a `case` or `if` opened. The branch's proofs do not
+    /// survive the closer: only the arm that runs them may use them.
+    name_frames: Vec<std::collections::HashMap<String, NameProof>>,
     /// Open `if` and `case`. Each branch's values join at `fi` or `esac`.
     assign_stack: Vec<AssignFrame>,
     /// `exit` ran here. A side of `||` or `&&` that exits does not fall
@@ -580,6 +586,8 @@ struct Saved {
     left_tree: bool,
     known: Option<std::path::PathBuf>,
     cmd_values: std::collections::HashMap<String, Vec<String>>,
+    names: std::collections::HashMap<String, NameProof>,
+    name_frames: Vec<std::collections::HashMap<String, NameProof>>,
     assign_stack: Vec<AssignFrame>,
 }
 
@@ -595,6 +603,8 @@ impl Shell {
             left_tree: self.left_tree,
             known: self.known.clone(),
             cmd_values: self.cmd_values.clone(),
+            names: self.names.clone(),
+            name_frames: self.name_frames.clone(),
             assign_stack: self.assign_stack.clone(),
         }
     }
@@ -609,6 +619,8 @@ impl Shell {
         self.left_tree = saved.left_tree;
         self.known = saved.known;
         self.cmd_values = saved.cmd_values;
+        self.names = saved.names;
+        self.name_frames = saved.name_frames;
         self.assign_stack = saved.assign_stack;
     }
 
@@ -624,6 +636,9 @@ impl Shell {
         self.known = None;
         // A body recorded before this no longer says what a call runs.
         self.funcs.clear();
+        // The command may have assigned over what was proven.
+        self.names.clear();
+        self.name_frames.clear();
     }
 }
 
@@ -930,6 +945,8 @@ fn runner_commands(
             Some(inn.cwd.to_path_buf())
         },
         cmd_values: initial_cmd_values(),
+        names: std::collections::HashMap::new(),
+        name_frames: Vec::new(),
         assign_stack: Vec::new(),
         halted: false,
     };
@@ -1127,9 +1144,12 @@ fn walk(
     // anywhere in it counts as made before the loop.
     let mut loops = Vec::new();
     let mut spans = Vec::new();
-    let (heredocs, data) = heredoc_bodies(&ended_commands(&argv));
+    let ended = ended_commands(&argv);
+    let (heredocs, data) = heredoc_bodies(&ended);
     let pattern_skip = case_pattern_skips(&argv);
-    for (ci, (cmd, end)) in ended_commands(&argv).into_iter().enumerate() {
+    for (ci, (cmd, end)) in ended.iter().enumerate() {
+        let cmd = cmd.clone();
+        let end = *end;
         finish_conditional(
             &mut groups,
             after,
@@ -1297,6 +1317,8 @@ fn walk(
             set_vars(&shown, &mut shell.vars);
             note_startup(&shown, &mut shell.vars);
             note_cmd_values(&shown, shell);
+            let next = ended.get(ci + 1).map(|(c, _)| c.as_slice());
+            note_name_state(&cmd, end, next, shell);
             match before {
                 "||" => shell.vars.merge(was),
                 "&&" => match &mut vars_failed {
@@ -1414,7 +1436,7 @@ fn walk(
                     && shell.follow_unseen
                     && (bare_unseen(&cmd) || blinds_functions(&cmd))
                     && !assigned_command_keeps(&cmd, &shell.cmd_values)
-                    && !shown_eval_keeps(&cmd, &shell.cmd_values, 0)
+                    && !shown_eval_keeps(&cmd, &shell.cmd_values, &shell.names, 0)
                 {
                     shell.lose();
                 }
@@ -2339,6 +2361,7 @@ fn expand_eval_scripts(
 fn shown_eval_keeps(
     cmd: &[&str],
     values: &std::collections::HashMap<String, Vec<String>>,
+    names: &std::collections::HashMap<String, NameProof>,
     depth: usize,
 ) -> bool {
     if depth > 4 {
@@ -2361,13 +2384,14 @@ fn shown_eval_keeps(
     };
     texts
         .iter()
-        .all(|script| eval_text_keeps(script, values, depth))
+        .all(|script| eval_text_keeps(script, values, names, depth))
 }
 
 /// Whether the script `eval` runs leaves this shell where it is.
 fn eval_text_keeps(
     script: &str,
     values: &std::collections::HashMap<String, Vec<String>>,
+    names: &std::collections::HashMap<String, NameProof>,
     depth: usize,
 ) -> bool {
     // A function defined in the script does not run its body. A call does.
@@ -2395,23 +2419,410 @@ fn eval_text_keeps(
         // part of the command name, not `cd`.
         if c.iter().all(|w| {
             is_assignment(w)
-                || built_assignment(w)
+                || built_name_proven(w, names)
                 || (w.starts_with('=') && !w.contains([';', '|', '&', '\n']))
         }) {
             return true;
         }
-        if assigned_command_keeps(c, values) || shown_eval_keeps(c, values, depth + 1) {
+        if assigned_command_keeps(c, values) || shown_eval_keeps(c, values, names, depth + 1) {
             return true;
         }
         !bare_unseen(c)
     })
 }
 
+/// What `$name` is known to expand to. `Exact` is one literal. `Class`
+/// is any string of name characters plus `extras` (`-+.` after
+/// configure's `expr` test). Absent means the expansion is not shown.
+#[derive(Clone)]
+enum NameProof {
+    Exact(String),
+    Class { extras: String },
+}
+
+fn name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+fn name_chars(s: &str) -> bool {
+    s.chars().all(name_char)
+}
+
+fn proof_is_name(p: &NameProof) -> bool {
+    match p {
+        NameProof::Exact(s) => name_chars(s),
+        NameProof::Class { extras } => extras.is_empty(),
+    }
+}
+
+/// Quotes around a whole assignment value, so `$name` inside them is
+/// still the expansion. A backslash or a nested quote is left as written.
+fn strip_wrapping_quotes(v: &str) -> &str {
+    let b = v.as_bytes();
+    if v.len() >= 2 && b[0] == b'\'' && b[v.len() - 1] == b'\'' && !v[1..v.len() - 1].contains('\'')
+    {
+        return &v[1..v.len() - 1];
+    }
+    if v.len() >= 2 && b[0] == b'"' && b[v.len() - 1] == b'"' {
+        let inner = &v[1..v.len() - 1];
+        if !inner.contains(['`', '\\', '"']) {
+            return inner;
+        }
+    }
+    v
+}
+
+/// `value` joined from literals and expansions that are already proven.
+/// `$$` and `${name:-word}` are not a value the line shows.
+fn concat_proof(
+    v: &str,
+    names: &std::collections::HashMap<String, NameProof>,
+) -> Option<NameProof> {
+    let b = v.as_bytes();
+    let mut i = 0;
+    let mut exact = String::new();
+    let mut extras = String::new();
+    let mut known_exact = true;
+    let push_extra = |c: char, extras: &mut String| {
+        if !name_char(c) && !extras.contains(c) {
+            extras.push(c);
+        }
+    };
+    while i < b.len() {
+        if b[i] != b'$' {
+            let c = v[i..].chars().next().unwrap();
+            i += c.len_utf8();
+            if known_exact {
+                exact.push(c);
+            } else {
+                push_extra(c, &mut extras);
+            }
+            continue;
+        }
+        i += 1;
+        let braced = i < b.len() && b[i] == b'{';
+        if braced {
+            i += 1;
+        }
+        let start = i;
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        let end = i;
+        if braced {
+            if i >= b.len() || b[i] != b'}' {
+                return None;
+            }
+            i += 1;
+        }
+        let proof = names.get(&v[start..end])?;
+        match proof {
+            NameProof::Exact(s) => {
+                if known_exact {
+                    exact.push_str(s);
+                } else {
+                    for c in s.chars() {
+                        push_extra(c, &mut extras);
+                    }
+                }
+            }
+            NameProof::Class { extras: more } => {
+                if known_exact {
+                    for c in exact.chars() {
+                        push_extra(c, &mut extras);
+                    }
+                    known_exact = false;
+                }
+                for c in more.chars() {
+                    push_extra(c, &mut extras);
+                }
+            }
+        }
+    }
+    if known_exact {
+        Some(NameProof::Exact(exact))
+    } else {
+        Some(NameProof::Class { extras })
+    }
+}
+
+/// `s/[-+.]/_/g` applied to a value whose every character is already
+/// known. Characters other than `-+.` have to already be name characters,
+/// or the result can still be `x;cd`.
+fn apply_sed(p: &NameProof) -> Option<NameProof> {
+    match p {
+        NameProof::Exact(s) => {
+            let out: String = s
+                .chars()
+                .map(|c| if matches!(c, '-' | '+' | '.') { '_' } else { c })
+                .collect();
+            name_chars(&out).then_some(NameProof::Exact(out))
+        }
+        NameProof::Class { extras } if extras.chars().all(|c| matches!(c, '-' | '+' | '.')) => {
+            Some(NameProof::Class {
+                extras: String::new(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// `` `printf … "$name" | sed 's/[-+.]/_/g'` `` and the `$(…)` form.
+/// One substitution, one variable, and no second command: a `;` after
+/// the sed would print whatever it liked.
+fn sed_of_value(
+    raw: &str,
+    names: &std::collections::HashMap<String, NameProof>,
+) -> Option<NameProof> {
+    let inner = raw.trim();
+    let inner = if let Some(s) = inner.strip_prefix("$(").and_then(|s| s.strip_suffix(')')) {
+        s
+    } else {
+        inner.strip_prefix('`').and_then(|s| s.strip_suffix('`'))?
+    };
+    if inner.contains([';', '&', '\n', '`']) || inner.contains("$(") {
+        return None;
+    }
+    let (left, right) = inner.split_once('|')?;
+    if right.contains('|') {
+        return None;
+    }
+    let right = right.trim();
+    if right != "sed 's/[-+.]/_/g'" && right != "sed \"s/[-+.]/_/g\"" && right != "sed s/[-+.]/_/g"
+    {
+        return None;
+    }
+    let left = left.trim();
+    if !(left.starts_with("printf") || left.starts_with("echo") || left.starts_with("print ")) {
+        return None;
+    }
+    let vars = dollar_names(left);
+    if vars.len() != 1 {
+        return None;
+    }
+    apply_sed(names.get(&vars[0])?)
+}
+
+fn proof_of_value(
+    raw: &str,
+    names: &std::collections::HashMap<String, NameProof>,
+) -> Option<NameProof> {
+    if raw.contains('`') || raw.contains("$(") {
+        return sed_of_value(raw, names);
+    }
+    concat_proof(strip_wrapping_quotes(raw), names)
+}
+
+/// `x$name` or `x${name}`, the subject of configure's `expr` test.
+fn x_dollar_var(w: &str) -> Option<&str> {
+    let rest = w.strip_prefix('x')?.strip_prefix('$')?;
+    if let Some(name) = rest.strip_prefix('{') {
+        return var_name(name.strip_suffix('}')?);
+    }
+    var_name(rest)
+}
+
+/// The body of `[^…]` in an `expr` pattern.
+fn negated_class(w: &str) -> Option<&str> {
+    let start = w.find("[^")?;
+    let rest = &w[start + 2..];
+    let end = rest.find(']')?;
+    Some(&rest[..end])
+}
+
+/// Characters `body` allows that are not name characters. `$name` adds
+/// the characters its proof allows. An expansion that is not proven is
+/// not a class the guard can trust.
+fn class_extras(
+    body: &str,
+    names: &std::collections::HashMap<String, NameProof>,
+) -> Option<String> {
+    let b = body.as_bytes();
+    let mut i = 0;
+    let mut extras = String::new();
+    while i < b.len() {
+        if b[i] == b'$' {
+            i += 1;
+            let braced = i < b.len() && b[i] == b'{';
+            if braced {
+                i += 1;
+            }
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            if i == start {
+                return None;
+            }
+            let end = i;
+            if braced {
+                if i >= b.len() || b[i] != b'}' {
+                    return None;
+                }
+                i += 1;
+            }
+            match names.get(&body[start..end])? {
+                NameProof::Exact(s) => {
+                    for c in s.chars() {
+                        if !name_char(c) && !extras.contains(c) {
+                            extras.push(c);
+                        }
+                    }
+                }
+                NameProof::Class { extras: more } => {
+                    for c in more.chars() {
+                        if !extras.contains(c) {
+                            extras.push(c);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        let c = body[i..].chars().next().unwrap();
+        i += c.len_utf8();
+        if !name_char(c) && !extras.contains(c) {
+            extras.push(c);
+        }
+    }
+    Some(extras)
+}
+
+/// `expr "x$name" : ".*[^class]"`, so a later failure of that `expr`
+/// means `name` holds only `class`.
+fn charset_guard(
+    cmd: &[&str],
+    names: &std::collections::HashMap<String, NameProof>,
+) -> Option<(String, String)> {
+    if head_word(cmd)
+        .as_deref()
+        .is_none_or(|w| base_of(w) != "expr")
+    {
+        return None;
+    }
+    let mut var = None;
+    let mut body = None;
+    for w in cmd {
+        if var.is_none() {
+            var = x_dollar_var(w).map(str::to_string);
+        }
+        if body.is_none() {
+            body = negated_class(w);
+        }
+    }
+    Some((var?, class_extras(body?, names)?))
+}
+
+/// Whether `cmd` runs `exit`, or a function whose body does, on every
+/// path. `exit` behind `&&`, `||`, `|` or inside `if` / `case` does not:
+/// the shell can come back.
+fn command_always_exits(cmd: &[&str], funcs: &FnMap, depth: usize) -> bool {
+    if command_exits(cmd) {
+        return true;
+    }
+    let Some(head) = head_word(cmd) else {
+        return false;
+    };
+    let Some(body) = funcs.get(base_of(&head)) else {
+        return false;
+    };
+    if body.subshell || depth > 8 {
+        return false;
+    }
+    always_exits(&body.words, funcs, depth + 1)
+}
+
+fn always_exits(words: &[String], funcs: &FnMap, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let ended = ended_commands(words);
+    let mut cond = false;
+    let mut branch = 0i32;
+    for (cmd, end) in &ended {
+        match branch_keyword(cmd) {
+            Some("if" | "case") => branch += 1,
+            Some("fi" | "esac") => branch = branch.saturating_sub(1),
+            _ => {}
+        }
+        if branch == 0
+            && !cond
+            && !matches!(*end, "|" | "&")
+            && command_always_exits(cmd, funcs, depth)
+        {
+            return true;
+        }
+        cond = *end == "&&" || *end == "||";
+    }
+    false
+}
+
+/// Record literals and the configure checks that make an expansion a
+/// name fragment. Proofs from inside a `case` or `if` die at the closer.
+/// A `&&` whose other side always exits, after `expr`'s negated class,
+/// is that class for the commands that follow: the shell only reaches
+/// them when the class matched.
+fn note_name_state(cmd: &[&str], end: &str, next: Option<&[&str]>, shell: &mut Shell) {
+    match branch_keyword(cmd) {
+        Some("if" | "case") => shell.name_frames.push(shell.names.clone()),
+        Some("else" | "elif") => {
+            if let Some(base) = shell.name_frames.last() {
+                shell.names.clone_from(base);
+            }
+        }
+        Some("fi" | "esac") => {
+            if let Some(base) = shell.name_frames.pop() {
+                shell.names = base;
+            }
+        }
+        _ => {}
+    }
+    let words = operands(cmd);
+    let mut i = 0;
+    while i < words.len() && (is_assignment(words[i]) || keyword_at(&words, i)) {
+        i += 1;
+    }
+    if i == words.len() {
+        for w in words {
+            if let Some((name, value)) = assign_sides(w) {
+                match proof_of_value(&value, &shell.names) {
+                    Some(p) => {
+                        shell.names.insert(name, p);
+                    }
+                    None => {
+                        shell.names.remove(&name);
+                    }
+                }
+            } else if let Some(name) = w.split(['+', '[', '=']).next() {
+                if var_name(name).is_some() && name != w {
+                    shell.names.remove(name);
+                }
+            }
+        }
+    }
+    if end == "&&" {
+        let proved = next.and_then(|next| {
+            if command_always_exits(next, &shell.funcs, 0) {
+                charset_guard(cmd, &shell.names)
+            } else {
+                None
+            }
+        });
+        if let Some((var, extras)) = proved {
+            shell.names.insert(var, NameProof::Class { extras });
+        }
+    }
+}
+
 /// `NAME=value` in an `eval` script where NAME is built from shell-name
 /// characters and `$name` or `${name}`, as in `enable_$ac_useropt=no`.
-/// Whatever the name holds, the word assigns or runs a command whose
-/// name holds `=`, and neither is `cd`. A value with a substitution is
-/// not this.
+/// The shape is an assignment or a command whose name holds `=`. It is
+/// not enough: `$name` can be `x;cd evil;y`. [`built_name_proven`] is
+/// the check that keeps the directory. A value with a substitution is
+/// not this shape.
 fn built_assignment(w: &str) -> bool {
     let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
     let Some((mut name, value)) = w.split_once('=') else {
@@ -2441,6 +2852,18 @@ fn built_assignment(w: &str) -> bool {
         name = rest;
     }
     true
+}
+
+/// `w` is [`built_assignment`] and every expansion in the name is proven
+/// to be name characters. Anything else can introduce `cd`.
+fn built_name_proven(w: &str, names: &std::collections::HashMap<String, NameProof>) -> bool {
+    if !built_assignment(w) {
+        return false;
+    }
+    let name = w.split_once('=').map(|(n, _)| n).unwrap_or("");
+    dollar_names(name)
+        .iter()
+        .all(|v| names.get(v).is_some_and(proof_is_name))
 }
 
 fn assigned_command_keeps(
@@ -15276,22 +15699,49 @@ hash -r 2> /dev/null
         }
     }
 
-    /// `eval enable_$ac_useropt=no` assigns to a name built from a value
-    /// the line does not show, here from `expr` and `sed`. The text is a
-    /// lone `NAME=value` word, so it is an assignment or a command whose
-    /// name holds `=`, and neither is `cd`. Any other word, or a value
-    /// with a substitution, still drops the directory.
+    /// `eval enable_$ac_useropt=no` keeps the directory only when every
+    /// expansion in the name is proven to be name characters. A literal
+    /// is. So is configure's loop: `expr` rejects anything outside
+    /// `-+._` and `$as_cr_alnum`, `as_fn_error` exits on a hit, and
+    /// `sed 's/[-+.]/_/g'` turns the rest into a name. An unproven
+    /// value, including `x;cd evil;y`, drops the directory.
     #[test]
     fn an_eval_of_a_built_name_is_an_assignment() {
+        let configure = "\
+as_cr_letters='abcdefghijklmnopqrstuvwxyz'
+as_cr_LETTERS='ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+as_cr_Letters=$as_cr_letters$as_cr_LETTERS
+as_cr_digits='0123456789'
+as_cr_alnum=$as_cr_Letters$as_cr_digits
+as_fn_exit ()
+{
+  exit $1
+}
+as_fn_error ()
+{
+  as_fn_exit $1
+}
+ac_useropt=`expr \"x$ac_option\" : 'x-*disable-\\(.*\\)'`
+expr \"x$ac_useropt\" : \".*[^-+._$as_cr_alnum]\" >/dev/null &&
+  as_fn_error $? \"invalid feature name: $ac_useropt\"
+ac_useropt=`printf \"%s\\n\" \"$ac_useropt\" | sed 's/[-+.]/_/g'`
+eval enable_$ac_useropt=no
+make -C safe test
+";
         for line in [
-            "ac_useropt=`expr \"x$ac_option\" : 'x-*disable-\\(.*\\)'`; eval enable_$ac_useropt=no; make -C safe test",
-            "ac_useropt=`printf '%s\\n' \"$ac_useropt\" | sed 's/[-+.]/_/g'`; eval enable_$ac_useropt=\\$ac_optarg; make -C safe test",
-            "eval with_${ac_useropt}_x=no; make -C safe test",
-            "eval \\$ac_prev=\\$ac_option; make -C safe test",
+            configure,
+            "ac_useropt=feature; eval enable_$ac_useropt=no; make -C safe test",
+            "ac_useropt=foo-bar; ac_useropt=`printf \"%s\\n\" \"$ac_useropt\" | sed 's/[-+.]/_/g'`; eval enable_$ac_useropt=no; make -C safe test",
         ] {
             assert_eq!(evil_and_safe("evalbuilt", line), Decision::Allow, "{line}");
         }
         for line in [
+            "ac_useropt='x;cd evil;y'; eval enable_$ac_useropt=no; make -C safe test",
+            "ac_useropt=feature; ac_useropt='x;cd evil;y'; eval enable_$ac_useropt=no; make -C safe test",
+            "ac_useropt=`expr \"x$ac_option\" : 'x-*disable-\\(.*\\)'`; eval enable_$ac_useropt=no; make -C safe test",
+            "ac_useropt=`printf '%s\\n' \"$ac_useropt\" | sed 's/[-+.]/_/g'`; eval enable_$ac_useropt=no; make -C safe test",
+            "eval with_${ac_useropt}_x=no; make -C safe test",
+            "eval \\$ac_prev=\\$ac_option; make -C safe test",
             "eval enable_$x=no $y; make clean-all",
             "eval enable_$x=no; $y; make clean-all",
             "eval enable_$x-y=no; make clean-all",
