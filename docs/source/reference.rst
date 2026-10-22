@@ -129,6 +129,13 @@ shows that and does not set ``PWD`` (``export HOME="$PWD/.home"``).
 With ``HOME`` unset, ``~`` is the home in the user's passwd entry, as in
 bash, and a bare ``cd`` stays.
 
+A ``cd`` or ``pushd`` takes ``..`` off the path by name, as the shell's
+logical ``cd`` does, so ``cd lnk/..`` comes back to where it started even
+when ``lnk`` is a symbolic link. ``cd -P``, the last of ``-L`` and ``-P``
+winning, resolves the link first, and after a ``set -P`` or
+``set -o physical`` on the line either may hold. ``env -C`` resolves it,
+as ``chdir`` does.
+
 ``pushd`` and ``popd`` follow the directory stack. ``pushd -n`` stacks its
 directory without entering it, ``pushd +N`` and ``-N`` enter the entry they
 bring to the top, and a bare ``popd`` enters the entry under the top,

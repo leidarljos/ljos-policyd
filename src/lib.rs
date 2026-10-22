@@ -483,13 +483,14 @@ fn runner_commands(
 /// line does not show it. `pwd` is read only by [`writes_pwd`], to see
 /// whether a command writes `PWD`. `lastpipe` is set once a `BASHOPTS` or
 /// `SHELLOPTS` that may name `lastpipe` is set, which a bash the line
-/// starts reads at startup.
+/// starts reads at startup. `physical` says a `set -P` may have run.
 #[derive(Clone)]
 struct Vars {
     cdpath: Option<String>,
     home: Option<String>,
     pwd: Option<String>,
     lastpipe: bool,
+    physical: bool,
 }
 
 /// The variables [`Vars`] holds.
@@ -503,6 +504,7 @@ impl Vars {
             home: var("HOME"),
             pwd: None,
             lastpipe: false,
+            physical: false,
         }
     }
 
@@ -579,6 +581,7 @@ impl Vars {
             self.home = Some("$".into());
         }
         self.lastpipe |= other.lastpipe;
+        self.physical |= other.physical;
     }
 }
 
@@ -604,6 +607,7 @@ fn writes_pwd(argv: &[String], cwd: &std::path::Path) -> bool {
                 home: None,
                 pwd: Some(UNTRACKED.into()),
                 lastpipe: false,
+                physical: false,
             };
             set_vars(&cmd, &mut probe);
             if probe.pwd.as_deref() != Some(UNTRACKED) {
@@ -975,6 +979,7 @@ fn writes_tracked(cmd: &[&str]) -> bool {
         home: Some(mark.into()),
         pwd: Some(mark.into()),
         lastpipe: false,
+        physical: false,
     };
     set_vars(cmd, &mut vars);
     vars.cdpath.as_deref() != Some(mark)
@@ -1160,6 +1165,13 @@ fn set_vars(cmd: &[&str], vars: &mut Vars) {
     if special.contains(&name) {
         words[..front].iter().for_each(|w| vars.lose(w));
     }
+    if name == "set"
+        && args
+            .iter()
+            .any(|a| *a == "physical" || (a.starts_with('-') && a.contains('P')))
+    {
+        vars.physical = true;
+    }
 }
 
 /// Whether the arithmetic in `w` may assign `name`: an assignment
@@ -1251,12 +1263,28 @@ fn entered(
     set: &Vars,
     home: Option<&str>,
 ) -> Vec<std::path::PathBuf> {
-    let Some(&to) = args
+    let at = args
         .iter()
-        .find(|a| !a.starts_with(['-', '+']) || **a == "-")
-    else {
+        .position(|a| !a.starts_with(['-', '+']) || *a == "-");
+    // The last of `-L` and `-P` wins. Without either the shell takes `..`
+    // off by name, unless a `set -P` may have run.
+    let flag = args[..at.unwrap_or(args.len())]
+        .iter()
+        .filter(|a| a.starts_with('-'))
+        .flat_map(|a| a.chars())
+        .rfind(|c| matches!(c, 'L' | 'P'));
+    let forms = |p: std::path::PathBuf| {
+        let by_name = (flag != Some('P')).then(|| logical(&p));
+        let resolved = (flag == Some('P') || flag.is_none() && set.physical)
+            .then(|| p.canonicalize().unwrap_or(p));
+        by_name.into_iter().chain(resolved)
+    };
+    let Some(to) = at.map(|i| args[i]) else {
         let bare = home_from(set.home.as_deref(), dir);
-        return if pushd { None } else { bare }.into_iter().collect();
+        return if pushd { None } else { bare }
+            .into_iter()
+            .flat_map(forms)
+            .collect();
     };
     if to == "-" {
         return old.to_vec();
@@ -1273,20 +1301,24 @@ fn entered(
     if let Some(cdpath) = set.cdpath.as_deref().filter(|_| searched) {
         // The shell takes the first entry it can enter, an empty one being
         // `dir`, or else `dir`; an entry that names no directory the line
-        // shows may be any, and the walk goes on past it.
+        // shows may be any, and the walk goes on past it, as it does past
+        // one the line may enter only by name or only resolved.
         for entry in cdpath.split(':') {
             let d = path_from(entry, dir, home)
                 .unwrap_or_else(|| UNTRACKED.into())
                 .join(to);
             if is_untracked(&d) {
                 dirs.push(d);
-            } else if d.join(".").is_dir() {
-                dirs.push(d);
+                continue;
+            }
+            let (here, gone): (Vec<_>, Vec<_>) = forms(d).partition(|d| d.join(".").is_dir());
+            dirs.extend(here);
+            if gone.is_empty() {
                 return dirs;
             }
         }
     }
-    dirs.push(path);
+    dirs.extend(forms(path));
     dirs
 }
 
@@ -1303,6 +1335,26 @@ fn popd_args<'a>(args: &[&'a str]) -> Option<(Option<&'a str>, bool)> {
         }
     }
     Some((index, keep))
+}
+
+/// `path` with each `.` and `..` taken off by name, as a logical `cd`
+/// takes them. dash does so past a part that is not there, where bash
+/// fails the `cd`. An untracked path stays one.
+fn logical(path: &std::path::Path) -> std::path::PathBuf {
+    if is_untracked(path) {
+        return path.to_path_buf();
+    }
+    let mut out = std::path::PathBuf::new();
+    for c in path.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Whether `a` is a `pushd` stack index, `+N` or `-N`.
@@ -5647,7 +5699,8 @@ mod tests {
     /// The shell's `cd` takes `..` off the path by name unless it is told
     /// `-P`, so `lnk/..` is where the line started even when `lnk` links
     /// into `safe`. The last of `-L` and `-P` wins, and after `set -P`
-    /// either may hold. A `..` after a part that is not there fails.
+    /// either may hold. Past a part that is not there, bash stays where it
+    /// was and dash goes on, so both are read.
     #[cfg(unix)]
     #[test]
     fn a_cd_takes_dot_dot_off_by_name() {
@@ -5664,6 +5717,7 @@ mod tests {
             "pushd lnk/.. && make clean-all",
             "set -P; cd lnk/.. && make clean-all",
             "cd missing/../safe; make clean-all",
+            "export HOME=$(mktemp -d); cd ~/../.. && make clean-all",
         ] {
             assert_eq!(leaving("logical", line), Decision::Deny, "{line}");
         }
