@@ -1,0 +1,1 @@
+A `BASHOPTS` or `SHELLOPTS` set in front of a shell, or exported before it, to a value that names `lastpipe` or that the line does not show may turn `lastpipe` on in that shell, so `BASHOPTS=lastpipe bash -c "true | cd evil; make clean-all"` is refused.

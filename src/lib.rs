@@ -219,9 +219,10 @@ fn runner_commands(
     let mut ran_in = Vec::new();
     // `$PWD` follows the line's directory unless the line sets it.
     let pwd_set = writes_pwd(argv);
-    // With `shopt -s lastpipe` anywhere on the line, the last stage of a
-    // pipeline may run in this shell.
-    let lastpipe = commands(argv).iter().any(|c| may_set_lastpipe(c));
+    // With `shopt -s lastpipe` anywhere on the line, or a `BASHOPTS` the
+    // shell running it started with, the last stage of a pipeline may
+    // run in this shell.
+    let lastpipe = vars.lastpipe || commands(argv).iter().any(|c| may_set_lastpipe(c));
     for (cmd, end) in ended_commands(argv) {
         if after == "&" {
             (here, old, pushed, vars) = list.clone();
@@ -456,12 +457,15 @@ fn runner_commands(
 /// The `CDPATH` and `HOME` a command on the line sees: `None` where one is
 /// unset, and a value with `$` in it, which names no directory, where the
 /// line does not show it. `pwd` is read only by [`writes_pwd`], to see
-/// whether a command writes `PWD`.
+/// whether a command writes `PWD`. `lastpipe` is set once a `BASHOPTS` or
+/// `SHELLOPTS` that may name `lastpipe` is set, which a bash the line
+/// starts reads at startup.
 #[derive(Clone)]
 struct Vars {
     cdpath: Option<String>,
     home: Option<String>,
     pwd: Option<String>,
+    lastpipe: bool,
 }
 
 /// The variables [`Vars`] holds.
@@ -474,6 +478,7 @@ impl Vars {
             cdpath: var("CDPATH"),
             home: var("HOME"),
             pwd: None,
+            lastpipe: false,
         }
     }
 
@@ -494,6 +499,11 @@ impl Vars {
             return;
         };
         let (name, add) = name.strip_suffix('+').map_or((name, false), |n| (n, true));
+        if matches!(name, "BASHOPTS" | "SHELLOPTS")
+            && (v.contains("lastpipe") || v.contains(['$', '`', '*', '?', '[']))
+        {
+            self.lastpipe = true;
+        }
         if name.contains('[') {
             self.lose_target(name);
             return;
@@ -544,6 +554,7 @@ impl Vars {
         if self.home != other.home {
             self.home = Some("$".into());
         }
+        self.lastpipe |= other.lastpipe;
     }
 }
 
@@ -558,6 +569,7 @@ fn writes_pwd(argv: &[String]) -> bool {
             cdpath: None,
             home: None,
             pwd: Some(UNTRACKED.into()),
+            lastpipe: false,
         };
         set_vars(cmd, &mut probe);
         probe.pwd.as_deref() != Some(UNTRACKED)
