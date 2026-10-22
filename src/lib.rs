@@ -5056,6 +5056,22 @@ mod tests {
         }
     }
 
+    /// A command that writes `PWD` through the name an option holds
+    /// (`printf -vPWD`) sets it, so `$PWD` is no longer the line's
+    /// directory.
+    #[test]
+    fn an_option_that_names_pwd_sets_it() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "printf -vPWD %s {dir}; cd \"$PWD\" && make clean-all",
+            "wait -pPWD; cd \"$PWD\" && make test",
+            "printf -vPWD %s /x; export HOME=\"$PWD/project\"; cd ~ && make test",
+        ] {
+            let c = entering("pwd-option", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+    }
+
     /// `command`, `command -p` and `builtin` do not hide `cd`.
     #[test]
     fn follows_a_cd_behind_command_or_builtin() {
