@@ -7763,6 +7763,49 @@ fn nest_bump(kind: Nest, open: bool, depth: &mut [i32; 5]) {
     }
 }
 
+/// Whether `cmd` is a `case` arm's patterns and not the command the arm
+/// runs. The `|` after it separates patterns (`case z in a | b)`), so it
+/// is not the pipeline a `{ printf | read` opener starts.
+fn pure_case_pattern(cmd: &[String]) -> bool {
+    let closes = |p: &str| {
+        p == ")"
+            || (p.ends_with(')') && p.matches(')').count() > p.matches('(').count())
+            || (p.starts_with('(') && !p.starts_with("((") && p.ends_with(')'))
+    };
+    let mut saw_case = false;
+    let mut await_in = false;
+    let mut pattern = false;
+    let mut body = false;
+    for (wi, w) in cmd.iter().enumerate() {
+        let w = w.as_str();
+        if !saw_case {
+            if is_assignment(w) {
+                continue;
+            }
+            if w != "case" {
+                return false;
+            }
+            saw_case = true;
+            await_in = true;
+            continue;
+        }
+        if pattern {
+            if closes(w) {
+                pattern = false;
+                if wi + 1 < cmd.len() {
+                    body = true;
+                }
+            }
+            continue;
+        }
+        if w == "in" && await_in {
+            await_in = false;
+            pattern = true;
+        }
+    }
+    saw_case && pattern && !body
+}
+
 /// The command that closes the compound `ended[i]` opens, or `i` when
 /// it is a simple command. The scan stays inside `[i, hi)`.
 fn compound_end(ended: &[(Vec<String>, String)], i: usize, hi: usize) -> usize {
@@ -7786,6 +7829,8 @@ fn compound_end(ended: &[(Vec<String>, String)], i: usize, hi: usize) -> usize {
 /// The last stage is this shell only after `lastpipe` may be on. A
 /// `(...)` group and a command ended by `&` are their own shell too.
 /// The body of `while` stays in the shell that runs the `while`.
+/// A compound opener is the first stage when its separator is `|`
+/// (`{ printf | read`), so that stage's successor stays in its own shell.
 fn command_shells(ended: &[(Vec<String>, String)]) -> Vec<u32> {
     let n = ended.len();
     let mut shells = vec![0u32; n];
@@ -7815,7 +7860,19 @@ fn walk_shells(
     let mut i = lo;
     while i < hi {
         let end = compound_end(ended, i, hi).min(hi.saturating_sub(1));
-        let sep_before = if i > lo { ended[i - 1].1.as_str() } else { "" };
+        // The first command of a compound body still has a separator.
+        // The opener is the command before it (`{ printf`, `if printf`,
+        // `while printf`, `case … printf`), and a trailing `|` is the
+        // pipeline that command started. Dropping it put `read` back in
+        // the shell that follows the group. A `|` that only splits `case`
+        // patterns is not a pipeline. The top of the line has nothing
+        // before it. `!`, `time` and `&&` / `||` do not open a body, so
+        // their `|` is already the separator of the command it follows.
+        let sep_before = if i > lo || (lo > 0 && i == lo && !pure_case_pattern(&ended[i - 1].0)) {
+            ended[i - 1].1.as_str()
+        } else {
+            ""
+        };
         let sep_after = ended[end].1.as_str();
         let in_pipe = sep_before == "|" || sep_after == "|";
         let last = in_pipe && sep_after != "|";
@@ -18345,6 +18402,8 @@ hash -r 2> /dev/null
 
     /// A `read` counts only in the shell that runs it, and only for a
     /// command after it. A pipeline stage is a subshell until `lastpipe`.
+    /// The opener of `{`, `if`, `while`, `until` or `case` is that first
+    /// stage when a `|` follows it.
     #[test]
     fn a_read_in_another_shell_keeps_the_earlier_value() {
         let v = |s: &str| verdict(&shell_words(s));
@@ -18352,6 +18411,15 @@ hash -r 2> /dev/null
             "x=/; printf '/tmp/a\\n' | read x; rm -rf \"$x\"",
             "x=/; rm -rf \"$x\"; read x <<< /tmp/a",
             "x=/; printf '/tmp/a\\n' | while read x; do :; done; rm -rf \"$x\"",
+            "x=/; { printf '/tmp/a\\n' | read x; }; rm -rf \"$x\"",
+            "x=/; if printf '/tmp/a\\n' | read x; then :; fi; rm -rf \"$x\"",
+            "x=/; while printf '/tmp/a\\n' | read x; do break; done; rm -rf \"$x\"",
+            "x=/; until ! printf '/tmp/a\\n' | read x; do break; done; rm -rf \"$x\"",
+            "x=/; f() { printf '/tmp/a\\n' | read x; }; f; rm -rf \"$x\"",
+            "x=/; true && printf '/tmp/a\\n' | read x; rm -rf \"$x\"",
+            "x=/; { { printf '/tmp/a\\n' | read x; }; }; rm -rf \"$x\"",
+            "x=/; {\n{ printf '/tmp/a\\n' | read x; }; }; rm -rf \"$x\"",
+            "x=/; case z in z) printf '/tmp/a\\n' | read x ;; esac; rm -rf \"$x\"",
         ] {
             assert_eq!(v(line), "deny\trm-rf-outside-tmp", "{line}");
         }
@@ -18363,6 +18431,34 @@ hash -r 2> /dev/null
             v("shopt -s lastpipe; x=/; printf '/tmp/a\\n' | read x; rm -rf \"$x\""),
             "allow"
         );
+        assert_eq!(
+            v("shopt -s lastpipe; x=/; { printf '/tmp/a\\n' | read x; }; rm -rf \"$x\""),
+            "allow"
+        );
+        assert_eq!(
+            v("x=/; case z in a) read x <<< /tmp/a ;; esac; rm -rf \"$x\""),
+            "allow"
+        );
+        assert_eq!(
+            v("x=/; ( printf '/tmp/a\\n' | read x ); rm -rf \"$x\""),
+            "deny\trm-rf-outside-tmp"
+        );
+        assert_eq!(
+            v("x=/; ( printf '/tmp/a\\n' | read x; rm -rf \"$x\" )"),
+            "allow"
+        );
+        for line in [
+            "x=/; time { printf '/tmp/a\\n' | read x; }; rm -rf \"$x\"",
+            "x=/; ! { printf '/tmp/a\\n' | read x; }; rm -rf \"$x\"",
+            "x=/; true && { printf '/tmp/a\\n' | read x; }; rm -rf \"$x\"",
+            "x=/; false || printf '/tmp/a\\n' | read x; rm -rf \"$x\"",
+            "x=/; { printf '/tmp/a\\n' | cat | read x; }; rm -rf \"$x\"",
+            "x=/; for n in a; do printf '/tmp/a\\n' | read x; done; rm -rf \"$x\"",
+            "x=/tmp/a; { read x <<< /; }; rm -rf \"$x\"",
+            "x=/; case z in a | b) read x <<< /tmp/a ;; esac; rm -rf \"$x\"",
+        ] {
+            assert_eq!(v(line), "deny\trm-rf-outside-tmp", "{line}");
+        }
     }
 
     /// Each name takes one field. The last keeps the rest of the line.
