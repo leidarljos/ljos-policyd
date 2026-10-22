@@ -668,6 +668,7 @@ fn wire_rewritten(raw: &str) -> bool {
 fn address_denied(addr: &NormAddr, config: &Config) -> bool {
     for (local, domain) in alias_forms(&addr.local, &addr.domain, &config.aliases) {
         let seps = separators(&domain, config);
+        let cut = families_of(&domain, &config.aliases).any(|f| f.cut);
         for rule in &config.deny_addresses {
             let Some((rule_local, rule_domain)) = rule.split_once('@') else {
                 continue;
@@ -675,7 +676,11 @@ fn address_denied(addr: &NormAddr, config: &Config) -> bool {
             if domain != rule_domain {
                 continue;
             }
-            if local == rule_local || is_subaddress(rule_local, &local, &seps) {
+            let base = match rule_local.find(|c| cut && seps.contains(c)) {
+                Some(at) => &rule_local[..at],
+                None => rule_local,
+            };
+            if local == rule_local || local == base || is_subaddress(base, &local, &seps) {
                 return true;
             }
         }
@@ -703,7 +708,9 @@ fn is_subaddress(rule_local: &str, local: &str, seps: &str) -> bool {
 /// separators are added to the `subaddress` line on those domains.
 /// `shared` makes the domains one mailbox, `dots` ignores dots in the
 /// local part, and `subdomain` reads `<anything>@<user>.<domain>` as
-/// `<user>@<domain>`. Every entry only widens what an address rule
+/// `<user>@<domain>`. `cut` also cuts the rule's own local part at the
+/// first separator, so a rule naming one disposable address covers
+/// every address with that base. Every entry only widens what an address rule
 /// covers, so a wrong entry over-blocks and cannot allow a recipient.
 const ALIAS_FAMILIES: &[&str] = &[
     // Dots do not matter, and gmail.com and googlemail.com are the same:
@@ -713,6 +720,27 @@ const ALIAS_FAMILIES: &[&str] = &[
     // Plus and subdomain addressing, one subdomain level only:
     // https://www.fastmail.help/hc/en-us/articles/360060591053-Plus-addressing-and-subdomain-addressing
     "fastmail.com + subdomain",
+    // Plus addressing only. The domains and their country variants are
+    // separate mailboxes, so none of them is shared:
+    // https://support.microsoft.com/en-us/outlook/send-email-from-a-different-address-in-outlook-com
+    "outlook.com,hotmail.com,live.com,msn.com +",
+    "outlook.fr,outlook.de,outlook.es,outlook.it,outlook.jp +",
+    "hotmail.co.uk,hotmail.fr,hotmail.de,hotmail.es,hotmail.it +",
+    "live.co.uk,live.fr,live.de,live.it,live.nl,live.ca +",
+    // One account across the four Proton domains, with plus aliases:
+    // https://proton.me/support/mail
+    // https://proton.me/support/addresses-and-aliases
+    "proton.me,protonmail.com,protonmail.ch,pm.me + shared",
+    // One account across the three Apple domains. Apple does not
+    // document plus addressing, and + is cut anyway, which can only
+    // over-block:
+    // https://support.apple.com/en-us/118230
+    "icloud.com,me.com,mac.com + shared",
+    // Disposable addresses are `<base>-<keyword>`, so a denied
+    // disposable address denies its base and every keyword on it:
+    // https://help.yahoo.com/kb/SLN36718.html
+    "yahoo.com,yahoo.co.uk,yahoo.fr,yahoo.de,yahoo.es,yahoo.it,yahoo.ca,yahoo.com.au - cut",
+    "ymail.com,rocketmail.com - cut",
 ];
 
 struct AliasFamily {
@@ -721,6 +749,7 @@ struct AliasFamily {
     shared: bool,
     dots: bool,
     subdomain: bool,
+    cut: bool,
 }
 
 fn builtin_families() -> Option<Vec<AliasFamily>> {
@@ -749,12 +778,14 @@ fn alias_family(value: &str) -> Option<AliasFamily> {
         shared: false,
         dots: false,
         subdomain: false,
+        cut: false,
     };
     for flag in parts {
         let slot = match flag {
             "shared" => &mut family.shared,
             "dots" => &mut family.dots,
             "subdomain" => &mut family.subdomain,
+            "cut" => &mut family.cut,
             _ => return None,
         };
         *slot = true;
@@ -1706,6 +1737,45 @@ pair left right
         );
         assert!(codes(&plain("To: x@a.user.fastmail.com\r\n"), fast, "").is_empty());
         assert!(codes(&plain("To: other@fastmail.com\r\n"), fast, "").is_empty());
+    }
+
+    /// Proton and Apple domains are one mailbox each. Microsoft domains
+    /// are not, and only cut on `+`. A Yahoo rule covers every
+    /// disposable address on its base.
+    #[test]
+    fn provider_alias_families_cover_their_aliases() {
+        let denied = |to: &str, deny: &str| {
+            codes_with(&plain(&format!("To: {to}\r\n")), deny, "", "subaddress =\n")
+                == vec!["recipient-address-denied"]
+        };
+        let proton = "address bad@proton.me\n";
+        for to in ["bad@pm.me", "bad+x@protonmail.ch", "bad+x@protonmail.com"] {
+            assert!(denied(to, proton), "{to}");
+        }
+        assert!(!denied("bad@gmail.com", proton));
+        let apple = "address bad@me.com\n";
+        for to in ["bad@icloud.com", "bad+x@mac.com"] {
+            assert!(denied(to, apple), "{to}");
+        }
+        let outlook = "address bad@outlook.com\n";
+        assert!(denied("bad+x@outlook.com", outlook));
+        assert!(!denied("bad@hotmail.com", outlook));
+        assert!(!denied("bad-x@outlook.com", outlook));
+        assert!(denied("bad+x@hotmail.co.uk", "address bad@hotmail.co.uk\n"));
+        let yahoo = "address base-shop@yahoo.com\n";
+        for to in [
+            "base-shop@yahoo.com",
+            "base-other@yahoo.com",
+            "base@yahoo.com",
+        ] {
+            assert!(denied(to, yahoo), "{to}");
+        }
+        assert!(!denied("based-x@yahoo.com", yahoo));
+        assert!(!denied("base-x@ymail.com", yahoo));
+        assert!(denied("bad-x@yahoo.co.uk", "address bad@yahoo.co.uk\n"));
+        let fast = "address user@fastmail.com\n";
+        assert!(denied("user+x@fastmail.com", fast));
+        assert!(denied("x@user.fastmail.com", fast));
     }
 
     #[test]

@@ -251,8 +251,16 @@ domain, dots in the local part are ignored, and ``+`` is a
 separator. On ``fastmail.com``, ``+`` is a separator and a
 mailbox at ``<local>@<user>.fastmail.com`` (one label, then
 ``fastmail.com``) is ``<user>@fastmail.com``. A hyphen in that
-label is part of the user name. Domain rules and ``From`` are
-not matched this way. A domain literal (an
+label is part of the user name. ``proton.me``,
+``protonmail.com``, ``protonmail.ch`` and ``pm.me`` are one
+domain, and so are ``icloud.com``, ``me.com`` and ``mac.com``,
+each with ``+``. ``outlook.com``, ``hotmail.com``, ``live.com``,
+``msn.com`` and their country variants are separate domains, each
+with ``+``. On ``yahoo.com``, its country variants, ``ymail.com``
+and ``rocketmail.com``, ``-`` is a separator, and an address rule
+is also cut at its first separator, so a rule for one disposable
+address ``<base>-<keyword>`` covers ``<base>`` and every keyword.
+Domain rules and ``From`` are not matched this way. A domain literal (an
 address at ``@[ ... ]``) in a watched header is a refusal. An
 all-numeric domain is a refusal, judged after IDNA. That
 includes a dotted quad, a shorter form ``inet_aton`` accepts,
