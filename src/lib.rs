@@ -115,32 +115,97 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
     table
 }
 
-/// Every simple command the line runs, wrappers off, with the directory it
-/// runs in: the line split on its separators, then each `-c` script,
+/// How many directories the commands after a `cd` that may have failed
+/// are read in. Past this, a further `cd` drops the ones it leaves.
+const MAX_DIRS: usize = 16;
+
+/// Add each of `dirs` that `set` lacks, while it holds fewer than
+/// [`MAX_DIRS`].
+fn add_dirs(set: &mut Vec<std::path::PathBuf>, dirs: impl IntoIterator<Item = std::path::PathBuf>) {
+    for d in dirs {
+        if set.len() < MAX_DIRS && !set.contains(&d) {
+            set.push(d);
+        }
+    }
+}
+
+/// Every simple command the line runs, wrappers off, with each directory
+/// it may run in: the line split on its separators, then each `-c` script,
 /// `eval` and wrapper inside it, down to [`MAX_DEPTH`]. A `cd`, `pushd`
-/// or `popd` moves the commands after it on the same line; a script
-/// nested in the line starts from `cwd`.
+/// or `popd` moves the commands after it on the same line, unless it runs
+/// in a subshell: a stage of a pipeline, or a list sent to the background
+/// with `&`. The line goes on past a `cd` that fails at a `;` or `||`, so
+/// the commands there are read both where it went and where it was. A
+/// script nested in the line starts where the command that runs it does.
 fn runner_commands(
     argv: &[String],
     cwd: &std::path::Path,
     depth: usize,
     out: &mut Vec<(Vec<String>, std::path::PathBuf)>,
 ) {
-    let mut dir = cwd.to_path_buf();
-    let mut pushed = Vec::new();
-    let mut own = Vec::new();
-    for cmd in commands(argv) {
-        let b = base_of(cmd[0]);
+    // Every directory the next command may run in. A `cd` before `&&`
+    // holds for the commands after it, and the directories it left wait
+    // in `failed` for the next `;` or `||`.
+    let mut here = vec![cwd.to_path_buf()];
+    let mut failed = Vec::new();
+    // Each `pushd`'s directories, and whether it surely ran.
+    let mut pushed: Vec<(Vec<std::path::PathBuf>, bool)> = Vec::new();
+    // Where the list now running started, for a `&` to put back.
+    let mut list = (here.clone(), pushed.clone());
+    let mut after = ";";
+    let mut ran_in = Vec::new();
+    for (cmd, end) in ended_commands(argv) {
+        if after == "&" {
+            (here, pushed) = list.clone();
+            failed.clear();
+        }
+        if matches!(after, ";" | "||") {
+            add_dirs(&mut here, failed.drain(..));
+            for p in &mut pushed {
+                p.1 = false;
+            }
+        }
+        if matches!(after, ";" | "&") {
+            list = (here.clone(), pushed.clone());
+        }
+        let piped = after == "|" || end == "|";
+        // A `cd` before `&&` holds for what runs after it, unless a `||`
+        // before it may have skipped it.
+        let gates = end == "&&" && after != "||";
+        after = end;
+        ran_in.push(here.clone());
+        // An assignment in front of a builtin is set for that command
+        // alone: `FOO=1 cd dir` still moves the shell.
+        let words = &cmd[cmd.iter().take_while(|w| is_assignment(w)).count()..];
+        let b = words.first().map_or("", |w| base_of(w));
+        if piped && matches!(b, "cd" | "pushd" | "popd") {
+            continue;
+        }
         if b == "popd" {
-            dir = pushed.pop().unwrap_or(dir);
+            if let Some((back, sure)) = pushed.pop() {
+                let now = std::mem::replace(&mut here, back);
+                if !sure {
+                    add_dirs(&mut here, now);
+                }
+            }
             continue;
         }
         if b == "cd" || b == "pushd" {
-            if let Some(to) = entered(&cmd[1..], &dir, b == "pushd") {
-                let from = std::mem::replace(&mut dir, to);
+            // A `cd` that may have failed keeps the directories it left,
+            // and one into a directory that is not there moves nothing.
+            let mut to = Vec::new();
+            add_dirs(
+                &mut to,
+                here.iter()
+                    .filter_map(|d| entered(&words[1..], d, b == "pushd"))
+                    .filter(|d| gates || d.is_dir()),
+            );
+            if !to.is_empty() {
+                let from = std::mem::replace(&mut here, to);
                 if b == "pushd" {
-                    pushed.push(from);
+                    pushed.push((from.clone(), gates));
                 }
+                add_dirs(if gates { &mut failed } else { &mut here }, from);
             }
             continue;
         }
@@ -149,19 +214,20 @@ fn runner_commands(
         if run.is_empty() {
             continue;
         }
-        if !out.iter().any(|(r, d)| *r == run && *d == dir) {
-            out.push((run.clone(), dir.clone()));
+        for dir in &here {
+            if !out.iter().any(|(r, d)| *r == run && d == dir) {
+                out.push((run.clone(), dir.clone()));
+            }
         }
-        own.push(run);
     }
     if depth >= MAX_DEPTH {
         return;
     }
-    // This line's own commands are already in `out` with their directory;
-    // read again from `cwd`, they would be judged in the wrong one.
-    for inner in inner_commands(argv) {
-        if inner.as_slice() != argv && !own.contains(&inner) {
-            runner_commands(&inner, cwd, depth + 1, out);
+    for (i, inner) in inner_commands_at(argv) {
+        if inner.as_slice() != argv {
+            for dir in &ran_in[i] {
+                runner_commands(&inner, dir, depth + 1, out);
+            }
         }
     }
 }
@@ -222,11 +288,20 @@ fn host_argv_table_at(argv: &[String], depth: usize, moved: bool) -> Checked {
 /// The commands a line runs once separators are split, wrapper words are
 /// taken off, and a shell's `-c` script is read as its own line.
 fn inner_commands(argv: &[String]) -> Vec<Vec<String>> {
+    inner_commands_at(argv)
+        .into_iter()
+        .map(|(_, c)| c)
+        .collect()
+}
+
+/// [`inner_commands`], each with the index in [`commands`] of the command
+/// it comes from.
+fn inner_commands_at(argv: &[String]) -> Vec<(usize, Vec<String>)> {
     let mut out = Vec::new();
     // `g=git; $g push -f`: a bare assignment earlier on the line names what
     // a later `$g` or `${g}` command word runs.
     let mut names: Vec<(String, String)> = Vec::new();
-    for cmd in commands(argv) {
+    for (i, cmd) in commands(argv).into_iter().enumerate() {
         if cmd.iter().all(|w| is_assignment(w)) {
             for w in &cmd {
                 if let Some((k, v)) = w.split_once('=') {
@@ -258,35 +333,35 @@ fn inner_commands(argv: &[String]) -> Vec<Vec<String>> {
                 .collect::<Vec<_>>()
                 .as_slice()
         {
-            out.push(owned.clone());
+            out.push((i, owned.clone()));
         }
         let (run, handed) = unwrap_wrappers(&owned);
         if let Some(code) = inline_program(run) {
             for s in program_shell_strings(code) {
-                out.extend(script_lines(&s, 0).iter().map(|l| shell_words(l)));
+                out.extend(script_lines(&s, 0).iter().map(|l| (i, shell_words(l))));
             }
         }
         if let Some(script) = handed {
-            out.extend(script_lines(script, 0).iter().map(|l| shell_words(l)));
+            out.extend(script_lines(script, 0).iter().map(|l| (i, shell_words(l))));
             continue;
         }
         if run.is_empty() {
             continue;
         }
         if let Some(inside) = container_command(run) {
-            out.push(inside);
+            out.push((i, inside));
         }
         if let Some(script) = shell_script(run) {
-            out.extend(script_lines(script, 0).iter().map(|l| shell_words(l)));
+            out.extend(script_lines(script, 0).iter().map(|l| (i, shell_words(l))));
         } else if base_of(&run[0]) == "eval" {
             // eval joins its words with spaces and runs that as a script.
             out.extend(
                 script_lines(&run[1..].join(" "), 0)
                     .iter()
-                    .map(|l| shell_words(l)),
+                    .map(|l| (i, shell_words(l))),
             );
         } else {
-            out.push(run.to_vec());
+            out.push((i, run.to_vec()));
         }
     }
     out
@@ -638,7 +713,8 @@ fn shell_script(run: &[String]) -> Option<&str> {
 
 /// A script split into words the way a shell would: quotes group, a
 /// backslash escapes the next character outside single quotes, and `;`,
-/// `&&`, `||` and `|` stand as words of their own.
+/// `&&`, `||`, `|` and `&` stand as words of their own. The `&` of a
+/// redirection (`2>&1`, `<&3`, `&>log`) stays in its word.
 fn shell_words(script: &str) -> Vec<String> {
     let chars: Vec<char> = script.chars().collect();
     let mut out = Vec::new();
@@ -671,6 +747,14 @@ fn shell_words(script: &str) -> Vec<String> {
             }
             '"' if !single => {
                 double = !double;
+                word = true;
+            }
+            '&' if !single
+                && !double
+                && ((word && cur.ends_with(['>', '<']))
+                    || (!word && chars.get(i) == Some(&'>'))) =>
+            {
+                cur.push('&');
                 word = true;
             }
             c if !single && !double && (c.is_whitespace() || matches!(c, ';' | '|' | '&')) => {
@@ -1932,22 +2016,30 @@ fn decoded_exec(argv: &[String]) -> bool {
 /// Split a hooked line into its commands at shell separators. A token
 /// ending in `;` closes its command.
 fn commands(argv: &[String]) -> Vec<Vec<&str>> {
-    let mut out: Vec<Vec<&str>> = vec![Vec::new()];
+    ended_commands(argv).into_iter().map(|(c, _)| c).collect()
+}
+
+/// [`commands`], each with the separator that ends it: `;`, `&&`, `||`,
+/// `|`, `&`, or nothing at the end of the line.
+fn ended_commands(argv: &[String]) -> Vec<(Vec<&str>, &str)> {
+    let mut out: Vec<(Vec<&str>, &str)> = vec![(Vec::new(), "")];
     for a in argv.iter().map(String::as_str) {
         if matches!(a, ";" | "&&" | "||" | "|" | "&") {
-            out.push(Vec::new());
+            out.last_mut().expect("one command").1 = a;
+            out.push((Vec::new(), ""));
             continue;
         }
         let closes = a.ends_with(';');
         let tok = a.trim_end_matches(';');
         if !tok.is_empty() {
-            out.last_mut().expect("one command").push(tok);
+            out.last_mut().expect("one command").0.push(tok);
         }
         if closes {
-            out.push(Vec::new());
+            out.last_mut().expect("one command").1 = ";";
+            out.push((Vec::new(), ""));
         }
     }
-    out.retain(|c| !c.is_empty());
+    out.retain(|(c, _)| !c.is_empty());
     out
 }
 
@@ -3585,6 +3677,121 @@ mod tests {
         ] {
             let c = entering("none-cd", &files, line);
             assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+    }
+
+    /// `line` checked from a directory whose Makefile is `MAKEFILE`, beside
+    /// a `safe` project whose `clean-all` only echoes. `missing` is absent.
+    fn leaving(name: &str, line: &str) -> Decision {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(root.join("safe")).expect("dir");
+        std::fs::write(root.join("Makefile"), MAKEFILE).expect("write");
+        std::fs::write(root.join("safe/Makefile"), "clean-all:\n\techo clean\n").expect("write");
+        check_shell_in(&shell_words(line), &root, 0).decision
+    }
+
+    /// A `cd` sent to the background, or run as a pipeline stage, moves
+    /// only its own subshell: the runner after it reads the Makefile here.
+    #[test]
+    fn reads_here_past_a_cd_in_a_subshell() {
+        for line in [
+            "cd safe & make clean-all",
+            "cd safe && true & make clean-all",
+            "cd safe | true && make clean-all",
+            "true | cd safe && make clean-all",
+            "cd safe | make clean-all",
+            "pushd safe | true; make clean-all",
+        ] {
+            assert_eq!(leaving("bg-cd", line), Decision::Deny, "{line}");
+        }
+        for line in ["cd safe && make clean-all", "cd safe && make clean-all &"] {
+            assert_eq!(leaving("bg-cd", line), Decision::Allow, "{line}");
+        }
+    }
+
+    /// An assignment in front of `cd`, `pushd` or `popd` does not hide it.
+    #[test]
+    fn follows_a_cd_behind_an_assignment() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "FOO=1 cd project && make clean-all",
+            "A=1 B=2 pushd project && make clean-all",
+        ] {
+            let c = entering("assign-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        let c = entering(
+            "assign-cd",
+            &files,
+            "pushd project && FOO=1 popd && make clean-all",
+        );
+        assert_eq!(c.decision, Decision::Allow);
+    }
+
+    /// A script the line hands a shell, `eval` or a named command word runs
+    /// where the line has moved to by then.
+    #[test]
+    fn reads_a_nested_script_where_the_line_enters() {
+        let files = [("Makefile", MAKEFILE), ("package.json", PACKAGE)];
+        for line in [
+            "cd project && bash -lc 'make clean-all'",
+            "cd project && env FOO=1 sh -c 'true; npm run nuke'",
+            "pushd project && eval make clean-all",
+            "m=make; cd project && $m clean-all",
+        ] {
+            let c = entering("nested-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        let c = entering(
+            "nested-cd",
+            &files,
+            "bash -lc 'make clean-all' && cd project",
+        );
+        assert_eq!(c.decision, Decision::Allow);
+    }
+
+    /// The line goes on past a `cd` that fails at a `;` or `||`, so the
+    /// runner after it is read where the `cd` went and where it was.
+    #[test]
+    fn reads_both_directories_past_a_cd_that_may_fail() {
+        for line in [
+            "cd missing ; make clean-all",
+            "cd missing; make clean-all",
+            "cd missing || make clean-all",
+            "cd safe ; make clean-all",
+            "cd safe && true ; make clean-all",
+            "true || cd safe && make clean-all",
+            "pushd safe && pushd missing ; popd ; make clean-all",
+            "cd missing ; bash -c 'make clean-all'",
+            "cd m1; cd m2; cd m3; cd m4; cd m5; cd m6; cd safe; make clean-all",
+        ] {
+            assert_eq!(leaving("fail-cd", line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "cd safe && make clean-all",
+            "cd missing && make clean-all",
+            "cd safe && true && make clean-all",
+            "cd safe && pushd .. && popd && make clean-all",
+        ] {
+            assert_eq!(leaving("fail-cd", line), Decision::Allow, "{line}");
+        }
+    }
+
+    /// The `&` of a redirection does not send the `cd` before it to the
+    /// background.
+    #[test]
+    fn keeps_a_redirection_ampersand_in_its_word() {
+        assert_eq!(
+            shell_words("make 2>&1 >&2 <&3 &>log x & y |& z"),
+            ["make", "2>&1", ">&2", "<&3", "&>log", "x", "&", "y", "|", "&", "z"]
+        );
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "sh -c 'pushd project >/dev/null 2>&1 && make clean-all'",
+            "sh -c 'cd project &>/dev/null && make clean-all'",
+        ] {
+            let c = entering("redir-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
         }
     }
 
