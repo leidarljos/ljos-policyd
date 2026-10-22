@@ -2393,9 +2393,11 @@ fn eval_text_keeps(
         }
         // `eval $ac_prev=\$x` with `ac_prev` empty is `=...`. The `=` is
         // part of the command name, not `cd`.
-        if c.iter()
-            .all(|w| is_assignment(w) || (w.starts_with('=') && !w.contains([';', '|', '&', '\n'])))
-        {
+        if c.iter().all(|w| {
+            is_assignment(w)
+                || built_assignment(w)
+                || (w.starts_with('=') && !w.contains([';', '|', '&', '\n']))
+        }) {
             return true;
         }
         if assigned_command_keeps(c, values) || shown_eval_keeps(c, values, depth + 1) {
@@ -2403,6 +2405,42 @@ fn eval_text_keeps(
         }
         !bare_unseen(c)
     })
+}
+
+/// `NAME=value` in an `eval` script where NAME is built from shell-name
+/// characters and `$name` or `${name}`, as in `enable_$ac_useropt=no`.
+/// Whatever the name holds, the word assigns or runs a command whose
+/// name holds `=`, and neither is `cd`. A value with a substitution is
+/// not this.
+fn built_assignment(w: &str) -> bool {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let Some((mut name, value)) = w.split_once('=') else {
+        return false;
+    };
+    if name.is_empty() || value.contains(['`', ';', '|', '&', '\n']) || value.contains("$(") {
+        return false;
+    }
+    while !name.is_empty() {
+        let (var, rest) = if let Some(r) = name.strip_prefix("${") {
+            let Some(end) = r.find('}') else {
+                return false;
+            };
+            (&r[..end], &r[end + 1..])
+        } else if let Some(r) = name.strip_prefix('$') {
+            let end = r.find(|c: char| !ident(c)).unwrap_or(r.len());
+            (&r[..end], &r[end..])
+        } else if name.starts_with(ident) {
+            name = &name[1..];
+            continue;
+        } else {
+            return false;
+        };
+        if var_name(var).is_none() {
+            return false;
+        }
+        name = rest;
+    }
+    true
 }
 
 fn assigned_command_keeps(
@@ -15235,6 +15273,34 @@ hash -r 2> /dev/null
             "eval cd evil; make clean-all",
         ] {
             assert_eq!(evil_and_safe("evalname", line), Decision::Deny, "{line}");
+        }
+    }
+
+    /// `eval enable_$ac_useropt=no` assigns to a name built from a value
+    /// the line does not show, here from `expr` and `sed`. The text is a
+    /// lone `NAME=value` word, so it is an assignment or a command whose
+    /// name holds `=`, and neither is `cd`. Any other word, or a value
+    /// with a substitution, still drops the directory.
+    #[test]
+    fn an_eval_of_a_built_name_is_an_assignment() {
+        for line in [
+            "ac_useropt=`expr \"x$ac_option\" : 'x-*disable-\\(.*\\)'`; eval enable_$ac_useropt=no; make -C safe test",
+            "ac_useropt=`printf '%s\\n' \"$ac_useropt\" | sed 's/[-+.]/_/g'`; eval enable_$ac_useropt=\\$ac_optarg; make -C safe test",
+            "eval with_${ac_useropt}_x=no; make -C safe test",
+            "eval \\$ac_prev=\\$ac_option; make -C safe test",
+        ] {
+            assert_eq!(evil_and_safe("evalbuilt", line), Decision::Allow, "{line}");
+        }
+        for line in [
+            "eval enable_$x=no $y; make clean-all",
+            "eval enable_$x=no; $y; make clean-all",
+            "eval enable_$x-y=no; make clean-all",
+            "eval enable_$x=`cd evil`; make clean-all",
+            "eval enable_$x=$(cd evil); make clean-all",
+            "eval \\$x; make clean-all",
+            "eval enable_$x=no \\; cd evil; make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("evalbuilt", line), Decision::Deny, "{line}");
         }
     }
 }
