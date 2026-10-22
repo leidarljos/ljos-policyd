@@ -220,7 +220,8 @@ fn runner_commands(
     let pwd_set = argv.iter().any(|w| may_set(w, "PWD"));
     // With `shopt -s lastpipe` anywhere on the line, the last stage of a
     // pipeline may run in this shell.
-    let lastpipe = argv.iter().any(|w| w == "lastpipe");
+    let lastpipe =
+        argv.iter().any(|w| w == "lastpipe") || commands(argv).iter().any(|c| may_set_lastpipe(c));
     for (cmd, end) in ended_commands(argv) {
         if after == "&" {
             (here, old, pushed, vars) = list.clone();
@@ -539,6 +540,22 @@ fn may_set(w: &str, name: &str) -> bool {
             && !post.starts_with(ident)
             && (!pre.ends_with(['$', '{']) || post.starts_with('=') || post.starts_with(":="))
     })
+}
+
+/// Whether the command `cmd` may turn on `lastpipe` without naming it: a
+/// `shopt` with a word the line does not show (`shopt -s $opt`, `shopt
+/// -s last*`), or a command word it does not show, which may be `shopt`.
+fn may_set_lastpipe(cmd: &[&str]) -> bool {
+    let unshown = |w: &&str| w.contains(['$', '`', '*', '?', '[', '{']);
+    let words = operands(cmd);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    match peel_cd_command_word(&words[front..]).split_first() {
+        Some((w, args)) if base_of(w) == "shopt" => args.iter().any(unshown),
+        Some((w, _)) => unshown(w),
+        None => false,
+    }
 }
 
 /// `w` with each `$PWD` and `${PWD}` in it read as `pwd`, the one

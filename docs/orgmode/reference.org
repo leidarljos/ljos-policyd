@@ -103,7 +103,8 @@ while =popd -n=, =popd +N= and =popd -N= drop an entry and stay. An
 index that counts past a =pushd= that may have failed may name any
 directory on the stack. A =popd= that fails, on a word it does not take
 (=popd x=) or with nothing left to pop (after =dirs -c=), leaves the
-line in a directory it does not follow. Under =shopt -s lastpipe= a
+line in a directory it does not follow. Under =shopt -s lastpipe=, or
+a =shopt= with a word the line does not show (=shopt -s $opt=), a
 =cd=, =pushd= or =popd= in the last stage of a pipeline does the same,
 and a =dirs= there leaves the stack not followed.
 
