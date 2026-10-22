@@ -621,7 +621,9 @@ fn set_vars(cmd: &[&str], vars: &mut Vars) {
     }
     // `((...))` and `$((...))` evaluate here and may assign what they name.
     for w in cmd.iter().filter(|w| w.contains("((")) {
-        vars.lose(w);
+        for name in VAR_NAMES.into_iter().filter(|n| arith_writes(w, n)) {
+            vars.lose_target(name);
+        }
     }
     let words = operands(cmd);
     let front = (0..words.len())
@@ -664,6 +666,36 @@ fn set_vars(cmd: &[&str], vars: &mut Vars) {
     if special.contains(&name) {
         words[..front].iter().for_each(|w| vars.lose(w));
     }
+}
+
+/// Whether the arithmetic in `w` may assign `name`: an assignment
+/// operator after it, past any subscript (`HOME=5`, `HOME <<= 1`,
+/// `HOME[0]=1`), or `++` or `--` next to it. Reading it (`$((HOME))`,
+/// `HOME == 1`) does not.
+fn arith_writes(w: &str, name: &str) -> bool {
+    const OPS: [&str; 10] = ["+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "^=", "|="];
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    w.match_indices(name).any(|(i, _)| {
+        let (pre, post) = (&w[..i], &w[i + name.len()..]);
+        if pre.ends_with(ident) || post.starts_with(ident) {
+            return false;
+        }
+        let pre = pre.trim_end();
+        let mut post = post.trim_start();
+        if post.starts_with('[') {
+            // A subscript that does not close may hide anything.
+            let Some(j) = post.find(']') else {
+                return true;
+            };
+            post = post[j + 1..].trim_start();
+        }
+        pre.ends_with("++")
+            || pre.ends_with("--")
+            || post.starts_with("++")
+            || post.starts_with("--")
+            || (post.starts_with('=') && !post.starts_with("=="))
+            || OPS.iter().any(|op| post.starts_with(op))
+    })
 }
 
 /// The words naming what the command `name` with `args` writes in the
