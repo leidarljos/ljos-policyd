@@ -6895,7 +6895,9 @@ fn fed_sensitive(cmd: &[String]) -> bool {
     let b = base_of(head);
     if matches!(
         b,
-        "rm" | "rmdir"
+        "rm" | "srm"
+            | "wipe"
+            | "rmdir"
             | "unlink"
             | "shred"
             | "dd"
@@ -6919,7 +6921,7 @@ fn fed_sensitive(cmd: &[String]) -> bool {
     // No subcommand yet: the words still to come can be `push -f`.
     matches!(
         git_subcommand(cmd).map(|(s, _)| s),
-        Some("clean" | "push" | "reset") | None
+        Some("clean" | "push" | "reset" | "checkout") | None
     )
 }
 
@@ -8671,6 +8673,12 @@ const RUNNERS: &[(&str, &[&str])] = &[
     ("chrt", &[]),
     ("taskset", &[]),
     ("timeout", &["-k", "--kill-after", "-s", "--signal"]),
+    (
+        "strace",
+        &[
+            "-o", "--output", "-e", "-E", "-p", "-u", "-s", "-P", "-I", "-D",
+        ],
+    ),
     (
         "xargs",
         &[
@@ -13091,7 +13099,7 @@ fn rm_recursive(cmd: &[&str]) -> bool {
         return false;
     };
     let b = base_of(head);
-    if b != "rm" && b != "rtrash" {
+    if b != "rm" && b != "rtrash" && b != "srm" && b != "wipe" {
         return false;
     }
     cmd.iter()
@@ -13776,7 +13784,7 @@ fn deletes_a_root_tree(argv: &[String]) -> bool {
                     && !a.starts_with("--")
                     && (a.contains('r') || a.contains('R')))
         });
-        if !(gio || TRASHERS.contains(&b) || (b == "rm" && recursive)) {
+        if !(gio || TRASHERS.contains(&b) || (matches!(b, "rm" | "srm" | "wipe") && recursive)) {
             return false;
         }
         let from = usize::from(gio) + 1;
@@ -17979,13 +17987,16 @@ hash -r 2> /dev/null
         for line in [
             "read x; echo \"$x\"",
             "read -r x; sh -c 'echo \"$1\"' _ \"$x\"",
-            "read name; git checkout \"$name\"",
             "read xy; sh -c \"$x\"",
             "sh -c \"$x\"; read x",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
+        // The name is not on the line, and it can be `.`.
+        let c = at("read name; git checkout \"$name\"");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert_eq!(c.token, "operand-unshown");
         assert_everyday_allowed(&root);
     }
 
@@ -18146,6 +18157,18 @@ hash -r 2> /dev/null
                 "{line}: {got}"
             );
         }
+    }
+
+    /// `srm` and `wipe` remove a tree the way `rm` does. `strace` runs the
+    /// command after it. `git checkout` can discard the work tree, so an
+    /// `xargs` that does not show the path is refused.
+    #[test]
+    fn a_shredder_or_traced_delete_is_still_a_delete() {
+        let v = |s: &str| verdict(&shell_words(s));
+        assert_eq!(v("srm -r /"), "deny\trm-rf-outside-tmp");
+        assert_eq!(v("wipe -r /"), "deny\trm-rf-outside-tmp");
+        assert_eq!(v("strace rm -rf /"), "deny\trm-rf-outside-tmp");
+        assert_eq!(v("xargs git checkout --"), "deny\toperand-unshown");
     }
 
     /// Words `xargs`, `parallel`, `find -exec` or `read` add are part of
@@ -19730,7 +19753,6 @@ sed 's/[$]LINENO.*/&-/' <$as_myself >$as_me.lineno
             "pyenv init -",
             "git -C repo status",
             "tee build.log",
-            "read -r name; git checkout \"$name\"",
             "cp config.mk . && sh ./configure",
             "echo 'echo ok' > build/run.sh && sh build/run.sh",
         ] {
