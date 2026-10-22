@@ -675,6 +675,7 @@ fn walk(
         if !piped {
             let was = shell.vars.clone();
             set_vars(&shown, &mut shell.vars);
+            note_startup(&shown, &mut shell.vars);
             match before {
                 "||" => shell.vars.merge(was),
                 "&&" => match &mut vars_failed {
@@ -692,6 +693,12 @@ fn walk(
             if set.home != shell.vars.home {
                 shell.vars.home = Some("$".into());
             }
+        }
+        // A non-interactive bash or sh sources BASH_ENV or ENV in the
+        // child, before the -c script. That text is judged here.
+        judge_startup(&shown, shell, depth, out, denied);
+        if denied.is_some() {
+            return;
         }
         let words = peel_cd_command_word(&shown);
         let b = words.first().map_or("", |w| base_of(w));
@@ -1003,6 +1010,14 @@ struct Vars {
     home: Option<String>,
     pwd: Option<String>,
     lastpipe: bool,
+    /// The shell's `BASH_ENV`. `Some("$")` is a value the line does not
+    /// show. `bash_env_exported` is set once `export` or `declare -x`
+    /// has put it in the environment a later `bash` inherits.
+    bash_env: Option<String>,
+    bash_env_exported: bool,
+    /// The shell's `ENV`, same as [`Vars::bash_env`] for `sh`.
+    sh_env: Option<String>,
+    sh_env_exported: bool,
 }
 
 /// The variables [`Vars`] holds.
@@ -1016,6 +1031,10 @@ impl Vars {
             home: var("HOME"),
             pwd: None,
             lastpipe: false,
+            bash_env: None,
+            bash_env_exported: false,
+            sh_env: None,
+            sh_env_exported: false,
         }
     }
 
@@ -1092,6 +1111,15 @@ impl Vars {
             self.home = Some("$".into());
         }
         self.lastpipe |= other.lastpipe;
+        // A startup file one side set and the other did not is not known.
+        if self.bash_env != other.bash_env || self.bash_env_exported != other.bash_env_exported {
+            self.bash_env = Some("$".into());
+            self.bash_env_exported = true;
+        }
+        if self.sh_env != other.sh_env || self.sh_env_exported != other.sh_env_exported {
+            self.sh_env = Some("$".into());
+            self.sh_env_exported = true;
+        }
     }
 }
 
@@ -1117,6 +1145,10 @@ fn writes_pwd(argv: &[String], cwd: &std::path::Path) -> bool {
                 home: None,
                 pwd: Some(UNTRACKED.into()),
                 lastpipe: false,
+                bash_env: None,
+                bash_env_exported: false,
+                sh_env: None,
+                sh_env_exported: false,
             };
             set_vars(&cmd, &mut probe);
             if probe.pwd.as_deref() != Some(UNTRACKED) {
@@ -1222,6 +1254,198 @@ fn sourced(cmd: &[&str], cwd: Option<&std::path::Path>, aliases: &[(String, Stri
         keeps: scan.keeps,
         words: scan.words,
     }
+}
+
+/// A startup-file value the line shows as a path, or `"$"` when it does
+/// not. Empty is empty: bash sources nothing when `BASH_ENV` is empty.
+fn shown_startup(v: &str) -> String {
+    if v.is_empty() {
+        String::new()
+    } else if v.contains(['$', '`', '*', '?', '[', '~', '\n']) {
+        "$".into()
+    } else {
+        v.to_string()
+    }
+}
+
+fn startup_pair(w: &str) -> Option<(&str, &str)> {
+    let (n, v) = w.split_once('=')?;
+    let n = n.strip_suffix('+').unwrap_or(n);
+    matches!(n, "BASH_ENV" | "ENV").then_some((n, v))
+}
+
+fn store_startup(vars: &mut Vars, name: &str, value: String, export: bool) {
+    let (slot, flag) = match name {
+        "BASH_ENV" => (&mut vars.bash_env, &mut vars.bash_env_exported),
+        "ENV" => (&mut vars.sh_env, &mut vars.sh_env_exported),
+        _ => return,
+    };
+    *slot = Some(value);
+    if export {
+        *flag = true;
+    }
+}
+
+/// Record `BASH_ENV` and `ENV` when `cmd` sets them in this shell.
+/// A prefix assignment (`BASH_ENV=file bash`) belongs to that command
+/// alone and is not recorded here.
+fn note_startup(cmd: &[&str], vars: &mut Vars) {
+    let words = operands(cmd);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    let rest = peel_cd_command_word(&words[front..]);
+    let name = rest.first().map_or("", |w| base_of(w));
+    if name.is_empty() {
+        for w in &words[..front] {
+            if let Some((n, v)) = startup_pair(w) {
+                store_startup(vars, n, shown_startup(v), false);
+            }
+        }
+        return;
+    }
+    if name == "unset" {
+        for a in rest.iter().skip(1) {
+            match *a {
+                "BASH_ENV" => {
+                    vars.bash_env = None;
+                    vars.bash_env_exported = false;
+                }
+                "ENV" => {
+                    vars.sh_env = None;
+                    vars.sh_env_exported = false;
+                }
+                _ if a.contains(['$', '`']) => {
+                    vars.bash_env = Some("$".into());
+                    vars.bash_env_exported = true;
+                    vars.sh_env = Some("$".into());
+                    vars.sh_env_exported = true;
+                }
+                _ => {}
+            }
+        }
+        return;
+    }
+    let exporting = name == "export"
+        || (matches!(name, "declare" | "typeset")
+            && rest
+                .iter()
+                .skip(1)
+                .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('x')));
+    if !exporting {
+        return;
+    }
+    for a in rest.iter().skip(1) {
+        if *a == "BASH_ENV" {
+            vars.bash_env_exported = true;
+            if vars.bash_env.is_none() {
+                vars.bash_env = Some("$".into());
+            }
+        } else if *a == "ENV" {
+            vars.sh_env_exported = true;
+            if vars.sh_env.is_none() {
+                vars.sh_env = Some("$".into());
+            }
+        } else if let Some((n, v)) = startup_pair(a) {
+            store_startup(vars, n, shown_startup(v), true);
+        }
+    }
+}
+
+/// The `NAME=value` for `var` written before the shell word `shell` on
+/// `cmd`: a prefix assignment or one `env` puts in the child's environment.
+fn prefix_startup<'a>(cmd: &[&'a str], shell: &str, var: &str) -> Option<&'a str> {
+    let mut found = None;
+    for w in cmd {
+        if let Some((n, v)) = startup_pair(w) {
+            if n == var {
+                found = Some(v);
+            }
+            continue;
+        }
+        if base_of(w) == shell {
+            break;
+        }
+    }
+    found
+}
+
+fn startup_unshown() -> Checked {
+    Checked {
+        decision: Decision::Deny,
+        code: PolicyReason::ShellDangerousRunner,
+        token: Cow::Borrowed("startup-script-unshown"),
+    }
+}
+
+/// Judge the `BASH_ENV` or `ENV` file a non-interactive `bash` or `sh`
+/// sources before its `-c` script. The file runs in the child, so a `cd`
+/// in it does not move this shell; the commands are still recorded there.
+fn judge_startup(
+    cmd: &[&str],
+    shell: &Shell,
+    depth: usize,
+    out: &mut Vec<(Vec<String>, std::path::PathBuf, bool)>,
+    denied: &mut Option<Checked>,
+) {
+    if denied.is_some() {
+        return;
+    }
+    let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+    let owned = split_env_strings(&owned).into_owned();
+    let (run, _) = unwrap_wrappers(&owned);
+    let Some(first) = run.first() else {
+        return;
+    };
+    let (var, exported) = match base_of(first) {
+        "bash" => ("BASH_ENV", shell.vars.bash_env_exported),
+        "sh" => ("ENV", shell.vars.sh_env_exported),
+        _ => return,
+    };
+    if shell_script(run).is_none() {
+        return;
+    }
+    let value = prefix_startup(cmd, base_of(first), var)
+        .map(shown_startup)
+        .or_else(|| {
+            if !exported {
+                return None;
+            }
+            match var {
+                "BASH_ENV" => shell.vars.bash_env.clone(),
+                _ => shell.vars.sh_env.clone(),
+            }
+        });
+    let Some(value) = value.filter(|v| !v.is_empty()) else {
+        return;
+    };
+    if value == "$" {
+        *denied = Some(startup_unshown());
+        return;
+    }
+    let path = std::path::Path::new(&value);
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match shell.here.as_slice() {
+            [d] if !is_untracked(d) => d.join(path),
+            _ => {
+                *denied = Some(startup_unshown());
+                return;
+            }
+        }
+    };
+    let Some(text) = read_regular_nofollow(&full) else {
+        *denied = Some(startup_unshown());
+        return;
+    };
+    let mut aliases = shell.aliases.clone();
+    let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
+    if let Some(c) = judge_body(&words, shell) {
+        *denied = Some(c);
+        return;
+    }
+    replay_subshell(&words, shell, depth, out, denied);
 }
 
 /// The command word of `cmd`, past assignments, redirections and the
@@ -1460,6 +1684,10 @@ fn writes_tracked(cmd: &[&str]) -> bool {
         home: Some(mark.into()),
         pwd: Some(mark.into()),
         lastpipe: false,
+        bash_env: None,
+        bash_env_exported: false,
+        sh_env: None,
+        sh_env_exported: false,
     };
     set_vars(cmd, &mut vars);
     vars.cdpath.as_deref() != Some(mark)
@@ -9089,6 +9317,62 @@ hash -r 2> /dev/null
             "f() { echo hi; }; f",
         ] {
             let c = at(&root, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+    }
+
+    /// A non-interactive `bash` reads `BASH_ENV` and a non-interactive
+    /// `sh` reads `ENV` before its `-c` script. A literal file is judged
+    /// as a sourced script; a value the line does not show is unknown.
+    #[test]
+    fn a_startup_file_is_judged_as_a_sourced_script() {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-stenv", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sub = root.join("sub");
+        for d in ["sub", "evil", "safe"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("evil/force.sh"), "git push -f origin\n").unwrap();
+        std::fs::write(root.join("safe/hi.sh"), "echo hi\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &sub, 0);
+        for line in [
+            "BASH_ENV=../evil/force.sh bash -c 'echo ok'",
+            "ENV=../evil/force.sh sh -c 'echo ok'",
+            "export BASH_ENV=../evil/force.sh; bash -c 'echo ok'",
+            "BASH_ENV=../evil/force.sh; export BASH_ENV; bash -c 'echo ok'",
+            "export ENV=../evil/force.sh; sh -c 'echo ok'",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
+        }
+        for line in [
+            "BASH_ENV=\"$F\" bash -c 'echo ok'",
+            "export BASH_ENV=\"$F\"; bash -c 'echo ok'",
+            "ENV=\"$F\" sh -c 'echo ok'",
+            "BASH_ENV=../evil/missing.sh bash -c 'echo ok'",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(
+                c.token.contains("startup-script-unshown"),
+                "{line}: {}",
+                c.token
+            );
+        }
+        for line in [
+            "bash -c 'echo ok'",
+            "sh -c 'echo ok'",
+            "BASH_ENV=../safe/hi.sh bash -c 'echo ok'",
+            "ENV=../evil/force.sh bash -c 'echo ok'",
+            "BASH_ENV=../evil/force.sh sh -c 'echo ok'",
+            "conda activate",
+            "nvm use",
+            "direnv allow",
+            "pyenv init -",
+            "f() { echo hi; }; f",
+        ] {
+            let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
     }
