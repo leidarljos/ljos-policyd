@@ -98,7 +98,9 @@ the line where it was. The text is read with the aliases the line
 defined before the ``source`` expanded, as the shell that sources it
 reads it.
 Raw newlines and carriage returns split script commands, and ``$'...'``
-ANSI-C quoted words are decoded before the line is judged.
+ANSI-C quoted words are decoded before the line is judged. A backslash
+before a newline joins the two lines, outside single quotes, as the
+shell joins them.
 
 A ``cd`` or ``pushd`` to a relative path whose first part is not ``.`` or
 ``..`` enters that path under the first ``CDPATH`` entry that holds it, an

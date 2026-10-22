@@ -2522,10 +2522,11 @@ fn decode_ansi_c_quoted(chars: &[char], i: &mut usize, out: &mut String) {
 }
 
 /// A script split into words the way a shell would: quotes group, a
-/// backslash escapes the next character outside single quotes, a `#`
-/// that starts a word comments out the rest of its line, and `;`,
-/// `&&`, `||`, `|` and `&` stand as words of their own. The `&` of a
-/// redirection (`2>&1`, `<&3`, `&>log`) stays in its word.
+/// backslash escapes the next character outside single quotes, a
+/// backslash and the newline after it drop out, a `#` that starts a word
+/// comments out the rest of its line, and `;`, `&&`, `||`, `|` and `&`
+/// stand as words of their own. The `&` of a redirection (`2>&1`, `<&3`,
+/// `&>log`) stays in its word.
 fn shell_words(script: &str) -> Vec<String> {
     let chars: Vec<char> = script.chars().collect();
     let mut out = Vec::new();
@@ -2550,6 +2551,7 @@ fn shell_words(script: &str) -> Vec<String> {
                 decode_ansi_c_quoted(&chars, &mut i, &mut cur);
                 word = true;
             }
+            '\\' if !single && chars.get(i) == Some(&'\n') => i += 1,
             '\\' if !single => {
                 if let Some(n) = chars.get(i) {
                     cur.push(*n);
