@@ -5795,6 +5795,33 @@ mod tests {
         }
     }
 
+    /// Where the path by name is no directory, bash enters the path as it
+    /// stands, through the link: `lnk/../foo` with no `foo` here is the
+    /// `foo` beside the link's target, and its Makefile is the one read.
+    #[cfg(unix)]
+    #[test]
+    fn a_cd_by_name_that_finds_nothing_goes_through_the_link() {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-through", std::process::id()));
+        let start = root.join("start");
+        std::fs::create_dir_all(&start).expect("dir");
+        std::fs::create_dir_all(root.join("other/leaf")).expect("dir");
+        std::fs::create_dir_all(root.join("other/foo")).expect("dir");
+        std::fs::write(start.join("Makefile"), "clean-all:\n\techo clean\n").expect("write");
+        std::fs::write(root.join("other/foo/Makefile"), MAKEFILE).expect("write");
+        let _ = std::fs::remove_file(start.join("lnk"));
+        std::os::unix::fs::symlink(root.join("other/leaf"), start.join("lnk")).expect("link");
+        let decide = |line: &str| check_shell_in(&shell_words(line), &start, 0).decision;
+        for line in [
+            "cd lnk/../foo && make clean-all",
+            "cd -L lnk/../foo && make clean-all",
+            "pushd lnk/../foo && make clean-all",
+            "cd lnk/../foo/. && make clean-all",
+        ] {
+            assert_eq!(decide(line), Decision::Deny, "{line}");
+        }
+        assert_eq!(decide("cd lnk/.. && make clean-all"), Decision::Allow);
+    }
+
     /// An assignment, `NAME=value` or `NAME+=value`, in front of `cd`,
     /// `pushd`, `popd` or a task runner does not hide it.
     #[test]
