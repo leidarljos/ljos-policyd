@@ -5584,6 +5584,89 @@ mod tests {
         }
     }
 
+    /// The lines an agent runs every day stay allowed beside the rules for
+    /// case arms, traps, stdin scripts, aliases and lastpipe. A sourced
+    /// script that does not move the shell, such as a virtualenv's
+    /// `activate`, leaves the line followed; one that may, or one the
+    /// line cannot read, does not.
+    #[test]
+    fn everyday_lines_stay_allowed() {
+        const ACTIVATE: &str = r#"deactivate () {
+    if [ -n "${_OLD_VIRTUAL_PATH:-}" ] ; then
+        PATH="${_OLD_VIRTUAL_PATH:-}"
+        export PATH
+        unset _OLD_VIRTUAL_PATH
+    fi
+    hash -r 2> /dev/null
+    unset VIRTUAL_ENV
+    if [ ! "${1:-}" = "nondestructive" ] ; then
+        unset -f deactivate
+    fi
+}
+deactivate nondestructive
+case "$(uname)" in
+    CYGWIN*|MSYS*|MINGW*)
+        VIRTUAL_ENV=$(cygpath /srv/proj/.venv)
+        ;;
+    *)
+        VIRTUAL_ENV=/srv/proj/.venv
+        ;;
+esac
+export VIRTUAL_ENV
+_OLD_VIRTUAL_PATH="$PATH"
+PATH="$VIRTUAL_ENV/"bin":$PATH"
+export PATH
+if [ -z "${VIRTUAL_ENV_DISABLE_PROMPT:-}" ] ; then
+    _OLD_VIRTUAL_PS1="${PS1:-}"
+    PS1="(.venv) ${PS1:-}"
+    export PS1
+fi
+hash -r 2> /dev/null
+"#;
+        evil_and_safe("daily", "true");
+        let root =
+            std::env::temp_dir().join(format!("policyd-lib-{}-everyday", std::process::id()));
+        let safe = root.join("safe");
+        for d in ["sub", "x", ".venv/bin", "bad/bin"] {
+            std::fs::create_dir_all(safe.join(d)).expect("dir");
+        }
+        std::fs::write(safe.join("sub/Makefile"), "all:\n\techo sub\n").expect("write");
+        std::fs::write(safe.join(".venv/bin/activate"), ACTIVATE).expect("write");
+        std::fs::write(safe.join("bad/bin/activate"), "cd ../../evil\n").expect("write");
+        let check = |line: &str| check_shell_in(&shell_words(line), &safe, 0).decision;
+        for line in [
+            "cargo --version",
+            "make clean-all",
+            "npm --version",
+            "pytest --version",
+            "git status",
+            "git diff --stat",
+            "git log --oneline -1",
+            "cd sub && make",
+            "cd -",
+            "pushd x && popd",
+            "source .venv/bin/activate && make test",
+            ". .venv/bin/activate && make clean-all",
+            "trap 'rm -f /tmp/x' EXIT",
+            "case $1 in a) echo a;; esac",
+        ] {
+            assert_eq!(check(line), Decision::Allow, "{line}");
+            assert_eq!(
+                check(&format!("bash -c \"{line}\"")),
+                Decision::Allow,
+                "bash -c {line}"
+            );
+        }
+        for line in [
+            "source bad/bin/activate && make clean-all",
+            "source missing/activate && make clean-all",
+            "source activate && make clean-all",
+            "source \"$VENV/bin/activate\" && make clean-all",
+        ] {
+            assert_eq!(check(line), Decision::Deny, "{line}");
+        }
+    }
+
     /// `command`, `command -p` and `builtin` do not hide `cd`.
     #[test]
     fn follows_a_cd_behind_command_or_builtin() {
