@@ -3662,6 +3662,46 @@ mod tests {
         }
     }
 
+    /// The lines an agent runs every day stay allowed beside a project
+    /// whose `clean-all` deletes home, whether the line enters it or
+    /// starts there.
+    #[test]
+    fn allows_everyday_lines_beside_a_refused_target() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "cd project && make test",
+            "cd project; make test",
+            "cd project && make clean",
+            "FOO=1 cd project && make test",
+            "pushd project && make test && popd",
+            "pushd project; make test; popd",
+            "cd project && bash -lc 'make test'",
+            "cd project && rm -rf target",
+            "make test 2>&1",
+            "bash -lc 'make test'",
+            "cargo test",
+            "git status",
+        ] {
+            let c = entering("everyday", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+        let project = std::env::temp_dir()
+            .join(format!("policyd-lib-{}-everyday", std::process::id()))
+            .join("project");
+        for line in [
+            "make test",
+            "make test 2>&1",
+            "make clean",
+            "bash -lc 'make test'",
+            "cargo test",
+            "git status",
+            "rm -rf target",
+        ] {
+            let c = check_shell_in(&shell_words(line), &project, 0);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+    }
+
     /// A directory the line does not show, or one it leaves again, is not
     /// read, and the runner is judged as before.
     #[test]
