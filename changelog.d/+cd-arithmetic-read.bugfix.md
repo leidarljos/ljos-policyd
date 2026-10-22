@@ -1,1 +1,0 @@
-Arithmetic that only reads `HOME` or `CDPATH` (`echo $((HOME))`, `(( HOME == 1 ))`) leaves the value the line set, so `cd ~` after it is followed. An assignment operator after the name, past any subscript, or `++` or `--` next to it (`((HOME=5))`, `((HOME++))`, `((HOME <<= 1))`) still leaves it untracked.

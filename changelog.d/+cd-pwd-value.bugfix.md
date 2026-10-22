@@ -1,1 +1,0 @@
-`$PWD` or `${PWD}` in a `HOME` or `CDPATH` the line assigns is the one directory the line is in, when the line shows that and does not set `PWD`, so `export HOME="$PWD/.home"; cd ~ && make test` is allowed again. Every `$` in the value used to leave the variable untracked, which refused the runner after the `cd ~`.

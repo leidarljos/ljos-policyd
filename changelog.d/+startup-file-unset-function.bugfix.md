@@ -1,1 +1,0 @@
-`unset -f BASH_ENV` (or `ENV`) takes out a function of that name and leaves an exported startup file in place, so the next `bash -c` is still judged against it. It was taken to drop the file, and `export BASH_ENV=evil.sh; unset -f BASH_ENV; bash -c 'echo ok'` was allowed.

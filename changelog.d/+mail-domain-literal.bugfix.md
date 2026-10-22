@@ -1,1 +1,0 @@
-An address at `@[ ... ]` was accepted as a domain, so a recipient or a reply path in that shape was not the denied name and was not refused. A domain literal is not a name this check can compare, and the header is refused.

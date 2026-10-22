@@ -1,1 +1,0 @@
-A command word that an `alias` earlier on the line defines is judged as the alias's body, so `alias m="make clean-all"; cd ../evil; m` reads the Makefile in `../evil` and `alias p='git push -f'; p` is refused as `git-force-push`. An alias whose body the line does not show leaves the line untracked, so a runner after it is refused.

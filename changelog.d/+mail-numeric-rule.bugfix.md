@@ -1,1 +1,0 @@
-A deny-file `domain` or pack-law `deny-domain` rule for an all-numeric domain such as a dotted quad loaded, but a recipient at that domain is refused before it is compared, so the rule matched nothing. Rule domains are now read by the same parser as recipient domains, and such a line refuses the file with only the line number as detail.

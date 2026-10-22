@@ -1,1 +1,0 @@
-An `eval`, `source` or `.` that runs in this shell, or a command word the line does not show (`c=cd; $c evil`), leaves the directory, the stack, `HOME`, `CDPATH` and `PWD` untracked, since what it runs may move the shell or set them. `eval cd evil; make clean-all` and `source env.sh && make clean-all` are refused.

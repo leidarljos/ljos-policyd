@@ -1,1 +1,0 @@
-Sender, Errors-To and Return-Path were checked against the deny file only, so the message could name an operator other than the identity. When one of those headers is present it has to be the identity, under the same rule as From. An empty Return-Path is not that address.

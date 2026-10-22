@@ -1,1 +1,0 @@
-A word that only names `PWD` (`echo PWD`, `grep PWD`, `env PWD=/x cmd`) no longer stops `$PWD` being read as the directory the line is in. Only an assignment in this shell, or a command that writes the name it takes (`read PWD`, `printf -v PWD`, `unset PWD`, `((PWD=1))`), does.

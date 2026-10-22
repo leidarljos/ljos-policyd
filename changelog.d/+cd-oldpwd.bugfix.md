@@ -1,1 +1,0 @@
-`cd -` and `pushd -` enter `OLDPWD`, which each `cd`, `pushd` and `popd` on the line moves, so `cd - && make clean-all` reads the Makefile the shell goes back to; it read the one where the line was and allowed the `rm -rf ~` in `$OLDPWD/Makefile`. Without `OLDPWD` in the environment, and inside a recipe, a runner after `cd -` is refused as `may run in an untracked directory`.

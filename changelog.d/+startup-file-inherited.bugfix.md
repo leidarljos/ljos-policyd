@@ -1,1 +1,0 @@
-A `BASH_ENV` or `ENV` in the guard's own environment counts as exported to every shell the line starts: with `BASH_ENV=evil.sh` inherited, `bash -c 'echo ok'` was allowed, although that bash sources evil.sh first. The file is judged as one the line exported, and `env -u BASH_ENV`, `env -i` and `unset BASH_ENV` still take it out.

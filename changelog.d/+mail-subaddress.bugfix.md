@@ -1,1 +1,0 @@
-An address rule matched the mailbox and not a local+tag subaddress, so Reply-To of evil+x was allowed while evil itself was refused. Most providers deliver the tag to that mailbox. The rule covers the subaddress.

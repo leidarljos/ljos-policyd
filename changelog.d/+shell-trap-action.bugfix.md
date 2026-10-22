@@ -1,1 +1,0 @@
-A `trap` action is judged as a script, so `trap "git push -f" EXIT` is refused as `git-force-push`. A `trap` whose action may move the shell (`trap 'cd evil' DEBUG`, `trap "$X" DEBUG`) leaves the line untracked, so a runner after it is refused.

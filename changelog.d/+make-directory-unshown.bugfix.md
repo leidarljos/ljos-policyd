@@ -1,1 +1,0 @@
-`make -C "$d"`, `make -C $(echo bld)` and `make -C bl*` found no makefile and were allowed. The directory is not one the line spells out, so the recipes there were never judged. A directory that is empty, or holds `$`, a backtick or a glob, is refused.

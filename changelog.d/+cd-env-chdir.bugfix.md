@@ -1,1 +1,0 @@
-`env -C DIR` and `env --chdir=DIR` read a task runner's file in `DIR` for the one command they run, so `env -C project make clean-all` reads `project/Makefile` and is refused where it was allowed. `env -C project true && make clean-all` still reads the Makefile where the line is.

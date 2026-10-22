@@ -1,1 +1,0 @@
-The target of a `cp`, `mv` or `ln` counts as a file the line writes, so a script copied, moved or linked into place and then sourced or run on the same line is refused as `script-written-on-line`: `cp evil.sh ok.sh; source ok.sh`, `mv evil.sh ok.sh; ./ok.sh`, `ln -sf evil.sh ok.sh; . ok.sh`. A `-t` or `--target-directory` directory covers every script under it.

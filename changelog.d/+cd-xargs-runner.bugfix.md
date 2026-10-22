@@ -1,1 +1,0 @@
-A task runner that `xargs` runs is refused as `xargs make may take a target from stdin`, since the words `xargs` adds can name any target: `cd project && printf '%s\n' clean-all | xargs make` read the default goal and allowed the `rm -rf ~` in `project/Makefile`, and `echo clean-all | xargs make test` runs both targets. `cd project && ls | xargs wc -l` stays allowed.

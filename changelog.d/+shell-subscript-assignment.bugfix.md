@@ -1,1 +1,0 @@
-An assignment to an array element, `NAME[i]=value` or `NAME[i]+=value`, in front of a command is read as an assignment, so `a[0]=1 cd evil && make clean-all` follows the `cd` and `a[0]=1 git push --force origin main` is refused. One to `HOME[0]` or `CDPATH[0]` leaves that variable untracked.

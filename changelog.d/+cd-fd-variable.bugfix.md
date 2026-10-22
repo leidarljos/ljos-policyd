@@ -1,1 +1,0 @@
-A redirection that stores its descriptor in a variable, `{fd}>file`, is no longer taken for the `cd` or `pushd` target, so `cd {fd}>/dev/null evil && make clean-all` follows the `cd` and refuses the `rm -rf ~` in `evil/Makefile`. `{HOME}>file` or `{CDPATH}>file` sets that variable in the shell, so it is no longer followed after one.

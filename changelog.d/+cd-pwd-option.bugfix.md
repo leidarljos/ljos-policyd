@@ -1,1 +1,0 @@
-A command that writes `PWD` through a name glued to its option (`printf -vPWD`, `wait -pPWD`) sets it, so `$PWD` after it is no longer read as the directory the line is in and a `cd "$PWD"` is not followed.

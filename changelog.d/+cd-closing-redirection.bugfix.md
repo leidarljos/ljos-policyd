@@ -1,1 +1,0 @@
-A redirection that closes a descriptor (`2>&-`, `>&-`, `<&-`) is read as a whole word, so the word after it is the `cd` or `pushd` target: `cd 2>&- project && make clean-all` took `project` for the redirection's file, read the Makefile in home, and allowed the `rm -rf ~` in `project/Makefile`, where the shell runs it.

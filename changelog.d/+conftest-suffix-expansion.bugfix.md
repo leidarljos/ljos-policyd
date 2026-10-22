@@ -1,1 +1,0 @@
-`rm -rf conftst$IFS..`, `libconftest.dylib$IFS$x`, `conf$$$IFS..` and a backtick after `conftest` were scratch. The suffix split into another operand. A suffix is scratch only when it is literal, or one variable the script assigns to a single path piece.

@@ -1,1 +1,0 @@
-A redirection in a `pushd` no longer hides a bare `pushd` or a stack index: `pushd safe >/dev/null && pushd >/dev/null && make clean-all` and `pushd safe && pushd 2>/dev/null +1 && make clean-all` swap back to where the line started, and read its Makefile there. Both read only `safe` and allowed the `rm -rf ~` in the Makefile the shell runs.
