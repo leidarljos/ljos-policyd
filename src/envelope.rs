@@ -757,15 +757,17 @@ const TRANSPARENT: &[char] = &['.', '_', '-', '+', '='];
 /// An empty skeleton is refused at load: `starts_with("")` is true.
 const MIN_SKELETON: usize = 3;
 
-/// NFD, combining marks (general category Mn) removed, case folded
-/// twice, marks removed again, then NFC, with every `TRANSPARENT`
-/// character removed and nothing cut. `normalize_local` has already
-/// composed, so the decomposition runs here on the rule and the
-/// recipient: `abc` + U+0301 + `x` is `abćx` by then, and the mark
-/// has to come off or the prefix never sees `abc`. Case folding İ
-/// produces i and U+0307, so the second strip is what makes that one
-/// skeleton with i. One upper-then-lower leaves capital sharp s as
-/// ß, so the fold runs again and ß becomes ss. A recipient whose
+/// NFD, nonspacing marks (Mn) and enclosing marks (Me) removed, case
+/// folded twice, marks removed again, then NFC, with every
+/// `TRANSPARENT` character removed and nothing cut. `normalize_local`
+/// has already composed, so the decomposition runs here on the rule
+/// and the recipient: `abc` + U+0301 + `x` is `abćx` by then, and the
+/// mark has to come off or the prefix never sees `abc`. An enclosing
+/// mark such as U+20DD or U+0488 does not decompose, and leaving it in
+/// the skeleton made `oth<U+20DD>er` miss a rule for `other`. Case
+/// folding İ produces i and U+0307, so the second strip is what makes
+/// that one skeleton with i. One upper-then-lower leaves capital sharp
+/// s as ß, so the fold runs again and ß becomes ss. A recipient whose
 /// skeleton starts with a rule's skeleton, at that domain or one in
 /// the same family, is denied. This over-blocks on purpose: `john`
 /// also denies `johnny` and `jo.hn-x`, so a provider that ignores a
@@ -783,8 +785,32 @@ fn strip_marks(local: &str) -> String {
     let category = CodePointMapData::<GeneralCategory>::new();
     local
         .nfd()
-        .filter(|c| category.get(*c) != GeneralCategory::NonspacingMark)
+        .filter(|c| {
+            !matches!(
+                category.get(*c),
+                GeneralCategory::NonspacingMark | GeneralCategory::EnclosingMark
+            )
+        })
         .collect()
+}
+
+/// A spacing mark (Mc) whose base is an ASCII character. The skeleton
+/// keeps Mc, so U+0903 after `h` is a different local part from `h`
+/// and misses the rule. Devanagari and other non-ASCII bases keep the
+/// mark: it is part of that spelling.
+fn spacing_mark_on_ascii(local: &str) -> bool {
+    let category = CodePointMapData::<GeneralCategory>::new();
+    let mut ascii_base = false;
+    for c in local.chars() {
+        match category.get(c) {
+            GeneralCategory::SpacingMark if ascii_base => return true,
+            GeneralCategory::NonspacingMark
+            | GeneralCategory::EnclosingMark
+            | GeneralCategory::SpacingMark => {}
+            _ => ascii_base = c.is_ascii() && !c.is_ascii_control(),
+        }
+    }
+    false
 }
 
 /// NFKC, then uppercase, then lowercase, then NFKC again.
@@ -1082,6 +1108,12 @@ fn normalize_local(raw: &str) -> Option<String> {
         .chars()
         .any(|c| local_closed(&sets, c) || c.is_control())
     {
+        return None;
+    }
+    // After NFKC, so a compatibility form that opens into an ASCII base
+    // plus a spacing mark is caught too. The pre-NFKC spelling is
+    // checked as well: composition must not hide the mark.
+    if spacing_mark_on_ascii(&stripped) || spacing_mark_on_ascii(&folded) {
         return None;
     }
     let lower: String = folded.chars().flat_map(|c| c.to_lowercase()).collect();
@@ -3084,6 +3116,38 @@ pair left right
                 u32::from(blank)
             );
         }
+    }
+
+    /// An enclosing mark stays in the local part and used to miss the
+    /// rule. It comes off in the skeleton, so the rule matches. A
+    /// spacing mark on an ASCII base is not that letter, and is refused.
+    /// The same mark on a Devanagari base is part of the spelling.
+    #[test]
+    fn an_enclosing_or_spacing_mark_does_not_hide_a_denied_address() {
+        let deny = "address other@example.test\n";
+        for mark in ['\u{20DD}', '\u{0488}'] {
+            let raw = plain(&format!("To: oth{mark}er@example.test\r\n"));
+            assert_eq!(
+                codes(&raw, deny, ""),
+                vec!["recipient-address-denied"],
+                "U+{:04X}",
+                u32::from(mark)
+            );
+            assert!(
+                codes(&plain(&format!("To: oth{mark}er@example.test\r\n")), "", "").is_empty(),
+                "U+{:04X} refused when nothing is denied",
+                u32::from(mark)
+            );
+        }
+        let visarga = plain("To: oth\u{0903}er@example.test\r\n");
+        assert_eq!(codes(&visarga, deny, ""), vec!["recipient-unparsed"]);
+        assert_eq!(codes(&visarga, "", ""), vec!["recipient-unparsed"]);
+        let devanagari = plain("To: \u{0915}\u{0903}@example.test\r\n");
+        assert!(
+            codes(&devanagari, "", "").is_empty(),
+            "{:?}",
+            details(&devanagari, "", "")
+        );
     }
 
     /// Every code point in a local part is refused, or the skeleton it
