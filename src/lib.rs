@@ -174,6 +174,15 @@ fn runner_commands(
         let gates = end == "&&" && after != "||";
         after = end;
         ran_in.push(here.clone());
+        // A subshell or substitution in the command runs where the
+        // command does, and a `cd` inside it moves only itself.
+        if depth < MAX_DEPTH {
+            for body in cmd.iter().flat_map(|w| substitutions(w)) {
+                for dir in &here {
+                    runner_commands(&shell_words(&body), dir, depth + 1, out);
+                }
+            }
+        }
         // An assignment in front of a builtin is set for that command
         // alone: `FOO=1 cd dir` still moves the shell.
         let words = &cmd[cmd.iter().take_while(|w| is_assignment(w)).count()..];
@@ -3814,6 +3823,36 @@ mod tests {
             "cd safe && pushd .. && popd && make clean-all",
         ] {
             assert_eq!(leaving("fail-cd", line), Decision::Allow, "{line}");
+        }
+    }
+
+    /// A subshell or substitution runs where the command holding it runs,
+    /// after any `cd` before it on the line.
+    #[test]
+    fn reads_a_subshell_where_the_line_enters() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "sh -c 'cd project && (make clean-all)'",
+            "sh -c 'cd project && echo $(make clean-all)'",
+            "cd project && (make clean-all)",
+            "cd project && echo \"$(make clean-all)\"",
+            "cd project && echo `make clean-all`",
+        ] {
+            let c = entering("sub-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        for line in [
+            "cd project && (make test)",
+            "cd project && echo $(make test)",
+        ] {
+            let c = entering("sub-cd", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+        for line in [
+            "cd safe && (make clean-all)",
+            "cd safe && echo $(make clean-all)",
+        ] {
+            assert_eq!(leaving("sub-cd", line), Decision::Allow, "{line}");
         }
     }
 
