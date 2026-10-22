@@ -1176,6 +1176,13 @@ fn host_argv_table_at(argv: &[String], depth: usize, moved: bool) -> Checked {
             token: Cow::Borrowed("env-split-string-unshown"),
         };
     }
+    if unshown_stdin_script(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: Cow::Borrowed("shell-stdin-unshown"),
+        };
+    }
     own
 }
 
@@ -1266,6 +1273,9 @@ fn inner_commands_at(argv: &[String]) -> Vec<(usize, Vec<String>)> {
         }
         if let Some(inside) = container_command(run) {
             out.push((i, inside));
+        }
+        if let Some((Fed::Text(script), _)) = shell_stdin(run) {
+            out.extend(script_lines(script, 0).iter().map(|l| (i, shell_words(l))));
         }
         if let Some(script) = shell_script(run) {
             out.extend(script_lines(script, 0).iter().map(|l| (i, shell_words(l))));
@@ -1835,6 +1845,80 @@ fn shell_script(run: &[String]) -> Option<&str> {
         }
     }
     None
+}
+
+/// What the line feeds a shell on stdin.
+enum Fed<'a> {
+    /// A here-string's text.
+    Text(&'a str),
+    /// A heredoc, whose lines are already commands of the line.
+    Heredoc,
+    /// Nothing the line shows: a pipe, or the stdin it inherits.
+    Unshown,
+}
+
+/// For a shell that reads its script from stdin, having no `-c` script
+/// and no file operand (or `-s`, after which operands are arguments),
+/// what the line feeds it there and whether `-s` asks for it. `None` for
+/// a call that is not such a shell.
+fn shell_stdin(run: &[String]) -> Option<(Fed<'_>, bool)> {
+    let (first, args) = run.split_first()?;
+    if !SHELLS.contains(&base_of(first)) || shell_script(run).is_some() {
+        return None;
+    }
+    let mut fed = Fed::Unshown;
+    let mut it = args.iter().map(String::as_str);
+    while let Some(a) = it.next() {
+        let body = redirection_body(a);
+        if let Some(text) = body.strip_prefix("<<<") {
+            fed = Fed::Text(if text.is_empty() {
+                it.next().unwrap_or_default()
+            } else {
+                text
+            });
+        } else if body.starts_with("<<") {
+            fed = Fed::Heredoc;
+        }
+    }
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut stdin = false;
+    let mut it = operands(&words).into_iter();
+    while let Some(a) = it.next() {
+        if a == "--" || a == "-" {
+            break;
+        }
+        if !(a.starts_with('-') || a.starts_with('+')) {
+            if !stdin {
+                return None;
+            }
+            break;
+        }
+        if a.starts_with('-') && !a.starts_with("--") && a[1..].contains('s') {
+            stdin = true;
+        }
+        if matches!(a, "--rcfile" | "--init-file")
+            || (!a.starts_with("--") && a.ends_with(['o', 'O']))
+        {
+            it.next();
+        }
+    }
+    Some((fed, stdin))
+}
+
+/// Whether a shell on the line runs a script from stdin that the line
+/// does not show: one after a `|`, or one called with `-s`, that no
+/// here-string or heredoc feeds, or a here-string holding an expansion.
+fn unshown_stdin_script(argv: &[String]) -> bool {
+    let mut piped = false;
+    ended_commands(argv).into_iter().any(|(cmd, end)| {
+        let after_pipe = std::mem::replace(&mut piped, end == "|");
+        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        match shell_stdin(unwrap_wrappers(&owned).0) {
+            Some((Fed::Text(text), _)) => text.contains(['$', '`']),
+            Some((Fed::Unshown, dash_s)) => after_pipe || dash_s,
+            _ => false,
+        }
+    })
 }
 
 fn decode_ansi_c_quoted(chars: &[char], i: &mut usize, out: &mut String) {

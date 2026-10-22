@@ -1,0 +1,1 @@
+A shell that reads its script from stdin is judged on it: the text of a here-string (`bash <<< "git push -f"`) is read as the script, and a pipe into a shell (`echo "git push -f" | bash`), a `bash -s` fed no here-string or heredoc, or a here-string holding an expansion is refused as `shell-stdin-unshown`.

@@ -21,7 +21,11 @@ First match wins. The head is the last path component of argv[0].
 Leading assignments, ``NAME=value`` or ``NAME+=value``, and runner words
 such as ``env``, ``nice`` and ``timeout`` come off first, as does the head
 of a ``case`` arm (``case $x in a)``, or ``b)`` after ``;;``). A ``trap``
-action is judged as a script of its own.
+action is judged as a script of its own. A shell with no ``-c`` script
+and no file runs what it reads on stdin: the text of a here-string or
+heredoc is judged as that script, and a pipe, a ``-s`` shell fed
+neither, or a here-string holding an expansion is refused as
+``shell-stdin-unshown``.
 
 ===================== ======================== ============================
 Token                 Cap'n PolicyReason       When
