@@ -1324,6 +1324,16 @@ fn note_startup(cmd: &[&str], vars: &mut Vars) {
         return;
     }
     if name == "unset" {
+        // `unset -f` takes out functions, and leaves a variable of the
+        // same name.
+        if rest
+            .iter()
+            .skip(1)
+            .take_while(|a| a.starts_with('-') && **a != "--")
+            .any(|a| a[1..].contains('f'))
+        {
+            return;
+        }
         for a in rest.iter().skip(1) {
             match *a {
                 "BASH_ENV" => {
@@ -10342,6 +10352,48 @@ hash -r 2> /dev/null
         );
         assert_eq!(c.decision, Decision::Deny, "{}", c.token);
         assert_eq!(c.token, "startup-script-unshown");
+    }
+
+    fn startup_root(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["evil", "safe", ".venv/bin"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("evil/force.sh"), "git push -f origin\n").unwrap();
+        std::fs::write(root.join("safe/Makefile"), "test:\n\techo ok\n").unwrap();
+        std::fs::write(
+            root.join(".venv/bin/activate"),
+            include_str!("../tests/fixtures/pyvenv-activate.sh"),
+        )
+        .unwrap();
+        root
+    }
+
+    /// `unset -f BASH_ENV` takes out a function and leaves the exported
+    /// variable, yet it was taken to drop it, so the next bash went
+    /// unjudged.
+    #[test]
+    fn an_unset_f_keeps_the_startup_file() {
+        let root = startup_root("stunsetf");
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "export BASH_ENV=evil/force.sh; unset -f BASH_ENV; bash -c 'echo ok'",
+            "export BASH_ENV=evil/force.sh; unset -f -- BASH_ENV; bash -c 'echo ok'",
+            "export ENV=evil/force.sh; unset -f ENV; sh -c 'echo ok'",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
+        }
+        for line in [
+            "export BASH_ENV=evil/force.sh; unset BASH_ENV; bash -c 'echo ok'",
+            "export BASH_ENV=evil/force.sh; unset -v BASH_ENV; bash -c 'echo ok'",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        assert_everyday_allowed(&root);
     }
 
     /// `bash evil.sh` was allowed whatever evil.sh held: only a `-c`
