@@ -4915,6 +4915,40 @@ mod tests {
         );
     }
 
+    /// With `HOME` unset, `~` is the passwd home, as bash expands it, while
+    /// a bare `cd` fails and stays.
+    #[cfg(unix)]
+    #[test]
+    fn tilde_with_home_unset_is_the_passwd_home() {
+        // SAFETY: getpwuid returns null or a record valid until the next call.
+        let pw = unsafe { libc::getpwuid(libc::getuid()) };
+        assert!(!pw.is_null());
+        let home = unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) };
+        let home = std::path::PathBuf::from(home.to_string_lossy().into_owned());
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-nohome", std::process::id()));
+        for (line, want) in [
+            ("unset HOME; cd ~/x && make clean-all", home.join("x")),
+            ("unset HOME; env -C ~/x make clean-all", home.join("x")),
+            ("unset HOME; cd && make clean-all", root.clone()),
+        ] {
+            let mut runs = Vec::new();
+            runner_commands(
+                &shell_words(line),
+                &root,
+                &[],
+                &Vars::from_env(),
+                0,
+                &mut runs,
+            );
+            let dirs: Vec<_> = runs
+                .iter()
+                .filter(|(r, _, _)| r[0] == "make")
+                .map(|(_, d, _)| d.clone())
+                .collect();
+            assert_eq!(dirs, [want], "{line}");
+        }
+    }
+
     /// Redirections before the `cd` target are not directory names.
     #[test]
     fn skips_redirections_before_a_cd_target() {
