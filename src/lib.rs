@@ -300,6 +300,13 @@ fn runner_commands(
         }
         let words = peel_cd_command_word(&shown);
         let b = words.first().map_or("", |w| base_of(w));
+        if unseen(&cmd) && (!piped || lastpipe && end != "|") {
+            here = vec![UNTRACKED.into()];
+            old = vec![UNTRACKED.into()];
+            pushed.clear();
+            vars.cdpath = Some("$".into());
+            vars.home = Some("$".into());
+        }
         if piped && matches!(b, "cd" | "pushd" | "popd" | "dirs") {
             // A last stage that may run here leaves where the line is,
             // and the stack under it, not followed.
@@ -543,6 +550,9 @@ impl Vars {
 /// it, by the rules [`set_vars`] follows for `HOME`.
 fn writes_pwd(argv: &[String]) -> bool {
     commands(argv).iter().any(|cmd| {
+        if unseen(cmd) {
+            return true;
+        }
         let mut probe = Vars {
             cdpath: None,
             home: None,
@@ -563,6 +573,20 @@ fn may_set(w: &str, name: &str) -> bool {
             && !post.starts_with(ident)
             && (!pre.ends_with(['$', '{']) || post.starts_with('=') || post.starts_with(":="))
     })
+}
+
+/// Whether the command `cmd` runs, in the shell that runs it, what the
+/// walk does not follow: `eval`, `source` or `.`, or a command word the
+/// line does not show (`$c dir`), which may be `cd`. After one nothing is
+/// known of where the line is or what `CDPATH`, `HOME` and `PWD` hold.
+fn unseen(cmd: &[&str]) -> bool {
+    let words = operands(cmd);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    peel_cd_command_word(&words[front..])
+        .first()
+        .is_some_and(|w| matches!(base_of(w), "eval" | "source" | ".") || w.contains(['$', '`']))
 }
 
 /// Whether the command `cmd` may turn on `lastpipe`: `shopt -s` or `set

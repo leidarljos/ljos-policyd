@@ -72,7 +72,10 @@ target and the line: =make clean-all runs `rm -rf ~`: rm-rf-outside-tmp=.
 Nothing is spawned. A missing or unreadable file leaves the line
 judged as written. A =cd= or =pushd= to a path the line does not show
 (=cd "$X"=) leaves it in a directory it does not follow, so a runner
-after it is refused.
+after it is refused. So does an =eval=, =source= or =.=, whose script
+is not followed, and a command word the line does not show (=$c dir=),
+which may be =cd=; after one =HOME=, =CDPATH= and =PWD= are not
+followed either.
 Raw newlines and carriage returns split script commands, and =$'...'=
 ANSI-C quoted words are decoded before the line is judged.
 
