@@ -6719,7 +6719,7 @@ fn may_write_anywhere(run: &[String], at: &[std::path::PathBuf], home: Option<&s
         // A subshell and a function definition are read by the walk, and
         // a word with a glob in the place of a command is a case arm.
         _ if word.starts_with('(') || marker_index(word).is_some() => false,
-        _ if !word.contains('/') && word.contains(['*', '?']) => false,
+        _ if word.contains(['*', '?', '[']) => false,
         _ if word.contains('/') => placed(word, at, home)
             .into_iter()
             .any(|p| p.is_none_or(|p| matches!(read_script(&p), ScriptText::Binary))),
@@ -14181,5 +14181,26 @@ hash -r 2> /dev/null
             let c = at(line);
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
         }
+    }
+
+    /// A command word with a glob is not a program that writes every
+    /// file. A real program the guard does not know still may.
+    #[test]
+    fn a_glob_in_the_command_word_writes_nothing() {
+        let root = startup_root("globcmd");
+        std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "/usr/bin/foo*; sh ./ok.sh",
+            "/usr/bin/foo?; sh ./ok.sh",
+            "/usr/bin/foo[0]; sh ./ok.sh",
+            "ls /usr/bin/*; sh ./ok.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        let c = at("mysterybin; sh ./ok.sh");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(c.token.contains("may write any file"), "{}", c.token);
     }
 }
