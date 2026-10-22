@@ -206,15 +206,55 @@ fn runner_commands(
             continue;
         }
         if b == "cd" || b == "pushd" {
+            let pushd = b == "pushd";
+            // `pushd -n` changes the stack and leaves the directory.
+            let args: Vec<&str> = words[1..]
+                .iter()
+                .copied()
+                .filter(|a| !pushd || *a != "-n")
+                .collect();
+            let keep = args.len() + 1 < words.len();
+            if pushd && args.first().is_none_or(|a| stack_index(a)) {
+                let stack: Vec<_> = std::iter::once((here.clone(), true))
+                    .chain(pushed.iter().rev().cloned())
+                    .collect();
+                if let Some(mut s) = rotated(&stack, args.first().copied()) {
+                    let top = s.remove(0).0;
+                    pushed = s
+                        .into_iter()
+                        .rev()
+                        .map(|(d, sure)| (d, sure && gates))
+                        .collect();
+                    if !keep {
+                        let from = std::mem::replace(&mut here, top);
+                        add_dirs(if gates { &mut failed } else { &mut here }, from);
+                    }
+                }
+                continue;
+            }
+            let named: Vec<_> = here
+                .iter()
+                .filter_map(|d| entered(&args, d, pushd))
+                .collect();
+            if pushd && (keep || named.is_empty()) {
+                // A directory the line does not name still takes its place
+                // on the stack, and is read as the one the line is in.
+                let mut dirs = Vec::new();
+                add_dirs(
+                    &mut dirs,
+                    if named.is_empty() {
+                        here.clone()
+                    } else {
+                        named
+                    },
+                );
+                pushed.push((dirs, gates));
+                continue;
+            }
             // A `cd` that may have failed keeps the directories it left,
             // and one into a directory that is not there moves nothing.
             let mut to = Vec::new();
-            add_dirs(
-                &mut to,
-                here.iter()
-                    .filter_map(|d| entered(&words[1..], d, b == "pushd"))
-                    .filter(|d| gates || d.is_dir()),
-            );
+            add_dirs(&mut to, named.into_iter().filter(|d| gates || d.is_dir()));
             if !to.is_empty() {
                 let from = std::mem::replace(&mut here, to);
                 if b == "pushd" {
@@ -260,6 +300,51 @@ fn entered(args: &[&str], dir: &std::path::Path, pushd: bool) -> Option<std::pat
         return None;
     }
     path_from(to, dir)
+}
+
+/// Whether `a` is a `pushd` stack index, `+N` or `-N`.
+fn stack_index(a: &str) -> bool {
+    a.len() > 1 && a.starts_with(['+', '-']) && a[1..].bytes().all(|c| c.is_ascii_digit())
+}
+
+/// A directory stack, top first: each entry's directories, and whether the
+/// `pushd` that left it surely ran.
+type Stack = Vec<(Vec<std::path::PathBuf>, bool)>;
+
+/// `stack` after `pushd` brings entry `index` to the top: `+N` counts from
+/// the top and `-N` from the bottom, and a bare `pushd` swaps the top two.
+/// None when the stack is too short. An entry the index counts past may
+/// be missing, so the one it names may be another and the top may then be
+/// any directory on the stack.
+fn rotated(stack: &Stack, index: Option<&str>) -> Option<Stack> {
+    let n: usize = index.map_or(Some(1), |a| a[1..].parse().ok())?;
+    let from_top = !index.is_some_and(|a| a.starts_with('-'));
+    let i = if from_top {
+        n
+    } else {
+        stack.len().checked_sub(n + 1)?
+    };
+    if i >= stack.len() {
+        return None;
+    }
+    let counted = if from_top { &stack[1..=i] } else { &stack[1..] };
+    let mut s = stack.clone();
+    if index.is_none() {
+        s.swap(0, 1);
+    } else {
+        s.rotate_left(i);
+    }
+    if counted.iter().any(|(_, sure)| !sure) {
+        s[0].0.clear();
+        add_dirs(
+            &mut s[0].0,
+            stack.iter().flat_map(|(d, _)| d.iter().cloned()),
+        );
+        for e in &mut s {
+            e.1 = false;
+        }
+    }
+    Some(s)
 }
 
 fn home_dir() -> Option<std::path::PathBuf> {
@@ -3937,6 +4022,43 @@ mod tests {
             leaving("env-cd", "env -C safe make clean-all"),
             Decision::Allow
         );
+    }
+
+    /// `pushd -n` stacks a directory without entering it, and `pushd +N`,
+    /// `-N` or a bare `pushd` enters the one it brings to the top.
+    #[test]
+    fn follows_pushd_through_its_stack() {
+        for line in [
+            "pushd -n safe && make clean-all",
+            "pushd safe && pushd +1 && make clean-all",
+            "pushd safe && pushd -0 && make clean-all",
+            "pushd safe && pushd && make clean-all",
+            "pushd safe && pushd \"$PWD\" && pushd +2 && make clean-all",
+            "pushd safe ; pushd +1 && make clean-all",
+        ] {
+            assert_eq!(leaving("pushd-stack", line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "pushd -n safe && popd && make clean-all",
+            "cd safe && pushd -n .. && make clean-all",
+            "pushd safe && pushd +0 && make clean-all",
+            "pushd safe && pushd -1 && make clean-all",
+        ] {
+            assert_eq!(leaving("pushd-stack", line), Decision::Allow, "{line}");
+        }
+        let other = std::env::temp_dir()
+            .join(format!("policyd-lib-{}-pushd-other", std::process::id()))
+            .join("project/other");
+        std::fs::create_dir_all(&other).expect("dir");
+        std::fs::write(other.join("Makefile"), "clean-all:\n\techo clean\n").expect("write");
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "pushd project && pushd other && pushd +1 && make clean-all",
+            "pushd project && pushd \"$PWD/other\" && pushd +1 && make clean-all",
+        ] {
+            let c = entering("pushd-other", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
     }
 
     /// The `&` of a redirection does not send the `cd` before it to the
