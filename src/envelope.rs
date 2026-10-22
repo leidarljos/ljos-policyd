@@ -916,13 +916,29 @@ fn alias_forms(local: &str, domain: &str, families: &[AliasFamily]) -> Vec<(Stri
                     .next()
                     .filter(|_| family.subdomain)
                 {
-                    push_form(&mut forms, format!("{user}{sep}{local}"), base.clone());
+                    for user in subdomain_users(user) {
+                        push_form(&mut forms, format!("{user}{sep}{local}"), base.clone());
+                    }
                 }
             }
         }
         i += 1;
     }
     forms
+}
+
+/// The domain is IDNA ASCII and the local part is Unicode, so the user
+/// label is decoded and folded as a local part. The ASCII label is kept
+/// as well, and a label that does not decode is only that.
+fn subdomain_users(label: &str) -> Vec<String> {
+    let mut users = vec![label.to_string()];
+    let (unicode, result) = idna::domain_to_unicode(label);
+    if let Some(user) = result.ok().and_then(|()| normalize_local(&unicode)) {
+        if user != label {
+            users.push(user);
+        }
+    }
+    users
 }
 
 fn push_form(forms: &mut Vec<(String, String)>, local: String, domain: String) {
@@ -1989,6 +2005,19 @@ pair left right
         let fm = "alias fastmail.com,fastmail.fm + shared\n";
         assert!(denied("shop@user.fastmail.fm", plus, fm));
         assert!(denied("user+shop@fastmail.fm", sub, fm));
+        let unicode = "address b\u{FC}cher@fastmail.com\n";
+        for to in [
+            "x@b\u{FC}cher.fastmail.com",
+            "x@xn--bcher-kva.fastmail.com",
+            "x@B\u{DC}CHER.fastmail.com",
+        ] {
+            assert!(denied(to, unicode, ""), "{to}");
+        }
+        let label = "address x@b\u{FC}cher.fastmail.com\n";
+        for to in ["b\u{FC}cher+x@fastmail.com", "x@xn--bcher-kva.fastmail.com"] {
+            assert!(denied(to, label, ""), "{to}");
+        }
+        assert!(!denied("bucher+x@fastmail.com", label, ""));
         let dotted = "alias example.test + dots subdomain\n";
         for deny in [
             "address jdoe@example.test\n",

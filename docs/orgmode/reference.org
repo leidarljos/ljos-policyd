@@ -251,7 +251,9 @@ separator. On =fastmail.com=, =+= is a separator and a
 mailbox at =<local>@<user>.fastmail.com= is
 =<user>+<local>@fastmail.com=. Every label in front of
 =fastmail.com= is the user, and a hyphen there is part of the
-user name. =proton.me=,
+user name. A punycode user label is decoded to Unicode and folded as a
+local part, so =x@xn--bcher-kva.fastmail.com= is
+=bücher+x@fastmail.com=. =proton.me=,
 =protonmail.com=, =protonmail.ch= and =pm.me= are one
 domain, and so are =icloud.com=, =me.com= and =mac.com=,
 each with =+=. =outlook.*=, =hotmail.*=, =live.*= and
