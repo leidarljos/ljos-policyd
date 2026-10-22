@@ -5997,6 +5997,45 @@ mod tests {
         }
     }
 
+    /// `$HOME` and `${HOME}` at the head of a path expand from the `HOME`
+    /// the line shows, as `~` does, `~login` from the password database,
+    /// and `~+` to where the line is, so a make there is judged by its
+    /// recipe and not refused as one that may run anywhere.
+    #[cfg(unix)]
+    #[test]
+    fn a_cd_follows_home_through_a_variable_or_a_login() {
+        let files = [("Makefile", MAKEFILE)];
+        // SAFETY: the record getpwuid returns is copied out at once.
+        let (name, home) = unsafe {
+            let pw = libc::getpwuid(libc::getuid());
+            assert!(!pw.is_null(), "no password entry");
+            let s = |p| std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned();
+            (s((*pw).pw_name), s((*pw).pw_dir))
+        };
+        let up = "/..".repeat(std::path::Path::new(&home).components().count() - 1);
+        for line in [
+            "export HOME={dir}; cd $HOME && make TARGET".to_string(),
+            "export HOME={dir}; cd ${HOME}/. && make TARGET".into(),
+            "export HOME={dir}; cd \"$HOME\" && make TARGET".into(),
+            "export HOME={dir}; env -C $HOME make TARGET".into(),
+            "HOME={dir} bash -c 'cd $HOME && make TARGET'".into(),
+            "cd ~+/project && make TARGET".into(),
+            format!("cd ~{name}{up}{{dir}} && make TARGET"),
+        ] {
+            for (target, want) in [("clean-all", Decision::Deny), ("test", Decision::Allow)] {
+                let line = line.replace("TARGET", target);
+                let c = entering("home-word", &files, &line);
+                assert_eq!(c.decision, want, "{line}");
+            }
+        }
+        let c = entering(
+            "home-word",
+            &files,
+            "HOME=$(mktemp -d); cd $HOME/x && make clean-all",
+        );
+        assert_eq!(c.decision, Decision::Deny);
+    }
+
     /// `$PWD` in a value names the one directory the line is in, unless
     /// the line sets `PWD` itself.
     #[test]
