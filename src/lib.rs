@@ -216,6 +216,11 @@ fn runner_commands(
     let mut list = (here.clone(), old.clone(), pushed.clone(), vars.clone());
     let mut after = ";";
     let mut ran_in = Vec::new();
+    // `$PWD` follows the line's directory unless the line sets it.
+    let pwd_set = argv.iter().any(|w| may_set(w, "PWD"));
+    // With `shopt -s lastpipe` anywhere on the line, the last stage of a
+    // pipeline may run in this shell.
+    let lastpipe = argv.iter().any(|w| w == "lastpipe");
     for (cmd, end) in ended_commands(argv) {
         if after == "&" {
             (here, old, pushed, vars) = list.clone();
@@ -242,6 +247,7 @@ fn runner_commands(
         let gates = end == "&&" && after != "||";
         let before = std::mem::replace(&mut after, end);
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        let owned = split_env_strings(&owned).into_owned();
         let run = unwrap_wrappers(&owned).0.to_vec();
         // `env -C DIR` runs its own command, and any script it hands a
         // shell, in DIR, and moves nothing after it.
@@ -250,10 +256,14 @@ fn runner_commands(
             .iter()
             .map(|d| env_dir(wrappers, d, vars.home.as_deref()))
             .collect();
+        let pwd = match here.as_slice() {
+            [d] if !pwd_set && !is_untracked(d) => Some(d.as_path()),
+            _ => None,
+        };
         // The command's own assignments hold for it and what it runs.
         let mut set = vars.clone();
         for w in wrappers.iter().filter(|w| is_assignment(w)) {
-            set.assign(w);
+            set.assign(&with_pwd(w, pwd));
         }
         ran_in.push((at.clone(), old.clone(), set.clone()));
         // A subshell or substitution in the command runs where the
@@ -265,9 +275,11 @@ fn runner_commands(
                 }
             }
         }
+        let shown: Vec<_> = cmd.iter().map(|w| with_pwd(w, pwd)).collect();
+        let shown: Vec<&str> = shown.iter().map(|w| &**w).collect();
         if !piped {
             let was = vars.clone();
-            set_vars(&cmd, &mut vars);
+            set_vars(&shown, &mut vars);
             match before {
                 "||" => vars.merge(was),
                 "&&" => match &mut vars_failed {
@@ -276,28 +288,48 @@ fn runner_commands(
                 },
                 _ => {}
             }
+        } else if lastpipe && end != "|" {
+            let mut set = vars.clone();
+            set_vars(&shown, &mut set);
+            if set.cdpath != vars.cdpath {
+                vars.cdpath = Some("$".into());
+            }
+            if set.home != vars.home {
+                vars.home = Some("$".into());
+            }
         }
         let words = peel_cd_command_word(&cmd);
         let b = words.first().map_or("", |w| base_of(w));
-        if piped && matches!(b, "cd" | "pushd" | "popd") {
+        if piped && matches!(b, "cd" | "pushd" | "popd" | "dirs") {
+            continue;
+        }
+        if b == "dirs" {
+            let args = operands(&words[1..]);
+            if args.iter().any(|a| a.starts_with('-') && a.contains('c')) {
+                pushed.clear();
+            }
             continue;
         }
         if b == "popd" {
-            let args = operands(&words[1..]);
-            let index = args.iter().copied().find(|a| stack_index(a));
             let stack: Vec<_> = std::iter::once((here.clone(), true))
                 .chain(pushed.iter().rev().cloned())
                 .collect();
-            if let Some((mut s, moved)) = popped(&stack, index, args.contains(&"-n")) {
-                let (back, sure) = s.remove(0);
-                pushed = s.into_iter().rev().collect();
-                if moved {
-                    let now = std::mem::replace(&mut here, back);
-                    let was = std::mem::replace(&mut old, now.clone());
-                    if !sure {
-                        add_dirs(&mut here, now);
-                        add_dirs(&mut old, was);
-                    }
+            // A popd that fails, or that pops past the stack the line built
+            // into one the shell had before, is not followed.
+            let Some((mut s, moved)) = popd_args(&operands(&words[1..]))
+                .and_then(|(index, keep)| popped(&stack, index, keep))
+            else {
+                here = vec![UNTRACKED.into()];
+                continue;
+            };
+            let (back, sure) = s.remove(0);
+            pushed = s.into_iter().rev().collect();
+            if moved {
+                let now = std::mem::replace(&mut here, back);
+                let was = std::mem::replace(&mut old, now.clone());
+                if !sure {
+                    add_dirs(&mut here, now);
+                    add_dirs(&mut old, was);
                 }
             }
             continue;
@@ -427,12 +459,17 @@ impl Vars {
     }
 
     /// Take the assignment `w`, which may append. A value the shell
-    /// expands, with `~` in it as well as `$` or `` ` ``, is not shown.
+    /// expands, with `~` in it as well as `$` or `` ` ``, is not shown,
+    /// nor is one set through an array element (`HOME[0]=dir`).
     fn assign(&mut self, w: &str) {
         let Some((name, v)) = w.split_once('=') else {
             return;
         };
         let (name, add) = name.strip_suffix('+').map_or((name, false), |n| (n, true));
+        if name.contains('[') {
+            self.lose_target(name);
+            return;
+        }
         if let Some(slot) = self.slot(name) {
             let was = slot.take().filter(|_| add).unwrap_or_default();
             *slot = Some(was + if v.contains('~') { "$" } else { v });
@@ -443,22 +480,30 @@ impl Vars {
     /// other than to read it (`$NAME`, `${NAME}`), or sets by default
     /// (`${NAME:=value}`).
     fn lose(&mut self, w: &str) {
-        let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
-        let sets = |name: &str| {
-            w.match_indices(name).any(|(i, _)| {
-                let (pre, post) = (&w[..i], &w[i + name.len()..]);
-                !pre.ends_with(ident)
-                    && !post.starts_with(ident)
-                    && (!pre.ends_with(['$', '{'])
-                        || post.starts_with('=')
-                        || post.starts_with(":="))
-            })
-        };
-        if sets("CDPATH") {
+        if may_set(w, "CDPATH") {
             self.cdpath = Some("$".into());
         }
-        if sets("HOME") {
+        if may_set(w, "HOME") {
             self.home = Some("$".into());
+        }
+    }
+
+    /// Leave the variable the word `w` names as the target of a write not
+    /// shown: `NAME`, `NAME=value`, `NAME+=value` or `NAME[i]=value`.
+    fn lose_target(&mut self, w: &str) {
+        let name = w.split(['=', '+', '[']).next().unwrap_or_default();
+        if let Some(slot) = self.slot(name) {
+            *slot = Some("$".into());
+        }
+    }
+
+    /// Leave each variable the word `w` sets by default (`${NAME:=value}`,
+    /// `${NAME=value}`) not shown.
+    fn lose_default(&mut self, w: &str) {
+        for name in ["CDPATH", "HOME"] {
+            if w.contains(&format!("${{{name}:=")) || w.contains(&format!("${{{name}=")) {
+                self.lose_target(name);
+            }
         }
     }
 
@@ -475,23 +520,66 @@ impl Vars {
     }
 }
 
-/// Keywords that open or continue a compound command; the command after
-/// them runs in this shell.
-const KEYWORDS: [&str; 9] = [
-    "!", "{", "if", "then", "else", "elif", "while", "until", "do",
+/// Whether the word `w` names the variable `name` other than to read it
+/// (`$NAME`, `${NAME}`), or sets it by default (`${NAME:=value}`).
+fn may_set(w: &str, name: &str) -> bool {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    w.match_indices(name).any(|(i, _)| {
+        let (pre, post) = (&w[..i], &w[i + name.len()..]);
+        !pre.ends_with(ident)
+            && !post.starts_with(ident)
+            && (!pre.ends_with(['$', '{']) || post.starts_with('=') || post.starts_with(":="))
+    })
+}
+
+/// `w` with each `$PWD` and `${PWD}` in it read as `pwd`, the one
+/// directory the line is in when it shows that.
+fn with_pwd<'a>(w: &'a str, pwd: Option<&std::path::Path>) -> Cow<'a, str> {
+    let Some(p) = pwd.and_then(|p| p.to_str()).filter(|_| w.contains("$")) else {
+        return Cow::Borrowed(w);
+    };
+    let w = w.replace("${PWD}", p);
+    let mut out = String::new();
+    let mut rest = w.as_str();
+    while let Some(i) = rest.find("$PWD") {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + 4..];
+        let longer = rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
+        out.push_str(if longer { "$PWD" } else { p });
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
+/// Keywords that open or continue a compound command, or time one; the
+/// command after them runs in this shell. `time` takes a `-p` after it.
+const KEYWORDS: [&str; 10] = [
+    "!", "{", "if", "then", "else", "elif", "while", "until", "do", "time",
 ];
+
+/// Whether `words[i]` is a keyword, or the `-p` of a `time` before it.
+fn keyword_at(words: &[&str], i: usize) -> bool {
+    KEYWORDS.contains(&words[i]) || (words[i] == "-p" && i > 0 && words[i - 1] == "time")
+}
 
 /// Apply to `vars` what the command `cmd` leaves set in the shell that
 /// runs it: assignments alone set themselves, `export`, `declare` and the
-/// like with plain flags set theirs, and `unset` unsets. A word of any
-/// other command that may set one (`read CDPATH`, `case`'s `CDPATH=dir`,
-/// `${CDPATH:=dir}`) leaves it not shown, as does an assignment in front
-/// of a special builtin, which some shells keep (`CDPATH=dir :`).
+/// like with plain flags set theirs, and `unset` unsets. A command that
+/// writes one some other way ([`written`], `${CDPATH:=dir}`, `{HOME}>f`) leaves it
+/// not shown, as do `let` and `eval` naming it and an assignment in front
+/// of a special builtin, which some shells keep (`CDPATH=dir :`). A word
+/// that only names one (`grep HOME`, `env HOME=dir cmd`) sets nothing.
 fn set_vars(cmd: &[&str], vars: &mut Vars) {
+    for name in cmd.iter().filter_map(|w| fd_variable(w)) {
+        vars.lose_target(name);
+    }
+    // `((...))` and `$((...))` evaluate here and may assign what they name.
+    for w in cmd.iter().filter(|w| w.contains("((")) {
+        vars.lose(w);
+    }
     let words = operands(cmd);
-    let front = words
-        .iter()
-        .take_while(|w| is_assignment(w) || KEYWORDS.contains(w))
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
         .count();
     let rest = peel_cd_command_word(&words[front..]);
     let name = rest.first().map_or("", |w| base_of(w));
@@ -510,11 +598,18 @@ fn set_vars(cmd: &[&str], vars: &mut Vars) {
                 }
             }
         }
-        // A subshell sets nothing here.
-        _ => words[front..]
-            .iter()
-            .filter(|w| !w.starts_with('('))
-            .for_each(|w| vars.lose(w)),
+        _ => {
+            // A subshell sets nothing here.
+            for w in words[front..].iter().filter(|w| !w.starts_with('(')) {
+                vars.lose_default(w);
+            }
+            match name {
+                "let" | "eval" => args.iter().for_each(|a| vars.lose(a)),
+                _ => written(name, args)
+                    .into_iter()
+                    .for_each(|a| vars.lose_target(a)),
+            }
+        }
     }
     let special = [
         ":", ".", "source", "eval", "exec", "exit", "export", "readonly", "return", "set", "shift",
@@ -522,6 +617,29 @@ fn set_vars(cmd: &[&str], vars: &mut Vars) {
     ];
     if special.contains(&name) {
         words[..front].iter().for_each(|w| vars.lose(w));
+    }
+}
+
+/// The words naming what the command `name` with `args` writes in the
+/// shell that runs it: the names `read`, `mapfile`, `getopts` and a
+/// `declare` with other than plain flags take, the one after `printf -v`
+/// or `wait -p`, and the loop variable of `for` and `select`.
+fn written<'a>(name: &str, args: &[&'a str]) -> Vec<&'a str> {
+    match name {
+        "read" | "mapfile" | "readarray" | "getopts" | "export" | "readonly" | "declare"
+        | "typeset" | "local" => args.to_vec(),
+        "printf" | "wait" => {
+            let flag = if name == "printf" { "-v" } else { "-p" };
+            args.iter()
+                .enumerate()
+                .filter_map(|(i, a)| match a.strip_prefix(flag) {
+                    Some("") => args.get(i + 1).copied(),
+                    v => v,
+                })
+                .collect()
+        }
+        "for" | "select" => args.first().copied().into_iter().collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -537,8 +655,8 @@ fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
         }
         // The `-` of `2>&-` closes the descriptor and is the whole target;
         // only the heredoc `<<-` still wants the next word.
-        let rest = a.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
-        if rest == "<<-" || rest.chars().all(|c| matches!(c, '>' | '<' | '&')) {
+        let rest = redirection_body(a);
+        if rest == "<<-" || rest.chars().all(|c| matches!(c, '>' | '<' | '&' | '|')) {
             words.next();
         }
     }
@@ -573,25 +691,45 @@ fn entered(
     let Some(path) = path_from(to, dir, home) else {
         return Vec::new();
     };
-    let mut dirs = vec![path];
+    let mut dirs = Vec::new();
     let searched = !to.starts_with('~')
         && matches!(
             std::path::Path::new(to).components().next(),
             Some(std::path::Component::Normal(_))
         );
     if let Some(cdpath) = set.cdpath.as_deref().filter(|_| searched) {
-        // The shell takes the first entry it can enter, or else `dir`; an
-        // entry that names no directory the line shows may be any.
+        // The shell takes the first entry it can enter, an empty one being
+        // `dir`, or else `dir`; an entry that names no directory the line
+        // shows may be any, and the walk goes on past it.
         for entry in cdpath.split(':') {
             let d = path_from(entry, dir, home)
                 .unwrap_or_else(|| UNTRACKED.into())
                 .join(to);
-            if is_untracked(&d) || d.join(".").is_dir() {
+            if is_untracked(&d) {
                 dirs.push(d);
+            } else if d.join(".").is_dir() {
+                dirs.push(d);
+                return dirs;
             }
         }
     }
+    dirs.push(path);
     dirs
+}
+
+/// The index and the `-n` that `popd` reads from `args`, which end at
+/// `--`. None for a word bash refuses, on which popd fails.
+fn popd_args<'a>(args: &[&'a str]) -> Option<(Option<&'a str>, bool)> {
+    let (mut index, mut keep) = (None, false);
+    for &a in args {
+        match a {
+            "--" => break,
+            "-n" => keep = true,
+            _ if stack_index(a) => index = Some(a),
+            _ => return None,
+        }
+    }
+    Some((index, keep))
 }
 
 /// Whether `a` is a `pushd` stack index, `+N` or `-N`.
@@ -688,6 +826,25 @@ fn home_from(home: Option<&str>, dir: &std::path::Path) -> Option<std::path::Pat
     })
 }
 
+/// What `~` expands to with `HOME` at `home`: that value, or with `HOME`
+/// unset the home in the user's passwd entry, as bash takes it. A user
+/// with no entry names no directory the line shows.
+fn tilde_home(home: Option<&str>) -> Cow<'_, str> {
+    if let Some(h) = home {
+        return Cow::Borrowed(h);
+    }
+    // SAFETY: getpwuid returns null or a record that stays valid until the
+    // next lookup, and pw_dir is copied out before this returns.
+    let dir = unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() || (*pw).pw_dir.is_null() {
+            return Cow::Borrowed("$");
+        }
+        std::ffi::CStr::from_ptr((*pw).pw_dir)
+    };
+    Cow::Owned(dir.to_string_lossy().into_owned())
+}
+
 /// Where the path word `to` lands from `dir`: `~` and `~/path` from
 /// `home`, anything else joined onto `dir`. A variable, a substitution or
 /// `~user` names no directory the line shows.
@@ -696,10 +853,10 @@ fn path_from(to: &str, dir: &std::path::Path, home: Option<&str>) -> Option<std:
         return None;
     }
     if to == "~" {
-        return home_from(home, dir);
+        return home_from(Some(&tilde_home(home)), dir);
     }
     if let Some(rest) = to.strip_prefix("~/") {
-        return home_from(home, dir).map(|h| h.join(rest));
+        return home_from(Some(&tilde_home(home)), dir).map(|h| h.join(rest));
     }
     (!to.starts_with('~')).then(|| dir.join(to))
 }
@@ -825,8 +982,13 @@ fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
                     }
                 }
             }
+            // `/usr/bin/time` is a program, and runs `cd` in a child.
+            "time" if *w != "time" => return words,
             k if KEYWORDS.contains(&k) => {
                 words = rest;
+                if k == "time" && words.first() == Some(&"-p") {
+                    words = &words[1..];
+                }
             }
             _ => return words,
         }
@@ -882,7 +1044,16 @@ fn inner_commands_at(argv: &[String]) -> Vec<(usize, Vec<String>)> {
         if cmd.iter().all(|w| is_assignment(w)) {
             for w in &cmd {
                 if let Some((k, v)) = w.split_once('=') {
-                    names.push((k.to_string(), v.trim_matches(['"', '\'']).to_string()));
+                    let v = v.trim_matches(['"', '\'']);
+                    let v = match k.strip_suffix('+') {
+                        Some(k) => names
+                            .iter()
+                            .rev()
+                            .find(|(n, _)| n == k)
+                            .map_or(v.to_string(), |(_, was)| format!("{was}{v}")),
+                        None => v.to_string(),
+                    };
+                    names.push((k.trim_end_matches('+').to_string(), v));
                 }
             }
             continue;
@@ -903,6 +1074,12 @@ fn inner_commands_at(argv: &[String]) -> Vec<(usize, Vec<String>)> {
                 }
             }
         }
+        // GNU env runs no `$(...)` in a `-S` string, but one is still read
+        // as a script, so a substitution in it is judged as before.
+        if let Walk::Split(_, _, s) = wrapper_walk(&owned) {
+            out.extend(script_lines(s, 0).iter().map(|l| (i, shell_words(l))));
+        }
+        let owned = split_env_strings(&owned).into_owned();
         if owned.as_slice()
             != cmd
                 .iter()
@@ -1087,10 +1264,16 @@ fn substitutions(script: &str) -> Vec<String> {
     out
 }
 
-/// A `NAME=value` or `NAME+=value` word.
+/// A `NAME=value` or `NAME+=value` word, where NAME may be an array
+/// element, `NAME[i]`.
 fn is_assignment(w: &str) -> bool {
     w.split_once('=').is_some_and(|(k, _)| {
         let k = k.strip_suffix('+').unwrap_or(k);
+        let k = match k.split_once('[') {
+            Some((name, sub)) if sub.ends_with(']') => name,
+            Some(_) => return false,
+            None => k,
+        };
         !k.is_empty()
             && !k.starts_with(|c: char| c.is_ascii_digit())
             && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -1157,10 +1340,32 @@ const RUNNERS: &[(&str, &[&str])] = &[
 /// runner's flags (and their values) taken off. `timeout`, `flock`,
 /// `taskset` and `chrt` also take one positional word before the command.
 ///
-/// Some runners take the command as one string a shell splits: `env -S
-/// STRING`, `flock FILE -c STRING` and `watch STRING`. That string comes back
-/// as the second value, to be read as a script.
+/// Some runners take the command as one string a shell splits: `flock FILE
+/// -c STRING` and `watch STRING`. That string comes back as the second
+/// value, to be read as a script. An `env -S STRING` runs nothing here;
+/// [`split_env_strings`] puts the words of STRING in its place first.
 fn unwrap_wrappers(cmd: &[String]) -> (&[String], Option<&str>) {
+    match wrapper_walk(cmd) {
+        Walk::Run(i) => (&cmd[i..], None),
+        Walk::Script(s) => (&[], s),
+        Walk::Split(..) => (&[], None),
+    }
+}
+
+/// Where [`wrapper_walk`] stops in a command.
+enum Walk<'a> {
+    /// The command it runs starts at this word.
+    Run(usize),
+    /// A runner takes the command as one string a shell splits.
+    Script(Option<&'a str>),
+    /// The `env` option word at this index, with the number of words it
+    /// takes, holds this `-S` string.
+    Split(usize, usize, &'a str),
+}
+
+/// Walk `cmd` past its leading assignments and runner words, as
+/// [`unwrap_wrappers`] reads them.
+fn wrapper_walk(cmd: &[String]) -> Walk<'_> {
     let mut i = 0;
     while i < cmd.len() {
         let w = cmd[i].as_str();
@@ -1180,7 +1385,7 @@ fn unwrap_wrappers(cmd: &[String]) -> (&[String], Option<&str>) {
         i += 1;
         if *name == "flock" {
             if let Some(at) = cmd[i..].iter().position(|a| a == "-c" || a == "--command") {
-                return (&[], cmd.get(i + at + 1).map(String::as_str));
+                return Walk::Script(cmd.get(i + at + 1).map(String::as_str));
             }
         }
         while i < cmd.len() {
@@ -1192,7 +1397,7 @@ fn unwrap_wrappers(cmd: &[String]) -> (&[String], Option<&str>) {
             if *name == "env" && a.starts_with('-') {
                 let (taken, value) = env_flag(a, cmd.get(i + 1).map(String::as_str));
                 if let Some(('S', s)) = value {
-                    return (&[], Some(s));
+                    return Walk::Split(i, taken, s);
                 }
                 i += taken;
             } else if *name == "env" && is_assignment(a) {
@@ -1204,13 +1409,106 @@ fn unwrap_wrappers(cmd: &[String]) -> (&[String], Option<&str>) {
             }
         }
         if *name == "watch" && i + 1 == cmd.len() {
-            return (&[], Some(cmd[i].as_str()));
+            return Walk::Script(Some(cmd[i].as_str()));
         }
         if matches!(*name, "timeout" | "flock" | "taskset" | "chrt") && i < cmd.len() {
             i += 1;
         }
     }
-    (&cmd[i.min(cmd.len())..], None)
+    Walk::Run(i.min(cmd.len()))
+}
+
+/// `cmd` with each `env -S STRING` it runs replaced the way GNU env does
+/// it: the words of STRING take the option's place, after any options
+/// clustered in front of the `S`, and env reads its options again.
+fn split_env_strings(cmd: &[String]) -> Cow<'_, [String]> {
+    let mut cmd = Cow::Borrowed(cmd);
+    // Each round takes one `-S` off; a string may hold another.
+    for _ in 0..8 {
+        let Walk::Split(at, taken, s) = wrapper_walk(&cmd) else {
+            break;
+        };
+        let word = cmd[at].as_str();
+        let front = (!word.starts_with("--"))
+            .then(|| &word[..word.find('S').unwrap_or(0)])
+            .filter(|f| f.len() > 1);
+        let mut out: Vec<String> = cmd[..at].to_vec();
+        out.extend(front.map(str::to_string));
+        out.extend(env_split_words(s));
+        out.extend(cmd[at + taken..].iter().cloned());
+        cmd = Cow::Owned(out);
+    }
+    cmd
+}
+
+/// The words GNU env's `-S` splits `s` into. Blanks separate words and
+/// quotes group them; a backslash escapes outside single quotes, where
+/// `\_` is a separator outside double quotes and a space inside, and `\c`
+/// ends the string; a `#` that starts a word comments out the rest.
+/// `${NAME}` is kept as written, a value the line does not show.
+fn env_split_words(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut word = false;
+    let (mut single, mut double) = (false, false);
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !double => {
+                single = !single;
+                word = true;
+            }
+            '"' if !single => {
+                double = !double;
+                word = true;
+            }
+            '\\' if single => match chars.peek() {
+                Some(&n @ ('\\' | '\'')) => {
+                    chars.next();
+                    cur.push(n);
+                }
+                _ => cur.push('\\'),
+            },
+            '\\' => {
+                let Some(n) = chars.next() else {
+                    break;
+                };
+                match n {
+                    'c' => break,
+                    '_' if !double => {
+                        if word {
+                            out.push(std::mem::take(&mut cur));
+                            word = false;
+                        }
+                        continue;
+                    }
+                    '_' => cur.push(' '),
+                    'f' => cur.push('\u{000c}'),
+                    'n' => cur.push('\n'),
+                    'r' => cur.push('\r'),
+                    't' => cur.push('\t'),
+                    'v' => cur.push('\u{000b}'),
+                    n => cur.push(n),
+                }
+                word = true;
+            }
+            '#' if !single && !double && !word => break,
+            c if !single && !double && c.is_whitespace() => {
+                if word {
+                    out.push(std::mem::take(&mut cur));
+                    word = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                word = true;
+            }
+        }
+    }
+    if word {
+        out.push(cur);
+    }
+    out
 }
 
 /// How many words a function definition's head takes at the front of
@@ -1375,7 +1673,8 @@ fn decode_ansi_c_quoted(chars: &[char], i: &mut usize, out: &mut String) {
 }
 
 /// A script split into words the way a shell would: quotes group, a
-/// backslash escapes the next character outside single quotes, and `;`,
+/// backslash escapes the next character outside single quotes, a `#`
+/// that starts a word comments out the rest of its line, and `;`,
 /// `&&`, `||`, `|` and `&` stand as words of their own. The `&` of a
 /// redirection (`2>&1`, `<&3`, `&>log`) stays in its word.
 fn shell_words(script: &str) -> Vec<String> {
@@ -1425,9 +1724,25 @@ fn shell_words(script: &str) -> Vec<String> {
                 cur.push('&');
                 word = true;
             }
+            // `>|` overwrites a file under noclobber; the `>` before it is
+            // bare unless a backslash escapes it.
+            '|' if !single
+                && !double
+                && i >= 2
+                && chars[i - 2] == '>'
+                && (i < 3 || chars[i - 3] != '\\') =>
+            {
+                cur.push('|');
+                word = true;
+            }
+            '#' if !single && !double && !word => {
+                while i < chars.len() && !matches!(chars[i], '\n' | '\r') {
+                    i += 1;
+                }
+            }
             c if !single && !double && (c.is_whitespace() || matches!(c, ';' | '|' | '&')) => {
                 if word {
-                    out.push(std::mem::take(&mut cur));
+                    out.push(closed_word(std::mem::take(&mut cur)));
                     word = false;
                 }
                 if matches!(c, '\n' | '\r') {
@@ -1450,9 +1765,20 @@ fn shell_words(script: &str) -> Vec<String> {
         }
     }
     if word {
-        out.push(cur);
+        out.push(closed_word(cur));
     }
     out
+}
+
+/// A word [`shell_words`] closes. A bare separator is a word of its own,
+/// so a word that still reads as one (`';'`, `'a;'`, `\;`) was quoted,
+/// and keeps quotes to stay an argument.
+fn closed_word(w: String) -> String {
+    if matches!(w.as_str(), ";" | "&&" | "||" | "|" | "&") || w.ends_with(';') {
+        format!("'{w}'")
+    } else {
+        w
+    }
 }
 
 fn host_argv_rules(argv: &[String], moved: bool) -> Checked {
@@ -2716,8 +3042,25 @@ fn ended_commands(argv: &[String]) -> Vec<(Vec<&str>, &str)> {
 }
 
 fn is_redirection(a: &str) -> bool {
-    let rest = a.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+    let rest = redirection_body(a);
     rest.starts_with('>') || rest.starts_with('<')
+}
+
+/// The redirection word `a` past the descriptor in front of its
+/// operator: digits, `&`, or a `{name}` bash stores the one it opens in.
+fn redirection_body(a: &str) -> &str {
+    let a = fd_variable(a).map_or(a, |n| &a[n.len() + 2..]);
+    a.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&')
+}
+
+/// The variable a `{name}>file` or `{name}<file` redirection sets to the
+/// descriptor it opens.
+fn fd_variable(a: &str) -> Option<&str> {
+    let (name, rest) = a.strip_prefix('{')?.split_once('}')?;
+    let ident = !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    (ident && rest.starts_with(['>', '<'])).then_some(name)
 }
 
 /// True when any `rm` or `rtrash` on the line deletes recursively with an
@@ -3460,7 +3803,8 @@ fn setuid_mode(argv: &[String]) -> bool {
 fn interpreter_setuid(argv: &[String]) -> bool {
     commands(argv).iter().any(|cmd| {
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
-        let (run, _) = unwrap_wrappers(&owned);
+        let split = split_env_strings(&owned);
+        let (run, _) = unwrap_wrappers(&split);
         inline_program(run).is_some_and(chmod_expr_sets_id)
     })
 }
@@ -4514,6 +4858,107 @@ mod tests {
         }
     }
 
+    /// A word that only names `HOME` or `CDPATH`, as a pattern, a message,
+    /// a read or a child's environment, leaves the one the line set alone;
+    /// a command that writes it in this shell does not.
+    #[test]
+    fn only_a_write_in_this_shell_loses_home_or_cdpath() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "HOME={dir}; grep HOME notes; cd ~ && make test",
+            "HOME={dir}; git commit -m 'set HOME'; cd ~ && make test",
+            "HOME={dir}; printenv HOME; cd ~ && make test",
+            "HOME={dir}; echo ${#HOME}; cd ~ && make test",
+            "HOME={dir}; docker run -e HOME=/root img; cd ~ && make test",
+            "HOME={dir}; env HOME=/x true; cd ~ && make test",
+            "unset CDPATH; grep CDPATH notes; cd project && make test",
+            "unset CDPATH; git commit -m CDPATH=x; cd project && make test",
+        ] {
+            let c = entering("home-named", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+        for line in [
+            "HOME={dir}; read -r HOME; cd ~ && make test",
+            "HOME={dir}; printf -v HOME %s x; cd ~ && make test",
+            "HOME={dir}; mapfile HOME < f; cd ~ && make test",
+            "HOME={dir}; declare -n HOME=x; cd ~ && make test",
+            "HOME={dir}; echo ${HOME:=x}; cd ~ && make test",
+            "HOME={dir}; for HOME in a; do cd ~ && make test; done",
+            "unset CDPATH; read CDPATH; cd project && make test",
+        ] {
+            let c = entering("home-named", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+    }
+
+    /// Under `shopt -s lastpipe` the last stage of a pipeline runs in this
+    /// shell, so a variable it writes is not followed.
+    #[test]
+    fn a_lastpipe_stage_loses_what_it_writes() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "shopt -s lastpipe; HOME={dir}; echo /x | read HOME; cd ~ && make test",
+            "shopt -s lastpipe; unset CDPATH; echo x | read CDPATH; cd project && make test",
+            "shopt -s lastpipe; HOME={dir}; true | HOME=/x; cd ~ && make test",
+        ] {
+            let c = entering("lastpipe", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        for line in [
+            "HOME={dir}; echo /x | read HOME; cd ~ && make test",
+            "shopt -s lastpipe; HOME={dir}; read HOME | true; cd ~ && make test",
+        ] {
+            let c = entering("lastpipe", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+    }
+
+    /// Arithmetic runs in this shell, so `((HOME=5))` or `$((HOME=5))`
+    /// leaves `HOME` untracked.
+    #[test]
+    fn an_arithmetic_assignment_loses_home() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "HOME={dir}; ((HOME=5)); cd ~ && make test",
+            "HOME={dir}; (( HOME += 1 )); cd ~ && make test",
+            "HOME={dir}; echo $((HOME=5)); cd ~ && make test",
+            "unset CDPATH; ((CDPATH=1)); cd project && make test",
+        ] {
+            let c = entering("arith", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        let c = entering(
+            "arith",
+            &files,
+            "HOME={dir}; ((n=1)); echo $((n+1)); cd ~ && make test",
+        );
+        assert_eq!(c.decision, Decision::Allow);
+    }
+
+    /// `$PWD` in a value names the one directory the line is in, unless
+    /// the line sets `PWD` itself.
+    #[test]
+    fn pwd_in_an_assigned_home_is_the_line_directory() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "export HOME=\"$PWD/.home\"; cd ~ && make test",
+            "export HOME=\"$PWD/project\"; cd ~ && make test",
+            "cd project && export HOME=\"${PWD}\" && cd && make test",
+        ] {
+            let c = entering("pwd-home", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+        for line in [
+            "export HOME=\"$PWD/project\"; cd ~ && make clean-all",
+            "cd project && HOME=$PWD && cd /tmp && cd && make clean-all",
+            "PWD=/; export HOME=\"$PWD/project\"; cd ~ && make test",
+            "HOME=$PWDX/project; cd ~ && make test",
+        ] {
+            let c = entering("pwd-home", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+    }
+
     /// `command`, `command -p` and `builtin` do not hide `cd`.
     #[test]
     fn follows_a_cd_behind_command_or_builtin() {
@@ -4545,6 +4990,38 @@ mod tests {
             let c = entering("control-cd", &files, line);
             assert_eq!(c.decision, Decision::Deny, "{line}");
         }
+    }
+
+    /// An assignment to an array element, `NAME[i]=value`, in front of a
+    /// command does not hide it, and one to `HOME` is not followed.
+    #[test]
+    fn reads_past_a_subscripted_assignment() {
+        for line in [
+            "a[0]=1 cd evil && make clean-all",
+            "a[k]+=1 pushd evil && make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("subscript", line), Decision::Deny, "{line}");
+        }
+        assert!(v(&["a[0]=1", "git", "push", "--force", "origin", "main"]).starts_with("deny\t"));
+        let files = [("Makefile", MAKEFILE)];
+        let c = entering("subscript", &files, "HOME[0]=/x; cd && make test");
+        assert_eq!(c.decision, Decision::Deny);
+    }
+
+    /// The `time` keyword, with or without `-p`, runs `cd` in this shell.
+    #[test]
+    fn follows_a_cd_behind_time() {
+        for line in [
+            "time cd evil && make clean-all",
+            "time -p cd evil && make clean-all",
+            "time FOO=1 cd evil && make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("time-cd", line), Decision::Deny, "{line}");
+        }
+        assert_eq!(
+            leaving("time-cd", "/usr/bin/time cd safe && make clean-all"),
+            Decision::Deny
+        );
     }
 
     /// An opening `{` before `cd` does not hide it.
@@ -4814,6 +5291,35 @@ mod tests {
         );
     }
 
+    /// `env -S` splits its string into words that take the place of the
+    /// option, so options in it are read and the words after it still run.
+    #[test]
+    fn env_split_string_options_and_words_after_it_run() {
+        for argv in [
+            &[
+                "env", "-S", "-v", "git", "push", "--force", "origin", "main",
+            ][..],
+            &["env", "-S", "", "git", "push", "--force", "origin", "main"],
+            &["env", "-S", "git push", "--force", "origin", "main"],
+            &["env", "-S-i git", "push", "--force", "origin", "main"],
+        ] {
+            assert!(v(argv).starts_with("deny\t"), "{argv:?}");
+        }
+        for line in [
+            "env -S '-C evil make clean-all'",
+            "env -S '-C evil' make clean-all",
+            "env -iS '-C evil make clean-all'",
+            "env --split-string='-C evil' make clean-all",
+            "env -S \"-C 'evil' make clean-all\"",
+        ] {
+            assert_eq!(evil_and_safe("env-split", line), Decision::Deny, "{line}");
+        }
+        assert_eq!(
+            evil_and_safe("env-split", "env -S '-C safe make clean-all'"),
+            Decision::Allow
+        );
+    }
+
     /// `pushd -n` stacks a directory without entering it, and `pushd +N`,
     /// `-N` or a bare `pushd` enters the one it brings to the top.
     #[test]
@@ -4881,6 +5387,94 @@ mod tests {
         }
     }
 
+    /// `line` checked from an empty directory beside an `evil` project
+    /// whose Makefile is `MAKEFILE` and a `safe` one whose `clean-all`
+    /// only echoes.
+    fn evil_and_safe(name: &str, line: &str) -> Decision {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(root.join("evil")).expect("dir");
+        std::fs::create_dir_all(root.join("safe")).expect("dir");
+        std::fs::write(root.join("evil/Makefile"), MAKEFILE).expect("write");
+        std::fs::write(root.join("safe/Makefile"), "clean-all:\n\techo clean\n").expect("write");
+        check_shell_in(&shell_words(line), &root, 0).decision
+    }
+
+    /// `popd` takes no option past `--`, so what follows it is not an
+    /// index and the bare form runs.
+    #[test]
+    fn popd_stops_reading_options_at_double_dash() {
+        for line in [
+            "pushd evil && pushd ../safe && popd -- +1 && make clean-all",
+            "pushd evil && pushd ../safe && popd -- -n && make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("popd-dash", line), Decision::Deny, "{line}");
+        }
+        assert_eq!(
+            evil_and_safe(
+                "popd-dash",
+                "pushd evil && pushd ../safe && popd -n -- && make clean-all"
+            ),
+            Decision::Allow
+        );
+    }
+
+    /// A `popd` that fails, on a word it does not take or a stack it
+    /// cannot pop, leaves the line in a directory it does not follow.
+    #[test]
+    fn a_failing_popd_leaves_the_line_untracked() {
+        for line in [
+            "pushd evil && popd x; make clean-all",
+            "pushd evil && popd +x; make clean-all",
+            "pushd evil && popd -q; make clean-all",
+            "pushd evil && popd -n x; make clean-all",
+            "pushd evil && dirs -c && popd; make clean-all",
+            "pushd safe && popd && popd; make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("popd-fail", line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "pushd safe && popd -n; make clean-all",
+            "pushd safe && dirs && popd; make clean-all",
+            "pushd evil && pushd ../safe && popd -n && make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("popd-fail", line), Decision::Allow, "{line}");
+        }
+    }
+
+    /// With `HOME` unset, `~` is the passwd home, as bash expands it, while
+    /// a bare `cd` fails and stays.
+    #[cfg(unix)]
+    #[test]
+    fn tilde_with_home_unset_is_the_passwd_home() {
+        // SAFETY: getpwuid returns null or a record valid until the next call.
+        let pw = unsafe { libc::getpwuid(libc::getuid()) };
+        assert!(!pw.is_null());
+        let home = unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) };
+        let home = std::path::PathBuf::from(home.to_string_lossy().into_owned());
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-nohome", std::process::id()));
+        for (line, want) in [
+            ("unset HOME; cd ~/x && make clean-all", home.join("x")),
+            ("unset HOME; env -C ~/x make clean-all", home.join("x")),
+            ("unset HOME; cd && make clean-all", root.clone()),
+        ] {
+            let mut runs = Vec::new();
+            runner_commands(
+                &shell_words(line),
+                &root,
+                &[],
+                &Vars::from_env(),
+                0,
+                &mut runs,
+            );
+            let dirs: Vec<_> = runs
+                .iter()
+                .filter(|(r, _, _)| r[0] == "make")
+                .map(|(_, d, _)| d.clone())
+                .collect();
+            assert_eq!(dirs, [want], "{line}");
+        }
+    }
+
     /// Redirections before the `cd` target are not directory names.
     #[test]
     fn skips_redirections_before_a_cd_target() {
@@ -4914,6 +5508,93 @@ mod tests {
             leaving("close-redir-cd", "cd 2>&- safe && make clean-all"),
             Decision::Allow
         );
+    }
+
+    /// `NAME+=value` appends to what an earlier assignment named, so the
+    /// command word it builds is read whole.
+    #[test]
+    fn an_appended_command_word_does_not_hide_git() {
+        for script in [
+            "g=git; g+=\" push\"; $g --force origin main",
+            "g=git; g+=' push --force'; ${g} origin main",
+        ] {
+            assert_eq!(v(&["sh", "-c", script]), "deny\tgit-force-push", "{script}");
+        }
+    }
+
+    /// A `#` that starts a word comments out the rest of its line.
+    #[test]
+    fn a_comment_runs_nothing() {
+        assert_eq!(
+            shell_words("a # b ; c\nd e#f '#g' \\#h"),
+            ["a", ";", "d", "e#f", "#g", "#h"]
+        );
+        for line in [
+            "true # ; cd safe\nmake clean-all",
+            "true #; cd safe\nmake clean-all",
+        ] {
+            assert_eq!(leaving("comment", line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "true '#'; cd safe && make clean-all",
+            "true a#b; cd safe && make clean-all",
+        ] {
+            assert_eq!(leaving("comment", line), Decision::Allow, "{line}");
+        }
+    }
+
+    /// A quoted or escaped `;`, `&&` or `|` is an argument, not a separator.
+    #[test]
+    fn a_quoted_separator_is_an_argument() {
+        for line in [
+            "echo ';' cd safe && make clean-all",
+            "echo 'a;' cd safe && make clean-all",
+            "echo \\; cd safe && make clean-all",
+            "echo \"&&\" cd safe && make clean-all",
+            "find . -exec true {} \\; cd safe && make clean-all",
+        ] {
+            assert_eq!(leaving("quoted-sep", line), Decision::Deny, "{line}");
+        }
+        assert_eq!(
+            leaving("quoted-sep", "echo x; cd safe && make clean-all"),
+            Decision::Allow
+        );
+    }
+
+    /// A redirection that names its descriptor by a variable, `{fd}>file`,
+    /// is not the `cd` target, and it sets that variable in this shell.
+    #[test]
+    fn reads_a_named_descriptor_redirection() {
+        for line in [
+            "cd {fd}>/dev/null evil && make clean-all",
+            "cd {fd}> /dev/null evil && make clean-all",
+            "pushd {fd}>&- evil && make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("fd-name", line), Decision::Deny, "{line}");
+        }
+        let files = [("Makefile", MAKEFILE)];
+        let c = entering(
+            "fd-name",
+            &files,
+            "HOME={dir}; true {HOME}>/dev/null; cd ~ && make test",
+        );
+        assert_eq!(c.decision, Decision::Deny);
+    }
+
+    /// `>|` is a redirection that overwrites under `noclobber`, not a pipe.
+    #[test]
+    fn reads_a_clobber_redirection_as_one_word() {
+        assert_eq!(
+            shell_words("cd >| x evil 2>|y | z"),
+            ["cd", ">|", "x", "evil", "2>|y", "|", "z"]
+        );
+        for line in [
+            "cd >| /dev/null evil && make clean-all",
+            "cd >|/dev/null evil && make clean-all",
+            "pushd 2>| /dev/null evil && make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("clobber", line), Decision::Deny, "{line}");
+        }
     }
 
     /// The `&` of a redirection does not send the `cd` before it to the

@@ -1,0 +1,1 @@
+`NAME+=value` appends to what an earlier assignment on the line put in NAME when a later `$NAME` command word is resolved, so `g=git; g+=" push"; $g --force origin main` is refused as a force push. The append was recorded as a separate variable and `$g` read as plain `git`.

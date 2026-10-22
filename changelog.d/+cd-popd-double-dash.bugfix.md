@@ -1,0 +1,1 @@
+`popd` reads no option or index past `--`, as bash does, so `pushd evil && pushd ../safe && popd -- +1 && make clean-all`, where the bare `popd` returns to `evil` and runs the `rm -rf ~` in its Makefile, is refused again. The `+1` after `--` was taken as an index, which left the line in `safe`.

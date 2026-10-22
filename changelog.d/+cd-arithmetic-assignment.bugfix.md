@@ -1,0 +1,1 @@
+An arithmetic command or expansion that names `HOME` or `CDPATH` (`((HOME=5))`, `$((HOME=5))`) leaves that variable untracked, since it evaluates in the shell that runs the line and may assign it, so a runner after `cd ~` is refused.

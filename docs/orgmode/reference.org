@@ -43,9 +43,12 @@ the one the runner's own =-C=, =--prefix= or =--cwd= names.
 =env= reads its flags as GNU =env= does: short ones cluster
 (=-iC DIR=, =-uVAR -C DIR=) and a long one may be cut to a prefix that
 names only it (=--ch DIR=), so these move the command as =-C DIR=
-does, and =-iS STRING= is read as =-S STRING=.
+does. =-S STRING= (or =-iS STRING=) splits STRING into words that take
+its place, so options in it (=env -S '-C dir' make=) and the words
+after it are read too.
 Leading words that still run =cd= in this shell (=command=,
-=builtin=, =if=, =while=, ={= and the other control keywords)
+=builtin=, =if=, =while=, ={= and the other control keywords, and
+the =time= keyword with its =-p=)
 are peeled before this check, as are assignments among them
 (=if FOO=1 cd dir=), and a redirection among the words of a
 =cd= or =pushd= names neither the directory nor a =pushd= stack index.
@@ -67,30 +70,40 @@ Raw newlines and carriage returns split script commands, and =$'...'=
 ANSI-C quoted words are decoded before the line is judged.
 
 A =cd= or =pushd= to a relative path whose first part is not =.= or
-=..= may enter that path under any =CDPATH= entry, so the runner after
-it is also read in each entry that holds the path. A =CDPATH= set in
+=..= enters that path under the first =CDPATH= entry that holds it, an
+empty or =.= entry being the working directory, so the runner after it
+is read there, and in any entry before it the line does not show. A
+=CDPATH= set in
 front of the =cd= (=CDPATH=dir cd x=), or of the shell that runs it, is
 the one searched, as is one the line sets before it, alone or with
 =export=, =declare= and the like (=export CDPATH=dir; cd x=), unless a
 pipeline stage, a subshell or a list sent to the background set it.
 One set where it may not run, past a =&&= or =||=, is searched along
-with the one before it. Another word that may set it (=read CDPATH=,
-=${CDPATH:=dir}=, or an assignment in front of a special builtin such
-as =:=), or an entry with =$=, a backquote or =~= in it, names no
-directory the line shows, so a runner after the =cd= is refused.
+with the one before it. Another command that writes it in this shell
+(=read CDPATH=, =printf -v CDPATH=, =${CDPATH:=dir}=, or an
+assignment in front of a special builtin such as =:=), or an entry with
+=$=, a backquote or =~= in it, names no directory the line shows, so
+a runner after the =cd= is refused. A word that only names it
+(=grep CDPATH=, =env CDPATH=dir cmd=) changes nothing.
 
 =HOME= is followed the same way: a bare =cd= enters the one set in
 front of it (=HOME=dir cd=) or earlier on the line (=export HOME=dir;
 cd=), and =~= expands from the one set before the command. A =HOME=
 that may hold either of two values, or one the line does not show
 (=HOME=$(mktemp -d) cd=), leaves the runner after the =cd= refused.
+=$PWD= in either value is the one directory the line is in, when it
+shows that and does not set =PWD= (=export HOME="$PWD/.home"=).
+With =HOME= unset, =~= is the home in the user's passwd entry, as in
+bash, and a bare =cd= stays.
 
 =pushd= and =popd= follow the directory stack. =pushd -n= stacks its
 directory without entering it, =pushd +N= and =-N= enter the entry they
 bring to the top, and a bare =popd= enters the entry under the top,
 while =popd -n=, =popd +N= and =popd -N= drop an entry and stay. An
 index that counts past a =pushd= that may have failed may name any
-directory on the stack.
+directory on the stack. A =popd= that fails, on a word it does not take
+(=popd x=) or with nothing left to pop (after =dirs -c=), leaves the
+line in a directory it does not follow.
 
 The line goes on past a =cd= that may fail, so the runner after it is
 read in each directory the line may be in, up to sixteen. A =cd= into a
