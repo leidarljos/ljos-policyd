@@ -104,7 +104,22 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
         .filter(|p| depth == 0 && !p.is_empty())
         .map_or_else(|| UNTRACKED.into(), |p| cwd.join(p));
     let mut runs = Vec::new();
-    runner_commands(argv, cwd, &[oldpwd], &Vars::from_env(), 0, &mut runs);
+    let mut denied = None;
+    let vars = Vars::from_env();
+    let funcs = FnMap::new();
+    let old = [oldpwd];
+    let inn = ShellIn {
+        cwd,
+        oldpwd: &old,
+        vars: &vars,
+        funcs: &funcs,
+        fn_depth: 0,
+        left_tree: false,
+    };
+    runner_commands(argv, &inn, 0, &mut runs, &mut denied);
+    if let Some(c) = denied {
+        return c;
+    }
     for (run, dir, stdin) in runs {
         if is_untracked(&dir) && scripts::runner(&run) {
             return Checked {
@@ -179,6 +194,327 @@ fn add_dirs(set: &mut Vec<std::path::PathBuf>, dirs: impl IntoIterator<Item = st
     }
 }
 
+/// A function body the walk can replay. A body in parentheses runs in a
+/// subshell: its commands are judged, and they do not move the caller.
+#[derive(Clone)]
+struct FnBody {
+    words: Vec<String>,
+    subshell: bool,
+}
+
+type FnMap = std::collections::HashMap<String, FnBody>;
+
+/// How many function calls deep the walk follows. Past this, or when a
+/// call is already on the stack, the body may move the shell and the walk
+/// cannot see where it stops, so the line is not followed.
+const FUNC_DEPTH: usize = 8;
+
+/// Where the shell is, and the functions it holds, while [`walk`] reads a
+/// line. A `&` runs its command in a subshell, so the snapshot a list
+/// starts from is what the next command comes back to.
+struct Shell {
+    here: Vec<std::path::PathBuf>,
+    old: Vec<std::path::PathBuf>,
+    pushed: Vec<(Vec<std::path::PathBuf>, bool)>,
+    vars: Vars,
+    funcs: FnMap,
+    aliases: Vec<(String, String)>,
+    pwd_set: bool,
+    lastpipe: bool,
+    /// A `cd` the walk followed can leave the working tree, so a relative
+    /// path in a function body is no longer inside it.
+    left_tree: bool,
+    fn_depth: usize,
+    stack: Vec<String>,
+    /// When false, an unseen command word does not drop the directory.
+    /// A sourced file that keeps is already known not to move the shell;
+    /// its case arms and discarded substitutions only look unseen.
+    follow_unseen: bool,
+}
+
+#[derive(Clone)]
+struct Saved {
+    here: Vec<std::path::PathBuf>,
+    old: Vec<std::path::PathBuf>,
+    pushed: Vec<(Vec<std::path::PathBuf>, bool)>,
+    vars: Vars,
+    funcs: FnMap,
+    pwd_set: bool,
+    left_tree: bool,
+}
+
+impl Shell {
+    fn save(&self) -> Saved {
+        Saved {
+            here: self.here.clone(),
+            old: self.old.clone(),
+            pushed: self.pushed.clone(),
+            vars: self.vars.clone(),
+            funcs: self.funcs.clone(),
+            pwd_set: self.pwd_set,
+            left_tree: self.left_tree,
+        }
+    }
+
+    fn restore(&mut self, saved: Saved) {
+        self.here = saved.here;
+        self.old = saved.old;
+        self.pushed = saved.pushed;
+        self.vars = saved.vars;
+        self.funcs = saved.funcs;
+        self.pwd_set = saved.pwd_set;
+        self.left_tree = saved.left_tree;
+    }
+
+    /// The directory, the stack and `HOME` / `CDPATH` are no longer known.
+    fn lose(&mut self) {
+        self.here = vec![UNTRACKED.into()];
+        self.old = vec![UNTRACKED.into()];
+        self.pushed.clear();
+        self.vars.cdpath = Some("$".into());
+        self.vars.home = Some("$".into());
+        self.pwd_set = true;
+        self.left_tree = true;
+        // A body recorded before this no longer says what a call runs.
+        self.funcs.clear();
+    }
+}
+
+/// What a nested walk starts from: one directory, the `cd -` list, the
+/// variables and the functions the shell already holds.
+struct ShellIn<'a> {
+    cwd: &'a std::path::Path,
+    oldpwd: &'a [std::path::PathBuf],
+    vars: &'a Vars,
+    funcs: &'a FnMap,
+    fn_depth: usize,
+    left_tree: bool,
+}
+
+/// `words` with each function definition replaced by a marker, in order.
+/// The body stays out of the line until a call replays it. A definition
+/// whose name is not a literal, or whose body does not close, is a marker
+/// that loses the line: the walk cannot see what it defined.
+fn lift_functions(words: &[String]) -> (Vec<String>, Vec<(String, FnBody)>) {
+    let mut top = Vec::new();
+    let mut defs = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        if let Some((name, body, next)) = function_at(words, i) {
+            let opener = words
+                .get(next.wrapping_sub(1))
+                .map(String::as_str)
+                .unwrap_or("");
+            let subshell = body.is_empty() && opener.starts_with('(') && !opener.starts_with("((");
+            let body = if subshell {
+                subshell_body(opener)
+            } else {
+                body
+            };
+            let mark = format!("\0fn{}", defs.len());
+            defs.push((
+                name,
+                FnBody {
+                    words: body,
+                    subshell,
+                },
+            ));
+            top.push(mark);
+            i = next;
+            continue;
+        }
+        if opens_function(words, i) {
+            top.push("\0lose".to_string());
+        }
+        top.push(words[i].clone());
+        i += 1;
+    }
+    (top, defs)
+}
+
+/// The words of a subshell body held in one word, `( cd ../evil )`.
+fn subshell_body(opener: &str) -> Vec<String> {
+    let inner = opener
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .unwrap_or("");
+    shell_words(inner.trim())
+}
+
+/// Whether `words[i]` starts a function the walk cannot take apart:
+/// `name()` or `function name` with a body after it, and [`function_at`]
+/// did not take it. `echo foo()` has no body and is left as written.
+fn opens_function(words: &[String], i: usize) -> bool {
+    let Some(w) = words.get(i).map(String::as_str) else {
+        return false;
+    };
+    if w.ends_with("(){") {
+        return true;
+    }
+    if let Some(name) = w.strip_suffix("()") {
+        if name.is_empty() {
+            return false;
+        }
+        return words.get(i + 1).is_some_and(|n| {
+            n == "{" || n == "()" || (n.starts_with('(') && !n.starts_with("(("))
+        });
+    }
+    if w != "function" {
+        return false;
+    }
+    let Some(raw) = words.get(i + 1).map(String::as_str) else {
+        return false;
+    };
+    if raw.ends_with("(){") {
+        return true;
+    }
+    let mut k = i + 2;
+    if words.get(k).is_some_and(|n| n == "()") {
+        k += 1;
+    }
+    words
+        .get(k)
+        .is_some_and(|n| n == "{" || (n.starts_with('(') && !n.starts_with("((")))
+}
+
+fn marker_index(w: &str) -> Option<usize> {
+    w.strip_prefix("\0fn")?.parse().ok()
+}
+
+/// `command` and `builtin` skip a function and run the program. A leading
+/// backslash does not: `\go` is still the function `go`.
+fn skips_function(cmd: &[&str]) -> bool {
+    let words = operands(cmd);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    let mut words = &words[front..];
+    let head = case_head(words);
+    if head > 0 {
+        words = &words[head..];
+    }
+    loop {
+        let Some((w, tail)) = words.split_first() else {
+            return false;
+        };
+        if is_assignment(w) {
+            words = tail;
+            continue;
+        }
+        return matches!(base_of(w), "command" | "builtin");
+    }
+}
+
+fn fn_lookup_name(w: &str) -> &str {
+    base_of(w.strip_prefix('\\').unwrap_or(w))
+}
+
+/// The function `cmd` calls, when the shell holds it. `None` for a program.
+fn called_fn(cmd: &[&str], funcs: &FnMap) -> Option<String> {
+    if skips_function(cmd) || funcs.is_empty() {
+        return None;
+    }
+    let owned = head_word(cmd)?;
+    let name = fn_lookup_name(&owned);
+    funcs.contains_key(name).then(|| name.to_string())
+}
+
+/// `unset -f name` removes that function. A name the line does not show
+/// may be any of them, so the shell is not followed.
+fn unset_functions(cmd: &[&str], shell: &mut Shell) {
+    let words = operands(cmd);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    let rest = peel_cd_command_word(&words[front..]);
+    let Some((w, args)) = rest.split_first() else {
+        return;
+    };
+    if base_of(w) != "unset" || !args.contains(&"-f") {
+        return;
+    }
+    let mut bad = false;
+    for a in args {
+        if *a == "-f" || *a == "--" || (a.starts_with('-') && *a != "-") {
+            continue;
+        }
+        if is_name(a) {
+            shell.funcs.remove(*a);
+        } else {
+            bad = true;
+        }
+    }
+    if bad {
+        shell.lose();
+    }
+}
+
+/// `declare -f`, `typeset -f` or `export -f` with a name the line does not
+/// show can define or replace any function. A literal name only touches
+/// that one, which the walk already holds or does not.
+fn blinds_functions(cmd: &[&str]) -> bool {
+    let words = operands(cmd);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    let rest = peel_cd_command_word(&words[front..]);
+    let Some((w, args)) = rest.split_first() else {
+        return false;
+    };
+    if !matches!(base_of(w), "declare" | "typeset" | "export") {
+        return false;
+    }
+    let flags = args
+        .iter()
+        .any(|a| *a == "-f" || (a.starts_with('-') && !a.starts_with("--") && a.contains('f')));
+    flags && args.iter().any(|a| !a.starts_with('-') && !is_name(a))
+}
+
+/// The deny rules on a function body, in the directory the call has
+/// reached. `moved` when the shell may already be outside the tree.
+fn judge_body(words: &[String], shell: &Shell) -> Option<Checked> {
+    if words.is_empty() {
+        return None;
+    }
+    let moved =
+        shell.left_tree || shell.here.iter().any(|d| is_untracked(d)) || leaves_tree(words, 0);
+    let c = host_argv_table_at(words, 0, moved);
+    (c.decision != Decision::Allow).then_some(c)
+}
+
+fn replay_subshell(
+    body: &[String],
+    shell: &Shell,
+    depth: usize,
+    out: &mut Vec<(Vec<String>, std::path::PathBuf, bool)>,
+    denied: &mut Option<Checked>,
+) {
+    let dirs = shell.here.clone();
+    let old = shell.old.clone();
+    let vars = shell.vars.clone();
+    let funcs = shell.funcs.clone();
+    for dir in &dirs {
+        let inn = ShellIn {
+            cwd: dir,
+            oldpwd: &old,
+            vars: &vars,
+            funcs: &funcs,
+            fn_depth: shell.fn_depth,
+            left_tree: shell.left_tree,
+        };
+        runner_commands(body, &inn, depth, out, denied);
+        if denied.is_some() {
+            return;
+        }
+    }
+}
+
+/// Whether `words` is a `cd`, `pushd` or `popd` that can leave the tree.
+fn command_leaves_tree(words: &[&str]) -> bool {
+    let owned: Vec<String> = words.iter().copied().map(str::to_string).collect();
+    leaves_tree(&owned, 0)
+}
+
 /// Every simple command the line runs, wrappers off, with each directory
 /// it may run in: the line split on its separators, then each `-c` script,
 /// `eval` and wrapper inside it, down to [`MAX_DEPTH`]. A `cd`, `pushd`
@@ -190,65 +526,96 @@ fn add_dirs(set: &mut Vec<std::path::PathBuf>, dirs: impl IntoIterator<Item = st
 /// and with its `cd -`, which goes to one of `oldpwd` at the start, and
 /// with the [`Vars`] it sees, `vars` at the start.
 /// Each command also says whether `xargs` adds words to it from stdin.
+/// A function runs where it is called. The walk records the body and
+/// judges it there, so `go() { cd ../evil; }; go && make` reads the
+/// Makefile in `evil`.
 fn runner_commands(
     argv: &[String],
-    cwd: &std::path::Path,
-    oldpwd: &[std::path::PathBuf],
-    vars: &Vars,
+    inn: &ShellIn<'_>,
     depth: usize,
     out: &mut Vec<(Vec<String>, std::path::PathBuf, bool)>,
+    denied: &mut Option<Checked>,
 ) {
-    let argv = &*expand_aliases(argv);
+    if denied.is_some() {
+        return;
+    }
+    let mut shell = Shell {
+        here: vec![inn.cwd.to_path_buf()],
+        old: inn.oldpwd.to_vec(),
+        pushed: Vec::new(),
+        vars: inn.vars.clone(),
+        funcs: inn.funcs.clone(),
+        aliases: Vec::new(),
+        pwd_set: false,
+        lastpipe: inn.vars.lastpipe,
+        left_tree: inn.left_tree,
+        fn_depth: inn.fn_depth,
+        stack: Vec::new(),
+        follow_unseen: true,
+    };
+    walk(argv, &mut shell, depth, out, denied);
+}
+
+/// Commands of `argv` in `shell`. A function body and a sourced file are
+/// read here too, so a `cd` in the body moves the shell that called it.
+fn walk(
+    argv: &[String],
+    shell: &mut Shell,
+    depth: usize,
+    out: &mut Vec<(Vec<String>, std::path::PathBuf, bool)>,
+    denied: &mut Option<Checked>,
+) {
+    if denied.is_some() {
+        return;
+    }
+    let mut seen = shell.aliases.clone();
+    let expanded = expand_aliases_with(argv, &mut seen);
+    let cwd = shell
+        .here
+        .iter()
+        .find(|d| !is_untracked(d))
+        .cloned()
+        .unwrap_or_else(|| std::path::PathBuf::from("/"));
+    if writes_pwd(&expanded, &cwd) {
+        shell.pwd_set = true;
+    }
+    if commands(&expanded).iter().any(|c| may_set_lastpipe(c)) {
+        shell.lastpipe = true;
+    }
+    let (argv, defs) = lift_functions(&expanded);
     // Every directory the next command may run in, and every one its
     // `cd -` may enter. A `cd` before `&&` holds for the commands after
     // it, and the directories it left wait in `failed` and `old_failed`
     // for the next `;` or `||`.
-    let mut here = vec![cwd.to_path_buf()];
-    let mut old = oldpwd.to_vec();
     let mut failed = Vec::new();
     let mut old_failed = Vec::new();
-    // Each `pushd`'s directories, and whether it surely ran.
-    let mut pushed: Vec<(Vec<std::path::PathBuf>, bool)> = Vec::new();
-    // What the shell's variables hold, and, after an assignment behind
-    // `&&` that may not have run, what they held, for the next `;` or `||`.
-    let mut vars = vars.clone();
+    // What the variables held after an assignment behind `&&` that may
+    // not have run, for the next `;` or `||`.
     let mut vars_failed: Option<Vars> = None;
     // Where the list now running started, for a `&` to put back.
-    let mut list = (here.clone(), old.clone(), pushed.clone(), vars.clone());
+    let mut list = shell.save();
     let mut after = ";";
     let mut ran_in = Vec::new();
-    // `$PWD` follows the line's directory unless the line sets it.
-    let pwd_set = writes_pwd(argv, cwd);
-    // With `shopt -s lastpipe` anywhere on the line, or a `BASHOPTS` the
-    // shell running it started with, the last stage of a pipeline may
-    // run in this shell.
-    let lastpipe = vars.lastpipe || commands(argv).iter().any(|c| may_set_lastpipe(c));
-    // Functions a sourced file defined whose bodies may move this shell.
-    // A later call of one leaves the line untracked; a definition the
-    // line never calls does not.
-    let mut risky: std::collections::HashSet<String> = std::collections::HashSet::new();
-    // The aliases the line has defined, which a file it sources sees.
-    let mut aliases = Vec::new();
-    for (cmd, end) in ended_commands(argv) {
-        aliases.extend(alias_defs(&cmd));
+    for (cmd, end) in ended_commands(&argv) {
+        shell.aliases.extend(alias_defs(&cmd));
         if after == "&" {
-            (here, old, pushed, vars) = list.clone();
+            shell.restore(list.clone());
             failed.clear();
             old_failed.clear();
             vars_failed = None;
         }
         if matches!(after, ";" | "||") {
-            add_dirs(&mut here, failed.drain(..));
-            add_dirs(&mut old, old_failed.drain(..));
+            add_dirs(&mut shell.here, failed.drain(..));
+            add_dirs(&mut shell.old, old_failed.drain(..));
             if let Some(was) = vars_failed.take() {
-                vars.merge(was);
+                shell.vars.merge(was);
             }
-            for p in &mut pushed {
+            for p in &mut shell.pushed {
                 p.1 = false;
             }
         }
         if matches!(after, ";" | "&") {
-            list = (here.clone(), old.clone(), pushed.clone(), vars.clone());
+            list = shell.save();
         }
         let piped = after == "|" || end == "|";
         // A `cd` before `&&` holds for what runs after it, unless a `||`
@@ -261,87 +628,170 @@ fn runner_commands(
         // `env -C DIR` runs its own command, and any script it hands a
         // shell, in DIR, and moves nothing after it.
         let wrappers = &owned[..owned.len() - run.len()];
-        let at: Vec<_> = here
+        let at: Vec<_> = shell
+            .here
             .iter()
-            .map(|d| env_dir(wrappers, d, vars.home.as_deref()))
+            .map(|d| env_dir(wrappers, d, shell.vars.home.as_deref()))
             .collect();
-        let pwd = match here.as_slice() {
-            [d] if !pwd_set && !is_untracked(d) => Some(d.as_path()),
+        let pwd = match shell.here.as_slice() {
+            [d] if !shell.pwd_set && !is_untracked(d) => Some(d.as_path()),
             _ => None,
         };
         // The command's own assignments hold for it and what it runs.
-        let mut set = vars.clone();
+        let mut set = shell.vars.clone();
         for w in wrappers.iter().filter(|w| is_assignment(w)) {
             set.assign(&with_pwd(w, pwd));
         }
-        ran_in.push((at.clone(), old.clone(), set.clone()));
+        ran_in.push((at.clone(), shell.old.clone(), set.clone()));
         // A subshell or substitution in the command runs where the
         // command does, and a `cd` inside it moves only itself.
         if depth < MAX_DEPTH {
+            let dirs = shell.here.clone();
+            let oldpwd = shell.old.clone();
+            let vars_now = shell.vars.clone();
+            let funcs = shell.funcs.clone();
+            let fn_depth = shell.fn_depth;
+            let left = shell.left_tree;
             for body in cmd.iter().flat_map(|w| substitutions(w)) {
-                for dir in &here {
-                    runner_commands(&shell_words(&body), dir, &old, &vars, depth + 1, out);
+                let words = shell_words(&body);
+                for dir in &dirs {
+                    let inn = ShellIn {
+                        cwd: dir,
+                        oldpwd: &oldpwd,
+                        vars: &vars_now,
+                        funcs: &funcs,
+                        fn_depth,
+                        left_tree: left,
+                    };
+                    runner_commands(&words, &inn, depth + 1, out, denied);
+                    if denied.is_some() {
+                        return;
+                    }
                 }
             }
         }
         let shown: Vec<_> = cmd.iter().map(|w| with_pwd(w, pwd)).collect();
         let shown: Vec<&str> = shown.iter().map(|w| &**w).collect();
         if !piped {
-            let was = vars.clone();
-            set_vars(&shown, &mut vars);
+            let was = shell.vars.clone();
+            set_vars(&shown, &mut shell.vars);
             match before {
-                "||" => vars.merge(was),
+                "||" => shell.vars.merge(was),
                 "&&" => match &mut vars_failed {
                     Some(f) => f.merge(was),
                     None => vars_failed = Some(was),
                 },
                 _ => {}
             }
-        } else if lastpipe && end != "|" {
-            let mut set = vars.clone();
+        } else if shell.lastpipe && end != "|" {
+            let mut set = shell.vars.clone();
             set_vars(&shown, &mut set);
-            if set.cdpath != vars.cdpath {
-                vars.cdpath = Some("$".into());
+            if set.cdpath != shell.vars.cdpath {
+                shell.vars.cdpath = Some("$".into());
             }
-            if set.home != vars.home {
-                vars.home = Some("$".into());
+            if set.home != shell.vars.home {
+                shell.vars.home = Some("$".into());
             }
         }
         let words = peel_cd_command_word(&shown);
         let b = words.first().map_or("", |w| base_of(w));
         // A pipeline stage runs in a subshell, so it cannot move this
         // shell. The last stage can, once `lastpipe` is on.
-        let in_shell = !piped || (lastpipe && end != "|");
+        let in_shell = !piped || (shell.lastpipe && end != "|");
         if in_shell {
-            let dir = match here.as_slice() {
-                [d] if !is_untracked(d) => Some(d.as_path()),
-                _ => None,
+            let read = {
+                let dir = match shell.here.as_slice() {
+                    [d] if !is_untracked(d) => Some(d.as_path()),
+                    _ => None,
+                };
+                sourced(&cmd, dir, &shell.aliases)
             };
-            let loses = match sourced(&cmd, dir, &aliases) {
-                Sourced::Keeps(names) => {
-                    risky.extend(names);
-                    false
+            match read {
+                Sourced::Keeps(words) => {
+                    // The scan already accepted this file. Case arms and a
+                    // discarded substitution look like commands the walk
+                    // cannot see, and that would drop the directory and
+                    // turn `lastpipe` on for whatever the line runs next.
+                    let lastpipe = shell.lastpipe;
+                    let pwd_set = shell.pwd_set;
+                    let follow = shell.follow_unseen;
+                    shell.follow_unseen = false;
+                    walk(&words, shell, depth, out, denied);
+                    if denied.is_some() {
+                        return;
+                    }
+                    shell.lastpipe = lastpipe;
+                    shell.pwd_set = pwd_set;
+                    shell.follow_unseen = follow;
                 }
-                Sourced::Loses => true,
-                Sourced::No => bare_unseen(&cmd) || calls_risky(&cmd, &risky),
-            };
-            if loses {
-                here = vec![UNTRACKED.into()];
-                old = vec![UNTRACKED.into()];
-                pushed.clear();
-                vars.cdpath = Some("$".into());
-                vars.home = Some("$".into());
+                Sourced::Loses => shell.lose(),
+                Sourced::No => {
+                    if shell.follow_unseen && (bare_unseen(&cmd) || blinds_functions(&cmd)) {
+                        shell.lose();
+                    }
+                }
             }
+        }
+        if let Some(w) = head_word(&shown) {
+            if w == "\0lose" {
+                if in_shell {
+                    shell.lose();
+                }
+                if let Some(c) = judge_body(&owned, shell) {
+                    *denied = Some(c);
+                    return;
+                }
+                continue;
+            }
+            if let Some(i) = marker_index(&w) {
+                if in_shell {
+                    if let Some((name, body)) = defs.get(i) {
+                        shell.funcs.insert(name.clone(), body.clone());
+                    }
+                }
+                continue;
+            }
+        }
+        if in_shell {
+            unset_functions(&shown, shell);
+        }
+        if let Some(name) = called_fn(&shown, &shell.funcs) {
+            let body = shell.funcs.get(&name).cloned();
+            if let Some(body) = body {
+                if let Some(c) = judge_body(&body.words, shell) {
+                    *denied = Some(c);
+                    return;
+                }
+                let fork = !in_shell || body.subshell;
+                if fork {
+                    replay_subshell(&body.words, shell, depth, out, denied);
+                } else if shell.fn_depth >= FUNC_DEPTH || shell.stack.contains(&name) {
+                    shell.lose();
+                } else {
+                    let follow = shell.follow_unseen;
+                    shell.follow_unseen = true;
+                    shell.fn_depth += 1;
+                    shell.stack.push(name);
+                    walk(&body.words, shell, depth, out, denied);
+                    shell.stack.pop();
+                    shell.fn_depth -= 1;
+                    shell.follow_unseen = follow;
+                }
+                if denied.is_some() {
+                    return;
+                }
+            }
+            continue;
         }
         if piped && matches!(b, "cd" | "pushd" | "popd" | "dirs") {
             // A last stage that may run here leaves where the line is,
             // and the stack under it, not followed.
-            if lastpipe && end != "|" {
+            if shell.lastpipe && end != "|" {
                 if b != "dirs" {
-                    here = vec![UNTRACKED.into()];
-                    old = vec![UNTRACKED.into()];
+                    shell.here = vec![UNTRACKED.into()];
+                    shell.old = vec![UNTRACKED.into()];
                 }
-                pushed.clear();
+                shell.pushed.clear();
             }
             continue;
         }
@@ -352,30 +802,33 @@ fn runner_commands(
                 .take_while(|a| **a != "--")
                 .any(|a| a.starts_with('-') && a.contains('c'))
             {
-                pushed.clear();
+                shell.pushed.clear();
             }
             continue;
         }
+        if in_shell && matches!(b, "cd" | "pushd" | "popd") && command_leaves_tree(words) {
+            shell.left_tree = true;
+        }
         if b == "popd" {
-            let stack: Vec<_> = std::iter::once((here.clone(), true))
-                .chain(pushed.iter().rev().cloned())
+            let stack: Vec<_> = std::iter::once((shell.here.clone(), true))
+                .chain(shell.pushed.iter().rev().cloned())
                 .collect();
             // A popd that fails, or that pops past the stack the line built
             // into one the shell had before, is not followed.
             let Some((mut s, moved)) = popd_args(&operands(&words[1..]))
                 .and_then(|(index, keep)| popped(&stack, index, keep))
             else {
-                here = vec![UNTRACKED.into()];
+                shell.here = vec![UNTRACKED.into()];
                 continue;
             };
             let (back, sure) = s.remove(0);
-            pushed = s.into_iter().rev().collect();
+            shell.pushed = s.into_iter().rev().collect();
             if moved {
-                let now = std::mem::replace(&mut here, back);
-                let was = std::mem::replace(&mut old, now.clone());
+                let now = std::mem::replace(&mut shell.here, back);
+                let was = std::mem::replace(&mut shell.old, now.clone());
                 if !sure {
-                    add_dirs(&mut here, now);
-                    add_dirs(&mut old, was);
+                    add_dirs(&mut shell.here, now);
+                    add_dirs(&mut shell.old, was);
                 }
             }
             continue;
@@ -387,45 +840,62 @@ fn runner_commands(
             let keep = pushd && args.contains(&"-n");
             let args: Vec<&str> = args.into_iter().filter(|a| !keep || *a != "-n").collect();
             if pushd && args.first().is_none_or(|a| stack_index(a)) {
-                let stack: Vec<_> = std::iter::once((here.clone(), true))
-                    .chain(pushed.iter().rev().cloned())
+                let stack: Vec<_> = std::iter::once((shell.here.clone(), true))
+                    .chain(shell.pushed.iter().rev().cloned())
                     .collect();
                 if let Some(mut s) = rotated(&stack, args.first().copied()) {
                     let top = s.remove(0).0;
-                    pushed = s
+                    shell.pushed = s
                         .into_iter()
                         .rev()
                         .map(|(d, sure)| (d, sure && gates))
                         .collect();
                     if !keep {
-                        let from = std::mem::replace(&mut here, top);
-                        let was = std::mem::replace(&mut old, from.clone());
-                        add_dirs(if gates { &mut old_failed } else { &mut old }, was);
-                        add_dirs(if gates { &mut failed } else { &mut here }, from);
+                        let from = std::mem::replace(&mut shell.here, top);
+                        let was = std::mem::replace(&mut shell.old, from.clone());
+                        add_dirs(
+                            if gates {
+                                &mut old_failed
+                            } else {
+                                &mut shell.old
+                            },
+                            was,
+                        );
+                        add_dirs(if gates { &mut failed } else { &mut shell.here }, from);
                     }
                 }
                 continue;
             }
-            let named: Vec<_> = here
+            let named: Vec<_> = shell
+                .here
                 .iter()
-                .flat_map(|d| entered(&args, d, pushd, &old, &set, vars.home.as_deref()))
+                .flat_map(|d| {
+                    entered(
+                        &args,
+                        d,
+                        pushd,
+                        &shell.old,
+                        &set,
+                        shell.vars.home.as_deref(),
+                    )
+                })
                 .collect();
             if pushd && (keep || named.is_empty()) {
                 // A directory the line does not name still takes its place
                 // on the stack, and is read as the one the line is in.
                 if !keep {
-                    add_dirs(&mut old, here.clone());
+                    add_dirs(&mut shell.old, shell.here.clone());
                 }
                 let mut dirs = Vec::new();
                 add_dirs(
                     &mut dirs,
                     if named.is_empty() {
-                        here.clone()
+                        shell.here.clone()
                     } else {
                         named
                     },
                 );
-                pushed.push((dirs, gates));
+                shell.pushed.push((dirs, gates));
                 continue;
             }
             // A `cd` that may have failed keeps the directories it left,
@@ -440,15 +910,22 @@ fn runner_commands(
                     .filter(|d| gates || is_untracked(d) || d.join(".").is_dir()),
             );
             if to.is_empty() {
-                add_dirs(&mut old, here.clone());
+                add_dirs(&mut shell.old, shell.here.clone());
             } else {
-                let from = std::mem::replace(&mut here, to);
+                let from = std::mem::replace(&mut shell.here, to);
                 if b == "pushd" {
-                    pushed.push((from.clone(), gates));
+                    shell.pushed.push((from.clone(), gates));
                 }
-                let was = std::mem::replace(&mut old, from.clone());
-                add_dirs(if gates { &mut old_failed } else { &mut old }, was);
-                add_dirs(if gates { &mut failed } else { &mut here }, from);
+                let was = std::mem::replace(&mut shell.old, from.clone());
+                add_dirs(
+                    if gates {
+                        &mut old_failed
+                    } else {
+                        &mut shell.old
+                    },
+                    was,
+                );
+                add_dirs(if gates { &mut failed } else { &mut shell.here }, from);
             }
             continue;
         }
@@ -465,14 +942,30 @@ fn runner_commands(
             }
         }
     }
+    if after == "&" {
+        shell.restore(list.clone());
+    }
     if depth >= MAX_DEPTH {
         return;
     }
-    for (i, inner) in inner_commands_expanded(argv) {
-        if inner.as_slice() != argv {
-            let (dirs, old, set) = &ran_in[i];
+    for (i, inner) in inner_commands_expanded(&argv) {
+        if inner.as_slice() != argv.as_slice() {
+            let Some((dirs, oldpwd, set)) = ran_in.get(i) else {
+                continue;
+            };
             for dir in dirs {
-                runner_commands(&inner, dir, old, set, depth + 1, out);
+                let inn = ShellIn {
+                    cwd: dir,
+                    oldpwd,
+                    vars: set,
+                    funcs: &shell.funcs,
+                    fn_depth: shell.fn_depth,
+                    left_tree: shell.left_tree,
+                };
+                runner_commands(&inner, &inn, depth + 1, out, denied);
+                if denied.is_some() {
+                    return;
+                }
             }
         }
     }
@@ -682,8 +1175,9 @@ enum Sourced {
     /// The command is not a `source` or `.` of a literal path.
     No,
     /// The file can be read and its text leaves the shell where it was.
-    /// The set is the functions it defines whose bodies may not.
-    Keeps(std::collections::HashSet<String>),
+    /// The words are the file, aliases expanded, so a function it defines
+    /// or calls is judged with the line.
+    Keeps(Vec<String>),
     /// The file cannot be read, or its text may move the shell or set
     /// `HOME`, `CDPATH` or `PWD`.
     Loses,
@@ -705,32 +1199,10 @@ fn sourced(cmd: &[&str], cwd: Option<&std::path::Path>, aliases: &[(String, Stri
     };
     let scan = scan_script(&text, aliases);
     if scan.keeps {
-        Sourced::Keeps(scan.risky)
+        Sourced::Keeps(scan.words)
     } else {
         Sourced::Loses
     }
-}
-
-/// Whether `cmd` calls a function in `risky`. `command` and `builtin`
-/// skip a function and run the program.
-fn calls_risky(cmd: &[&str], risky: &std::collections::HashSet<String>) -> bool {
-    if risky.is_empty() {
-        return false;
-    }
-    let words = operands(cmd);
-    let front = (0..words.len())
-        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
-        .count();
-    let rest = &words[front..];
-    if rest
-        .first()
-        .is_some_and(|w| matches!(base_of(w), "command" | "builtin"))
-    {
-        return false;
-    }
-    peel_cd_command_word(rest)
-        .first()
-        .is_some_and(|w| risky.contains(base_of(w)))
 }
 
 /// The command word of `cmd`, past assignments, redirections and the
@@ -790,28 +1262,22 @@ fn read_regular_nofollow(path: &std::path::Path) -> Option<String> {
 }
 
 /// Whether the script `text`, read by a shell that holds `aliases`,
-/// leaves the shell where it was, and which of its functions may not,
-/// when called.
+/// leaves the shell where it was. `words` is that text with the aliases
+/// expanded, function bodies still in place.
 struct ScriptScan {
     keeps: bool,
-    risky: std::collections::HashSet<String>,
+    words: Vec<String>,
 }
 
 fn scan_script(text: &str, aliases: &[(String, String)]) -> ScriptScan {
     let words = shell_words(text);
-    let words = expand_aliases_with(&words, &mut aliases.to_vec());
+    let words = expand_aliases_with(&words, &mut aliases.to_vec()).into_owned();
     let mut funcs = std::collections::HashMap::new();
     let top = split_functions(&words, &mut funcs);
     let mut memo = std::collections::HashMap::new();
     let mut stack = std::collections::HashSet::new();
     let keeps = body_keeps(&top, &funcs, &mut memo, &mut stack);
-    stack.clear();
-    let risky = funcs
-        .keys()
-        .filter(|name| function_risks(name, &funcs, &mut memo, &mut stack))
-        .cloned()
-        .collect();
-    ScriptScan { keeps, risky }
+    ScriptScan { keeps, words }
 }
 
 /// Words of `words` with function bodies taken out into `funcs`. A body
@@ -6899,14 +7365,18 @@ hash -r 2> /dev/null
             ("unset HOME; cd && make clean-all", root.clone()),
         ] {
             let mut runs = Vec::new();
-            runner_commands(
-                &shell_words(line),
-                &root,
-                &[],
-                &Vars::from_env(),
-                0,
-                &mut runs,
-            );
+            let mut denied = None;
+            let vars = Vars::from_env();
+            let funcs = FnMap::new();
+            let inn = ShellIn {
+                cwd: &root,
+                oldpwd: &[],
+                vars: &vars,
+                funcs: &funcs,
+                fn_depth: 0,
+                left_tree: false,
+            };
+            runner_commands(&shell_words(line), &inn, 0, &mut runs, &mut denied);
             let dirs: Vec<_> = runs
                 .iter()
                 .filter(|(r, _, _)| r[0] == "make")
@@ -8413,6 +8883,131 @@ hash -r 2> /dev/null
             &["openssl", "rand", "-hex", "16"],
         ] {
             assert_eq!(v(argv), "allow", "{argv:?}");
+        }
+    }
+
+    /// A function runs in the shell that calls it. `go() { cd evil; }; go
+    /// && make clean-all` reads the Makefile in `evil`, including when
+    /// the body is `function go`, the call is `\go`, or the definition
+    /// and the call are split across a sourced file. `command` and
+    /// `builtin` run the program instead. A call that cannot be judged
+    /// leaves the line untracked.
+    #[test]
+    fn a_called_function_is_judged_where_it_runs() {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-fncall", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["evil", "safe", "sub", "x", ".venv/bin"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("evil/Makefile"), MAKEFILE).unwrap();
+        std::fs::write(root.join("safe/Makefile"), "clean-all:\n\techo clean\n").unwrap();
+        std::fs::write(root.join("sub/Makefile"), "test:\n\techo sub\n").unwrap();
+        std::fs::write(root.join("call.sh"), "go\n").unwrap();
+        std::fs::write(root.join("go.sh"), "go() { cd evil; }\n").unwrap();
+        std::fs::write(root.join("push.sh"), "go() { git push -f origin; }\n").unwrap();
+        std::fs::write(
+            root.join(".venv/bin/activate"),
+            include_str!("../tests/fixtures/pyvenv-activate.sh"),
+        )
+        .unwrap();
+        let check = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        let recipe = |line: &str| {
+            let c = check(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(
+                c.token.starts_with("make clean-all runs `rm -rf "),
+                "{line}: {}",
+                c.token
+            );
+            assert!(
+                c.token.ends_with(": rm-rf-outside-tmp"),
+                "{line}: {}",
+                c.token
+            );
+        };
+        for line in [
+            "go() { cd evil; }; go && make clean-all",
+            "function go { cd evil; }; go && make clean-all",
+            "bash -c 'go() { cd evil; }; go && make clean-all'",
+            "bash -c 'function go { cd evil; }; go && make clean-all'",
+            "go() { cd safe; }; go() { cd evil; }; go && make clean-all",
+            "unset -f other; go() { cd evil; }; go && make clean-all",
+            "f() { unset -f go; }; go() { cd evil; }; go && make clean-all",
+            "go() { cd evil; }; source call.sh && make clean-all",
+            "source go.sh && go && make clean-all",
+            "go() { cd evil; }; \\go && make clean-all",
+        ] {
+            recipe(line);
+        }
+        let from_sub = |line: &str| check_shell_in(&shell_words(line), &root.join("sub"), 0);
+        let c = from_sub("go() { cd ../evil; }; go && make clean-all");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(c.token.ends_with(": rm-rf-outside-tmp"), "{}", c.token);
+        let raw: Vec<String> = [
+            "go()",
+            "{",
+            "cd",
+            "evil",
+            ";",
+            "}",
+            ";",
+            "\\go",
+            "&&",
+            "make",
+            "clean-all",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let c = check_shell_in(&raw, &root, 0);
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(c.token.ends_with(": rm-rf-outside-tmp"), "{}", c.token);
+        let c = check("source push.sh && go");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(c.token.contains("git-force-push"), "{}", c.token);
+        let c = check("go() ( git push -f ); go");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(c.token.contains("git-force-push"), "{}", c.token);
+        for line in [
+            "go() { go; }; go && make clean-all",
+            "a() { b; }; b() { a; }; a && make clean-all",
+            "go() { cd evil; }; declare -f \"$n\"; go && make clean-all",
+            "go() { cd evil; }; unset -f \"$n\"; go && make clean-all",
+            "go() { cd evil; make clean-all",
+        ] {
+            let c = check(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("untracked"), "{line}: {}", c.token);
+        }
+        let mut chain = String::new();
+        for i in 0..12 {
+            let next = if i == 11 {
+                "cd evil".to_string()
+            } else {
+                format!("f{}", i + 1)
+            };
+            chain.push_str(&format!("f{i}() {{ {next}; }}; "));
+        }
+        chain.push_str("f0 && make clean-all");
+        let c = check(&chain);
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(c.token.contains("untracked"), "{}", c.token);
+        for line in [
+            "f() { echo hi; }; f",
+            "bash -c 'f() { echo hi; }; f'",
+            "go() { cd safe; }; go && make clean-all",
+            "go() { cd evil; }; command go && make clean-all",
+            "go() { cd evil; }; builtin go && make clean-all",
+            "go() { cd evil; }; unset -f go; go && make clean-all",
+            "go() ( cd evil ); go && make clean-all",
+            "source .venv/bin/activate && make test",
+            "cd sub && make",
+            "pushd x && popd",
+            "cd safe && make",
+            "source .venv/bin/activate && true | cd evil && make clean-all",
+        ] {
+            let c = check(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
     }
 
