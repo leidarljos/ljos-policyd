@@ -691,6 +691,25 @@ fn home_from(home: Option<&str>, dir: &std::path::Path) -> Option<std::path::Pat
     })
 }
 
+/// What `~` expands to with `HOME` at `home`: that value, or with `HOME`
+/// unset the home in the user's passwd entry, as bash takes it. A user
+/// with no entry names no directory the line shows.
+fn tilde_home(home: Option<&str>) -> Cow<'_, str> {
+    if let Some(h) = home {
+        return Cow::Borrowed(h);
+    }
+    // SAFETY: getpwuid returns null or a record that stays valid until the
+    // next lookup, and pw_dir is copied out before this returns.
+    let dir = unsafe {
+        let pw = libc::getpwuid(libc::getuid());
+        if pw.is_null() || (*pw).pw_dir.is_null() {
+            return Cow::Borrowed("$");
+        }
+        std::ffi::CStr::from_ptr((*pw).pw_dir)
+    };
+    Cow::Owned(dir.to_string_lossy().into_owned())
+}
+
 /// Where the path word `to` lands from `dir`: `~` and `~/path` from
 /// `home`, anything else joined onto `dir`. A variable, a substitution or
 /// `~user` names no directory the line shows.
@@ -699,10 +718,10 @@ fn path_from(to: &str, dir: &std::path::Path, home: Option<&str>) -> Option<std:
         return None;
     }
     if to == "~" {
-        return home_from(home, dir);
+        return home_from(Some(&tilde_home(home)), dir);
     }
     if let Some(rest) = to.strip_prefix("~/") {
-        return home_from(home, dir).map(|h| h.join(rest));
+        return home_from(Some(&tilde_home(home)), dir).map(|h| h.join(rest));
     }
     (!to.starts_with('~')).then(|| dir.join(to))
 }

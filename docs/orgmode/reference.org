@@ -84,6 +84,8 @@ front of it (=HOME=dir cd=) or earlier on the line (=export HOME=dir;
 cd=), and =~= expands from the one set before the command. A =HOME=
 that may hold either of two values, or one the line does not show
 (=HOME=$(mktemp -d) cd=), leaves the runner after the =cd= refused.
+With =HOME= unset, =~= is the home in the user's passwd entry, as in
+bash, and a bare =cd= stays.
 
 =pushd= and =popd= follow the directory stack. =pushd -n= stacks its
 directory without entering it, =pushd +N= and =-N= enter the entry they

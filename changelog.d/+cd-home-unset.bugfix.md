@@ -1,0 +1,1 @@
+With `HOME` unset, `~` is the home in the user's passwd entry, as bash expands it, so `unset HOME; cd ~/x && make clean-all` reads `~/x/Makefile` and refuses the `rm -rf ~` in it again. The `~` was read as naming no directory, and the runner was judged where the line started.
