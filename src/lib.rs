@@ -7273,6 +7273,18 @@ fn splice_feed(
     out
 }
 
+/// One template word that holds spaces is the shell command `parallel`
+/// runs. Several words are already the command.
+fn shell_template(template: &[String]) -> Vec<String> {
+    if template.len() == 1 {
+        let words = shell_words(&template[0]);
+        if words.len() > 1 {
+            return words;
+        }
+    }
+    template.to_vec()
+}
+
 fn feed_end(run: &[String], sep: Option<&str>) -> usize {
     run.iter()
         .position(|w| w == ":::" || w == "::::" || sep.is_some_and(|s| !s.is_empty() && w == s))
@@ -7329,7 +7341,9 @@ fn xargs_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Op
         let opaque = parsed.is_none();
         let argsep = parsed.as_ref().and_then(|s| s.argsep.clone());
         let end = feed_end(run_all, argsep.as_deref());
-        let template = run_all[..end].to_vec();
+        // `parallel 'rm -rf {}'` is one word. parallel runs it through a
+        // shell, so the words inside it are the command.
+        let template = shell_template(&run_all[..end]);
         if template.is_empty() || !fed_sensitive(&template) {
             continue;
         }
@@ -18084,6 +18098,16 @@ hash -r 2> /dev/null
             "printf '/\\n' | xargs -R 1 -I % rm -rf %",
             "printf '/\\n' | xargs -S 1024 -I % rm -rf %",
         ] {
+            assert_eq!(v(line), "deny\trm-rf-outside-tmp", "{line}");
+        }
+    }
+
+    /// `parallel` runs a one-word command through a shell. The words of
+    /// that string are the command, including a `{}` it replaces.
+    #[test]
+    fn a_parallel_shell_string_is_the_command() {
+        let v = |s: &str| verdict(&shell_words(s));
+        for line in ["parallel 'rm -rf' ::: /", "parallel 'rm -rf {}' ::: /"] {
             assert_eq!(v(line), "deny\trm-rf-outside-tmp", "{line}");
         }
     }
