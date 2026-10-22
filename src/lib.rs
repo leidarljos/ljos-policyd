@@ -220,8 +220,7 @@ fn runner_commands(
     let pwd_set = writes_pwd(argv);
     // With `shopt -s lastpipe` anywhere on the line, the last stage of a
     // pipeline may run in this shell.
-    let lastpipe =
-        argv.iter().any(|w| w == "lastpipe") || commands(argv).iter().any(|c| may_set_lastpipe(c));
+    let lastpipe = commands(argv).iter().any(|c| may_set_lastpipe(c));
     for (cmd, end) in ended_commands(argv) {
         if after == "&" {
             (here, old, pushed, vars) = list.clone();
@@ -566,19 +565,36 @@ fn may_set(w: &str, name: &str) -> bool {
     })
 }
 
-/// Whether the command `cmd` may turn on `lastpipe` without naming it: a
-/// `shopt` with a word the line does not show (`shopt -s $opt`, `shopt
-/// -s last*`), or a command word it does not show, which may be `shopt`.
+/// Whether the command `cmd` may turn on `lastpipe`: `shopt -s` or `set
+/// -o` naming it, either with a word the line does not show (`shopt -s
+/// $opt`, `shopt -s last*`), an `eval` of one, or a command word the line
+/// does not show, which may be `shopt`.
 fn may_set_lastpipe(cmd: &[&str]) -> bool {
     let unshown = |w: &&str| w.contains(['$', '`', '*', '?', '[', '{']);
     let words = operands(cmd);
     let front = (0..words.len())
         .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
         .count();
-    match peel_cd_command_word(&words[front..]).split_first() {
-        Some((w, args)) if base_of(w) == "shopt" => args.iter().any(unshown),
-        Some((w, _)) => unshown(w),
-        None => false,
+    let Some((w, args)) = peel_cd_command_word(&words[front..]).split_first() else {
+        return false;
+    };
+    let flag = |a: &str, c| a.starts_with('-') && !a.starts_with("--") && a.contains(c);
+    match base_of(w) {
+        "shopt" => {
+            args.iter().any(unshown)
+                || (args.iter().any(|a| flag(a, 's')) && args.contains(&"lastpipe"))
+        }
+        "set" => {
+            let opts: Vec<&str> = args.iter().copied().take_while(|a| *a != "--").collect();
+            opts.iter().any(unshown)
+                || opts
+                    .windows(2)
+                    .any(|p| flag(p[0], 'o') && p[1] == "lastpipe")
+        }
+        "eval" => commands(&shell_words(&args.join(" ")))
+            .iter()
+            .any(|c| may_set_lastpipe(c)),
+        _ => unshown(w),
     }
 }
 

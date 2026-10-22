@@ -1,0 +1,1 @@
+`lastpipe` is taken to be on only where `shopt -s` or `set -o` names it, alone, behind `builtin` or `command`, or in an `eval`, or where a `shopt` or `set` word is one the line does not show. A word that only names it (`echo lastpipe | read HOME`) no longer leaves `HOME` or `CDPATH` untracked.
