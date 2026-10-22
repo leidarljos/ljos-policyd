@@ -1327,7 +1327,7 @@ fn sourced_keeps(
     } else {
         cwd.join(rel)
     };
-    read_regular_nofollow(&full).is_some_and(|t| scan_script(&t, aliases).keeps)
+    read_regular(&full).is_some_and(|t| scan_script(&t, aliases).keeps)
 }
 
 /// Whether the word `w` names the variable `name` other than to read it
@@ -1393,7 +1393,7 @@ fn sourced(cmd: &[&str], cwd: Option<&std::path::Path>, aliases: &[(String, Stri
     let Some(cwd) = cwd.filter(|d| !is_untracked(d)) else {
         return Sourced::Loses;
     };
-    let Some(text) = read_regular_nofollow(&cwd.join(path)) else {
+    let Some(text) = read_regular(&cwd.join(path)) else {
         return Sourced::Loses;
     };
     let scan = scan_script(&text, aliases);
@@ -1612,7 +1612,7 @@ fn judge_startup(
             }
         }
     };
-    let Some(text) = read_regular_nofollow(&full) else {
+    let Some(text) = read_regular(&full) else {
         *denied = Some(startup_unshown());
         return;
     };
@@ -1660,7 +1660,7 @@ fn judge_script_file(
         [d] if !is_untracked(d) => env_dir(wrappers, d, shell.vars.home.as_deref()).join(path),
         _ => return,
     };
-    let Some(text) = read_regular_nofollow(&full) else {
+    let Some(text) = read_regular(&full) else {
         return;
     };
     if depth >= MAX_DEPTH {
@@ -1737,7 +1737,7 @@ fn read_shown_file(path: &str, shell: &Shell) -> Option<String> {
             _ => return None,
         }
     };
-    read_regular_nofollow(&full)
+    read_regular(&full)
 }
 
 fn procsub_unshown_denial() -> Checked {
@@ -1780,16 +1780,16 @@ fn literal_source_path(cmd: &[&str]) -> Option<String> {
 /// How large a sourced file is read. Past this the line is untracked.
 const SOURCE_MAX: u64 = 64 * 1024;
 
-/// The text of the regular file at `path`, opened with `O_NOFOLLOW` so a
-/// symlink is not the file, and `O_NONBLOCK` so a fifo cannot stall the
-/// check. `None` when it cannot be read, is not a regular file, is larger
-/// than [`SOURCE_MAX`], or is not UTF-8.
-fn read_regular_nofollow(path: &std::path::Path) -> Option<String> {
+/// The text of the regular file at `path`, opened through any symlink as
+/// the shell opens it, and with `O_NONBLOCK` so a fifo cannot stall the
+/// check. A loop of links fails to open. `None` when it cannot be read,
+/// is not a regular file, is larger than [`SOURCE_MAX`], or is not UTF-8.
+fn read_regular(path: &std::path::Path) -> Option<String> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .custom_flags(libc::O_NONBLOCK)
         .open(path)
         .ok()?;
     let meta = file.metadata().ok()?;
@@ -8068,8 +8068,8 @@ mod tests {
     /// `source` and `.` of a regular file the guard can read keep the
     /// directory when the file does not move the shell or set `HOME`,
     /// `CDPATH` or `PWD`. A function the line does not call is not that
-    /// file's text. `eval`, a symlink, a missing path and a word the line
-    /// does not show still lose the directory.
+    /// file's text, and a symlink is the file it names. `eval`, a missing
+    /// path and a word the line does not show still lose the directory.
     #[test]
     fn a_sourced_file_keeps_the_line_when_its_text_does() {
         let root = std::env::temp_dir().join(format!("policyd-lib-{}-srcread", std::process::id()));
@@ -8116,6 +8116,7 @@ mod tests {
             ". ./env.sh && make test",
             ". ./env.sh && cargo test",
             "source funcs.sh && make test",
+            "source link.sh && make test",
         ] {
             let c = check(&root, line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
@@ -8134,7 +8135,6 @@ mod tests {
             "source shopt.sh && make test",
             "source hidden.sh && make test",
             "source evals.sh && make test",
-            "source link.sh && make test",
             "source missing.sh && make test",
             "source $X && make test",
             "source \"$X\" && make test",
@@ -11393,5 +11393,34 @@ hash -r 2> /dev/null
         ] {
             assert_eq!(line(l), "allow", "{l}");
         }
+    }
+
+    /// `sh link.sh`, with link.sh a symlink to evil/force.sh, was allowed:
+    /// the file was opened without following the link, so nothing was
+    /// read. bash runs the file the link names.
+    #[test]
+    fn a_script_is_read_through_its_symlink() {
+        let root = startup_root("symlink");
+        std::os::unix::fs::symlink("evil/force.sh", root.join("link.sh")).unwrap();
+        std::os::unix::fs::symlink("link.sh", root.join("link2.sh")).unwrap();
+        std::os::unix::fs::symlink("evil/missing.sh", root.join("dangling.sh")).unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "sh link.sh",
+            "bash link2.sh",
+            "source link.sh",
+            ". ./link2.sh",
+            "BASH_ENV=link.sh bash -c 'echo ok'",
+            "bash <(cat link.sh)",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
+        }
+        for line in ["sh dangling.sh", "source dangling.sh"] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        assert_everyday_allowed(&root);
     }
 }
