@@ -6560,7 +6560,11 @@ fn ran_paths(cmd: &[String]) -> Vec<&str> {
     };
     let word = cmd[at].as_str();
     let mut out = Vec::new();
-    if word.contains('/') {
+    // A parenthesised group is a subshell, not a path, even when the
+    // text inside it contains a slash.
+    // A parenthesised group is a subshell, not a path, even when the
+    // text inside it contains a slash.
+    if word.contains('/') && !word.starts_with('(') {
         out.push(word);
     }
     let b = base_of(word);
@@ -7904,7 +7908,7 @@ impl Scratch {
 
     /// A command substitution that only makes a temp directory.
     fn cmdsub(&self, body: &str) -> Option<Hold> {
-        let words = shell_words(body);
+        let words = command_words(body);
         if !words
             .iter()
             .any(|w| matches!(base_of(w), "mktemp" | "tempfile"))
@@ -8072,6 +8076,27 @@ fn default_assign(body: &str) -> Option<(&str, &str)> {
     let rest = &body[end..];
     let value = rest.strip_prefix(":=").or_else(|| rest.strip_prefix('='))?;
     Some((&body[..end], value))
+}
+
+/// Words of a command substitution, with a parenthesised group opened.
+/// `$( (umask 077 && mktemp -d dir) )` hides `mktemp` inside one word
+/// until the group is read on its own.
+fn command_words(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    flatten_commands(&shell_words(body), 0, &mut out);
+    out
+}
+
+fn flatten_commands(words: &[String], depth: usize, out: &mut Vec<String>) {
+    for w in words {
+        if depth < 4 {
+            if let Some(inner) = w.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+                flatten_commands(&shell_words(inner), depth + 1, out);
+                continue;
+            }
+        }
+        out.push(w.clone());
+    }
 }
 
 /// The whole value is `$(...)` or a backtick command.
@@ -14339,6 +14364,36 @@ hash -r 2> /dev/null
             let c = at(line);
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
             assert_eq!(c.token, "rm-rf-outside-tmp", "{line}: {}", c.token);
+        }
+    }
+
+    /// `mktemp` inside a parenthesised group is still the temp directory
+    /// it makes. The group is not a file. A temp outside `/tmp` stays
+    /// refused, and a subshell that pushes is still judged.
+    #[test]
+    fn mktemp_inside_a_subshell_is_still_a_temp() {
+        let root = startup_root("mktempsh");
+        std::fs::write(root.join("evil.sh"), "git push -f origin\n").unwrap();
+        std::fs::create_dir_all(root.join("evil")).unwrap();
+        std::fs::write(root.join("evil/Makefile"), MAKEFILE).unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "tmp=`(umask 077 && mktemp -d \"./confXXXXXX\") 2>/dev/null` && rm -rf \"$tmp\"",
+            "tmp=$( (umask 077 && mktemp -d \"./confXXXXXX\") ) && rm -rf \"$tmp\"",
+            "tmp=$(mktemp -d) && rm -rf \"$tmp\"",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for line in [
+            "tmp=$(mktemp -d /etc/XXXXXX) && rm -rf \"$tmp\"",
+            "tmp=$( (umask 077 && mktemp -d /etc/XXXXXX) ) && rm -rf \"$tmp\"",
+            "tmp=/ && rm -rf \"$tmp\"",
+            "(./evil.sh)",
+            "(cd evil && make clean-all)",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
         }
     }
 }
