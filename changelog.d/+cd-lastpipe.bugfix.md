@@ -1,0 +1,1 @@
+With `shopt -s lastpipe` on the line, a `HOME` or `CDPATH` the last stage of a pipeline writes (`echo ../lib | read CDPATH`) is left untracked, since bash then runs that stage in the current shell, so a runner after the `cd` is refused.

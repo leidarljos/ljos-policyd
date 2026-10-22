@@ -218,6 +218,9 @@ fn runner_commands(
     let mut ran_in = Vec::new();
     // `$PWD` follows the line's directory unless the line sets it.
     let pwd_set = argv.iter().any(|w| may_set(w, "PWD"));
+    // With `shopt -s lastpipe` anywhere on the line, the last stage of a
+    // pipeline may run in this shell.
+    let lastpipe = argv.iter().any(|w| w == "lastpipe");
     for (cmd, end) in ended_commands(argv) {
         if after == "&" {
             (here, old, pushed, vars) = list.clone();
@@ -272,10 +275,11 @@ fn runner_commands(
                 }
             }
         }
+        let shown: Vec<_> = cmd.iter().map(|w| with_pwd(w, pwd)).collect();
+        let shown: Vec<&str> = shown.iter().map(|w| &**w).collect();
         if !piped {
             let was = vars.clone();
-            let shown: Vec<_> = cmd.iter().map(|w| with_pwd(w, pwd)).collect();
-            set_vars(&shown.iter().map(|w| &**w).collect::<Vec<_>>(), &mut vars);
+            set_vars(&shown, &mut vars);
             match before {
                 "||" => vars.merge(was),
                 "&&" => match &mut vars_failed {
@@ -283,6 +287,15 @@ fn runner_commands(
                     None => vars_failed = Some(was),
                 },
                 _ => {}
+            }
+        } else if lastpipe && end != "|" {
+            let mut set = vars.clone();
+            set_vars(&shown, &mut set);
+            if set.cdpath != vars.cdpath {
+                vars.cdpath = Some("$".into());
+            }
+            if set.home != vars.home {
+                vars.home = Some("$".into());
             }
         }
         let words = peel_cd_command_word(&cmd);
