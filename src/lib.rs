@@ -170,19 +170,19 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
                 )),
             };
         }
-        let lines = match scripts::resolved(&run, &dir) {
-            scripts::Recipes::Closed(token) => {
+        let (lines, at) = match scripts::resolved_at(&run, &dir) {
+            (scripts::Recipes::Closed(token), _) => {
                 return Checked {
                     decision: Decision::Deny,
                     code: PolicyReason::ShellDangerousRunner,
                     token: Cow::Borrowed(token),
                 };
             }
-            scripts::Recipes::Lines(lines) => lines,
+            (scripts::Recipes::Lines(lines), at) => (lines, at),
         };
         for line in &lines {
             let sh = ["sh".to_string(), "-c".to_string(), line.clone()];
-            let c = check_shell_in(&sh, &dir, depth + 1);
+            let c = check_shell_in(&sh, &at, depth + 1);
             if c.decision != Decision::Allow {
                 return Checked {
                     decision: c.decision,
@@ -196,7 +196,7 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
         if lines.len() > 1 {
             let whole: Vec<String> = lines.iter().map(|l| format!("(\n{l}\n)")).collect();
             let sh = ["sh".to_string(), "-c".to_string(), whole.join("\n")];
-            let c = check_shell_in(&sh, &dir, depth + 1);
+            let c = check_shell_in(&sh, &at, depth + 1);
             if c.decision != Decision::Allow {
                 return Checked {
                     decision: c.decision,
@@ -283,7 +283,11 @@ struct LineFiles {
     /// again on its own.
     data: bool,
     written: Vec<Written>,
-    ran: Vec<(Option<std::path::PathBuf>, Vec<usize>, Ran)>,
+    ran: Vec<(Option<std::path::PathBuf>, String, Vec<usize>, Ran)>,
+    /// `rm` operands, with the command that removes them.
+    removed: Vec<(String, Vec<usize>)>,
+    /// Variables whose value is the script being judged (`$0`).
+    script_vars: std::collections::HashSet<String>,
 }
 
 /// A path a command may write, and its place on the line. A `loose`
@@ -297,6 +301,9 @@ struct Written {
     text: Option<String>,
     /// The word naming the file, or for a loose write the command.
     word: String,
+    /// The bytes are a filter of the script being judged, and the
+    /// filter inserts no command.
+    rewrite: bool,
 }
 
 /// How a file is run: by a shell (a script operand, `source`, a startup
@@ -418,6 +425,7 @@ impl LineFiles {
                 loose,
                 text: None,
                 word: w.to_string(),
+                rewrite: false,
             });
         }
     }
@@ -435,7 +443,7 @@ impl LineFiles {
                 _ if how == Ran::Exec => Ran::Shell,
                 _ => how,
             };
-            self.ran.push((p, self.cmd.clone(), how));
+            self.ran.push((p, w.to_string(), self.cmd.clone(), how));
         }
     }
 
@@ -448,7 +456,7 @@ impl LineFiles {
     /// for one its own command runs.
     fn written_then_run(&self) -> Result<Vec<(String, String)>, String> {
         let mut texts = Vec::new();
-        for (r, rid, how) in &self.ran {
+        for (r, run_word, rid, how) in &self.ran {
             let shown = |p: &Option<std::path::PathBuf>| {
                 p.as_ref().map_or_else(
                     || "a script the line does not show".into(),
@@ -464,6 +472,7 @@ impl LineFiles {
                     (Some(r), Some(w)) => r.starts_with(w),
                     _ => true,
                 })
+                .filter(|w| !self.scratch_of_this_run(w, run_word, r, rid))
                 .peekable();
             if hits.peek().is_none() {
                 continue;
@@ -480,6 +489,46 @@ impl LineFiles {
             }
         }
         Ok(texts)
+    }
+
+    /// Whether `w` is scratch this run creates in the tracked directory
+    /// and then reads or removes, so it is not a new script for `run`.
+    ///
+    /// A rewrite of the script being judged (`sed <$0 >$as_me.lineno`
+    /// then `. "./$as_me.lineno"`) is that script. `$$` is only digits,
+    /// so `conf$$.file` stays in the directory and is not a later
+    /// `./configure`; once `rm` has removed it, it is not a later run
+    /// either. A bare `$x` or `"$LOG"` can be any path, so it still is.
+    fn scratch_of_this_run(
+        &self,
+        w: &Written,
+        run: &str,
+        run_path: &Option<std::path::PathBuf>,
+        run_id: &[usize],
+    ) -> bool {
+        if w.loose {
+            return false;
+        }
+        // A path the line places is that file, or a directory it is in.
+        // Word shape is only for a path the line does not show.
+        if w.path.is_some() && run_path.is_some() {
+            return false;
+        }
+        if w.rewrite && same_scratch_word(&w.word, run) {
+            return true;
+        }
+        if !cwd_confined(&w.word) {
+            return false;
+        }
+        if !shape_overlaps(&w.word, run) {
+            return true;
+        }
+        self.removed.iter().any(|(rm, id)| {
+            same_scratch_word(rm, &w.word)
+                && w.id.as_slice() < id.as_slice()
+                && id.as_slice() <= run_id
+                && !same_scratch_word(&w.word, run)
+        })
     }
 }
 
@@ -500,6 +549,400 @@ fn written_reason(script: &str, w: &Written) -> String {
         None => format!("{script}: `{}` may write any file where it runs", w.word),
         Some(_) => script.to_string(),
     }
+}
+
+/// `w` with quotes and a leading `./` taken off, so `$as_me.lineno` and
+/// `./$as_me.lineno` name one file.
+fn scratch_body(w: &str) -> &str {
+    let w = w.trim_matches(|c| c == '\'' || c == '"');
+    w.strip_prefix("./").unwrap_or(w)
+}
+
+fn same_scratch_word(a: &str, b: &str) -> bool {
+    scratch_body(a) == scratch_body(b)
+}
+
+/// Whether `w` can only name a file in the tracked directory. `$$` is
+/// the pid, which is digits. Any other expansion can hold a slash.
+fn cwd_confined(w: &str) -> bool {
+    let w = scratch_body(w);
+    if w.is_empty() || w.contains('/') || w.split('/').any(|p| p == ".." || p == ".") {
+        return false;
+    }
+    let mut rest = w;
+    while let Some(i) = rest.find('$') {
+        let after = &rest[i + 1..];
+        if let Some(tail) = after.strip_prefix('$') {
+            rest = tail;
+            continue;
+        }
+        return false;
+    }
+    !w.contains('`')
+}
+
+/// A piece of a path word. `$$` is digits. Any other `$name` can be
+/// any text, and the literals around it stay.
+#[derive(Clone, Debug)]
+enum PathPart {
+    Lit(String),
+    Digits,
+    Any,
+}
+
+/// Whether `write` and `run` can expand to the same path. `conf$$.file`
+/// ends in `.file` and `./$as_me.lineno` ends in `.lineno`, so they
+/// cannot. A bare `$cache_file` can be any path, so it can.
+fn shape_overlaps(write: &str, run: &str) -> bool {
+    parts_overlap(&path_parts(write), &path_parts(run), 0)
+}
+
+fn path_parts(w: &str) -> Vec<PathPart> {
+    let w = scratch_body(w);
+    let b = w.as_bytes();
+    let mut out = Vec::new();
+    let mut lit = String::new();
+    let mut i = 0;
+    let flush = |lit: &mut String, out: &mut Vec<PathPart>| {
+        if !lit.is_empty() {
+            out.push(PathPart::Lit(std::mem::take(lit)));
+        }
+    };
+    while i < b.len() {
+        if b[i] == b'$' && b.get(i + 1) == Some(&b'$') {
+            flush(&mut lit, &mut out);
+            out.push(PathPart::Digits);
+            i += 2;
+            continue;
+        }
+        if b[i] == b'$' {
+            flush(&mut lit, &mut out);
+            i += 1;
+            if b.get(i) == Some(&b'{') {
+                i += 1;
+                while i < b.len() && b[i] != b'}' {
+                    i += 1;
+                }
+                if i < b.len() {
+                    i += 1;
+                }
+            } else {
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+            }
+            out.push(PathPart::Any);
+            continue;
+        }
+        lit.push(b[i] as char);
+        i += 1;
+    }
+    flush(&mut lit, &mut out);
+    out
+}
+
+/// Whether some string matches both `a` and `b`. Past the depth bound
+/// the answer stays "yes": a path the line does not pin down still
+/// taints.
+fn parts_overlap(a: &[PathPart], b: &[PathPart], depth: u32) -> bool {
+    if depth > 48 {
+        return true;
+    }
+    match (a.split_first(), b.split_first()) {
+        (None, None) => true,
+        (None, Some((PathPart::Any, _))) | (Some((PathPart::Any, _)), None) => parts_overlap(
+            a.get(1..).unwrap_or(&[]),
+            b.get(1..).unwrap_or(&[]),
+            depth + 1,
+        ),
+        (None, _) | (_, None) => false,
+        (Some((PathPart::Lit(x), ar)), Some((PathPart::Lit(y), br))) => {
+            if x.is_empty() {
+                return parts_overlap(ar, b, depth + 1);
+            }
+            if y.is_empty() {
+                return parts_overlap(a, br, depth + 1);
+            }
+            if let Some(rest) = y.strip_prefix(x.as_str()) {
+                if rest.is_empty() {
+                    parts_overlap(ar, br, depth + 1)
+                } else if rest.starts_with('/') && ar.is_empty() {
+                    true
+                } else {
+                    let mut next = vec![PathPart::Lit(rest.to_string())];
+                    next.extend(br.iter().cloned());
+                    parts_overlap(ar, &next, depth + 1)
+                }
+            } else if let Some(rest) = x.strip_prefix(y.as_str()) {
+                if rest.starts_with('/') && br.is_empty() {
+                    true
+                } else {
+                    let mut next = vec![PathPart::Lit(rest.to_string())];
+                    next.extend(ar.iter().cloned());
+                    parts_overlap(&next, br, depth + 1)
+                }
+            } else {
+                false
+            }
+        }
+        (Some((PathPart::Digits, ar)), Some((PathPart::Lit(y), br))) => {
+            digits_overlap_lit(ar, y, br, depth, true)
+        }
+        (Some((PathPart::Lit(x), ar)), Some((PathPart::Digits, br))) => {
+            digits_overlap_lit(br, x, ar, depth, false)
+        }
+        (Some((PathPart::Digits, ar)), Some((PathPart::Digits, br))) => {
+            parts_overlap(ar, br, depth + 1)
+        }
+        (Some((PathPart::Any, ar)), _) => any_overlap(ar, b, depth),
+        (_, Some((PathPart::Any, br))) => any_overlap(br, a, depth),
+    }
+}
+
+/// `$$` against a literal: at least one digit, then the rest.
+fn digits_overlap_lit(
+    after_digits: &[PathPart],
+    lit: &str,
+    after_lit: &[PathPart],
+    depth: u32,
+    digits_on_left: bool,
+) -> bool {
+    let bytes = lit.as_bytes();
+    let mut n = 0;
+    while n < bytes.len() && bytes[n].is_ascii_digit() {
+        n += 1;
+        let rest = &lit[n..];
+        let tail = if rest.is_empty() {
+            after_lit.to_vec()
+        } else {
+            let mut t = vec![PathPart::Lit(rest.to_string())];
+            t.extend(after_lit.iter().cloned());
+            t
+        };
+        let hit = if digits_on_left {
+            parts_overlap(after_digits, &tail, depth + 1)
+        } else {
+            parts_overlap(&tail, after_digits, depth + 1)
+        };
+        if hit {
+            return true;
+        }
+    }
+    false
+}
+
+/// `$name` eats any prefix of the other pattern, including nothing.
+fn any_overlap(after_any: &[PathPart], other: &[PathPart], depth: u32) -> bool {
+    if parts_overlap(after_any, other, depth + 1) {
+        return true;
+    }
+    match other.split_first() {
+        None => false,
+        Some((PathPart::Lit(s), rest)) => {
+            for n in 1..=s.len() {
+                let tail = if n == s.len() {
+                    rest.to_vec()
+                } else {
+                    let mut t = vec![PathPart::Lit(s[n..].to_string())];
+                    t.extend(rest.iter().cloned());
+                    t
+                };
+                if parts_overlap(after_any, &tail, depth + 1) {
+                    return true;
+                }
+            }
+            false
+        }
+        Some((PathPart::Digits, rest)) => {
+            parts_overlap(after_any, rest, depth + 1)
+                || parts_overlap(
+                    &{
+                        let mut t = vec![PathPart::Digits];
+                        t.extend(after_any.iter().cloned());
+                        t
+                    },
+                    rest,
+                    depth + 1,
+                )
+        }
+        Some((PathPart::Any, rest)) => {
+            parts_overlap(after_any, rest, depth + 1) || any_overlap(after_any, rest, depth + 1)
+        }
+    }
+}
+
+/// Operands `rm` or `rmdir` deletes. Flags are not files.
+fn removal_words(cmd: &[String]) -> Vec<String> {
+    let words: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    let words = operands(&words);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    let rest = peel_cd_command_word(&words[front..]);
+    let Some((w, args)) = rest.split_first() else {
+        return Vec::new();
+    };
+    if !matches!(base_of(w), "rm" | "rmdir") {
+        return Vec::new();
+    }
+    args.iter()
+        .copied()
+        .skip_while(|a| *a != "--" && a.starts_with('-'))
+        .filter(|a| *a != "--" && !a.starts_with('-') && !is_redirection(a))
+        .map(|a| a.to_string())
+        .collect()
+}
+
+/// Record a variable set to the script being judged (`name=$0`,
+/// `name=$dir$0`). A later command substitution is walked on its own
+/// and does not see the assignment, but the file list does.
+fn note_script_var(cmd: &[String], files: &Files) {
+    let words: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    let words = operands(&words);
+    let pure = (0..words.len()).all(|i| is_assignment(words[i]) || keyword_at(&words, i));
+    if !pure {
+        return;
+    }
+    let mut files = files.borrow_mut();
+    for w in cmd {
+        let Some((name, value)) = assign_sides(w) else {
+            continue;
+        };
+        let script = !value.contains(['`', '\0'])
+            && (value == "$0"
+                || value == "${0}"
+                || value.ends_with("$0")
+                || value.ends_with("${0}"));
+        if script {
+            files.script_vars.insert(name);
+        } else {
+            files.script_vars.remove(&name);
+        }
+    }
+}
+
+/// Whether `cmd` reads the script being judged: `<$0`, or `<$name` when
+/// every value of `name` is `$0` or a path that ends in it.
+fn reads_script_stdin(
+    cmd: &[String],
+    values: &std::collections::HashMap<String, Vec<String>>,
+    script_vars: &std::collections::HashSet<String>,
+) -> bool {
+    cmd.iter().any(|w| {
+        let body = redirection_body(w);
+        let Some(target) = body.strip_prefix('<').filter(|t| !t.starts_with('<')) else {
+            return false;
+        };
+        script_source(
+            target.trim_matches(|c| c == '\'' || c == '"'),
+            values,
+            script_vars,
+        )
+    })
+}
+
+fn script_source(
+    target: &str,
+    values: &std::collections::HashMap<String, Vec<String>>,
+    script_vars: &std::collections::HashSet<String>,
+) -> bool {
+    if target == "$0" || target == "${0}" {
+        return true;
+    }
+    let Some(name) = target.strip_prefix('$') else {
+        return false;
+    };
+    let name = name
+        .strip_prefix('{')
+        .and_then(|n| n.strip_suffix('}'))
+        .unwrap_or(name);
+    if var_name(name).is_none()
+        || (target != format!("${name}") && target != format!("${{{name}}}"))
+    {
+        return false;
+    }
+    if script_vars.contains(name) {
+        return true;
+    }
+    values.get(name).is_some_and(|vs| {
+        !vs.is_empty()
+            && vs.iter().all(|v| {
+                !v.contains(['\0', '`'])
+                    && (v == "$0" || v == "${0}" || v.ends_with("$0") || v.ends_with("${0}"))
+            })
+    })
+}
+
+/// Whether `cmd` is `sed` or `cat` and a `sed` program's replacements
+/// add no command text (`&-`, `\1`, nothing). A letter, `$` or a
+/// backtick in a replacement is a new command.
+fn filter_keeps_script(cmd: &[String]) -> bool {
+    let words: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    let words = operands(&words);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    let rest = peel_cd_command_word(&words[front..]);
+    let Some(w) = rest.first() else {
+        return false;
+    };
+    match base_of(w) {
+        "cat" => true,
+        "sed" => rest[1..].iter().all(|p| !sed_inserts_command(p)),
+        _ => false,
+    }
+}
+
+fn sed_inserts_command(program: &str) -> bool {
+    let b = program.as_bytes();
+    let mut i = 0;
+    let mut at_cmd = true;
+    while i < b.len() {
+        let c = b[i];
+        if at_cmd && c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if at_cmd && (c == b's' || c == b'y') {
+            let Some(delim) = b.get(i + 1).copied().filter(|d| !d.is_ascii_whitespace()) else {
+                return true;
+            };
+            i += 2;
+            i = skip_sed_part(b, i, delim);
+            let start = i;
+            i = skip_sed_part(b, i, delim);
+            let repl = &program[start..i.saturating_sub(1).max(start)];
+            if repl
+                .chars()
+                .any(|ch| ch.is_ascii_alphabetic() || ch == '$' || ch == '`')
+            {
+                return true;
+            }
+            at_cmd = false;
+            continue;
+        }
+        if c == b'\n' || c == b';' {
+            at_cmd = true;
+        } else if !c.is_ascii_whitespace() {
+            at_cmd = false;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn skip_sed_part(b: &[u8], mut i: usize, delim: u8) -> usize {
+    while i < b.len() {
+        if b[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        i += 1;
+        if b[i - 1] == delim {
+            break;
+        }
+    }
+    i
 }
 
 /// Where the path word `w` lands from each of `dirs`, as [`path_from`]
@@ -557,11 +1000,19 @@ struct Shell {
     /// Literal values a variable used as a command word may hold. `\0`
     /// means one branch left it unset, so the word may be anything.
     cmd_values: std::collections::HashMap<String, Vec<String>>,
+    /// What an expansion in an `eval` name is proven to be. A value the
+    /// line does not show is absent: the name may hold a command.
+    names: std::collections::HashMap<String, NameProof>,
+    /// `names` as a `case` or `if` opened. The branch's proofs do not
+    /// survive the closer: only the arm that runs them may use them.
+    name_frames: Vec<std::collections::HashMap<String, NameProof>>,
     /// Open `if` and `case`. Each branch's values join at `fi` or `esac`.
     assign_stack: Vec<AssignFrame>,
     /// `exit` ran here. A side of `||` or `&&` that exits does not fall
     /// through, so the commands after that list keep only the other side.
     halted: bool,
+    /// The pipeline so far reads the script being judged on stdin.
+    script_pipe: bool,
 }
 
 /// One `if` or `case`, so a variable set in every branch can be read as
@@ -584,6 +1035,8 @@ struct Saved {
     left_tree: bool,
     known: Option<std::path::PathBuf>,
     cmd_values: std::collections::HashMap<String, Vec<String>>,
+    names: std::collections::HashMap<String, NameProof>,
+    name_frames: Vec<std::collections::HashMap<String, NameProof>>,
     assign_stack: Vec<AssignFrame>,
 }
 
@@ -599,6 +1052,8 @@ impl Shell {
             left_tree: self.left_tree,
             known: self.known.clone(),
             cmd_values: self.cmd_values.clone(),
+            names: self.names.clone(),
+            name_frames: self.name_frames.clone(),
             assign_stack: self.assign_stack.clone(),
         }
     }
@@ -613,6 +1068,8 @@ impl Shell {
         self.left_tree = saved.left_tree;
         self.known = saved.known;
         self.cmd_values = saved.cmd_values;
+        self.names = saved.names;
+        self.name_frames = saved.name_frames;
         self.assign_stack = saved.assign_stack;
     }
 
@@ -628,6 +1085,9 @@ impl Shell {
         self.known = None;
         // A body recorded before this no longer says what a call runs.
         self.funcs.clear();
+        // The command may have assigned over what was proven.
+        self.names.clear();
+        self.name_frames.clear();
     }
 }
 
@@ -934,8 +1394,11 @@ fn runner_commands(
             Some(inn.cwd.to_path_buf())
         },
         cmd_values: initial_cmd_values(),
+        names: std::collections::HashMap::new(),
+        name_frames: Vec::new(),
         assign_stack: Vec::new(),
         halted: false,
+        script_pipe: false,
     };
     walk(argv, &mut shell, depth, out, denied);
 }
@@ -1131,9 +1594,12 @@ fn walk(
     // anywhere in it counts as made before the loop.
     let mut loops = Vec::new();
     let mut spans = Vec::new();
-    let (heredocs, data) = heredoc_bodies(&ended_commands(&argv));
+    let ended = ended_commands(&argv);
+    let (heredocs, data) = heredoc_bodies(&ended);
     let pattern_skip = case_pattern_skips(&argv);
-    for (ci, (cmd, end)) in ended_commands(&argv).into_iter().enumerate() {
+    for (ci, (cmd, end)) in ended.iter().enumerate() {
+        let cmd = cmd.clone();
+        let end = *end;
         finish_conditional(
             &mut groups,
             after,
@@ -1296,11 +1762,39 @@ fn walk(
         }
         let shown: Vec<_> = cmd.iter().map(|w| with_pwd(w, pwd)).collect();
         let shown: Vec<&str> = shown.iter().map(|w| &**w).collect();
+        // A file this run creates in the tracked directory and then
+        // reads or removes is scratch, not a new script. The read is a
+        // filter of the script being judged; `$$` cannot leave the
+        // directory.
+        note_script_var(&owned, &shell.files);
+        let reads_script = {
+            let files = shell.files.borrow();
+            reads_script_stdin(&owned, &shell.cmd_values, &files.script_vars)
+        };
+        let pipe = shell.script_pipe || reads_script;
+        if pipe && end != "|" && filter_keeps_script(&owned) {
+            let mut files = shell.files.borrow_mut();
+            for w in &mut files.written {
+                if w.id == id && !w.loose {
+                    w.rewrite = true;
+                }
+            }
+        }
+        {
+            let mut files = shell.files.borrow_mut();
+            let id = files.cmd.clone();
+            for word in removal_words(&owned) {
+                files.removed.push((word, id.clone()));
+            }
+        }
+        shell.script_pipe = end == "|" && pipe;
         if !piped {
             let was = shell.vars.clone();
             set_vars(&shown, &mut shell.vars);
             note_startup(&shown, &mut shell.vars);
             note_cmd_values(&shown, shell);
+            let next = ended.get(ci + 1).map(|(c, _)| c.as_slice());
+            note_name_state(&cmd, end, next, shell);
             match before {
                 "||" => shell.vars.merge(was),
                 "&&" => match &mut vars_failed {
@@ -1418,7 +1912,7 @@ fn walk(
                     && shell.follow_unseen
                     && (bare_unseen(&cmd) || blinds_functions(&cmd))
                     && !assigned_command_keeps(&cmd, &shell.cmd_values)
-                    && !shown_eval_keeps(&cmd, &shell.cmd_values, 0)
+                    && !shown_eval_keeps(&cmd, &shell.cmd_values, &shell.names, 0)
                 {
                     shell.lose();
                 }
@@ -2343,6 +2837,7 @@ fn expand_eval_scripts(
 fn shown_eval_keeps(
     cmd: &[&str],
     values: &std::collections::HashMap<String, Vec<String>>,
+    names: &std::collections::HashMap<String, NameProof>,
     depth: usize,
 ) -> bool {
     if depth > 4 {
@@ -2365,13 +2860,14 @@ fn shown_eval_keeps(
     };
     texts
         .iter()
-        .all(|script| eval_text_keeps(script, values, depth))
+        .all(|script| eval_text_keeps(script, values, names, depth))
 }
 
 /// Whether the script `eval` runs leaves this shell where it is.
 fn eval_text_keeps(
     script: &str,
     values: &std::collections::HashMap<String, Vec<String>>,
+    names: &std::collections::HashMap<String, NameProof>,
     depth: usize,
 ) -> bool {
     // A function defined in the script does not run its body. A call does.
@@ -2399,23 +2895,410 @@ fn eval_text_keeps(
         // part of the command name, not `cd`.
         if c.iter().all(|w| {
             is_assignment(w)
-                || built_assignment(w)
+                || built_name_proven(w, names)
                 || (w.starts_with('=') && !w.contains([';', '|', '&', '\n']))
         }) {
             return true;
         }
-        if assigned_command_keeps(c, values) || shown_eval_keeps(c, values, depth + 1) {
+        if assigned_command_keeps(c, values) || shown_eval_keeps(c, values, names, depth + 1) {
             return true;
         }
         !bare_unseen(c)
     })
 }
 
+/// What `$name` is known to expand to. `Exact` is one literal. `Class`
+/// is any string of name characters plus `extras` (`-+.` after
+/// configure's `expr` test). Absent means the expansion is not shown.
+#[derive(Clone)]
+enum NameProof {
+    Exact(String),
+    Class { extras: String },
+}
+
+fn name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+fn name_chars(s: &str) -> bool {
+    s.chars().all(name_char)
+}
+
+fn proof_is_name(p: &NameProof) -> bool {
+    match p {
+        NameProof::Exact(s) => name_chars(s),
+        NameProof::Class { extras } => extras.is_empty(),
+    }
+}
+
+/// Quotes around a whole assignment value, so `$name` inside them is
+/// still the expansion. A backslash or a nested quote is left as written.
+fn strip_wrapping_quotes(v: &str) -> &str {
+    let b = v.as_bytes();
+    if v.len() >= 2 && b[0] == b'\'' && b[v.len() - 1] == b'\'' && !v[1..v.len() - 1].contains('\'')
+    {
+        return &v[1..v.len() - 1];
+    }
+    if v.len() >= 2 && b[0] == b'"' && b[v.len() - 1] == b'"' {
+        let inner = &v[1..v.len() - 1];
+        if !inner.contains(['`', '\\', '"']) {
+            return inner;
+        }
+    }
+    v
+}
+
+/// `value` joined from literals and expansions that are already proven.
+/// `$$` and `${name:-word}` are not a value the line shows.
+fn concat_proof(
+    v: &str,
+    names: &std::collections::HashMap<String, NameProof>,
+) -> Option<NameProof> {
+    let b = v.as_bytes();
+    let mut i = 0;
+    let mut exact = String::new();
+    let mut extras = String::new();
+    let mut known_exact = true;
+    let push_extra = |c: char, extras: &mut String| {
+        if !name_char(c) && !extras.contains(c) {
+            extras.push(c);
+        }
+    };
+    while i < b.len() {
+        if b[i] != b'$' {
+            let c = v[i..].chars().next().unwrap();
+            i += c.len_utf8();
+            if known_exact {
+                exact.push(c);
+            } else {
+                push_extra(c, &mut extras);
+            }
+            continue;
+        }
+        i += 1;
+        let braced = i < b.len() && b[i] == b'{';
+        if braced {
+            i += 1;
+        }
+        let start = i;
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        let end = i;
+        if braced {
+            if i >= b.len() || b[i] != b'}' {
+                return None;
+            }
+            i += 1;
+        }
+        let proof = names.get(&v[start..end])?;
+        match proof {
+            NameProof::Exact(s) => {
+                if known_exact {
+                    exact.push_str(s);
+                } else {
+                    for c in s.chars() {
+                        push_extra(c, &mut extras);
+                    }
+                }
+            }
+            NameProof::Class { extras: more } => {
+                if known_exact {
+                    for c in exact.chars() {
+                        push_extra(c, &mut extras);
+                    }
+                    known_exact = false;
+                }
+                for c in more.chars() {
+                    push_extra(c, &mut extras);
+                }
+            }
+        }
+    }
+    if known_exact {
+        Some(NameProof::Exact(exact))
+    } else {
+        Some(NameProof::Class { extras })
+    }
+}
+
+/// `s/[-+.]/_/g` applied to a value whose every character is already
+/// known. Characters other than `-+.` have to already be name characters,
+/// or the result can still be `x;cd`.
+fn apply_sed(p: &NameProof) -> Option<NameProof> {
+    match p {
+        NameProof::Exact(s) => {
+            let out: String = s
+                .chars()
+                .map(|c| if matches!(c, '-' | '+' | '.') { '_' } else { c })
+                .collect();
+            name_chars(&out).then_some(NameProof::Exact(out))
+        }
+        NameProof::Class { extras } if extras.chars().all(|c| matches!(c, '-' | '+' | '.')) => {
+            Some(NameProof::Class {
+                extras: String::new(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// `` `printf … "$name" | sed 's/[-+.]/_/g'` `` and the `$(…)` form.
+/// One substitution, one variable, and no second command: a `;` after
+/// the sed would print whatever it liked.
+fn sed_of_value(
+    raw: &str,
+    names: &std::collections::HashMap<String, NameProof>,
+) -> Option<NameProof> {
+    let inner = raw.trim();
+    let inner = if let Some(s) = inner.strip_prefix("$(").and_then(|s| s.strip_suffix(')')) {
+        s
+    } else {
+        inner.strip_prefix('`').and_then(|s| s.strip_suffix('`'))?
+    };
+    if inner.contains([';', '&', '\n', '`']) || inner.contains("$(") {
+        return None;
+    }
+    let (left, right) = inner.split_once('|')?;
+    if right.contains('|') {
+        return None;
+    }
+    let right = right.trim();
+    if right != "sed 's/[-+.]/_/g'" && right != "sed \"s/[-+.]/_/g\"" && right != "sed s/[-+.]/_/g"
+    {
+        return None;
+    }
+    let left = left.trim();
+    if !(left.starts_with("printf") || left.starts_with("echo") || left.starts_with("print ")) {
+        return None;
+    }
+    let vars = dollar_names(left);
+    if vars.len() != 1 {
+        return None;
+    }
+    apply_sed(names.get(&vars[0])?)
+}
+
+fn proof_of_value(
+    raw: &str,
+    names: &std::collections::HashMap<String, NameProof>,
+) -> Option<NameProof> {
+    if raw.contains('`') || raw.contains("$(") {
+        return sed_of_value(raw, names);
+    }
+    concat_proof(strip_wrapping_quotes(raw), names)
+}
+
+/// `x$name` or `x${name}`, the subject of configure's `expr` test.
+fn x_dollar_var(w: &str) -> Option<&str> {
+    let rest = w.strip_prefix('x')?.strip_prefix('$')?;
+    if let Some(name) = rest.strip_prefix('{') {
+        return var_name(name.strip_suffix('}')?);
+    }
+    var_name(rest)
+}
+
+/// The body of `[^…]` in an `expr` pattern.
+fn negated_class(w: &str) -> Option<&str> {
+    let start = w.find("[^")?;
+    let rest = &w[start + 2..];
+    let end = rest.find(']')?;
+    Some(&rest[..end])
+}
+
+/// Characters `body` allows that are not name characters. `$name` adds
+/// the characters its proof allows. An expansion that is not proven is
+/// not a class the guard can trust.
+fn class_extras(
+    body: &str,
+    names: &std::collections::HashMap<String, NameProof>,
+) -> Option<String> {
+    let b = body.as_bytes();
+    let mut i = 0;
+    let mut extras = String::new();
+    while i < b.len() {
+        if b[i] == b'$' {
+            i += 1;
+            let braced = i < b.len() && b[i] == b'{';
+            if braced {
+                i += 1;
+            }
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            if i == start {
+                return None;
+            }
+            let end = i;
+            if braced {
+                if i >= b.len() || b[i] != b'}' {
+                    return None;
+                }
+                i += 1;
+            }
+            match names.get(&body[start..end])? {
+                NameProof::Exact(s) => {
+                    for c in s.chars() {
+                        if !name_char(c) && !extras.contains(c) {
+                            extras.push(c);
+                        }
+                    }
+                }
+                NameProof::Class { extras: more } => {
+                    for c in more.chars() {
+                        if !extras.contains(c) {
+                            extras.push(c);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        let c = body[i..].chars().next().unwrap();
+        i += c.len_utf8();
+        if !name_char(c) && !extras.contains(c) {
+            extras.push(c);
+        }
+    }
+    Some(extras)
+}
+
+/// `expr "x$name" : ".*[^class]"`, so a later failure of that `expr`
+/// means `name` holds only `class`.
+fn charset_guard(
+    cmd: &[&str],
+    names: &std::collections::HashMap<String, NameProof>,
+) -> Option<(String, String)> {
+    if head_word(cmd)
+        .as_deref()
+        .is_none_or(|w| base_of(w) != "expr")
+    {
+        return None;
+    }
+    let mut var = None;
+    let mut body = None;
+    for w in cmd {
+        if var.is_none() {
+            var = x_dollar_var(w).map(str::to_string);
+        }
+        if body.is_none() {
+            body = negated_class(w);
+        }
+    }
+    Some((var?, class_extras(body?, names)?))
+}
+
+/// Whether `cmd` runs `exit`, or a function whose body does, on every
+/// path. `exit` behind `&&`, `||`, `|` or inside `if` / `case` does not:
+/// the shell can come back.
+fn command_always_exits(cmd: &[&str], funcs: &FnMap, depth: usize) -> bool {
+    if command_exits(cmd) {
+        return true;
+    }
+    let Some(head) = head_word(cmd) else {
+        return false;
+    };
+    let Some(body) = funcs.get(base_of(&head)) else {
+        return false;
+    };
+    if body.subshell || depth > 8 {
+        return false;
+    }
+    always_exits(&body.words, funcs, depth + 1)
+}
+
+fn always_exits(words: &[String], funcs: &FnMap, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let ended = ended_commands(words);
+    let mut cond = false;
+    let mut branch = 0i32;
+    for (cmd, end) in &ended {
+        match branch_keyword(cmd) {
+            Some("if" | "case") => branch += 1,
+            Some("fi" | "esac") => branch = branch.saturating_sub(1),
+            _ => {}
+        }
+        if branch == 0
+            && !cond
+            && !matches!(*end, "|" | "&")
+            && command_always_exits(cmd, funcs, depth)
+        {
+            return true;
+        }
+        cond = *end == "&&" || *end == "||";
+    }
+    false
+}
+
+/// Record literals and the configure checks that make an expansion a
+/// name fragment. Proofs from inside a `case` or `if` die at the closer.
+/// A `&&` whose other side always exits, after `expr`'s negated class,
+/// is that class for the commands that follow: the shell only reaches
+/// them when the class matched.
+fn note_name_state(cmd: &[&str], end: &str, next: Option<&[&str]>, shell: &mut Shell) {
+    match branch_keyword(cmd) {
+        Some("if" | "case") => shell.name_frames.push(shell.names.clone()),
+        Some("else" | "elif") => {
+            if let Some(base) = shell.name_frames.last() {
+                shell.names.clone_from(base);
+            }
+        }
+        Some("fi" | "esac") => {
+            if let Some(base) = shell.name_frames.pop() {
+                shell.names = base;
+            }
+        }
+        _ => {}
+    }
+    let words = operands(cmd);
+    let mut i = 0;
+    while i < words.len() && (is_assignment(words[i]) || keyword_at(&words, i)) {
+        i += 1;
+    }
+    if i == words.len() {
+        for w in words {
+            if let Some((name, value)) = assign_sides(w) {
+                match proof_of_value(&value, &shell.names) {
+                    Some(p) => {
+                        shell.names.insert(name, p);
+                    }
+                    None => {
+                        shell.names.remove(&name);
+                    }
+                }
+            } else if let Some(name) = w.split(['+', '[', '=']).next() {
+                if var_name(name).is_some() && name != w {
+                    shell.names.remove(name);
+                }
+            }
+        }
+    }
+    if end == "&&" {
+        let proved = next.and_then(|next| {
+            if command_always_exits(next, &shell.funcs, 0) {
+                charset_guard(cmd, &shell.names)
+            } else {
+                None
+            }
+        });
+        if let Some((var, extras)) = proved {
+            shell.names.insert(var, NameProof::Class { extras });
+        }
+    }
+}
+
 /// `NAME=value` in an `eval` script where NAME is built from shell-name
 /// characters and `$name` or `${name}`, as in `enable_$ac_useropt=no`.
-/// Whatever the name holds, the word assigns or runs a command whose
-/// name holds `=`, and neither is `cd`. A value with a substitution is
-/// not this.
+/// The shape is an assignment or a command whose name holds `=`. It is
+/// not enough: `$name` can be `x;cd evil;y`. [`built_name_proven`] is
+/// the check that keeps the directory. A value with a substitution is
+/// not this shape.
 fn built_assignment(w: &str) -> bool {
     let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
     let Some((mut name, value)) = w.split_once('=') else {
@@ -2445,6 +3328,18 @@ fn built_assignment(w: &str) -> bool {
         name = rest;
     }
     true
+}
+
+/// `w` is [`built_assignment`] and every expansion in the name is proven
+/// to be name characters. Anything else can introduce `cd`.
+fn built_name_proven(w: &str, names: &std::collections::HashMap<String, NameProof>) -> bool {
+    if !built_assignment(w) {
+        return false;
+    }
+    let name = w.split_once('=').map(|(n, _)| n).unwrap_or("");
+    dollar_names(name)
+        .iter()
+        .all(|v| names.get(v).is_some_and(proof_is_name))
 }
 
 fn assigned_command_keeps(
@@ -4901,6 +5796,11 @@ fn nested_end(chars: &[char], i: usize) -> usize {
     while j < n {
         match chars[j] {
             '\\' => j += 2,
+            '#' if starts_comment(chars, j) => {
+                while j < n && !matches!(chars[j], '\n' | '\r') {
+                    j += 1;
+                }
+            }
             '\'' => j = (j + 1..n).find(|k| chars[*k] == '\'').map_or(n, |k| k + 1),
             '"' => j = double_end(chars, j),
             '`' => j = nested_end(chars, j),
@@ -4919,6 +5819,15 @@ fn nested_end(chars: &[char], i: usize) -> usize {
         }
     }
     n
+}
+
+/// `#` starts a comment when it is the first character of a word. An
+/// apostrophe later on that line is text, not a quote.
+fn starts_comment(chars: &[char], i: usize) -> bool {
+    chars.get(i) == Some(&'#')
+        && (i == 0
+            || chars[i - 1].is_whitespace()
+            || matches!(chars[i - 1], ';' | '&' | '|' | '(' | ')'))
 }
 
 /// Just past the `"` that closes the string opening at `chars[i]`.
@@ -4968,6 +5877,11 @@ fn substitutions(script: &str) -> Vec<String> {
     while i < n {
         match chars[i] {
             '\\' => i += 2,
+            '#' if !double && starts_comment(&chars, i) => {
+                while i < n && !matches!(chars[i], '\n' | '\r') {
+                    i += 1;
+                }
+            }
             '\'' if !double => {
                 i = (i + 1..n).find(|k| chars[*k] == '\'').map_or(n, |k| k + 1);
             }
@@ -5298,21 +6212,48 @@ fn env_split_words(s: &str) -> Vec<String> {
 }
 
 /// How many words at the front of `words` open a `case` arm: `case WORD
-/// in` with the first arm's pattern (`a)`, `(a)`), or the pattern alone
-/// that opens each later arm after `;;`. The command after them is the
-/// one the arm runs. A pattern is a word with a `)` no `(` in it opens.
+/// in` with the first arm's pattern (`a)`, `(a)`, `pat )`), or the
+/// pattern alone that opens each later arm after `;;`. The command after
+/// them is the one the arm runs. A pattern is a word with a `)` no `(`
+/// in it opens, or pattern words closed by a `)` of their own.
 fn case_head<S: AsRef<str>>(words: &[S]) -> usize {
     let word = |i: usize| words.get(i).map(AsRef::as_ref);
-    let pattern = |p: &str| p.ends_with(')') && p.matches(')').count() > p.matches('(').count();
+    let closes =
+        |p: &str| p == ")" || (p.ends_with(')') && p.matches(')').count() > p.matches('(').count());
     let n = if word(0) == Some("case") && word(2) == Some("in") {
         3
     } else {
         0
     };
-    match word(n) {
-        Some(p) if pattern(p) || (n == 3 && p.starts_with('(') && p.ends_with(')')) => n + 1,
-        _ => n,
+    if let Some(p) = word(n) {
+        if closes(p) || (n == 3 && p.starts_with('(') && p.ends_with(')')) {
+            return n + 1;
+        }
     }
+    // `*[!_$as_cr_alnum]* )` keeps the `)` as its own word. That pattern
+    // is not a command, so the `$` in it does not drop the directory.
+    // `echo )` and `find \( -name x \)` are commands: their first word
+    // is not a pattern.
+    if let Some(k) = (n..words.len()).find(|&i| word(i).is_some_and(closes)) {
+        let arm = n == 3 || (n < k && (n..k).all(|i| word(i).is_some_and(is_case_pattern)));
+        if arm && k > n {
+            return k + 1;
+        }
+    }
+    n
+}
+
+/// Whether `p` can be a `case` pattern word rather than a command: a
+/// glob, an option (`-V`, `--help`), an empty `''`, or `(pattern`. `[`
+/// and `[[` are the test builtin.
+fn is_case_pattern(p: &str) -> bool {
+    if p.is_empty() || (p.starts_with('(') && !p.starts_with("((")) {
+        return true;
+    }
+    if p == "[" || p == "[[" {
+        return false;
+    }
+    p.contains(['*', '?', '[']) || p.starts_with('-')
 }
 
 /// How many words a function definition's head takes at the front of
@@ -8423,16 +9364,20 @@ fn configure_scratch_word(p: &str) -> bool {
 }
 
 /// What an autoconf `configure` makes as it runs and removes again:
-/// `conftest`, `conftest.dir`, the glob `conftest*`, `autom4te.cache`.
-/// They are regenerated on the next run, like build output.
+/// `conftest`, `conftest.dir`, the glob `conftest*`, `confdefs.h`,
+/// `autom4te.cache`. They are regenerated on the next run, like build
+/// output. `confdefs.h` is that header file in the build directory; it
+/// is not a pass for `/` or a home directory.
 fn configure_scratch(p: &str) -> bool {
     let p = p.trim_end_matches('/');
     let (dir, name) = p.rsplit_once('/').unwrap_or(("", p));
     (dir.is_empty() || dir == "." || plain_relative(dir))
-        && (matches!(name, "conftest*" | "conftest.*")
+        && (matches!(name, "conftest*" | "conftest.*" | "confdefs*")
             || (plain_relative(name)
                 && (name == "conftest"
                     || name.starts_with("conftest.")
+                    || name == "confdefs"
+                    || name == "confdefs.h"
                     || name == "autom4te.cache")))
 }
 
@@ -8845,6 +9790,15 @@ fn autoconf_operand(p: &str, bound: &Scratch) -> bool {
     ];
     if NAMES.contains(&name) || name.starts_with("conf$$") {
         return true;
+    }
+    // libtool's renamed object (`mv conftest.$ac_objext conftstm.$ac_objext`,
+    // then `rm -rf conftst*`) and the Apple `-single_module` probe
+    // (`libconftest.dylib*`). Same scratch as `conftest`, still not `/`.
+    if let Some(rest) = name
+        .strip_prefix("conftst")
+        .or_else(|| name.strip_prefix("libconftest"))
+    {
+        return !rest.contains('/') && !climbs(rest);
     }
     let Some(rest) = name.strip_prefix("conftest") else {
         return false;
@@ -14581,6 +15535,39 @@ hash -r 2> /dev/null
         assert_eq!(c.decision, Decision::Allow, "{}", c.token);
     }
 
+    /// Configure writes scratch in the directory it is running in and
+    /// reads or removes it in the same run. `$as_me.lineno` is a `sed`
+    /// of the script being judged, then sourced. `conf$$.file` is
+    /// created and removed, and `$$` is only digits, so it is not some
+    /// other script. A path the line does not pin down (`$x`, `"$LOG"`)
+    /// still taints a later script, and a `sed` that inserts a command
+    /// is still that command.
+    #[test]
+    fn configure_scratch_the_script_reads_or_removes_is_not_a_new_script() {
+        let root = startup_root("cfgscratch");
+        std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
+        std::fs::write(root.join("configure"), "echo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "sed 's/[$]LINENO.*/&-/' <$0 >$as_me.lineno\n. \"./$as_me.lineno\"\n",
+            "as_myself=$0\nsed 's/[$]LINENO.*/&-/' <$as_myself >$as_me.lineno\n. \"./$as_me.lineno\"\n",
+            "echo >conf$$.file\nrm -f conf$$.file\nsh ./ok.sh\n",
+            "echo >conf$$.file\nrm -f conf$$.file\nsh ./ok.sh\nsed 's/[$]LINENO.*/&-/' <$0 >$as_me.lineno\n. \"./$as_me.lineno\"\n",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for line in [
+            "echo 'git push -f' > $x; sh $x",
+            "echo start > \"$LOG\"; sh ./configure",
+            "sed 's/ok/git push -f/' <$0 >$as_me.lineno\n. \"./$as_me.lineno\"\n",
+            "echo 'git push -f' > conf$$.file; sh conf$$.file",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+        }
+    }
+
     #[test]
     fn a_mapfile_callback_is_judged() {
         let root = startup_root("mapfilecb");
@@ -14932,6 +15919,66 @@ hash -r 2> /dev/null
         }
     }
 
+    /// `make -C build` reads the makefile in `build`, and a recipe there
+    /// is judged there. CMake's `$(MAKE) -f CMakeFiles/Makefile2` names
+    /// that file under `build`, not in the directory make was started
+    /// from. A dangerous recipe in that file is still refused.
+    #[test]
+    fn make_dash_c_judges_recipes_in_that_directory() {
+        let root = startup_root("makec");
+        let build = root.join("build");
+        std::fs::create_dir_all(build.join("CMakeFiles")).unwrap();
+        std::fs::write(
+            build.join("Makefile"),
+            "all:\n\t$(MAKE) -f CMakeFiles/Makefile2 all\n",
+        )
+        .unwrap();
+        std::fs::write(build.join("CMakeFiles/Makefile2"), "all:\n\techo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        let c = at("make -C build");
+        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
+        std::fs::write(build.join("CMakeFiles/Makefile2"), "all:\n\trm -rf /\n").unwrap();
+        let c = at("make -C build");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(c.token.contains("rm-rf-outside-tmp"), "{}", c.token);
+    }
+
+    /// A `case` pattern is not a command. `*[!_$as_cr_alnum]* )` holds a
+    /// variable inside brackets and a `)` of its own, and neither moves
+    /// the shell. The arm still runs: a `cd` there leaves the line, and
+    /// `git push -f` there is still refused.
+    #[test]
+    fn a_case_pattern_holding_a_variable_is_not_a_command() {
+        let line = "\
+case $ac_envvar in
+  '' | [0-9]* | *[!_$as_cr_alnum]* )
+  as_fn_error $? \"invalid variable name: $ac_envvar\" ;;
+esac
+make -C safe test
+";
+        assert_eq!(evil_and_safe("casepat", line), Decision::Allow);
+        assert_eq!(
+            evil_and_safe(
+                "casepat",
+                "case $x in *[!_$as_cr_alnum]* ) cd evil;; esac; make clean-all"
+            ),
+            Decision::Deny
+        );
+        let pushed = evil_and_safe(
+            "casepat",
+            "case $x in *[!_$as_cr_alnum]* ) git push -f;; esac",
+        );
+        assert_eq!(pushed, Decision::Deny);
+        assert_eq!(
+            evil_and_safe("casepat", "echo ')'; make -C safe test"),
+            Decision::Allow
+        );
+        assert_eq!(
+            evil_and_safe("casepat", "case $x in a) $cmd;; esac; make -C safe test"),
+            Decision::Deny
+        );
+    }
+
     /// An EXIT trap runs as the shell exits. It does not move the
     /// commands after it. The action is still judged, and a trap on
     /// any other signal still moves the shell.
@@ -15059,8 +16106,9 @@ hash -r 2> /dev/null
     }
 
     /// The comment a generated configure starts with marks the temps that
-    /// file removes. It is not a pass for `/` or a home directory, and a
-    /// file without it does not get the temps.
+    /// file removes (`a.out`, `config.status`). It is not a pass for `/`
+    /// or a home directory. `confdefs.h` is rebuilt every run, like
+    /// `conftest*`, so that name does not need the header.
     #[test]
     fn a_generated_configure_header_marks_its_temps() {
         use std::os::unix::fs::PermissionsExt;
@@ -15093,16 +16141,142 @@ hash -r 2> /dev/null
         );
         write(
             "note.sh",
-            "# this is not a generated configure\nrm -rf confdefs.h\n",
+            "# this is not a generated configure\nrm -rf a.out\n",
         );
+        for line in [
+            "rm -rf conftest* confdefs.h",
+            "rm -f -r conftest* confdefs.h",
+            "rm -rf confdefs.h",
+            "rm -rf confdefs*",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
         for line in [
             "sh plain.sh",
             "sh root.sh",
             "sh home.sh",
             "sh poison.sh",
             "sh note.sh",
-            "rm -rf confdefs.h",
+            "rm -rf confdefs.h /",
+            "rm -rf ../confdefs.h",
+            "rm -rf \"$HOME\"",
         ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert_eq!(c.token, "rm-rf-outside-tmp", "{line}: {}", c.token);
+        }
+    }
+
+    /// An apostrophe in a comment does not open a quote. configure's
+    /// `if ( # -L didn't work. ... )` is a short subshell; stretching it
+    /// over the next quote hid the assignments that show
+    /// `$ac_clean_files` is scratch, so the exit `rm` was refused.
+    #[test]
+    fn a_comment_apostrophe_does_not_stretch_a_subshell() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = startup_root("commentquote");
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        let write = |name: &str, body: &str| {
+            let p = root.join(name);
+            std::fs::write(&p, body).unwrap();
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&p, perm).unwrap();
+        };
+        write(
+            "configure",
+            "# Generated by GNU Autoconf 2.71\n\
+ac_clean_files=\n\
+if (\n\
+  # -L didn't work.\n\
+  echo ok\n\
+)\n\
+ac_clean_files_save=$ac_clean_files\n\
+ac_clean_files=\"$ac_clean_files a.out a.exe b.out\"\n\
+ac_clean_files=$ac_clean_files_save\n\
+rm -f -r conftest* confdefs* conf$$* $ac_clean_files\n",
+        );
+        let c = at("sh ./configure");
+        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
+        write(
+            "then-push.sh",
+            "# Generated by GNU Autoconf 2.71\n\
+ac_clean_files=\n\
+if (\n\
+  # -L didn't work.\n\
+  echo ok\n\
+)\n\
+ac_clean_files_save=$ac_clean_files\n\
+ac_clean_files=\"$ac_clean_files a.out\"\n\
+ac_clean_files=$ac_clean_files_save\n\
+rm -f -r conftest* $ac_clean_files\n\
+git push -f\n",
+        );
+        let c = at("sh then-push.sh");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert_eq!(c.token, "git-force-push", "{}", c.token);
+        write(
+            "poison.sh",
+            "# Generated by GNU Autoconf 2.71\n\
+ac_clean_files=/\n\
+if (\n\
+  # didn't\n\
+  echo ok\n\
+)\n\
+rm -rf $ac_clean_files\n",
+        );
+        write(
+            "root.sh",
+            "# Generated by GNU Autoconf 2.71\n\
+if (\n\
+  # didn't\n\
+  echo ok\n\
+)\n\
+rm -rf /\n",
+        );
+        for line in ["sh poison.sh", "sh root.sh"] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert_eq!(c.token, "rm-rf-outside-tmp", "{line}: {}", c.token);
+        }
+    }
+
+    /// libtool renames `conftest.$ac_objext` to `conftstm.$ac_objext` and
+    /// removes `conftst*`. The Apple `-single_module` probe removes
+    /// `libconftest.dylib*`. Both are scratch next to `conftest*`. A
+    /// parent directory or `/` is not, and the names alone are not a pass
+    /// without the generated-configure header.
+    #[test]
+    fn libtool_conftest_globs_are_configure_scratch() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = startup_root("ltconf");
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        let write = |name: &str, body: &str| {
+            let p = root.join(name);
+            std::fs::write(&p, body).unwrap();
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&p, perm).unwrap();
+        };
+        write(
+            "configure",
+            "# Generated by GNU Autoconf 2.71\n\
+rm -rf conftest* conftst*\n\
+rm -rf libconftest.dylib*\n",
+        );
+        let c = at("sh ./configure");
+        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
+        write("plain.sh", "rm -rf conftest* conftst*\n");
+        write(
+            "root.sh",
+            "# Generated by GNU Autoconf 2.71\nrm -rf libconftest.dylib* /\n",
+        );
+        write(
+            "up.sh",
+            "# Generated by GNU Autoconf 2.71\nrm -rf ../conftst*\n",
+        );
+        for line in ["sh plain.sh", "sh root.sh", "sh up.sh"] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
             assert_eq!(c.token, "rm-rf-outside-tmp", "{line}: {}", c.token);
@@ -15280,22 +16454,49 @@ hash -r 2> /dev/null
         }
     }
 
-    /// `eval enable_$ac_useropt=no` assigns to a name built from a value
-    /// the line does not show, here from `expr` and `sed`. The text is a
-    /// lone `NAME=value` word, so it is an assignment or a command whose
-    /// name holds `=`, and neither is `cd`. Any other word, or a value
-    /// with a substitution, still drops the directory.
+    /// `eval enable_$ac_useropt=no` keeps the directory only when every
+    /// expansion in the name is proven to be name characters. A literal
+    /// is. So is configure's loop: `expr` rejects anything outside
+    /// `-+._` and `$as_cr_alnum`, `as_fn_error` exits on a hit, and
+    /// `sed 's/[-+.]/_/g'` turns the rest into a name. An unproven
+    /// value, including `x;cd evil;y`, drops the directory.
     #[test]
     fn an_eval_of_a_built_name_is_an_assignment() {
+        let configure = "\
+as_cr_letters='abcdefghijklmnopqrstuvwxyz'
+as_cr_LETTERS='ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+as_cr_Letters=$as_cr_letters$as_cr_LETTERS
+as_cr_digits='0123456789'
+as_cr_alnum=$as_cr_Letters$as_cr_digits
+as_fn_exit ()
+{
+  exit $1
+}
+as_fn_error ()
+{
+  as_fn_exit $1
+}
+ac_useropt=`expr \"x$ac_option\" : 'x-*disable-\\(.*\\)'`
+expr \"x$ac_useropt\" : \".*[^-+._$as_cr_alnum]\" >/dev/null &&
+  as_fn_error $? \"invalid feature name: $ac_useropt\"
+ac_useropt=`printf \"%s\\n\" \"$ac_useropt\" | sed 's/[-+.]/_/g'`
+eval enable_$ac_useropt=no
+make -C safe test
+";
         for line in [
-            "ac_useropt=`expr \"x$ac_option\" : 'x-*disable-\\(.*\\)'`; eval enable_$ac_useropt=no; make -C safe test",
-            "ac_useropt=`printf '%s\\n' \"$ac_useropt\" | sed 's/[-+.]/_/g'`; eval enable_$ac_useropt=\\$ac_optarg; make -C safe test",
-            "eval with_${ac_useropt}_x=no; make -C safe test",
-            "eval \\$ac_prev=\\$ac_option; make -C safe test",
+            configure,
+            "ac_useropt=feature; eval enable_$ac_useropt=no; make -C safe test",
+            "ac_useropt=foo-bar; ac_useropt=`printf \"%s\\n\" \"$ac_useropt\" | sed 's/[-+.]/_/g'`; eval enable_$ac_useropt=no; make -C safe test",
         ] {
             assert_eq!(evil_and_safe("evalbuilt", line), Decision::Allow, "{line}");
         }
         for line in [
+            "ac_useropt='x;cd evil;y'; eval enable_$ac_useropt=no; make -C safe test",
+            "ac_useropt=feature; ac_useropt='x;cd evil;y'; eval enable_$ac_useropt=no; make -C safe test",
+            "ac_useropt=`expr \"x$ac_option\" : 'x-*disable-\\(.*\\)'`; eval enable_$ac_useropt=no; make -C safe test",
+            "ac_useropt=`printf '%s\\n' \"$ac_useropt\" | sed 's/[-+.]/_/g'`; eval enable_$ac_useropt=no; make -C safe test",
+            "eval with_${ac_useropt}_x=no; make -C safe test",
+            "eval \\$ac_prev=\\$ac_option; make -C safe test",
             "eval enable_$x=no $y; make clean-all",
             "eval enable_$x=no; $y; make clean-all",
             "eval enable_$x-y=no; make clean-all",

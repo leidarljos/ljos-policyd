@@ -25,35 +25,42 @@ pub(crate) enum Recipes {
     Closed(&'static str),
 }
 
-/// Lines a runner invocation would hand to a shell, with `cwd` as the
-/// working directory, or nothing when `run` names no runner the module
-/// reads or its file is missing. An included makefile that cannot be
-/// read is [`Recipes::Closed`].
-pub(crate) fn resolved(run: &[String], cwd: &Path) -> Recipes {
+/// Lines a runner invocation would hand to a shell, and the directory
+/// they run in. `cwd` is where the runner was started. `make -C dir`
+/// reads the makefile in `dir` and its recipes run there. Nothing when
+/// `run` names no runner this module reads, or its file is missing. An
+/// included makefile that cannot be read is [`Recipes::Closed`].
+pub(crate) fn resolved_at(run: &[String], cwd: &Path) -> (Recipes, PathBuf) {
     resolved_with(run, cwd, &[])
 }
 
-/// [`resolved`], with `env` supplying `MAKEFLAGS`, `MFLAGS` and
+#[cfg(test)]
+fn resolved(run: &[String], cwd: &Path) -> Recipes {
+    resolved_at(run, cwd).0
+}
+
+/// [`resolved_at`], with `env` supplying `MAKEFLAGS`, `MFLAGS` and
 /// `GNUMAKEFLAGS` in place of the process environment for those names.
-fn resolved_with(run: &[String], cwd: &Path, env: &[(&str, &str)]) -> Recipes {
+fn resolved_with(run: &[String], cwd: &Path, env: &[(&str, &str)]) -> (Recipes, PathBuf) {
+    let here = cwd.to_path_buf();
     let (assigned, run) = split_make_assignments(run);
     let Some(first) = run.first() else {
-        return Recipes::Lines(Vec::new());
+        return (Recipes::Lines(Vec::new()), here);
     };
     let base = first.rsplit('/').next().unwrap_or(first);
     let rest = &run[1..];
     match base {
         "make" | "gmake" => make(rest, cwd, &assigned, env),
-        "npm" => Recipes::Lines(node("npm", rest, cwd)),
-        "pnpm" => Recipes::Lines(node("pnpm", rest, cwd)),
-        "yarn" => Recipes::Lines(node("yarn", rest, cwd)),
-        "bun" => Recipes::Lines(node("bun", rest, cwd)),
-        "just" => Recipes::Lines(just(rest, cwd)),
+        "npm" => (Recipes::Lines(node("npm", rest, cwd)), here),
+        "pnpm" => (Recipes::Lines(node("pnpm", rest, cwd)), here),
+        "yarn" => (Recipes::Lines(node("yarn", rest, cwd)), here),
+        "bun" => (Recipes::Lines(node("bun", rest, cwd)), here),
+        "just" => (Recipes::Lines(just(rest, cwd)), here),
         "cargo" if rest.first().map(String::as_str) == Some("make") => {
-            Recipes::Lines(cargo_make(&rest[1..], cwd))
+            (Recipes::Lines(cargo_make(&rest[1..], cwd)), here)
         }
-        "cargo-make" | "makers" => Recipes::Lines(cargo_make(rest, cwd)),
-        _ => Recipes::Lines(Vec::new()),
+        "cargo-make" | "makers" => (Recipes::Lines(cargo_make(rest, cwd)), here),
+        _ => (Recipes::Lines(Vec::new()), here),
     }
 }
 
@@ -415,7 +422,12 @@ fn apply_short(
     Ok(consumed)
 }
 
-fn make(args: &[String], cwd: &Path, assigned: &[&str], env: &[(&str, &str)]) -> Recipes {
+fn make(
+    args: &[String],
+    cwd: &Path,
+    assigned: &[&str],
+    env: &[(&str, &str)],
+) -> (Recipes, PathBuf) {
     let mut state = MakeCmd {
         dir: cwd.to_path_buf(),
         files: Vec::new(),
@@ -424,10 +436,10 @@ fn make(args: &[String], cwd: &Path, assigned: &[&str], env: &[(&str, &str)]) ->
         overrides: HashMap::new(),
     };
     if let Err(token) = apply_make_flag_vars(&mut state, assigned, args, env) {
-        return Recipes::Closed(token);
+        return (Recipes::Closed(token), state.dir);
     }
     if let Err(token) = apply_make_words(args, true, &mut state) {
-        return Recipes::Closed(token);
+        return (Recipes::Closed(token), state.dir);
     }
     let dir = state.dir;
     let mut targets = state.targets;
@@ -442,7 +454,7 @@ fn make(args: &[String], cwd: &Path, assigned: &[&str], env: &[(&str, &str)]) ->
             .collect()
     };
     if paths.is_empty() {
-        return Recipes::Lines(Vec::new());
+        return (Recipes::Lines(Vec::new()), dir);
     }
     let mut mf = Makefile::default();
     let mut stack = Vec::new();
@@ -452,16 +464,16 @@ fn make(args: &[String], cwd: &Path, assigned: &[&str], env: &[(&str, &str)]) ->
             // No makefile where make looks by default: the line is judged
             // as written. A file `-f` named and cannot be read is not.
             ReadMake::Missing | ReadMake::Unreadable if !named => {
-                return Recipes::Lines(Vec::new());
+                return (Recipes::Lines(Vec::new()), dir);
             }
             ReadMake::Missing | ReadMake::Unreadable => {
-                return Recipes::Closed("make-file-unread");
+                return (Recipes::Closed("make-file-unread"), dir);
             }
         };
         stack.push(path.clone());
         match parse_makefile_in(&text, &dir, &includes, 0, &mut stack) {
             Ok(inner) => merge_makefile(&mut mf, inner),
-            Err(token) => return Recipes::Closed(token),
+            Err(token) => return (Recipes::Closed(token), dir),
         }
         stack.pop();
     }
@@ -477,7 +489,10 @@ fn make(args: &[String], cwd: &Path, assigned: &[&str], env: &[(&str, &str)]) ->
     for t in &targets {
         walk(&mf, t, 0, &mut seen, &mut out);
     }
-    Recipes::Lines(out.iter().map(|l| expand(l, &vars, 0)).collect())
+    (
+        Recipes::Lines(out.iter().map(|l| expand(l, &vars, 0)).collect()),
+        dir,
+    )
 }
 
 /// Dependencies first, then the target's own recipe, as make runs them.
@@ -1254,7 +1269,7 @@ mod tests {
     }
 
     fn recipes_env(run: &[String], cwd: &Path, env: &[(&str, &str)]) -> Vec<String> {
-        match resolved_with(run, cwd, env) {
+        match resolved_with(run, cwd, env).0 {
             Recipes::Lines(lines) => lines,
             Recipes::Closed(token) => panic!("closed: {token}"),
         }
