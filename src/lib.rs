@@ -815,6 +815,10 @@ fn shell_words(script: &str) -> Vec<String> {
                     out.push(std::mem::take(&mut cur));
                     word = false;
                 }
+                if matches!(c, '\n' | '\r') {
+                    out.push(";".to_string());
+                    continue;
+                }
                 if matches!(c, ';' | '|' | '&') {
                     let mut sep = c.to_string();
                     if chars.get(i) == Some(&c) && c != ';' {
@@ -3897,6 +3901,18 @@ mod tests {
             let c = entering("redir-cd", &files, line);
             assert_eq!(c.decision, Decision::Deny, "{line}");
         }
+    }
+
+    #[test]
+    fn a_newline_or_carriage_return_splits_a_script_command() {
+        assert_eq!(
+            v(&["bash", "-lc", "true\nrm -rf ~"]),
+            "deny\trm-rf-outside-tmp"
+        );
+        assert_eq!(
+            v(&["bash", "-lc", "true\rrm -rf ~"]),
+            "deny\trm-rf-outside-tmp"
+        );
     }
 
     #[test]
