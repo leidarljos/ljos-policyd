@@ -1,0 +1,1 @@
+`find` took `-exec` as a command even when it was the argument of `-name`, `-path`, `-printf` or `-fprintf`, so a later `-fprint` was never judged. A word the shell expands where a predicate would stand is a write or a delete, and `gfind` is find.

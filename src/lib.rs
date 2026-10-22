@@ -6740,29 +6740,18 @@ fn find_terminator(w: &str) -> bool {
 
 /// The commands `find -exec`, `-execdir`, `-ok` and `-okdir` run. The
 /// words after the predicate, up to `;` or `+`, are the command. With no
-/// terminator the rest of the line is that command.
+/// terminator the rest of the line is that command. An `-exec` that is
+/// only another test's argument is not a command, and `gfind` is find.
 fn find_payloads(cmd: &[String]) -> Vec<Vec<String>> {
-    if cmd.first().is_none_or(|w| base_of(w) != "find") {
+    if cmd.first().is_none_or(|w| !is_find(w)) {
         return Vec::new();
     }
-    let mut out = Vec::new();
-    let mut i = 1;
-    while i < cmd.len() {
-        if matches!(cmd[i].as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
-            i += 1;
-            let start = i;
-            while i < cmd.len() && !find_terminator(&cmd[i]) {
-                i += 1;
-            }
-            out.push(peeled_payload(&cmd[start..i]));
-            if i < cmd.len() {
-                i += 1;
-            }
-        } else {
-            i += 1;
-        }
-    }
-    out
+    let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    scan_find(&refs)
+        .payloads
+        .into_iter()
+        .map(|(start, end)| peeled_payload(&cmd[start..end]))
+        .collect()
 }
 
 /// `env`, `nice`, `timeout` and `bash -c` are not the program find runs.
@@ -13055,46 +13044,185 @@ fn under_tmp(p: &str) -> bool {
 /// `find -fprint`, `-fprint0`, `-fprintf` or `-fls` names a file that is
 /// not a literal path under `/tmp` or `/var/tmp`. Each of those predicates
 /// creates or truncates that file. The command inside `-exec` is not a
-/// find predicate.
+/// find predicate, and neither is an `-exec` that is only another test's
+/// argument (`-name -exec`).
 fn find_print_off_tmp(argv: &[String]) -> bool {
-    commands(argv).iter().any(|cmd| {
-        cmd.first().is_some_and(|w| base_of(w) == "find") && find_print_file_off_tmp(cmd)
-    })
+    commands(argv)
+        .iter()
+        .any(|cmd| cmd.first().is_some_and(|w| is_find(w)) && scan_find(cmd).write)
 }
 
-fn find_print_file_off_tmp(cmd: &[&str]) -> bool {
-    let mut i = 0;
-    let mut off = false;
+fn is_find(w: &str) -> bool {
+    matches!(base_of(w), "find" | "gfind")
+}
+
+/// What a `find` expression does with files. `-exec` starts a command
+/// only as a predicate. A word the shell still expands, sitting where a
+/// predicate would, can be `-fprint` or `-delete`.
+struct FindScan {
+    write: bool,
+    delete: bool,
+    exec_rm: bool,
+    /// Byte ranges are not needed: payload word slices, as indexes.
+    payloads: Vec<(usize, usize)>,
+}
+
+fn scan_find(cmd: &[&str]) -> FindScan {
+    let mut out = FindScan {
+        write: false,
+        delete: false,
+        exec_rm: false,
+        payloads: Vec::new(),
+    };
+    let mut i = 1;
     while i < cmd.len() {
-        let a = cmd[i];
-        if matches!(a, "-exec" | "-execdir" | "-ok" | "-okdir") {
+        match cmd[i] {
+            "-H" | "-L" | "-P" => i += 1,
+            "-D" | "-files0-from" | "--files0-from" => {
+                i += 1;
+                if i < cmd.len() {
+                    i += 1;
+                }
+            }
+            w if w.len() > 2
+                && w.starts_with("-O")
+                && w[2..].chars().all(|c| c.is_ascii_digit()) =>
+            {
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    let mut saw_path = false;
+    while i < cmd.len() && !find_expr_at(cmd[i], saw_path) {
+        if literal_text(cmd[i]) {
+            saw_path = true;
+        }
+        i += 1;
+    }
+    while i < cmd.len() {
+        let w = cmd[i];
+        if !literal_text(w) {
+            find_unshown_primary(w, &mut out);
             i += 1;
+            continue;
+        }
+        if matches!(w, "-exec" | "-execdir" | "-ok" | "-okdir") {
+            i += 1;
+            let start = i;
             while i < cmd.len() && !find_terminator(cmd[i]) {
                 i += 1;
             }
+            if cmd
+                .get(start)
+                .is_some_and(|p| matches!(base_of(p), "rm" | "shred" | "unlink"))
+            {
+                out.exec_rm = true;
+            }
+            out.payloads.push((start, i));
             if i < cmd.len() {
                 i += 1;
             }
             continue;
         }
-        if !matches!(a, "-fprint" | "-fprint0" | "-fls" | "-fprintf") {
+        if matches!(w, "-fprint" | "-fprint0" | "-fls" | "-fprintf") {
+            let file = cmd.get(i + 1).copied();
+            if !file.is_some_and(literal_under_tmp) {
+                out.write = true;
+            }
+            i += 1;
+            if file.is_some() {
+                i += 1;
+            }
+            // `-fprintf` takes the format after the file. That word is
+            // not the next predicate, even when it is `-exec`.
+            if w == "-fprintf" && i < cmd.len() {
+                i += 1;
+            }
+            continue;
+        }
+        if w == "-delete" {
+            out.delete = true;
             i += 1;
             continue;
         }
-        let file = cmd.get(i + 1).copied();
-        if !file.is_some_and(literal_under_tmp) {
-            off = true;
-        }
-        if file.is_some() {
-            i += 2;
-        } else {
+        if find_takes_one(w) {
             i += 1;
+            if i < cmd.len() {
+                i += 1;
+            }
+            continue;
         }
-        if a == "-fprintf" && i < cmd.len() && !cmd[i].starts_with('-') {
-            i += 1;
-        }
+        i += 1;
     }
-    off
+    out
+}
+
+fn find_expr_at(w: &str, saw_path: bool) -> bool {
+    matches!(w, "(" | "!" | "\\(" | "-not") || w.starts_with('-') || (saw_path && !literal_text(w))
+}
+
+fn find_unshown_primary(w: &str, out: &mut FindScan) {
+    let stem = match w.find(['$', '`']) {
+        Some(i) => &w[..i],
+        None => w,
+    };
+    let write = matches!(stem, "-fprint" | "-fprint0" | "-fls" | "-fprintf")
+        || w.contains("-fprint")
+        || w.contains("-fls")
+        || w.contains("-fprintf");
+    let delete = stem == "-delete" || w.contains("-delete");
+    if write {
+        out.write = true;
+    }
+    if delete {
+        out.delete = true;
+    }
+    if !write && !delete {
+        out.write = true;
+        out.delete = true;
+    }
+}
+
+fn find_takes_one(w: &str) -> bool {
+    w.starts_with("-newer")
+        || matches!(
+            w,
+            "-name"
+                | "-iname"
+                | "-path"
+                | "-ipath"
+                | "-wholename"
+                | "-iwholename"
+                | "-regex"
+                | "-iregex"
+                | "-lname"
+                | "-ilname"
+                | "-samefile"
+                | "-type"
+                | "-xtype"
+                | "-user"
+                | "-group"
+                | "-uid"
+                | "-gid"
+                | "-links"
+                | "-inum"
+                | "-size"
+                | "-used"
+                | "-fstype"
+                | "-context"
+                | "-perm"
+                | "-printf"
+                | "-regextype"
+                | "-maxdepth"
+                | "-mindepth"
+                | "-amin"
+                | "-cmin"
+                | "-mmin"
+                | "-atime"
+                | "-ctime"
+                | "-mtime"
+        )
 }
 
 fn literal_under_tmp(p: &str) -> bool {
@@ -13105,14 +13233,16 @@ fn literal_under_tmp(p: &str) -> bool {
 /// `unlink`), whose starting points are not all under `/tmp`. With no
 /// starting point find walks the current directory. A cleanup of files a
 /// tool writes again ([`regenerable_cleanup`]) inside the working tree is
-/// allowed, unless the line can `cd` out of the tree first.
+/// allowed, unless the line can `cd` out of the tree first. `gfind` is
+/// find, and a word the shell expands where a predicate would stand can
+/// be `-delete`. An `-exec` that is only another test's argument is not.
 fn find_delete_off_tmp(argv: &[String], moved: bool) -> bool {
     commands(argv).iter().any(|cmd| {
-        let exec_delete = cmd.windows(2).any(|w| {
-            matches!(w[0], "-exec" | "-execdir" | "-ok" | "-okdir")
-                && matches!(base_of(w[1]), "rm" | "shred" | "unlink")
-        });
-        if base_of(cmd[0]) != "find" || !(cmd.contains(&"-delete") || exec_delete) {
+        if cmd.first().is_none_or(|w| !is_find(w)) {
+            return false;
+        }
+        let scan = scan_find(cmd);
+        if !(scan.delete || scan.exec_rm) {
             return false;
         }
         let starts: Vec<&str> = cmd[1..]
@@ -18348,6 +18478,15 @@ hash -r 2> /dev/null
             "find /tmp -name x -fprint /etc/x",
             "find / -fprint /tmp/out -fprintf /etc/y '%p'",
             "sh -c 'find / -fprint /etc/x'",
+            // `-exec` as another test's argument is not a command, so the
+            // `-fprint` after it still creates the file.
+            "find / -name -exec -fprint /etc/x",
+            "find / -path -execdir -fprint0 /etc/x",
+            "find / -printf -exec -fprint /etc/x",
+            "find / -fprintf /tmp/ok -exec -fprint /etc/x",
+            "find / -fprint$z /etc/x",
+            "find / $(echo -fprint) /etc/x",
+            "gfind / -fprint /etc/x",
         ] {
             assert_eq!(v(line), "deny\tfind-write-outside-tmp", "{line}");
         }
@@ -18361,6 +18500,10 @@ hash -r 2> /dev/null
             "find /tmp -printf '%p\\n'",
             "find /tmp -name x -fprint /tmp/out",
             "find . -exec echo -fprint /etc/x \\;",
+            // `-fprint` is the filename `-name` matches, not a predicate.
+            "find . -name -fprint",
+            "find \"$dir\" -name x",
+            "find \"$a\" \"$b\" -name x",
         ] {
             assert_eq!(v(line), "allow", "{line}");
         }
@@ -18408,6 +18551,11 @@ hash -r 2> /dev/null
             "find . -path '*' -delete",
             "cd / && find . -name '*.pyc' -delete",
             "cd ~ && find . -name .DS_Store -delete",
+            // A word that expands where a predicate would stand can be
+            // `-delete`. `$p` names no predicate, so it is one too.
+            "find / -delete$z",
+            "p=-fprint; find / $p /etc/x",
+            "gfind / -delete",
         ] {
             assert_eq!(
                 verdict(&shell_words(line)),
