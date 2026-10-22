@@ -1,0 +1,1 @@
+Bash expands `{push,-f}` before the command runs, and the judge was still looking at the braces. A brace word is the command it expands to. `make -C`, `source` and `cd` do not follow a directory written with braces.

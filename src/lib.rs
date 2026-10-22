@@ -4210,7 +4210,7 @@ fn resolve_source_paths(
     path: &str,
     values: &std::collections::HashMap<String, Vec<String>>,
 ) -> Option<Vec<String>> {
-    if path.contains(['`', '*', '?', '[']) || path.contains("$(") {
+    if path.contains(['`', '*', '?', '[']) || path.contains("$(") || brace_expands(path) {
         return None;
     }
     if !path.contains('$') {
@@ -5680,6 +5680,10 @@ fn tilde_home(home: Option<&str>) -> Cow<'_, str> {
 /// `dir`. Another variable or a substitution names no directory the line
 /// shows, and `~-` or a stack entry (`~1`) one the line does not follow.
 fn path_from(to: &str, dir: &std::path::Path, home: Option<&str>) -> Option<std::path::PathBuf> {
+    // `{sub,}` is not a directory. The shell expands it before `cd`.
+    if brace_expands(to) {
+        return None;
+    }
     let (head, rest) = to.split_once('/').unwrap_or((to, ""));
     if rest.contains(['$', '`']) {
         return None;
@@ -5890,6 +5894,262 @@ fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
 /// How deep `sh -c` scripts nest before the table stops reading them.
 const MAX_DEPTH: usize = 4;
 
+/// How many words one brace expansion may produce. Past this the
+/// command is not the one the line shows.
+const BRACE_CAP: usize = 32;
+
+fn brace_unshown() -> Checked {
+    Checked {
+        decision: Decision::Deny,
+        code: PolicyReason::ShellDangerousRunner,
+        token: Cow::Borrowed("brace-expansion-unshown"),
+    }
+}
+
+/// Whether `word` is a bash brace expansion (`{a,b}`, `{1..3}`), not a
+/// parameter expansion (`${name}`) and not a lone `{`.
+fn brace_expands(word: &str) -> bool {
+    !matches!(first_brace(word), Ok(None))
+}
+
+struct BraceHit {
+    start: usize,
+    end: usize,
+    alts: Vec<String>,
+}
+
+fn first_brace(word: &str) -> Result<Option<BraceHit>, ()> {
+    let chars: Vec<(usize, char)> = word.char_indices().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].1 == '$' && chars.get(i + 1).is_some_and(|(_, c)| *c == '{') {
+            i = skip_braced_param(&chars, i);
+            continue;
+        }
+        if chars[i].1 == '{' {
+            if let Some(hit) = brace_at(word, &chars, i)? {
+                return Ok(Some(hit));
+            }
+        }
+        i += 1;
+    }
+    Ok(None)
+}
+
+fn skip_braced_param(chars: &[(usize, char)], i: usize) -> usize {
+    let mut depth = 0i32;
+    let mut j = i + 1;
+    while j < chars.len() {
+        match chars[j].1 {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return j + 1;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    chars.len()
+}
+
+fn brace_at(word: &str, chars: &[(usize, char)], open: usize) -> Result<Option<BraceHit>, ()> {
+    let mut depth = 0i32;
+    let mut j = open;
+    while j < chars.len() {
+        match chars[j].1 {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let start = chars[open].0;
+                    let end = chars.get(j + 1).map_or(word.len(), |(p, _)| *p);
+                    let body = &word[chars[open].0 + '{'.len_utf8()..chars[j].0];
+                    let Some(alts) = brace_alts(body)? else {
+                        return Ok(None);
+                    };
+                    return Ok(Some(BraceHit { start, end, alts }));
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    Ok(None)
+}
+
+fn brace_alts(body: &str) -> Result<Option<Vec<String>>, ()> {
+    if body.contains(',') {
+        let mut alts = Vec::new();
+        let mut cur = String::new();
+        let mut depth = 0i32;
+        for c in body.chars() {
+            match c {
+                '{' => {
+                    depth += 1;
+                    cur.push(c);
+                }
+                '}' => {
+                    depth -= 1;
+                    cur.push(c);
+                }
+                ',' if depth == 0 => alts.push(std::mem::take(&mut cur)),
+                _ => cur.push(c),
+            }
+        }
+        alts.push(cur);
+        if alts.len() > BRACE_CAP {
+            return Err(());
+        }
+        return Ok(Some(alts));
+    }
+    sequence_alts(body)
+}
+
+fn sequence_alts(body: &str) -> Result<Option<Vec<String>>, ()> {
+    let parts: Vec<&str> = body.split("..").collect();
+    if parts.len() != 2 && parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+        return Ok(None);
+    }
+    let step: i64 = if parts.len() == 3 {
+        match parts[2].parse() {
+            Ok(n) => n,
+            Err(_) => return Ok(None),
+        }
+    } else {
+        1
+    };
+    let step = if step == 0 { 1 } else { step.abs() };
+    if let (Ok(start), Ok(end)) = (parts[0].parse::<i64>(), parts[1].parse::<i64>()) {
+        return num_range(parts[0], parts[1], start, end, step).map(Some);
+    }
+    let mut ac = parts[0].chars();
+    let mut bc = parts[1].chars();
+    let (Some(a), Some(b)) = (ac.next(), bc.next()) else {
+        return Ok(None);
+    };
+    if ac.next().is_some() || bc.next().is_some() {
+        return Ok(None);
+    }
+    if !a.is_ascii_alphabetic() || !b.is_ascii_alphabetic() {
+        return Ok(None);
+    }
+    if a.is_ascii_uppercase() != b.is_ascii_uppercase() {
+        return Ok(None);
+    }
+    char_range(a, b, step).map(Some)
+}
+
+fn num_range(raw_a: &str, raw_b: &str, start: i64, end: i64, step: i64) -> Result<Vec<String>, ()> {
+    let padded = raw_a.starts_with('0') || raw_b.starts_with('0') || raw_a.starts_with("-0");
+    let width = if padded {
+        raw_a.len().max(raw_b.len())
+    } else {
+        0
+    };
+    let dir = if end >= start { step } else { -step };
+    let mut n = start;
+    let mut out = Vec::new();
+    loop {
+        if out.len() >= BRACE_CAP {
+            return Err(());
+        }
+        if width == 0 {
+            out.push(n.to_string());
+        } else if n < 0 {
+            out.push(format!("-{:0width$}", -n, width = width.saturating_sub(1)));
+        } else {
+            out.push(format!("{n:0width$}"));
+        }
+        if n == end {
+            break;
+        }
+        n = n.checked_add(dir).ok_or(())?;
+        if dir > 0 && n > end || dir < 0 && n < end {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+fn char_range(a: char, b: char, step: i64) -> Result<Vec<String>, ()> {
+    let (start, end) = (a as u8, b as u8);
+    let dir: i32 = if end >= start {
+        step as i32
+    } else {
+        -(step as i32)
+    };
+    let mut n = start as i32;
+    let end = end as i32;
+    let mut out = Vec::new();
+    loop {
+        if out.len() >= BRACE_CAP {
+            return Err(());
+        }
+        out.push(char::from_u32(n as u32).ok_or(())?.to_string());
+        if n == end {
+            break;
+        }
+        n += dir;
+        if dir > 0 && n > end || dir < 0 && n < end {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// `word` after one brace expansion, each alternative a word of its own.
+/// A range past [`BRACE_CAP`] is [`Err`].
+fn expand_word(word: &str) -> Result<Vec<String>, ()> {
+    let Some(hit) = first_brace(word)? else {
+        return Ok(vec![word.to_string()]);
+    };
+    let mut out = Vec::new();
+    for alt in &hit.alts {
+        let mut next = String::new();
+        next.push_str(&word[..hit.start]);
+        next.push_str(alt);
+        next.push_str(&word[hit.end..]);
+        if next.is_empty() {
+            continue;
+        }
+        if brace_expands(&next) && next == word {
+            return Err(());
+        }
+        let parts = expand_word(&next)?;
+        if out.len() + parts.len() > BRACE_CAP {
+            return Err(());
+        }
+        out.extend(parts);
+    }
+    if out.is_empty() {
+        Ok(vec![word.to_string()])
+    } else {
+        Ok(out)
+    }
+}
+
+/// `cmd` with brace words expanded into the command bash would run.
+/// [`None`] when nothing expands. [`Err`] when the expansion is too wide
+/// to be the command the line shows.
+fn expanded_command(cmd: &[&str]) -> Result<Option<Vec<String>>, ()> {
+    let mut out = Vec::new();
+    let mut changed = false;
+    for w in cmd {
+        let parts = expand_word(w)?;
+        if parts.len() != 1 || parts.first().map(String::as_str) != Some(*w) {
+            changed = true;
+        }
+        if out.len() + parts.len() > BRACE_CAP {
+            return Err(());
+        }
+        out.extend(parts);
+    }
+    Ok(changed.then_some(out))
+}
+
 /// The table on one argv, then on every command it runs through a wrapper
 /// (`env`, `nice`, `xargs`, ...) or a shell's `-c` script, so `env git push
 /// -f` and `sh -c "git push -f"` meet the same rules as `git push -f`.
@@ -5973,6 +6233,23 @@ fn host_argv_table_at(argv: &[String], depth: usize, moved: bool, parent: &Scrat
     }
     if let Some(c) = judge_produced_argv(argv, depth, moved, &bound) {
         return c;
+    }
+    // Bash expands `{push,-f}` before it runs the command. The words
+    // the table saw are not the ones that run.
+    for cmd in commands(argv) {
+        match expanded_command(&cmd) {
+            Err(()) => return brace_unshown(),
+            Ok(Some(words)) => {
+                if depth >= MAX_DEPTH {
+                    return brace_unshown();
+                }
+                let c = host_argv_table_at(&words, depth + 1, moved, &bound);
+                if c.decision != Decision::Allow {
+                    return c;
+                }
+            }
+            Ok(None) => {}
+        }
     }
     own
 }
@@ -8686,6 +8963,18 @@ impl Seat {
         }
         if let Some(c) = self.produced_pack(argv, depth, &bound, moved) {
             return c;
+        }
+        for cmd in commands(argv) {
+            match expanded_command(&cmd) {
+                Err(()) => return brace_unshown(),
+                Ok(Some(words)) => {
+                    let c = self.check_at(&words, depth + 1, &bound, moved);
+                    if c.decision != Decision::Allow {
+                        return c;
+                    }
+                }
+                Ok(None) => {}
+            }
         }
         own
     }
@@ -14492,6 +14781,37 @@ hash -r 2> /dev/null
                 c.token
             );
         }
+        assert_everyday_allowed(&root);
+    }
+
+    /// Bash expands `{push,-f}` into the command before it runs. The
+    /// words the table saw were not that command, so `git {push,-f}`
+    /// was allowed, and so was a `make -C`, a `source` and a `cd`
+    /// written the same way.
+    #[test]
+    fn brace_expansion_is_part_of_the_command() {
+        let root = startup_root("brace");
+        std::fs::create_dir_all(root.join("bld")).unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("bld/Makefile"), "all:\n\tgit push -f\n").unwrap();
+        std::fs::write(root.join("sub/Makefile"), "all:\n\tgit push -f\n").unwrap();
+        std::fs::write(root.join("x2.sh"), "git push -f\n").unwrap();
+        std::fs::write(root.join("x.sh"), "git push -f\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "bash -c 'git {push,-f}'",
+            "bash -c 'make -C {bld,all}'",
+            "bash -c 'make {-Cbld,all}'",
+            "bash -c '. ./x{2,}.sh'",
+            "bash -c 'cd {sub,}; make'",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+        }
+        let c = at("bash -c 'git {push,-f}'");
+        assert!(c.token.contains("git-force-push"), "{}", c.token);
+        let c = at("bash -c 'echo {a,b}'");
+        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
         assert_everyday_allowed(&root);
     }
 

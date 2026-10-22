@@ -263,6 +263,11 @@ fn apply_make_words(
     let mut i = 0;
     while i < words.len() {
         let a = words[i].as_str();
+        // `make {-Cbld,all}` is `make -C bld` after brace expansion. The
+        // directory is not the word make was given.
+        if super::brace_expands(a) {
+            return Err("make-directory-unshown");
+        }
         if a == "--" {
             if !allow_targets {
                 return Err(MAKE_FLAG_TOKEN);
@@ -386,7 +391,10 @@ fn apply_long(name: &str, arg: &str, state: &mut MakeCmd) -> Result<(), &'static
 /// A `make -C` directory the line spells out. A variable, a substitution
 /// or a glob is not that directory, and an empty one is not either.
 fn shown_dir(arg: &str) -> Result<(), &'static str> {
-    if arg.is_empty() || arg.contains(['$', '`', '*', '?', '[', '~']) {
+    if arg.is_empty()
+        || arg.contains(['$', '`', '*', '?', '[', '~', '{'])
+        || super::brace_expands(arg)
+    {
         Err("make-directory-unshown")
     } else {
         Ok(())
