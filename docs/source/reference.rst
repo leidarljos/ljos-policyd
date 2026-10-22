@@ -40,6 +40,10 @@ A line that runs a task runner is also judged on what the target runs.
 The recipe comes from the file the runner reads, in the directory it
 runs in: the working directory, the one a ``cd`` or ``pushd`` earlier on
 the line enters, or the one ``-C``, ``--prefix`` or ``--cwd`` names.
+Leading words that still run ``cd`` in this shell (``command``,
+``builtin``, ``if``, ``while``, ``{`` and the other control keywords)
+are peeled before this check, and redirections before a ``cd`` target do
+not name the directory.
 
 ============================================ ==============================================================================================
 Runner                                       File read
@@ -55,6 +59,8 @@ target and the line: :literal:`make clean-all runs \`rm -rf ~\`: rm-rf-outside-t
 Nothing is spawned. A missing or unreadable file, or a directory the
 line does not name (a variable, ``cd -``), leaves the line judged as
 written.
+Raw newlines and carriage returns split script commands, and ``$'...'``
+ANSI-C quoted words are decoded before the line is judged.
 
 Argument limits
 ===============

@@ -764,6 +764,93 @@ fn shell_script(run: &[String]) -> Option<&str> {
     None
 }
 
+fn decode_ansi_c_quoted(chars: &[char], i: &mut usize, out: &mut String) {
+    while *i < chars.len() {
+        let c = chars[*i];
+        *i += 1;
+        if c == '\'' {
+            return;
+        }
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(esc) = chars.get(*i).copied() else {
+            out.push('\\');
+            return;
+        };
+        *i += 1;
+        match esc {
+            'a' => out.push('\u{0007}'),
+            'b' => out.push('\u{0008}'),
+            'e' | 'E' => out.push('\u{001b}'),
+            'f' => out.push('\u{000c}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'v' => out.push('\u{000b}'),
+            '\\' => out.push('\\'),
+            '\'' => out.push('\''),
+            '"' => out.push('"'),
+            '?' => out.push('?'),
+            'x' => {
+                let mut value = 0u32;
+                let mut n = 0;
+                while *i < chars.len() && n < 2 {
+                    if let Some(d) = chars[*i].to_digit(16) {
+                        value = value * 16 + d;
+                        *i += 1;
+                        n += 1;
+                        continue;
+                    }
+                    break;
+                }
+                if n == 0 {
+                    out.push('x');
+                } else if let Some(c) = char::from_u32(value) {
+                    out.push(c);
+                }
+            }
+            'u' | 'U' => {
+                let max = if esc == 'u' { 4 } else { 8 };
+                let mut value = 0u32;
+                let mut n = 0;
+                while *i < chars.len() && n < max {
+                    if let Some(d) = chars[*i].to_digit(16) {
+                        value = value * 16 + d;
+                        *i += 1;
+                        n += 1;
+                        continue;
+                    }
+                    break;
+                }
+                if n == 0 {
+                    out.push(esc);
+                } else if let Some(c) = char::from_u32(value) {
+                    out.push(c);
+                }
+            }
+            c if matches!(c, '0'..='7') => {
+                let mut value = c.to_digit(8).expect("octal digit");
+                let mut n = 1;
+                while *i < chars.len() && n < 3 {
+                    if let Some(d) = chars[*i].to_digit(8) {
+                        value = value * 8 + d;
+                        *i += 1;
+                        n += 1;
+                        continue;
+                    }
+                    break;
+                }
+                if let Some(c) = char::from_u32(value) {
+                    out.push(c);
+                }
+            }
+            c => out.push(c),
+        }
+    }
+}
+
 /// A script split into words the way a shell would: quotes group, a
 /// backslash escapes the next character outside single quotes, and `;`,
 /// `&&`, `||`, `|` and `&` stand as words of their own. The `&` of a
@@ -786,6 +873,11 @@ fn shell_words(script: &str) -> Vec<String> {
                 cur.extend(&chars[i - 1..end]);
                 word = true;
                 i = end;
+            }
+            '$' if !single && !double && chars.get(i) == Some(&'\'') => {
+                i += 1;
+                decode_ansi_c_quoted(&chars, &mut i, &mut cur);
+                word = true;
             }
             '\\' if !single => {
                 if let Some(n) = chars.get(i) {
@@ -3719,6 +3811,35 @@ mod tests {
         }
     }
 
+    /// Safe lines from the rereview stay allowed.
+    #[test]
+    fn keeps_rereview_safe_lines_allowed() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "cd project && make test",
+            "cd project; make test",
+            "cd project && make clean",
+            "FOO=1 cd project && make test",
+            "pushd project && make test && popd",
+            "bash -lc 'make test'",
+            "cd project && rm -rf target",
+        ] {
+            let c = entering("safe-lines", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+        assert_eq!(
+            in_dir(
+                "safe-lines-redir",
+                "Makefile",
+                MAKEFILE,
+                &["make", "test", "2>&1"]
+            ),
+            Decision::Allow
+        );
+        assert_eq!(v(&["cargo", "test"]), "allow");
+        assert_eq!(v(&["git", "status"]), "allow");
+    }
+
     /// A directory the line does not show, or one it leaves again, is not
     /// read, and the runner is judged as before.
     #[test]
@@ -3820,6 +3941,19 @@ mod tests {
         let files = [("Makefile", MAKEFILE)];
         let c = entering("brace-cd", &files, "{ cd project && make clean-all; }");
         assert_eq!(c.decision, Decision::Deny);
+    }
+
+    /// ANSI-C quoted words decode before `cd` chooses its target.
+    #[test]
+    fn follows_a_cd_with_an_ansi_c_quoted_target() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "cd $'project' && make clean-all",
+            "cd $'pro\\x6aect' && make clean-all",
+        ] {
+            let c = entering("ansi-c-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
     }
 
     /// A script the line hands a shell, `eval` or a named command word runs
