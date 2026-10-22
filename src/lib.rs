@@ -12870,6 +12870,8 @@ hash -r 2> /dev/null
         }
     }
 
+    // The pack a phronesis build loads keeps its own list of build
+    // output, so the host table is what this reads.
     #[test]
     fn configure_scratch_is_regenerable() {
         let root = startup_root("conftest");
@@ -12880,7 +12882,7 @@ hash -r 2> /dev/null
             "rm -rf conftest.dir conftest ./autom4te.cache/",
             "rm -rf sub/conftest.*",
         ] {
-            let c = at(line);
+            let c = host_argv_table(&shell_words(line));
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
         for line in [
