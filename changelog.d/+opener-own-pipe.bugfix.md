@@ -1,0 +1,1 @@
+The opener of a brace group, `if`, `while`, `until` or `case` stayed in this shell when the pipe followed the `read` itself. Bash runs that stage in a subshell, so the value this shell already holds is the one a later command uses.

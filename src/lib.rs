@@ -7831,6 +7831,9 @@ fn compound_end(ended: &[(Vec<String>, String)], i: usize, hi: usize) -> usize {
 /// The body of `while` stays in the shell that runs the `while`.
 /// A compound opener is the first stage when its separator is `|`
 /// (`{ printf | read`), so that stage's successor stays in its own shell.
+/// The opener's own trailing `|` (`{ read | cat`) is that stage too, so
+/// the opener is not this shell. The body is still walked here, and a
+/// `|` that only splits `case` patterns is not a pipeline.
 fn command_shells(ended: &[(Vec<String>, String)]) -> Vec<u32> {
     let n = ended.len();
     let mut shells = vec![0u32; n];
@@ -7885,7 +7888,20 @@ fn walk_shells(
         } else {
             shell
         };
-        shells[i] = stage;
+        // `{ read <<< /tmp/a | cat; }` keeps `read` in the opener. That
+        // `|` is the pipeline, so the opener is a subshell. The body
+        // stays in `stage`: `lastpipe` still runs the last stage here.
+        // `case z in a | b)` is a pattern list, not a pipe.
+        let own = ended[i].1.as_str();
+        let opener_pipe = end > i && matches!(own, "|" | "|&") && !pure_case_pattern(&ended[i].0);
+        let opener_shell = if opener_pipe {
+            let id = *next;
+            *next += 1;
+            id
+        } else {
+            stage
+        };
+        shells[i] = opener_shell;
         if end > i {
             shells[end] = stage;
             if i + 1 < end {
@@ -18496,7 +18512,8 @@ hash -r 2> /dev/null
     /// A `read` counts only in the shell that runs it, and only for a
     /// command after it. A pipeline stage is a subshell until `lastpipe`.
     /// The opener of `{`, `if`, `while`, `until` or `case` is that first
-    /// stage when a `|` follows it.
+    /// stage when a `|` follows it, including when the `read` is the
+    /// opener (`{ read | cat`).
     #[test]
     fn a_read_in_another_shell_keeps_the_earlier_value() {
         let v = |s: &str| verdict(&shell_words(s));
@@ -18513,8 +18530,16 @@ hash -r 2> /dev/null
             "x=/; { { printf '/tmp/a\\n' | read x; }; }; rm -rf \"$x\"",
             "x=/; {\n{ printf '/tmp/a\\n' | read x; }; }; rm -rf \"$x\"",
             "x=/; case z in z) printf '/tmp/a\\n' | read x ;; esac; rm -rf \"$x\"",
+            "x=/; { read x <<< /tmp/a | cat; }; rm -rf \"$x\"",
+            "x=/; if read x <<< /tmp/a | cat; then :; fi; rm -rf \"$x\"",
+            "x=/; while read x <<< /tmp/a | cat; do break; done; rm -rf \"$x\"",
+            "x=/; until read x <<< /tmp/a | cat; do break; done; rm -rf \"$x\"",
+            "x=/; case z in z) read x <<< /tmp/a | cat ;; esac; rm -rf \"$x\"",
+            "x=/; { read x <<< /tmp/a |& cat; }; rm -rf \"$x\"",
         ] {
             assert_eq!(v(line), "deny\trm-rf-outside-tmp", "{line}");
+            let bash = vec!["bash".into(), "-c".into(), line.to_string()];
+            assert_eq!(verdict(&bash), "deny\trm-rf-outside-tmp", "bash -c {line}");
         }
         assert_eq!(
             v("printf '/tmp/a\\n' | while read x; do rm -rf \"$x\"; done"),
