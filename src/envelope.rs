@@ -1818,6 +1818,36 @@ pair left right
         }
     }
 
+    /// U+FF0E is a full stop after NFKC, and an alias domain is matched
+    /// after case folding, on the rule and on the recipient.
+    #[test]
+    fn a_fullwidth_stop_or_mixed_case_does_not_hide_an_alias() {
+        let denied = |to: &str, deny: &str| {
+            codes(&plain(&format!("To: {to}\r\n")), deny, "") == vec!["recipient-address-denied"]
+        };
+        let gmail = "address bad@gmail.com\n";
+        for to in [
+            "b.ad@googlemail\u{FF0E}com",
+            "bad+x@gmail\u{FF0E}com",
+            "b.AD@GoogleMail.COM",
+            "Bad+X@GMAIL.com",
+        ] {
+            assert!(denied(to, gmail), "{to}");
+        }
+        assert!(denied(
+            "bad@gmail.com",
+            "address b.ad@GoogleMail\u{FF0E}COM\n"
+        ));
+        let proton = "address bad@proton.me\n";
+        for to in ["bad@PM.ME", "Bad+x@pm\u{FF0E}me", "bad@ProtonMail.CH"] {
+            assert!(denied(to, proton), "{to}");
+        }
+        assert!(denied("bad@proton.me", "address bad@PM\u{FF0E}ME\n"));
+        let fast = "address user@fastmail.com\n";
+        assert!(denied("x@User\u{FF0E}FastMail.COM", fast));
+        assert!(!denied("bad@pm\u{FF0E}me\u{FF0E}test", proton));
+    }
+
     #[test]
     fn a_zero_width_character_does_not_hide_a_denied_address() {
         let deny = "address other@example.test\n";
