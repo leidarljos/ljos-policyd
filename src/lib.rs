@@ -5583,11 +5583,55 @@ fn tee_paths(cmd: &[String]) -> Vec<&str> {
 }
 
 /// The words that name the files a command writes as a program: what
-/// `tee`, `curl` and `wget` save.
+/// `tee`, `curl` and `wget` save, and the target of `cp`, `mv` and `ln`.
 fn program_writes(run: &[String]) -> Vec<String> {
     let mut out = fetched_paths(run);
     out.extend(tee_paths(run).into_iter().map(str::to_string));
+    let Some((head, args)) = run.split_first() else {
+        return out;
+    };
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let args = operands(&args);
+    match base_of(head) {
+        "cp" | "mv" | "ln" => out.extend(copy_target(&args, base_of(head) == "ln")),
+        _ => {}
+    }
     out
+}
+
+/// The path a `cp`, `mv` or `ln` writes: the directory `-t` names, else
+/// its last operand. An `ln` with one operand makes a link of that name
+/// where it runs.
+fn copy_target(args: &[&str], ln: bool) -> Option<String> {
+    let mut ops = Vec::new();
+    let mut target = None;
+    let mut words = args.iter().copied();
+    let mut end = false;
+    while let Some(a) = words.next() {
+        if end || !a.starts_with('-') || a == "-" {
+            ops.push(a);
+            continue;
+        }
+        if a == "--" {
+            end = true;
+        } else if let Some(t) = a.strip_prefix("--target-directory") {
+            target = t.strip_prefix('=').or_else(|| words.next());
+        } else if matches!(a, "-S" | "--suffix") {
+            words.next();
+        } else if let Some(t) = a
+            .strip_prefix('-')
+            .filter(|f| !f.starts_with('-'))
+            .and_then(|f| f.find('t').map(|k| &f[k + 1..]))
+        {
+            target = if t.is_empty() { words.next() } else { Some(t) };
+        }
+    }
+    match (target, ops.as_slice()) {
+        (Some(t), _) => Some(t.to_string()),
+        (None, [one]) if ln => Some(base_of(one).to_string()),
+        (None, [_, .., last]) => Some((*last).to_string()),
+        _ => None,
+    }
 }
 
 /// A file a fetch on the line writes, then a later command on the line
@@ -10966,6 +11010,43 @@ hash -r 2> /dev/null
             "./configure > config.log && make",
             "echo x > /dev/null; source ok.sh",
             "(cd sub && echo x > ok.sh); source ok.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        assert_everyday_allowed(&root);
+    }
+
+    /// `cp evil.sh ok.sh; source ok.sh` was allowed: ok.sh was judged
+    /// as it stood before the copy. The target of `cp`, `mv` and `ln` is
+    /// written as a redirection's file is.
+    #[test]
+    fn a_script_copied_or_linked_earlier_is_refused() {
+        let root = startup_root("copied");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "cp evil/force.sh ok.sh; source ok.sh",
+            "cp evil/force.sh sub && source sub/force.sh",
+            "cp -t sub evil/force.sh; bash sub/force.sh",
+            "cp --target-directory=sub evil/force.sh; . sub/force.sh",
+            "mv evil/force.sh ok.sh; ./ok.sh",
+            "ln -sf evil/force.sh ok.sh; source ok.sh",
+            "ln -s evil/force.sh; source force.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(
+                c.token.starts_with("script-written-on-line: "),
+                "{line}: {}",
+                c.token
+            );
+        }
+        for line in [
+            "cp ok.sh backup.sh; source ok.sh",
+            "mv ok.sh sub/; echo moved",
+            "ln -s ok.sh link.sh; cat link.sh",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
