@@ -92,7 +92,9 @@ directory without entering it, =pushd +N= and =-N= enter the entry they
 bring to the top, and a bare =popd= enters the entry under the top,
 while =popd -n=, =popd +N= and =popd -N= drop an entry and stay. An
 index that counts past a =pushd= that may have failed may name any
-directory on the stack.
+directory on the stack. A =popd= that fails, on a word it does not take
+(=popd x=) or with nothing left to pop (after =dirs -c=), leaves the
+line in a directory it does not follow.
 
 The line goes on past a =cd= that may fail, so the runner after it is
 read in each directory the line may be in, up to sixteen. A =cd= into a

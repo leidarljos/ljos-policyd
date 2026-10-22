@@ -279,28 +279,36 @@ fn runner_commands(
         }
         let words = peel_cd_command_word(&cmd);
         let b = words.first().map_or("", |w| base_of(w));
-        if piped && matches!(b, "cd" | "pushd" | "popd") {
+        if piped && matches!(b, "cd" | "pushd" | "popd" | "dirs") {
+            continue;
+        }
+        if b == "dirs" {
+            let args = operands(&words[1..]);
+            if args.iter().any(|a| a.starts_with('-') && a.contains('c')) {
+                pushed.clear();
+            }
             continue;
         }
         if b == "popd" {
-            let mut args = operands(&words[1..]);
-            if let Some(end) = args.iter().position(|a| *a == "--") {
-                args.truncate(end);
-            }
-            let index = args.iter().copied().find(|a| stack_index(a));
             let stack: Vec<_> = std::iter::once((here.clone(), true))
                 .chain(pushed.iter().rev().cloned())
                 .collect();
-            if let Some((mut s, moved)) = popped(&stack, index, args.contains(&"-n")) {
-                let (back, sure) = s.remove(0);
-                pushed = s.into_iter().rev().collect();
-                if moved {
-                    let now = std::mem::replace(&mut here, back);
-                    let was = std::mem::replace(&mut old, now.clone());
-                    if !sure {
-                        add_dirs(&mut here, now);
-                        add_dirs(&mut old, was);
-                    }
+            // A popd that fails, or that pops past the stack the line built
+            // into one the shell had before, is not followed.
+            let Some((mut s, moved)) = popd_args(&operands(&words[1..]))
+                .and_then(|(index, keep)| popped(&stack, index, keep))
+            else {
+                here = vec![UNTRACKED.into()];
+                continue;
+            };
+            let (back, sure) = s.remove(0);
+            pushed = s.into_iter().rev().collect();
+            if moved {
+                let now = std::mem::replace(&mut here, back);
+                let was = std::mem::replace(&mut old, now.clone());
+                if !sure {
+                    add_dirs(&mut here, now);
+                    add_dirs(&mut old, was);
                 }
             }
             continue;
@@ -595,6 +603,21 @@ fn entered(
         }
     }
     dirs
+}
+
+/// The index and the `-n` that `popd` reads from `args`, which end at
+/// `--`. None for a word bash refuses, on which popd fails.
+fn popd_args<'a>(args: &[&'a str]) -> Option<(Option<&'a str>, bool)> {
+    let (mut index, mut keep) = (None, false);
+    for &a in args {
+        match a {
+            "--" => break,
+            "-n" => keep = true,
+            _ if stack_index(a) => index = Some(a),
+            _ => return None,
+        }
+    }
+    Some((index, keep))
 }
 
 /// Whether `a` is a `pushd` stack index, `+N` or `-N`.
