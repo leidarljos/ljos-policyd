@@ -1,0 +1,1 @@
+Postfix rewrites an unquoted percent-hack or bang-path local part when the domain is local, then relays to that address. The characters were accepted, so the rewritten domain was never judged. An unquoted local part that holds either is a refusal.

@@ -109,6 +109,9 @@ pub fn check_mail_bytes(message: &[u8], config_path: &Path) -> MailVerdict {
         Err(MessageFault::LineEnding) => {
             return MailVerdict::refusal("header-line-ending", "header block");
         }
+        Err(MessageFault::LineTooLong) => {
+            return MailVerdict::refusal("header-line-too-long", "header block");
+        }
         Err(MessageFault::Structure) => {
             return MailVerdict::refusal("message-invalid", "header block");
         }
@@ -118,12 +121,19 @@ pub fn check_mail_bytes(message: &[u8], config_path: &Path) -> MailVerdict {
     check_identity_headers(&message, &config, &mut reasons);
     check_recipients(&message, &config, &mut reasons);
     check_resent(&message, &mut reasons);
+    check_apparently_to(&message, &mut reasons);
     MailVerdict { reasons }
 }
 
 struct NormAddr {
+    /// Deny-file form: NFKC, ignorables removed, local part lowercased,
+    /// domain in IDNA ASCII.
     local: String,
     domain: String,
+    /// The mailbox as written, before that folding. `From` is compared
+    /// in this form.
+    raw_local: String,
+    raw_domain: String,
 }
 
 impl NormAddr {
@@ -299,12 +309,19 @@ fn check_from(message: &Message, identity: &NormAddr, reasons: &mut Vec<MailReas
     }
     let mut encoded = false;
     let mut unparsed = false;
+    let mut grouped = false;
     let mut not_identity = false;
     for header in froms {
         match read_mailboxes(header) {
             Parsed::EncodedWord => encoded = true,
             Parsed::Unparsed => unparsed = true,
             Parsed::Mailboxes(list) => {
+                // A group is not a From, even when its only mailbox is
+                // the identity. Receivers do not agree on the syntax.
+                match mail::contains_group(&header.raw) {
+                    Ok(true) | Err(_) => grouped = true,
+                    Ok(false) => {}
+                }
                 if list.len() != 1 || !same(&list[0], identity) {
                     not_identity = true;
                 }
@@ -316,6 +333,9 @@ fn check_from(message: &Message, identity: &NormAddr, reasons: &mut Vec<MailReas
     }
     if unparsed {
         reasons.push(reason("from-unparsed", "From"));
+    }
+    if grouped {
+        reasons.push(reason("from-group", "From"));
     }
     if not_identity {
         reasons.push(reason("from-not-identity", "From"));
@@ -337,6 +357,21 @@ fn check_identity_headers(message: &Message, config: &Config, reasons: &mut Vec<
             "return-receipt-to",
             "return-receipt-to-unparsed",
             "return-receipt-to-denied",
+        ),
+        (
+            "delivery-receipt-to",
+            "delivery-receipt-to-unparsed",
+            "delivery-receipt-to-denied",
+        ),
+        (
+            "mail-followup-to",
+            "mail-followup-to-unparsed",
+            "mail-followup-to-denied",
+        ),
+        (
+            "mail-reply-to",
+            "mail-reply-to-unparsed",
+            "mail-reply-to-denied",
         ),
     ] {
         check_named(
@@ -372,7 +407,7 @@ fn check_named(
                     if let Some(shown) = mixed_script_domain(&addr.domain) {
                         hits.push((true, format!("{name} {shown}")));
                     }
-                    if addresses.contains(&addr.key()) || domain_denied(&addr.domain, domains) {
+                    if address_denied(&addr, addresses) || domain_denied(&addr.domain, domains) {
                         hits.push((false, addr.key()));
                     }
                 }
@@ -404,6 +439,16 @@ fn check_resent(message: &Message, reasons: &mut Vec<MailReason>) {
     }
 }
 
+/// Sendmail `-t` delivers to `Apparently-To`. The header is a refusal
+/// on its own, whatever address it names.
+fn check_apparently_to(message: &Message, reasons: &mut Vec<MailReason>) {
+    for header in &message.headers {
+        if header.name == "apparently-to" {
+            reasons.push(reason("apparently-to", header.name.as_str()));
+        }
+    }
+}
+
 fn check_recipients(message: &Message, config: &Config, reasons: &mut Vec<MailReason>) {
     for name in ["to", "cc", "bcc"] {
         for header in message.headers.iter().filter(|h| h.name == name) {
@@ -414,6 +459,12 @@ fn check_recipients(message: &Message, config: &Config, reasons: &mut Vec<MailRe
                     for addr in list {
                         if let Some(shown) = mixed_script_domain(&addr.domain) {
                             reasons.push(reason("mixed-script", format!("{name} {shown}")));
+                        }
+                        if address_denied(&addr, &config.deny_addresses) {
+                            reasons.push(reason(
+                                "recipient-address-denied",
+                                format!("{name} {}", addr.key()),
+                            ));
                         }
                         if domain_denied(&addr.domain, &config.deny_domains)
                             || domain_denied(&addr.domain, &config.pack_domains)
@@ -457,8 +508,39 @@ fn read_mailboxes(header: &Header) -> Parsed {
     }
 }
 
+/// `From` equals the identity after ASCII case folding only. A local
+/// part or domain that NFKC or ignorable-stripping would change is a
+/// different mailbox on the wire, so it does not match.
 fn same(addr: &NormAddr, identity: &NormAddr) -> bool {
-    addr.local == identity.local && addr.domain == identity.domain
+    if wire_rewritten(&addr.raw_local) || wire_rewritten(&addr.raw_domain) {
+        return false;
+    }
+    addr.raw_local.eq_ignore_ascii_case(&identity.raw_local)
+        && addr.raw_domain.eq_ignore_ascii_case(&identity.raw_domain)
+}
+
+fn wire_rewritten(raw: &str) -> bool {
+    let stripped: String = raw.chars().filter(|c| !is_ignorable(*c)).collect();
+    if stripped != raw {
+        return true;
+    }
+    let folded: String = raw.nfkc().collect();
+    folded != raw
+}
+
+/// An `address` rule names that mailbox and a `local+tag` subaddress
+/// of it. Providers deliver the tag to the mailbox.
+fn address_denied(addr: &NormAddr, addresses: &BTreeSet<String>) -> bool {
+    if addresses.contains(&addr.key()) {
+        return true;
+    }
+    let Some((base, _)) = addr.local.split_once('+') else {
+        return false;
+    };
+    if base.is_empty() {
+        return false;
+    }
+    addresses.contains(&format!("{base}@{}", addr.domain))
 }
 
 fn domain_denied(domain: &str, denied: &BTreeSet<String>) -> bool {
@@ -470,7 +552,12 @@ fn domain_denied(domain: &str, denied: &BTreeSet<String>) -> bool {
 fn normalize_mailbox(mailbox: &Mailbox) -> Option<NormAddr> {
     let local = normalize_local(&mailbox.local)?;
     let domain = normalize_domain(&mailbox.domain)?;
-    Some(NormAddr { local, domain })
+    Some(NormAddr {
+        local,
+        domain,
+        raw_local: mailbox.local.clone(),
+        raw_domain: mailbox.domain.clone(),
+    })
 }
 
 fn normalize_local(raw: &str) -> Option<String> {
@@ -577,9 +664,9 @@ fn is_cyrillic_letter(c: char) -> bool {
         )
 }
 
-/// Characters a reader skips and a comparison must not treat as part of a
-/// different address. IDNA already rejects these in a domain; the local
-/// part has no such pass of its own.
+/// Characters a reader skips. A deny-file comparison removes them so
+/// they cannot hide an address. `From` does not: a mailbox these
+/// change is a different address on the wire and is refused.
 fn is_ignorable(c: char) -> bool {
     matches!(
         c,
@@ -721,6 +808,19 @@ From: =?utf-8?q?=28?= <other@evil.test> (=?utf-8?q?=29?= =?utf-8?q?=29?= mailsea
     }
 
     #[test]
+    fn a_group_in_from_is_refused() {
+        let raw = "From: G: mailseat@example.test;";
+        assert_eq!(codes(raw, "", ""), vec!["from-group"]);
+        let raw = "From: G: <mailseat@example.test>;\r\n";
+        assert_eq!(codes(raw, "", ""), vec!["from-group"]);
+        let raw = "From: G: other@example.test;\r\n";
+        assert_eq!(codes(raw, "", ""), vec!["from-group", "from-not-identity"]);
+        let raw = "From: \"G: H\" <mailseat@example.test>\r\n";
+        assert!(codes(raw, "", "").is_empty(), "{:?}", details(raw, "", ""));
+        assert!(codes(&plain("To: Friends: a@example.test;\r\n"), "", "").is_empty());
+    }
+
+    #[test]
     fn a_second_from_is_refused() {
         let same = "\
 From: mailseat@example.test\r\n\
@@ -735,12 +835,18 @@ From: other@example.test\r\n";
         );
     }
 
+    /// ASCII case is the same mailbox. A form NFKC or ignorable
+    /// stripping would change is a different mailbox on the wire.
     #[test]
-    fn from_case_and_fullwidth_local_still_match() {
+    fn from_matches_the_identity_in_ascii_case_only() {
         let raw = "From: MailSeat@Example.Test\r\n";
-        assert!(codes(raw, "", "").is_empty());
-        let raw = "From: \u{FF4D}\u{FF41}\u{FF49}\u{FF4C}\u{FF53}\u{FF45}\u{FF41}\u{FF54}@example.test\r\n";
         assert!(codes(raw, "", "").is_empty(), "{:?}", details(raw, "", ""));
+        let raw = "From: MAILSEAT@example.test\r\n";
+        assert!(codes(raw, "", "").is_empty(), "{:?}", details(raw, "", ""));
+        let raw = "From: \u{FF4D}\u{FF41}\u{FF49}\u{FF4C}\u{FF53}\u{FF45}\u{FF41}\u{FF54}@example.test\r\n";
+        assert_eq!(codes(raw, "", ""), vec!["from-not-identity"]);
+        let raw = "From: mail\u{200B}seat@example.test\r\n";
+        assert_eq!(codes(raw, "", ""), vec!["from-not-identity"]);
     }
 
     #[test]
@@ -812,6 +918,77 @@ From: other@example.test\r\n";
             codes(&raw, "domain xn--bcher-kva.test\n", ""),
             vec!["recipient-domain-denied"]
         );
+    }
+
+    #[test]
+    fn percent_hack_and_bang_path_locals_are_refused() {
+        let deny = "address evil@example.test\ndomain blocked.test\n";
+        let law = "deny-domain packblocked.test\n";
+        let percent = "From: mailseat@example.test\r\nTo: a%blocked.test@localhost\r\n\r\n";
+        assert_eq!(codes(percent, deny, law), vec!["recipient-unparsed"]);
+        let bang = "From: mailseat@example.test\r\nTo: blocked.test!a@localhost\r\n\r\n";
+        assert_eq!(codes(bang, deny, law), vec!["recipient-unparsed"]);
+        assert_eq!(
+            codes(&plain("Cc: a%blocked.test@localhost\r\n"), deny, law),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("Reply-To: a!b@example.test\r\n"), deny, law),
+            vec!["reply-to-unparsed"]
+        );
+        // A quoted local part holds the characters literally. It is not
+        // the unquoted form Postfix rewrites.
+        assert!(codes(&plain("To: \"a%blocked.test\"@example.test\r\n"), deny, law).is_empty());
+        assert!(codes(&plain("To: \"blocked.test!a\"@example.test\r\n"), deny, law).is_empty());
+    }
+
+    #[test]
+    fn a_source_route_is_refused() {
+        let deny = "address evil@example.test\ndomain blocked.test\n";
+        let law = "deny-domain packblocked.test\n";
+        let raw = "From: mailseat@example.test\r\nTo: <@blocked.test:a@ok.test>\r\n\r\n";
+        assert_eq!(codes(raw, deny, law), vec!["recipient-unparsed"]);
+        assert_eq!(
+            codes(
+                &plain("Cc: <@relay.example.test:person@ok.test>\r\n"),
+                deny,
+                law
+            ),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("Reply-To: <@blocked.test:a@ok.test>\r\n"), deny, law),
+            vec!["reply-to-unparsed"]
+        );
+        assert_eq!(
+            codes("From: <@example.test:mailseat@example.test>\r\n", "", ""),
+            vec!["from-unparsed"]
+        );
+    }
+
+    #[test]
+    fn an_all_numeric_domain_is_refused() {
+        let raw = "From: mailseat@example.test\r\nTo: a@192.0.2.1\r\n\r\n";
+        assert_eq!(codes(raw, "", ""), vec!["recipient-unparsed"]);
+        assert_eq!(
+            codes(&plain("Cc: a@192.0.2\r\n"), "", ""),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("Bcc: a@192.000.002.001\r\n"), "", ""),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("To: a@10.0.0.1.2\r\n"), "", ""),
+            vec!["recipient-unparsed"]
+        );
+        let full = "\u{FF11}\u{FF19}\u{FF12}.\u{FF10}.\u{FF12}.\u{FF11}";
+        assert_eq!(
+            codes(&plain(&format!("To: a@{full}\r\n")), "", ""),
+            vec!["recipient-unparsed"]
+        );
+        assert!(codes(&plain("To: a@mx1.example.test\r\n"), "", "").is_empty());
+        assert!(codes(&plain("To: a@192.0.2.example.test\r\n"), "", "").is_empty());
     }
 
     #[test]
@@ -903,6 +1080,47 @@ pair left right
         assert_eq!(codes(&both, "", ""), vec!["resent-header", "resent-header"]);
     }
 
+    /// Sendmail `-t` treats Apparently-To as a recipient, and a MUA
+    /// follows Mail-Followup-To and Mail-Reply-To. Apparently-To is a
+    /// refusal on its own. The other three are deny-file identities,
+    /// the same way Reply-To is.
+    #[test]
+    fn headers_outside_to_cc_bcc_cannot_name_a_denied_mailbox() {
+        let deny = "address evil@example.test\ndomain blocked.test\n";
+        let law = "deny-domain packblocked.test\n";
+        let apparent = "From: mailseat@example.test\r\nApparently-To: a@blocked.test\r\n\r\n";
+        assert_eq!(codes(apparent, deny, law), vec!["apparently-to"]);
+        let apparent_self =
+            "From: mailseat@example.test\r\nApparently-To: mailseat@example.test\r\n\r\n";
+        assert_eq!(codes(apparent_self, deny, law), vec!["apparently-to"]);
+        let receipt =
+            "From: mailseat@example.test\r\nDelivery-Receipt-To: evil@example.test\r\n\r\n";
+        assert_eq!(
+            codes(receipt, deny, law),
+            vec!["delivery-receipt-to-denied"]
+        );
+        let followup = "From: mailseat@example.test\r\nMail-Followup-To: evil@example.test\r\n\r\n";
+        assert_eq!(codes(followup, deny, law), vec!["mail-followup-to-denied"]);
+        let reply = "From: mailseat@example.test\r\nMail-Reply-To: evil@example.test\r\n\r\n";
+        assert_eq!(codes(reply, deny, law), vec!["mail-reply-to-denied"]);
+        let domain = "From: mailseat@example.test\r\nDelivery-Receipt-To: a@blocked.test\r\n\r\n";
+        assert_eq!(codes(domain, deny, law), vec!["delivery-receipt-to-denied"]);
+        assert!(codes(
+            "From: mailseat@example.test\r\nMail-Reply-To: mailseat@example.test\r\n\r\n",
+            deny,
+            law
+        )
+        .is_empty());
+        assert_eq!(
+            codes(
+                "From: mailseat@example.test\r\nMail-Followup-To: not-an-address\r\n\r\n",
+                "",
+                ""
+            ),
+            vec!["mail-followup-to-unparsed"]
+        );
+    }
+
     #[test]
     fn notification_headers_stay_clear_of_deny_identities() {
         let deny = "address evil@example.test\ndomain blocked.test\n";
@@ -940,14 +1158,52 @@ pair left right
         );
     }
 
+    /// The address is that mailbox in To, Cc and Bcc. A different
+    /// mailbox at the same domain is not this rule.
     #[test]
-    fn an_address_rule_is_not_a_recipient_domain_rule() {
+    fn an_address_rule_blocks_that_recipient() {
+        let deny = "address evil@example.test\n";
+        let raw = "From: mailseat@example.test\r\nTo: evil@example.test\r\n\r\n";
+        assert_eq!(codes(raw, deny, ""), vec!["recipient-address-denied"]);
+        assert_eq!(details(raw, deny, ""), vec!["to evil@example.test"]);
+        assert_eq!(
+            codes(&plain("Cc: evil@example.test\r\n"), deny, ""),
+            vec!["recipient-address-denied"]
+        );
+        assert_eq!(
+            codes(&plain("Bcc: Evil@Example.test\r\n"), deny, ""),
+            vec!["recipient-address-denied"]
+        );
+        assert!(codes(&plain("To: person@example.test\r\n"), deny, "").is_empty());
         let deny = "address other@blocked.test\n";
         assert!(codes(&plain("To: person@blocked.test\r\n"), deny, "").is_empty());
+        assert_eq!(
+            codes(&plain("To: other@blocked.test\r\n"), deny, ""),
+            vec!["recipient-address-denied"]
+        );
         assert_eq!(
             codes(&plain("Reply-To: Other@Blocked.test\r\n"), deny, ""),
             vec!["reply-to-denied"]
         );
+    }
+
+    /// `local+tag` is delivered to `local` at most providers. The
+    /// address rule covers that subaddress.
+    #[test]
+    fn an_address_rule_covers_a_subaddress() {
+        let deny = "address evil@example.test\n";
+        let raw = "From: mailseat@example.test\r\nReply-To: evil+x@example.test\r\n\r\n";
+        assert_eq!(codes(raw, deny, ""), vec!["reply-to-denied"]);
+        assert_eq!(
+            codes(&plain("To: evil+x@example.test\r\n"), deny, ""),
+            vec!["recipient-address-denied"]
+        );
+        assert_eq!(
+            codes(&plain("Bcc: Evil+Tag@Example.test\r\n"), deny, ""),
+            vec!["recipient-address-denied"]
+        );
+        assert!(codes(&plain("Reply-To: evilx@example.test\r\n"), deny, "").is_empty());
+        assert!(codes(&plain("To: notevil+x@example.test\r\n"), deny, "").is_empty());
     }
 
     #[test]
@@ -997,6 +1253,28 @@ pair left right
     }
 
     #[test]
+    fn a_header_line_over_998_octets_is_refused() {
+        let deny = "domain blocked.test\n";
+        let mut line = String::from("Subject: ");
+        while line.len() < 998 {
+            line.push('a');
+        }
+        line.push_str("Bcc: a@blocked.test");
+        let raw = format!("From: mailseat@example.test\r\n{line}\r\n\r\n");
+        assert_eq!(codes(&raw, deny, ""), vec!["header-line-too-long"]);
+        let mut ok = String::from("Subject: ");
+        while ok.len() < 998 {
+            ok.push('b');
+        }
+        let raw = format!("From: mailseat@example.test\r\n{ok}\r\n\r\n");
+        assert!(
+            codes(&raw, deny, "").is_empty(),
+            "{:?}",
+            details(&raw, deny, "")
+        );
+    }
+
+    #[test]
     fn mixed_header_line_endings_are_refused() {
         let hidden = "From: mailseat@example.test\n\nBcc: a@blocked.test\r\n\r\n";
         assert_eq!(
@@ -1011,6 +1289,19 @@ pair left right
         assert!(codes(crlf_then_body, "", "").is_empty());
         assert!(codes("From: mailseat@example.test\r\n", "", "").is_empty());
         assert!(codes("From: mailseat@example.test\n", "", "").is_empty());
+    }
+
+    #[test]
+    fn unicode_line_separators_in_the_header_are_refused() {
+        let deny = "domain blocked.test\n";
+        let raw = "From: mailseat@example.test\r\nSubject: x\u{0085}Bcc: a@blocked.test\r\n\r\n";
+        assert_eq!(codes(raw, deny, ""), vec!["header-control"]);
+        let raw = "From: mailseat@example.test\r\nSubject: x\u{2028}Bcc: a@blocked.test\r\n\r\n";
+        assert_eq!(codes(raw, deny, ""), vec!["header-control"]);
+        let raw = "From: mailseat@example.test\r\nSubject: x\u{2029}Bcc: a@blocked.test\r\n\r\n";
+        assert_eq!(codes(raw, deny, ""), vec!["header-control"]);
+        let raw = "From: mailseat@example.test\r\n\r\nx\u{0085}y\r\n";
+        assert!(codes(raw, "", "").is_empty(), "{:?}", details(raw, "", ""));
     }
 
     #[test]

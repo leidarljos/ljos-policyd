@@ -1,0 +1,1 @@
+A group in From was accepted when its mailbox was the identity. RFC 5322 does not allow a group there, and receivers parse the syntax differently. A group in From is a refusal. A group in a recipient header still contributes its mailboxes.

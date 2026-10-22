@@ -1,0 +1,1 @@
+Sendmail -t delivers to Apparently-To, and a MUA follows Delivery-Receipt-To, Mail-Followup-To and Mail-Reply-To. Apparently-To is a refusal on its own. The other three are deny-file identities, the same way Reply-To is.
