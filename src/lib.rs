@@ -122,12 +122,25 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
     if let Some(c) = denied {
         return c;
     }
-    if let Some(path) = files.borrow().written_then_run() {
-        return Checked {
-            decision: Decision::Deny,
-            code: PolicyReason::ShellDangerousRunner,
-            token: Cow::Owned(format!("script-written-on-line: {path}")),
-        };
+    let texts = match files.borrow().written_then_run() {
+        Ok(texts) => texts,
+        Err(path) => {
+            return Checked {
+                decision: Decision::Deny,
+                code: PolicyReason::ShellDangerousRunner,
+                token: Cow::Owned(format!("script-written-on-line: {path}")),
+            }
+        }
+    };
+    for (path, text) in texts {
+        let c = check_shell_in(&["sh".into(), "-c".into(), text], cwd, depth + 1);
+        if c.decision != Decision::Allow {
+            return Checked {
+                decision: c.decision,
+                code: c.code,
+                token: Cow::Owned(format!("script-written-on-line: {path}: {}", c.token)),
+            };
+        }
     }
     for (run, dir, stdin) in runs {
         if is_untracked(&dir) && scripts::runner(&run) {
@@ -221,6 +234,12 @@ type FnMap = std::collections::HashMap<String, FnBody>;
 #[derive(Default)]
 struct LineFiles {
     cmd: Vec<usize>,
+    /// Each command's here-document text, so a pass that walks the
+    /// command again on its own, under it, still has it.
+    heredocs: Vec<(Vec<usize>, Vec<String>, String)>,
+    /// Set while a line of a here-document that runs nothing is walked
+    /// again on its own.
+    data: bool,
     written: Vec<Written>,
     ran: Vec<(Option<std::path::PathBuf>, Vec<usize>, Ran)>,
 }
@@ -232,6 +251,8 @@ struct Written {
     path: Option<std::path::PathBuf>,
     id: Vec<usize>,
     loose: bool,
+    /// What the write leaves in the file, when the line spells it out.
+    text: Option<String>,
 }
 
 /// How a file is run: by a shell (a script operand, `source`, a startup
@@ -250,7 +271,8 @@ impl LineFiles {
     /// Take what the command `owned` writes and runs. Its redirections
     /// land where the shell is, `here`; what `run` writes or runs lands
     /// where it runs, `at`. A `walked` command, a function the walk
-    /// reads, writes only what its own commands do.
+    /// reads, writes only what its own commands do. `heredoc` is the
+    /// text of its here-document, where that is literal.
     #[allow(clippy::too_many_arguments)]
     fn note(
         &mut self,
@@ -261,10 +283,28 @@ impl LineFiles {
         home: Option<&str>,
         id: &[usize],
         walked: bool,
+        heredoc: Option<&str>,
     ) {
         self.cmd = id.to_vec();
+        let heredoc = match heredoc {
+            Some(t) => {
+                self.heredocs
+                    .push((id.to_vec(), owned.to_vec(), t.to_string()));
+                Some(t.to_string())
+            }
+            None => self
+                .heredocs
+                .iter()
+                .find(|(at, words, _)| id.starts_with(at) && id != at && words == owned)
+                .map(|(_, _, t)| t.clone()),
+        };
+        let from = self.written.len();
         for w in redirection_targets(owned) {
             self.wrote(w, here, home, false);
+        }
+        let text = written_text(owned, heredoc.as_deref());
+        for w in &mut self.written[from..] {
+            w.text.clone_from(&text);
         }
         let is_dir = |w: &str| {
             placed(w, at, home)
@@ -275,7 +315,7 @@ impl LineFiles {
         for w in program_writes(run, &is_dir) {
             self.wrote(&w, at, home, false);
         }
-        if !walked && may_write_anywhere(run, at, home) {
+        if !walked && !self.data && may_write_anywhere(run, at, home) {
             self.wrote(".", at, home, true);
         }
         let run = peeled(run);
@@ -321,6 +361,7 @@ impl LineFiles {
                 path,
                 id: self.cmd.clone(),
                 loose,
+                text: None,
             });
         }
     }
@@ -349,23 +390,40 @@ impl LineFiles {
     /// to the file while the shell reads it. A loose write counts only
     /// for a script a shell runs from a path the line shows, and not
     /// for one its own command runs.
-    fn written_then_run(&self) -> Option<String> {
-        self.ran.iter().find_map(|(r, rid, how)| {
-            self.written
+    fn written_then_run(&self) -> Result<Vec<(String, String)>, String> {
+        let mut texts = Vec::new();
+        for (r, rid, how) in &self.ran {
+            let shown = |p: &Option<std::path::PathBuf>| {
+                p.as_ref().map_or_else(
+                    || "a script the line does not show".into(),
+                    |p| p.display().to_string(),
+                )
+            };
+            let mut hits = self
+                .written
                 .iter()
                 .filter(|w| &w.id <= rid && !(w.loose && rid.starts_with(&w.id)))
                 .filter(|w| !w.loose || (*how == Ran::Shell && r.is_some()))
-                .find(|w| match (r, &w.path) {
+                .filter(|w| match (r, &w.path) {
                     (Some(r), Some(w)) => r.starts_with(w),
                     _ => true,
                 })
-                .map(|_| {
-                    r.as_ref().map_or_else(
-                        || "a script the line does not show".into(),
-                        |p| p.display().to_string(),
-                    )
-                })
-        })
+                .peekable();
+            if hits.peek().is_none() {
+                continue;
+            }
+            // A shell script whose every write the line spells out is
+            // judged on that text instead.
+            for w in hits {
+                match &w.text {
+                    Some(t) if *how == Ran::Shell && r.is_some() && w.path == *r => {
+                        texts.push((shown(r), t.clone()))
+                    }
+                    _ => return Err(shown(r)),
+                }
+            }
+        }
+        Ok(texts)
     }
 }
 
@@ -795,7 +853,8 @@ fn walk(
     // anywhere in it counts as made before the loop.
     let mut loops = Vec::new();
     let mut spans = Vec::new();
-    for (cmd, end) in ended_commands(&argv) {
+    let (heredocs, data) = heredoc_bodies(&ended_commands(&argv));
+    for (ci, (cmd, end)) in ended_commands(&argv).into_iter().enumerate() {
         shell.aliases.extend(alias_defs(&cmd));
         if after == "&" {
             shell.restore(list.clone());
@@ -887,7 +946,7 @@ fn walk(
             .borrow_mut()
             .lower(mark.., &[base.as_slice(), &[seq - 1]].concat());
         // After the substitutions, which run before the command does.
-        let walked = called_fn(&cmd, &shell.funcs).is_some();
+        let walked = data[ci] || called_fn(&cmd, &shell.funcs).is_some();
         shell.files.borrow_mut().note(
             &owned,
             &run,
@@ -896,6 +955,7 @@ fn walk(
             shell.vars.home.as_deref(),
             &id,
             walked,
+            heredocs[ci].as_deref(),
         );
         if cmd.first() == Some(&"done") {
             if let Some(start) = loops.pop().filter(|_| loops.is_empty()) {
@@ -1242,8 +1302,10 @@ fn walk(
             let Some((dirs, oldpwd, set, id)) = ran_in.get(i) else {
                 continue;
             };
+            let was = shell.files.borrow().data;
             for dir in dirs {
                 shell.files.borrow_mut().cmd.clone_from(id);
+                shell.files.borrow_mut().data = was || data.get(i).copied().unwrap_or(false);
                 let inn = ShellIn {
                     cwd: dir,
                     oldpwd,
@@ -1254,6 +1316,7 @@ fn walk(
                     files: &shell.files,
                 };
                 runner_commands(&inner, &inn, depth + 1, out, denied);
+                shell.files.borrow_mut().data = was;
                 if denied.is_some() {
                     return;
                 }
@@ -1262,6 +1325,96 @@ fn walk(
     }
     shell.files.borrow_mut().cmd.clone_from(&base);
     shell.files.borrow_mut().lower_loops(&base, &spans);
+}
+
+/// What a command leaves in the file its one output redirection
+/// truncates, where the line spells it out: the text of an `echo` or
+/// `printf` with literal words, or of a `cat` from a here-document whose
+/// every word is literal.
+fn written_text(owned: &[String], heredoc: Option<&str>) -> Option<String> {
+    let mut words = Vec::new();
+    let mut outputs = 0;
+    let mut i = 0;
+    while i < owned.len() {
+        let w = owned[i].as_str();
+        if let Some((_, ate)) = output_target(w, owned.get(i + 1).map(String::as_str)) {
+            let op = redirection_body(w);
+            if op.starts_with(">>") || !matches!(w.as_bytes()[0], b'>' | b'&' | b'1') {
+                return None;
+            }
+            outputs += 1;
+            i += usize::from(ate);
+        } else if w.starts_with("<<") && !w.starts_with("<<<") && heredoc.is_some() {
+        } else if is_redirection(w) {
+            return None;
+        } else {
+            words.push(owned[i].clone());
+        }
+        i += 1;
+    }
+    if outputs != 1 {
+        return None;
+    }
+    match words.split_first()? {
+        (h, rest) if h == "echo" => echo_text(rest),
+        (h, rest) if h == "printf" => printf_text(rest),
+        (h, []) if h == "cat" => heredoc.map(str::to_string),
+        _ => None,
+    }
+}
+
+/// The text of each command's here-document, when every word of it is
+/// literal: the commands after it, up to the one that is its delimiter.
+/// With it, which commands are lines of a here-document something other
+/// than a shell reads, which are data and run nothing.
+fn heredoc_bodies(cmds: &[(Vec<&str>, &str)]) -> (Vec<Option<String>>, Vec<bool>) {
+    let quote = |w: &&str| {
+        if w.contains(|c: char| c.is_whitespace() || ";&|<>()\"#".contains(c)) {
+            format!("'{w}'")
+        } else {
+            (*w).to_string()
+        }
+    };
+    let mut texts = vec![None; cmds.len()];
+    let mut data = vec![false; cmds.len()];
+    for (i, (cmd, _)) in cmds.iter().enumerate() {
+        let Some(delim) = cmd
+            .iter()
+            .find_map(|w| w.strip_prefix("<<").filter(|d| !d.starts_with('<')))
+        else {
+            continue;
+        };
+        let delim = delim.trim_start_matches('-');
+        let Some(len) = cmds[i + 1..]
+            .iter()
+            .position(|(c, _)| c.as_slice() == [delim])
+        else {
+            continue;
+        };
+        let body = &cmds[i + 1..i + 1 + len];
+        let to_shell = cmd
+            .iter()
+            .find(|w| !is_assignment(w))
+            .is_some_and(|w| SHELLS.contains(&base_of(w)));
+        for d in &mut data[i + 1..=i + 1 + len] {
+            *d |= !to_shell;
+        }
+        if body
+            .iter()
+            .flat_map(|(c, _)| c)
+            .any(|w| !literal_text(w) || w.contains(['\'', '\\']))
+        {
+            continue;
+        }
+        let mut text = String::new();
+        for (c, end) in body {
+            let line: Vec<String> = c.iter().map(quote).collect();
+            text.push_str(&line.join(" "));
+            text.push_str(if matches!(*end, ";" | "") { "\n" } else { end });
+        }
+        texts[i] = Some(text);
+    }
+    (texts, data)
 }
 
 /// Whether `cmd` opens a loop: `for`, `while`, `until` or `select`, past
@@ -11604,7 +11757,8 @@ hash -r 2> /dev/null
         }
         let c = at("echo 'git push -f' > x.sh; source x.sh");
         assert!(
-            c.token.starts_with("script-written-on-line: ") && c.token.ends_with("x.sh"),
+            c.token.starts_with("script-written-on-line: ")
+                && c.token.ends_with("x.sh: git-force-push"),
             "{}",
             c.token
         );
@@ -12428,6 +12582,45 @@ hash -r 2> /dev/null
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+    }
+
+    #[test]
+    fn a_script_the_line_spells_out_is_judged_on_its_text() {
+        let root = startup_root("spelled");
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "echo 'echo ok' > build/run.sh && sh build/run.sh",
+            "printf 'echo %s\\n' ok > build/run.sh; bash build/run.sh",
+            "cat > build/run.sh <<'EOF'\necho ok\nls -la\nEOF\nsh build/run.sh",
+            "echo 'make test' > run.sh && . ./run.sh",
+            "cat > notes.txt <<EOF\nhello world\nEOF\necho 'echo ok' > run.sh; sh run.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for line in [
+            "echo 'git push -f origin' > build/run.sh && sh build/run.sh",
+            "echo \"$CMD\" > build/run.sh && sh build/run.sh",
+            "echo 'echo ok' >> build/run.sh && sh build/run.sh",
+            "echo 'echo ok' > build/run.sh; cp evil/force.sh build/run.sh; sh build/run.sh",
+            "echo 'echo ok' > build/run.sh; tar xf a.tar; sh build/run.sh",
+            "echo 'import os' > build/run.py; python3 build/run.py",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(
+                c.token.starts_with("script-written-on-line: "),
+                "{line}: {}",
+                c.token
+            );
+        }
+        for line in [
+            "cat > build/run.sh <<'EOF'\necho ok\nrm -rf ~\nEOF\nsh build/run.sh",
+            "cat > build/run.sh <<EOF\n$CMD\nEOF\nsh build/run.sh",
+        ] {
+            assert_eq!(at(line).decision, Decision::Deny, "{line}");
         }
     }
 }
