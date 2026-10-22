@@ -4682,6 +4682,39 @@ mod tests {
         }
     }
 
+    /// A word that only names `HOME` or `CDPATH`, as a pattern, a message,
+    /// a read or a child's environment, leaves the one the line set alone;
+    /// a command that writes it in this shell does not.
+    #[test]
+    fn only_a_write_in_this_shell_loses_home_or_cdpath() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "HOME={dir}; grep HOME notes; cd ~ && make test",
+            "HOME={dir}; git commit -m 'set HOME'; cd ~ && make test",
+            "HOME={dir}; printenv HOME; cd ~ && make test",
+            "HOME={dir}; echo ${#HOME}; cd ~ && make test",
+            "HOME={dir}; docker run -e HOME=/root img; cd ~ && make test",
+            "HOME={dir}; env HOME=/x true; cd ~ && make test",
+            "unset CDPATH; grep CDPATH notes; cd project && make test",
+            "unset CDPATH; git commit -m CDPATH=x; cd project && make test",
+        ] {
+            let c = entering("home-named", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+        for line in [
+            "HOME={dir}; read -r HOME; cd ~ && make test",
+            "HOME={dir}; printf -v HOME %s x; cd ~ && make test",
+            "HOME={dir}; mapfile HOME < f; cd ~ && make test",
+            "HOME={dir}; declare -n HOME=x; cd ~ && make test",
+            "HOME={dir}; echo ${HOME:=x}; cd ~ && make test",
+            "HOME={dir}; for HOME in a; do cd ~ && make test; done",
+            "unset CDPATH; read CDPATH; cd project && make test",
+        ] {
+            let c = entering("home-named", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+    }
+
     /// `command`, `command -p` and `builtin` do not hide `cd`.
     #[test]
     fn follows_a_cd_behind_command_or_builtin() {
