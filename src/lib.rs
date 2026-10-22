@@ -1372,7 +1372,16 @@ fn walk(
                 .iter()
                 .any(|(r, d, s)| *r == run && d == dir && *s == stdin)
             {
-                out.push((run.clone(), dir.clone(), stdin));
+                let mut recorded = Vec::new();
+                for w in wrappers {
+                    if w.split_once('=')
+                        .is_some_and(|(k, _)| matches!(k, "MAKEFLAGS" | "MFLAGS" | "GNUMAKEFLAGS"))
+                    {
+                        recorded.push(w.clone());
+                    }
+                }
+                recorded.extend(run.iter().cloned());
+                out.push((recorded, dir.clone(), stdin));
             }
         }
     }
@@ -8627,6 +8636,28 @@ mod tests {
         let c = check_shell_in(&["make".into(), "all".into()], &d, 0);
         assert_eq!(c.decision, Decision::Deny, "{}", c.token);
         assert!(c.token.contains("makefile-include-unread"), "{}", c.token);
+    }
+
+    /// `MAKEFLAGS=--file=evil.mk make` reads evil.mk, including when the
+    /// assignment is in front of `make` or handed to it by `env`.
+    #[test]
+    fn make_flags_on_the_line_choose_the_makefile() {
+        let d = std::env::temp_dir().join(format!("policyd-lib-{}-mflags", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("Makefile"), "clean-all:\n\techo main\n").unwrap();
+        std::fs::write(d.join("evil.mk"), "clean-all:\n\trm -rf ~\n").unwrap();
+        for line in [
+            "MAKEFLAGS=--file=evil.mk make clean-all",
+            "env MAKEFLAGS=--file=evil.mk make clean-all",
+            "make MAKEFLAGS=--file=evil.mk clean-all",
+        ] {
+            let c = check_shell_in(&shell_words(line), &d, 0);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("rm-rf-outside-tmp"), "{line}: {}", c.token);
+        }
+        let c = check_shell_in(&shell_words("make clean-all"), &d, 0);
+        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
     }
 
     #[test]

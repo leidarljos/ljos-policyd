@@ -30,13 +30,20 @@ pub(crate) enum Recipes {
 /// reads or its file is missing. An included makefile that cannot be
 /// read is [`Recipes::Closed`].
 pub(crate) fn resolved(run: &[String], cwd: &Path) -> Recipes {
+    resolved_with(run, cwd, &[])
+}
+
+/// [`resolved`], with `env` supplying `MAKEFLAGS`, `MFLAGS` and
+/// `GNUMAKEFLAGS` in place of the process environment for those names.
+fn resolved_with(run: &[String], cwd: &Path, env: &[(&str, &str)]) -> Recipes {
+    let (assigned, run) = split_make_assignments(run);
     let Some(first) = run.first() else {
         return Recipes::Lines(Vec::new());
     };
     let base = first.rsplit('/').next().unwrap_or(first);
     let rest = &run[1..];
     match base {
-        "make" | "gmake" => make(rest, cwd),
+        "make" | "gmake" => make(rest, cwd, &assigned, env),
         "npm" => Recipes::Lines(node("npm", rest, cwd)),
         "pnpm" => Recipes::Lines(node("pnpm", rest, cwd)),
         "yarn" => Recipes::Lines(node("yarn", rest, cwd)),
@@ -53,6 +60,7 @@ pub(crate) fn resolved(run: &[String], cwd: &Path) -> Recipes {
 /// Whether `run` names one of the runners [`resolved`] reads a file for,
 /// whatever its target.
 pub(crate) fn runner(run: &[String]) -> bool {
+    let (_, run) = split_make_assignments(run);
     let Some(first) = run.first() else {
         return false;
     };
@@ -120,53 +128,343 @@ struct Makefile {
     default: Option<String>,
 }
 
-fn make(args: &[String], cwd: &Path) -> Recipes {
-    let mut dir = cwd.to_path_buf();
-    let mut file: Option<PathBuf> = None;
-    let mut targets = Vec::new();
-    let mut overrides = HashMap::new();
-    let mut i = 0;
-    while i < args.len() {
-        let a = args[i].as_str();
-        let value = |i: &mut usize, short: &str, long: &str| -> Option<String> {
-            if a == short || a == long {
-                *i += 1;
-                return args.get(*i).cloned();
+const MAKE_FLAG_TOKEN: &str = "make-flags-unshown";
+
+struct MakeCmd {
+    dir: PathBuf,
+    files: Vec<PathBuf>,
+    includes: Vec<PathBuf>,
+    targets: Vec<String>,
+    overrides: HashMap<String, String>,
+}
+
+fn is_make_flag_name(name: &str) -> bool {
+    matches!(name, "MAKEFLAGS" | "MFLAGS" | "GNUMAKEFLAGS")
+}
+
+/// Leading `MAKEFLAGS=...` words a shell put in front of the runner.
+fn split_make_assignments(run: &[String]) -> (Vec<&str>, &[String]) {
+    let n = run
+        .iter()
+        .take_while(|w| w.split_once('=').is_some_and(|(k, _)| is_make_flag_name(k)))
+        .count();
+    (run[..n].iter().map(String::as_str).collect(), &run[n..])
+}
+
+fn env_flag_value(name: &str, env: &[(&str, &str)]) -> Option<String> {
+    if let Some((_, value)) = env.iter().rev().find(|(k, _)| *k == name) {
+        return (!value.is_empty()).then(|| (*value).to_string());
+    }
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// The flag string make would read for `name`: the environment, then a
+/// shell assignment in front of the command, then `name=value` on the
+/// make command itself. The last one wins.
+fn effective_flag<'a>(
+    name: &str,
+    assigned: &'a [&str],
+    args: &'a [String],
+    env: &[(&str, &str)],
+) -> Option<String> {
+    let mut value = env_flag_value(name, env);
+    for word in assigned
+        .iter()
+        .copied()
+        .chain(args.iter().map(String::as_str))
+    {
+        if let Some((k, v)) = word.split_once('=') {
+            if !word.starts_with('-') && k == name {
+                value = (!v.is_empty()).then(|| v.to_string());
             }
-            if let Some(v) = a.strip_prefix(&format!("{long}=")) {
-                return Some(v.to_string());
-            }
-            a.strip_prefix(short)
-                .filter(|v| !v.is_empty())
-                .map(str::to_string)
-        };
-        if let Some(d) = value(&mut i, "-C", "--directory") {
-            dir = join_dir(&dir, &d);
-        } else if let Some(f) = value(&mut i, "-f", "--file") {
-            file = Some(join_dir(&dir, &f));
-        } else if a.starts_with('-') {
-        } else if let Some((k, v)) = a.split_once('=') {
-            overrides.insert(k.to_string(), v.to_string());
-        } else {
-            targets.push(a.to_string());
         }
+    }
+    value
+}
+
+fn apply_make_flag_vars(
+    state: &mut MakeCmd,
+    assigned: &[&str],
+    args: &[String],
+    env: &[(&str, &str)],
+) -> Result<(), &'static str> {
+    for name in ["GNUMAKEFLAGS", "MAKEFLAGS", "MFLAGS"] {
+        let Some(value) = effective_flag(name, assigned, args, env) else {
+            continue;
+        };
+        let words = split_flag_text(&value)?;
+        apply_make_words(&words, false, state)?;
+    }
+    Ok(())
+}
+
+/// `value` as make stores a flag string. A first word with no dash is
+/// single-letter options (`ks` is `-k -s`). A letter that takes an
+/// argument cannot sit in that word: there is no place for the argument.
+fn split_flag_text(value: &str) -> Result<Vec<String>, &'static str> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut quote = None;
+    for c in value.chars() {
+        if quote == Some(c) {
+            quote = None;
+            continue;
+        }
+        if quote.is_some() {
+            cur.push(c);
+            continue;
+        }
+        if c == '\'' || c == '"' {
+            quote = Some(c);
+            continue;
+        }
+        if c.is_whitespace() {
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        cur.push(c);
+    }
+    if quote.is_some() {
+        return Err(MAKE_FLAG_TOKEN);
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    let Some(first) = words.first() else {
+        return Ok(words);
+    };
+    if first.starts_with('-') {
+        return Ok(words);
+    }
+    if !first.chars().all(|c| c.is_ascii_alphanumeric())
+        || first.chars().any(|c| "CfIjoOWl".contains(c))
+    {
+        return Err(MAKE_FLAG_TOKEN);
+    }
+    let mut out: Vec<String> = first.chars().map(|c| format!("-{c}")).collect();
+    out.extend(words.into_iter().skip(1));
+    Ok(out)
+}
+
+fn apply_make_words(
+    words: &[String],
+    allow_targets: bool,
+    state: &mut MakeCmd,
+) -> Result<(), &'static str> {
+    let mut i = 0;
+    while i < words.len() {
+        let a = words[i].as_str();
+        if a == "--" {
+            if !allow_targets {
+                return Err(MAKE_FLAG_TOKEN);
+            }
+            state.targets.extend(words[i + 1..].iter().cloned());
+            return Ok(());
+        }
+        if let Some(rest) = a.strip_prefix("--") {
+            let (name, inline) = match rest.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (rest, None),
+            };
+            match long_option(name)? {
+                LongOpt::Flag => {
+                    if inline.is_some() {
+                        return Err(MAKE_FLAG_TOKEN);
+                    }
+                }
+                LongOpt::Reject => return Err(MAKE_FLAG_TOKEN),
+                LongOpt::Value => {
+                    let arg = if let Some(value) = inline {
+                        value.to_string()
+                    } else {
+                        i += 1;
+                        words.get(i).ok_or(MAKE_FLAG_TOKEN)?.clone()
+                    };
+                    apply_long(name, &arg, state);
+                }
+                LongOpt::Optional => {
+                    if let Some(value) = inline {
+                        let _ = value;
+                    } else if matches!(name, "jobs" | "load-average")
+                        && words
+                            .get(i + 1)
+                            .is_some_and(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_digit()))
+                    {
+                        i += 1;
+                    }
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(cluster) = a.strip_prefix('-').filter(|c| !c.is_empty()) {
+            if apply_short(cluster, words.get(i + 1).map(String::as_str), state)? {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if let Some((k, v)) = a.split_once('=') {
+            if !is_make_flag_name(k) {
+                state.overrides.insert(k.to_string(), v.to_string());
+            }
+            i += 1;
+            continue;
+        }
+        if !allow_targets {
+            return Err(MAKE_FLAG_TOKEN);
+        }
+        state.targets.push(a.to_string());
         i += 1;
     }
-    let Some(path) = file.or_else(|| first_file(&dir, &["GNUmakefile", "makefile", "Makefile"]))
-    else {
+    Ok(())
+}
+
+enum LongOpt {
+    Flag,
+    Value,
+    Optional,
+    Reject,
+}
+
+fn long_option(name: &str) -> Result<LongOpt, &'static str> {
+    Ok(match name {
+        "help"
+        | "version"
+        | "silent"
+        | "quiet"
+        | "keep-going"
+        | "stop"
+        | "no-keep-going"
+        | "ignore-errors"
+        | "just-print"
+        | "dry-run"
+        | "recon"
+        | "question"
+        | "touch"
+        | "always-make"
+        | "print-data-base"
+        | "warn-undefined-variables"
+        | "no-builtin-rules"
+        | "no-builtin-variables"
+        | "print-directory"
+        | "no-print-directory"
+        | "environment-overrides"
+        | "check-symlink-times" => LongOpt::Flag,
+        "file" | "makefile" | "directory" | "include-dir" | "assume-old" | "assume-new"
+        | "old-file" | "new-file" | "what-if" => LongOpt::Value,
+        "jobs" | "load-average" | "output-sync" | "debug" | "jobserver-auth" | "jobserver-fds" => {
+            LongOpt::Optional
+        }
+        "eval" => LongOpt::Reject,
+        _ => return Err(MAKE_FLAG_TOKEN),
+    })
+}
+
+fn apply_long(name: &str, arg: &str, state: &mut MakeCmd) {
+    match name {
+        "directory" => state.dir = join_dir(&state.dir, arg),
+        "file" | "makefile" => state.files.push(join_dir(&state.dir, arg)),
+        "include-dir" => state.includes.push(join_dir(&state.dir, arg)),
+        _ => {}
+    }
+}
+
+fn apply_short(
+    cluster: &str,
+    next: Option<&str>,
+    state: &mut MakeCmd,
+) -> Result<bool, &'static str> {
+    let chars: Vec<char> = cluster.chars().collect();
+    let mut n = 0;
+    let mut consumed = false;
+    while n < chars.len() {
+        let c = chars[n];
+        n += 1;
+        match c {
+            'b' | 'B' | 'd' | 'e' | 'h' | 'i' | 'k' | 'm' | 'n' | 'p' | 'q' | 'r' | 'R' | 's'
+            | 'S' | 't' | 'v' | 'w' => {}
+            'C' | 'f' | 'I' | 'o' | 'O' | 'W' => {
+                let arg = if n < chars.len() {
+                    chars[n..].iter().collect()
+                } else {
+                    consumed = true;
+                    next.ok_or(MAKE_FLAG_TOKEN)?.to_string()
+                };
+                match c {
+                    'C' => state.dir = join_dir(&state.dir, &arg),
+                    'f' => state.files.push(join_dir(&state.dir, &arg)),
+                    'I' => state.includes.push(join_dir(&state.dir, &arg)),
+                    _ => {}
+                }
+                break;
+            }
+            'j' | 'l' => {
+                if n < chars.len() {
+                    break;
+                }
+                if next.is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())) {
+                    consumed = true;
+                }
+            }
+            _ => return Err(MAKE_FLAG_TOKEN),
+        }
+    }
+    Ok(consumed)
+}
+
+fn make(args: &[String], cwd: &Path, assigned: &[&str], env: &[(&str, &str)]) -> Recipes {
+    let mut state = MakeCmd {
+        dir: cwd.to_path_buf(),
+        files: Vec::new(),
+        includes: Vec::new(),
+        targets: Vec::new(),
+        overrides: HashMap::new(),
+    };
+    if let Err(token) = apply_make_flag_vars(&mut state, assigned, args, env) {
+        return Recipes::Closed(token);
+    }
+    if let Err(token) = apply_make_words(args, true, &mut state) {
+        return Recipes::Closed(token);
+    }
+    let dir = state.dir;
+    let mut targets = state.targets;
+    let overrides = state.overrides;
+    let includes = state.includes;
+    let named = !state.files.is_empty();
+    let paths = if named {
+        state.files
+    } else {
+        first_file(&dir, &["GNUmakefile", "makefile", "Makefile"])
+            .into_iter()
+            .collect()
+    };
+    if paths.is_empty() {
         return Recipes::Lines(Vec::new());
-    };
-    // A missing top makefile is judged as written. An include that cannot
-    // be read is not: the recipes it would add are unknown.
-    let text = match read_make_text(&path) {
-        ReadMake::Text(t) => t,
-        ReadMake::Missing | ReadMake::Unreadable => return Recipes::Lines(Vec::new()),
-    };
-    let mut stack = vec![path];
-    let mf = match parse_makefile_in(&text, &dir, 0, &mut stack) {
-        Ok(mf) => mf,
-        Err(token) => return Recipes::Closed(token),
-    };
+    }
+    let mut mf = Makefile::default();
+    let mut stack = Vec::new();
+    for path in &paths {
+        let text = match read_make_text(path) {
+            ReadMake::Text(t) => t,
+            // No makefile where make looks by default: the line is judged
+            // as written. A file `-f` named and cannot be read is not.
+            ReadMake::Missing | ReadMake::Unreadable if !named => {
+                return Recipes::Lines(Vec::new());
+            }
+            ReadMake::Missing | ReadMake::Unreadable => {
+                return Recipes::Closed("make-file-unread");
+            }
+        };
+        stack.push(path.clone());
+        match parse_makefile_in(&text, &dir, &includes, 0, &mut stack) {
+            Ok(inner) => merge_makefile(&mut mf, inner),
+            Err(token) => return Recipes::Closed(token),
+        }
+        stack.pop();
+    }
     let mut vars = mf.vars.clone();
     vars.extend(overrides);
     vars.entry("MAKE".into()).or_insert_with(|| "make".into());
@@ -235,13 +533,24 @@ fn include_directive(code: &str) -> Option<(bool, Vec<String>)> {
     ))
 }
 
-fn include_path(name: &str, dir: &Path) -> PathBuf {
+/// `name` relative to `dir`. A name with no slash that is not there is
+/// looked up in `-I` directories. A name with a slash is only `dir`.
+fn find_include(name: &str, dir: &Path, includes: &[PathBuf]) -> PathBuf {
     let path = Path::new(name);
     if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        dir.join(path)
+        return path.to_path_buf();
     }
+    let at = dir.join(path);
+    if name.contains('/') || at.exists() {
+        return at;
+    }
+    for include in includes {
+        let candidate = include.join(name);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    at
 }
 
 fn merge_makefile(into: &mut Makefile, from: Makefile) {
@@ -266,6 +575,7 @@ fn merge_makefile(into: &mut Makefile, from: Makefile) {
 fn parse_makefile_in(
     text: &str,
     dir: &Path,
+    includes: &[PathBuf],
     depth: usize,
     stack: &mut Vec<PathBuf>,
 ) -> Result<Makefile, &'static str> {
@@ -308,7 +618,7 @@ fn parse_makefile_in(
                     }
                     return Err("makefile-include-unread");
                 }
-                let path = include_path(&name, dir);
+                let path = find_include(&name, dir, includes);
                 if stack.iter().any(|seen| seen == &path) {
                     return Err("makefile-include-unread");
                 }
@@ -319,7 +629,7 @@ fn parse_makefile_in(
                     }
                     ReadMake::Text(inner) => {
                         stack.push(path);
-                        let included = parse_makefile_in(&inner, dir, depth + 1, stack)?;
+                        let included = parse_makefile_in(&inner, dir, includes, depth + 1, stack)?;
                         stack.pop();
                         merge_makefile(&mut mf, included);
                     }
@@ -940,7 +1250,11 @@ mod tests {
     }
 
     fn recipes(run: &[String], cwd: &Path) -> Vec<String> {
-        match resolved(run, cwd) {
+        recipes_env(run, cwd, &[])
+    }
+
+    fn recipes_env(run: &[String], cwd: &Path, env: &[(&str, &str)]) -> Vec<String> {
+        match resolved_with(run, cwd, env) {
             Recipes::Lines(lines) => lines,
             Recipes::Closed(token) => panic!("closed: {token}"),
         }
@@ -1115,6 +1429,54 @@ mod tests {
         assert!(matches!(
             resolved(&argv(&["make", "clean-all"]), &d),
             Recipes::Closed("makefile-include-unread")
+        ));
+    }
+
+    /// MAKEFLAGS, on the command line, names the makefile the way `-f`
+    /// does. A flag string that does not parse is not a makefile the
+    /// guard can choose.
+    #[test]
+    fn reads_make_flags_from_the_command() {
+        let d = dir(
+            "mflags",
+            &[
+                ("Makefile", "clean-all:\n\techo main\n"),
+                ("evil.mk", "clean-all:\n\trm -rf ~\n"),
+            ],
+        );
+        assert_eq!(
+            recipes(
+                &argv(&["make", "MAKEFLAGS=--file=evil.mk", "clean-all"]),
+                &d
+            ),
+            ["rm -rf ~"]
+        );
+        assert_eq!(
+            recipes(&argv(&["make", "MAKEFLAGS=-fevil.mk", "clean-all"]), &d),
+            ["rm -rf ~"]
+        );
+        assert_eq!(
+            recipes_env(
+                &argv(&["make", "clean-all"]),
+                &d,
+                &[("MAKEFLAGS", "--file=evil.mk")]
+            ),
+            ["rm -rf ~"]
+        );
+        let inc = d.join("inc");
+        std::fs::create_dir_all(&inc).unwrap();
+        std::fs::write(inc.join("extra.mk"), "clean-all:\n\trm -rf /opt\n").unwrap();
+        std::fs::write(d.join("Makefile"), "include extra.mk\n").unwrap();
+        assert_eq!(
+            recipes(&argv(&["make", "--include-dir", "inc", "clean-all"]), &d),
+            ["rm -rf /opt"]
+        );
+        assert!(matches!(
+            resolved(
+                &argv(&["make", "MAKEFLAGS=--not-a-real-flag", "clean-all"]),
+                &d
+            ),
+            Recipes::Closed("make-flags-unshown")
         ));
     }
 }
