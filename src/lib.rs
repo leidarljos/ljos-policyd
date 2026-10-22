@@ -4859,6 +4859,35 @@ mod tests {
         );
     }
 
+    /// `env -S` splits its string into words that take the place of the
+    /// option, so options in it are read and the words after it still run.
+    #[test]
+    fn env_split_string_options_and_words_after_it_run() {
+        for argv in [
+            &[
+                "env", "-S", "-v", "git", "push", "--force", "origin", "main",
+            ][..],
+            &["env", "-S", "", "git", "push", "--force", "origin", "main"],
+            &["env", "-S", "git push", "--force", "origin", "main"],
+            &["env", "-S-i git", "push", "--force", "origin", "main"],
+        ] {
+            assert!(v(argv).starts_with("deny\t"), "{argv:?}");
+        }
+        for line in [
+            "env -S '-C evil make clean-all'",
+            "env -S '-C evil' make clean-all",
+            "env -iS '-C evil make clean-all'",
+            "env --split-string='-C evil' make clean-all",
+            "env -S \"-C 'evil' make clean-all\"",
+        ] {
+            assert_eq!(evil_and_safe("env-split", line), Decision::Deny, "{line}");
+        }
+        assert_eq!(
+            evil_and_safe("env-split", "env -S '-C safe make clean-all'"),
+            Decision::Allow
+        );
+    }
+
     /// `pushd -n` stacks a directory without entering it, and `pushd +N`,
     /// `-N` or a bare `pushd` enters the one it brings to the top.
     #[test]
