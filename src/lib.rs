@@ -123,6 +123,7 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
         files: &files,
         known: None,
         script_cwd_moved: false,
+        removals_live: true,
     };
     runner_commands(argv, &inn, 0, &mut runs, &mut denied);
     if let Some(c) = denied {
@@ -794,6 +795,48 @@ fn removal_words(cmd: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// `if`, `while`, `for` and `case` open a compound command. `fi`, `done`
+/// and `esac` close one. An `rm` in there does not run on every pass, so
+/// it does not clear a file. `{ ... }` does run, and is not counted.
+fn compound_delta(cmd: &[&str]) -> i32 {
+    let mut i = 0;
+    while i < cmd.len()
+        && (is_assignment(cmd[i])
+            || matches!(
+                cmd[i],
+                "!" | "{" | "}" | "time" | "then" | "else" | "elif" | "do"
+            ))
+    {
+        i += 1;
+    }
+    if cmd.get(i).is_some_and(|w| *w == "-p") && i > 0 && cmd[i - 1] == "time" {
+        i += 1;
+    }
+    match cmd.get(i).copied() {
+        Some("if" | "while" | "until" | "for" | "case" | "select") => 1,
+        Some("fi" | "done" | "esac") => -1,
+        _ => 0,
+    }
+}
+
+/// `rm` or `rmdir` after it has been redefined. `command rm` is the
+/// function or the alias too: the line no longer shows the real program.
+fn removal_shadowed(cmd: &[String], shell: &Shell) -> bool {
+    let words: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    let words = operands(&words);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    let rest = peel_cd_command_word(&words[front..]);
+    let Some(name) = rest.first().map(|w| base_of(w)) else {
+        return false;
+    };
+    if !matches!(name, "rm" | "rmdir") {
+        return false;
+    }
+    shell.funcs.contains_key(name) || shell.aliases.iter().any(|(k, _)| k == name)
+}
+
 /// Record a variable set to the script being judged (`name=$0`,
 /// `name=$dir$0`). A later command substitution is walked on its own
 /// and does not see the assignment, but the file list does.
@@ -1255,6 +1298,12 @@ struct Shell {
     /// A `cd` has run in this shell. `$0` is the path the script was
     /// started with, so a later read of it is a different file.
     script_cwd_moved: bool,
+    /// This walk may treat an `rm` as deleting the file. A nested walk
+    /// of a command that may not run does not.
+    removals_live: bool,
+    /// The command now being read runs unconditionally. A subshell of
+    /// one that does not must not clear a file either.
+    rm_gate: bool,
 }
 
 /// One `if` or `case`, so a variable set in every branch can be read as
@@ -1348,6 +1397,9 @@ struct ShellIn<'a> {
     /// The caller has run `cd` in this script. `$0` is the path it was
     /// started with, so a later read is a different file.
     script_cwd_moved: bool,
+    /// An `rm` in this walk deletes the file. False when the command
+    /// that started the walk may not run.
+    removals_live: bool,
 }
 
 /// `words` with each function definition replaced by a marker, in order.
@@ -1582,6 +1634,7 @@ fn replay_subshell(
             files: &shell.files,
             known: shell.known.clone(),
             script_cwd_moved: shell.script_cwd_moved,
+            removals_live: shell.removals_live && shell.rm_gate,
         };
         runner_commands(body, &inn, depth, out, denied);
         if denied.is_some() {
@@ -1646,6 +1699,8 @@ fn runner_commands(
         halted: false,
         script_pipe: false,
         script_cwd_moved: inn.script_cwd_moved,
+        removals_live: inn.removals_live,
+        rm_gate: true,
     };
     walk(argv, &mut shell, depth, out, denied);
 }
@@ -1841,6 +1896,12 @@ fn walk(
     // anywhere in it counts as made before the loop.
     let mut loops = Vec::new();
     let mut spans = Vec::new();
+    // Open `if` / `while` / `for` / `case`. An `rm` in one of them may
+    // not run, so it does not clear a file written on the line.
+    let mut compound = 0i32;
+    // Whether each command's `rm` runs. A later walk of that command
+    // alone must not clear a file the command itself may skip.
+    let mut rm_live = Vec::new();
     let ended = ended_commands(&argv);
     let (heredocs, data) = heredoc_bodies(&ended);
     let pattern_skip = case_pattern_skips(&argv);
@@ -1915,6 +1976,21 @@ fn walk(
         }
         shell.files.borrow_mut().cmd.clone_from(&id);
         ran_in.push((at.clone(), shell.old.clone(), set.clone(), id.clone()));
+        let text = data[ci] || pat;
+        if !text {
+            compound = (compound + compound_delta(&cmd)).max(0);
+        }
+        // `||`, `&&`, `&` and a compound command can skip this `rm`.
+        // A nested walk of the same command must skip it too.
+        let live = shell.removals_live
+            && !text
+            && compound == 0
+            && !matches!(before, "||" | "&&")
+            && end != "&";
+        shell.rm_gate = live;
+        // The command word itself. A nested walk of this `rm` does not
+        // see the alias or function that hid it.
+        rm_live.push(live && !removal_shadowed(&owned, shell));
         // A subshell or substitution in the command runs where the
         // command does, and a `cd` inside it moves only itself.
         let mark = shell.files.borrow().written.len();
@@ -1946,6 +2022,7 @@ fn walk(
                             files: &files,
                             known: shell.known.clone(),
                             script_cwd_moved: shell.script_cwd_moved,
+                            removals_live: live,
                         };
                         runner_commands(&words, &inn, depth + 1, out, denied);
                         if denied.is_some() {
@@ -2033,7 +2110,9 @@ fn walk(
                 }
             }
         }
-        {
+        // A function or alias named `rm` is not the program that deletes
+        // the file. `command rm` is that function too.
+        if live && !removal_shadowed(&owned, shell) {
             let mut files = shell.files.borrow_mut();
             let id = files.cmd.clone();
             for word in removal_words(&owned) {
@@ -2436,6 +2515,7 @@ fn walk(
                     files: &shell.files,
                     known: shell.known.clone(),
                     script_cwd_moved: shell.script_cwd_moved,
+                    removals_live: rm_live.get(i).copied().unwrap_or(false),
                 };
                 runner_commands(&inner, &inn, depth + 1, out, denied);
                 shell.files.borrow_mut().data = was;
@@ -12745,6 +12825,7 @@ hash -r 2> /dev/null
                 files: &files,
                 known: None,
                 script_cwd_moved: false,
+                removals_live: true,
             };
             runner_commands(&shell_words(line), &inn, 0, &mut runs, &mut denied);
             let dirs: Vec<_> = runs
@@ -15886,6 +15967,44 @@ hash -r 2> /dev/null
             write("configure", &format!("{h}{body}"));
             assert_eq!(at("sh configure").decision, Decision::Deny, "{body}");
         }
+    }
+
+    /// An `rm` clears a file it wrote only when that `rm` runs. One in
+    /// `if`, after `||` or `&&`, in the background, or after `rm` is a
+    /// function or an alias does not.
+    #[test]
+    fn an_rm_that_does_not_run_does_not_clear_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = startup_root("rmclear");
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        let write = |body: &str| {
+            let p = root.join("s.sh");
+            std::fs::write(&p, body).unwrap();
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&p, perm).unwrap();
+        };
+        for mid in [
+            "if false; then rm -f conf.sh; fi",
+            "true || rm -f conf.sh",
+            "false && rm -f conf.sh",
+            "rm -f conf.sh &",
+            "rm() { :; }\nrm -f conf.sh",
+            "alias rm=:; rm -f conf.sh",
+        ] {
+            write(&format!(
+                "as_me=$(echo conf)\necho 'git push -f' > conf.sh\n{mid}\n. \"./$as_me.sh\"\n"
+            ));
+            assert_eq!(at("sh ./s.sh").decision, Decision::Deny, "{mid}");
+        }
+        write(
+            "as_me=$(echo conf)\necho 'git push -f' > conf.sh\nrm -f conf.sh\n. \"./$as_me.sh\"\n",
+        );
+        assert_eq!(at("sh ./s.sh").decision, Decision::Allow);
+        write("as_me=$(echo conf)\necho 'git push -f' > conf.sh\n{ rm -f conf.sh; }\n. \"./$as_me.sh\"\n");
+        assert_eq!(at("sh ./s.sh").decision, Decision::Allow);
+        write("as_me=$(echo conf)\necho 'git push -f' > conf.sh\nrm -f conf.sh && echo gone\n. \"./$as_me.sh\"\n");
+        assert_eq!(at("sh ./s.sh").decision, Decision::Allow);
     }
 
     #[test]

@@ -1,0 +1,1 @@
+An `rm` in `if`, after `||` or `&&`, in the background, or after `rm` was defined as a function or an alias was still recorded. The file it named then counted as removed, so a later source of what the line had written was not judged. A removal counts only when that `rm` runs at the top level of the line.
