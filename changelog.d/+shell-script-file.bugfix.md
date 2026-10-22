@@ -1,0 +1,1 @@
+The file a shell runs as its script (`bash evil.sh`, `env -C dir sh run.sh`, `cd dir && bash run.sh`) is judged as a sourced file is, in the directory the line has reached. `bash evil.sh` was allowed whatever the file held, since only a `-c` script was read. A file that is not there runs nothing and stays allowed.

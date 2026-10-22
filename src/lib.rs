@@ -700,6 +700,10 @@ fn walk(
         if denied.is_some() {
             return;
         }
+        judge_script_file(&shown, shell, depth, out, denied);
+        if denied.is_some() {
+            return;
+        }
         // `bash <(cat file)` runs the file in the child. The directory
         // the path is relative to is known only here.
         judge_procsub(&shown, shell, depth, out, denied);
@@ -1456,6 +1460,55 @@ fn judge_startup(
     // one would be read without end.
     if depth >= MAX_DEPTH {
         *denied = Some(startup_unshown());
+        return;
+    }
+    let mut aliases = shell.aliases.clone();
+    let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
+    if let Some(c) = judge_body(&words, shell) {
+        *denied = Some(c);
+        return;
+    }
+    replay_subshell(&words, shell, depth + 1, out, denied);
+}
+
+/// Judge the file a shell runs as its script (`bash ok.sh`) as a sourced
+/// file is judged. It runs in the child, so a `cd` in it does not move
+/// this shell. A file that is not there runs nothing.
+fn judge_script_file(
+    cmd: &[&str],
+    shell: &Shell,
+    depth: usize,
+    out: &mut Vec<(Vec<String>, std::path::PathBuf, bool)>,
+    denied: &mut Option<Checked>,
+) {
+    if denied.is_some() {
+        return;
+    }
+    let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+    let owned = split_env_strings(&owned).into_owned();
+    let (run, _) = unwrap_wrappers(&owned);
+    let Some(op) = shell_file_operand(run) else {
+        return;
+    };
+    if op.starts_with(['<', '>']) || op == "-" || is_stdin_source(op) {
+        return;
+    }
+    let wrappers = &owned[..owned.len() - run.len()];
+    let path = std::path::Path::new(op);
+    let full = match shell.here.as_slice() {
+        _ if path.is_absolute() => path.to_path_buf(),
+        [d] if !is_untracked(d) => env_dir(wrappers, d, shell.vars.home.as_deref()).join(path),
+        _ => return,
+    };
+    let Some(text) = read_regular_nofollow(&full) else {
+        return;
+    };
+    if depth >= MAX_DEPTH {
+        *denied = Some(Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: Cow::Borrowed("script-file-unshown"),
+        });
         return;
     }
     let mut aliases = shell.aliases.clone();
@@ -10289,6 +10342,48 @@ hash -r 2> /dev/null
         );
         assert_eq!(c.decision, Decision::Deny, "{}", c.token);
         assert_eq!(c.token, "startup-script-unshown");
+    }
+
+    /// `bash evil.sh` was allowed whatever evil.sh held: only a `-c`
+    /// script was read. The file a shell runs is judged as a sourced file.
+    #[test]
+    fn a_shell_script_file_is_judged_as_a_sourced_script() {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-shfile", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["evil", "safe", ".venv/bin"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("evil/force.sh"), "git push -f origin\n").unwrap();
+        std::fs::write(root.join("evil/self.sh"), "bash self.sh\n").unwrap();
+        std::fs::write(root.join("safe/hi.sh"), "echo hi\n").unwrap();
+        std::fs::write(root.join("safe/Makefile"), "test:\n\techo ok\n").unwrap();
+        std::fs::write(
+            root.join(".venv/bin/activate"),
+            include_str!("../tests/fixtures/pyvenv-activate.sh"),
+        )
+        .unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "bash evil/force.sh",
+            "sh evil/force.sh",
+            "bash -x evil/force.sh",
+            "bash -- evil/force.sh origin",
+            "env -C evil bash force.sh",
+            "cd evil && bash force.sh",
+            "nohup sh evil/force.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
+        }
+        let c = at("cd evil && bash self.sh");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert_eq!(c.token, "script-file-unshown");
+        for line in ["bash safe/hi.sh", "sh missing.sh", "bash -c 'echo ok'"] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        assert_everyday_allowed(&root);
     }
 
     /// `find -exec` runs its payload, and so does a wrapper in front of a
