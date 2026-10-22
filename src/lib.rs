@@ -2607,6 +2607,13 @@ fn host_argv_table_at(argv: &[String], depth: usize, moved: bool) -> Checked {
             token: Cow::Borrowed("parallel-command-unshown"),
         };
     }
+    if xargs_script_unshown(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: Cow::Borrowed("xargs-script-unshown"),
+        };
+    }
     for inner in inner_commands(argv)
         .into_iter()
         .filter(|_| depth < MAX_DEPTH)
@@ -2943,6 +2950,129 @@ fn parallel_command_unshown(argv: &[String]) -> bool {
             _ => false,
         }
     })
+}
+
+/// An `xargs` or `parallel` whose input lands where the command it runs
+/// reads a script: in a shell's `-c` string or script file, in `eval`,
+/// `source` or `.`, or in an interpreter's `-c` or `-e` program. That
+/// input comes from stdin or an argument list, so the script is unknown.
+/// It lands there through a replace string (`xargs -I{} sh -c '{}'`), or
+/// as the words xargs appends when the command ends where the script
+/// would be (`xargs sh -c`, `xargs bash`, `xargs python3 -c`).
+fn xargs_script_unshown(argv: &[String]) -> bool {
+    commands(argv).into_iter().any(|cmd| {
+        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        let owned = split_env_strings(&owned).into_owned();
+        let run = unwrap_wrappers(&owned).0;
+        let wrappers = &owned[..owned.len() - run.len()];
+        let Some(at) = wrappers
+            .iter()
+            .rposition(|w| matches!(base_of(w), "xargs" | "parallel"))
+        else {
+            return false;
+        };
+        let parallel = base_of(&wrappers[at]) == "parallel";
+        let marks = replace_strings(&wrappers[at..]);
+        let fed = |w: &str| {
+            marks.iter().any(|m| w.contains(m.as_str()))
+                || (parallel
+                    && w.match_indices('{').any(|(i, _)| {
+                        w[i + 1..].starts_with(|c: char| "}./#%=".contains(c) || c.is_ascii_digit())
+                    }))
+        };
+        let end = run
+            .iter()
+            .position(|w| w.starts_with(":::"))
+            .unwrap_or(run.len());
+        let run = &run[..end];
+        let appended = if parallel {
+            !run.iter().any(|w| fed(w))
+        } else {
+            marks.is_empty()
+        };
+        script_takes_input(run, &fed, appended)
+    })
+}
+
+/// The replace strings the `xargs` or `parallel` call `call` takes: `-I
+/// R`, `-IR`, `-i` or `--replace` (`{}`), `-iR` and `--replace=R`.
+fn replace_strings(call: &[String]) -> Vec<String> {
+    let Some((name, flags)) = call.split_first() else {
+        return Vec::new();
+    };
+    let valued = RUNNERS
+        .iter()
+        .find(|(n, _)| *n == base_of(name))
+        .map_or(&[][..], |(_, v)| *v);
+    let mut out = Vec::new();
+    let mut words = flags.iter().map(String::as_str);
+    while let Some(w) = words.next() {
+        if let Some(long) = w.strip_prefix("--") {
+            match long.split_once('=') {
+                Some(("replace", r)) => out.push(r.to_string()),
+                None if long == "replace" => out.push("{}".into()),
+                None if valued.contains(&w) => {
+                    words.next();
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let Some(short) = w.strip_prefix('-').filter(|s| !s.is_empty()) else {
+            break;
+        };
+        for (k, c) in short.char_indices() {
+            let rest = &short[k + 1..];
+            match c {
+                'I' if rest.is_empty() => out.extend(words.next().map(str::to_string)),
+                'I' => out.push(rest.to_string()),
+                'i' => out.push(if rest.is_empty() { "{}" } else { rest }.into()),
+                c if valued.contains(&format!("-{c}").as_str()) => {
+                    if rest.is_empty() {
+                        words.next();
+                    }
+                }
+                _ => continue,
+            }
+            break;
+        }
+    }
+    out.retain(|m| !m.is_empty());
+    out
+}
+
+/// Whether the input `fed` names, or with `appended` the words added
+/// after `run`, land where `run` reads a script.
+fn script_takes_input(run: &[String], fed: &dyn Fn(&str) -> bool, appended: bool) -> bool {
+    let Some(head) = run.first() else {
+        return false;
+    };
+    let b = base_of(head);
+    if SHELLS.contains(&b) {
+        if let Some(s) = shell_script(run) {
+            return fed(s);
+        }
+        let short =
+            |a: &&String, f: char| a.starts_with('-') && !a.starts_with("--") && a[1..].contains(f);
+        let opts: Vec<_> = run[1..]
+            .iter()
+            .take_while(|a| a.starts_with(['-', '+']) && a.len() > 1)
+            .collect();
+        if opts.iter().any(|a| short(a, 'c')) {
+            return appended;
+        }
+        return match shell_file_operand(run) {
+            Some(op) => fed(op),
+            None => appended && !opts.iter().any(|a| short(a, 's')),
+        };
+    }
+    if SOURCERS.contains(&b) {
+        return appended || run[1..].iter().any(|a| fed(a));
+    }
+    match inline_flag_at(run) {
+        Some(at) => run.get(at + 1).map_or(appended, |code| fed(code)),
+        None => false,
+    }
 }
 
 /// A script written out in the line: no parameter, glob or `~`.
@@ -5748,20 +5878,24 @@ const INTERPRETERS: &[(&str, &str)] = &[
 
 /// The program text an interpreter call runs inline (`python3 -c CODE`).
 fn inline_program(run: &[String]) -> Option<&str> {
+    run.get(inline_flag_at(run)? + 1).map(String::as_str)
+}
+
+/// Where an interpreter call's inline-program flag (`-c`, `-e`) is.
+fn inline_flag_at(run: &[String]) -> Option<usize> {
     let b = base_of(run.first()?);
     let b = b.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
     let flag = INTERPRETERS
         .iter()
         .find(|(n, _)| n.trim_end_matches(|c: char| c.is_ascii_digit()) == b)?
         .1;
-    let at = run.iter().position(|a| {
+    run.iter().position(|a| {
         a == flag
             || (a.starts_with('-')
                 && !a.starts_with("--")
                 && a.ends_with(&flag[1..])
                 && flag.starts_with('-'))
-    })?;
-    run.get(at + 1).map(String::as_str)
+    })
 }
 
 /// The quoted strings an inline program hands to a shell: the first string
@@ -10464,6 +10598,56 @@ hash -r 2> /dev/null
         ] {
             assert_eq!(verdict(&shell_words(line)), "allow", "{line}");
         }
+    }
+
+    /// `printf 'rm -rf ~/Documents' | xargs -I{} sh -c '{}'` was allowed:
+    /// the script was read as `{}`, but xargs puts its input there. Input
+    /// that lands where a command reads a script is unknown text.
+    #[test]
+    fn xargs_input_in_a_script_position_is_refused() {
+        let root = startup_root("xargsscript");
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "printf 'rm -rf ~/Documents' | xargs -I{} sh -c '{}'",
+            "printf x | xargs -I {} bash -c 'echo {}'",
+            "printf x | xargs -n 1 -I % sh -c 'cd %'",
+            "printf x | xargs --replace sh -c 'true; {}'",
+            "printf x | xargs -i sh -c '{}'",
+            "printf x | xargs -I{} env sh -c '{}'",
+            "printf x | xargs -I{} eval '{}'",
+            "printf x | xargs -I{} sh '{}'",
+            "printf x | xargs -I{} python3 -c '{}'",
+            "printf x | xargs -0 -I@ node -e @",
+            "printf x | xargs sh -c",
+            "printf x | xargs -n1 bash -c",
+            "printf x | xargs bash",
+            "printf x | xargs python3 -c",
+            "printf x | xargs eval",
+            "printf x | xargs source",
+            "parallel sh -c {} ::: 'git push -f'",
+            "parallel -j 4 bash -c '{.}' ::: a",
+            "parallel sh -c ::: 'git push -f'",
+            "bash -c \"printf x | xargs -I{} sh -c '{}'\"",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+        }
+        let c = at("printf 'rm -rf ~/Documents' | xargs -I{} sh -c '{}'");
+        assert_eq!(c.token, "xargs-script-unshown");
+        for line in [
+            "printf x | xargs -n1 sh -c 'echo \"$1\"' _",
+            "printf x | xargs -I{} sh -c 'echo \"$1\"' _ {}",
+            "printf x | xargs echo",
+            "printf x | xargs -I{} cp {} /tmp/out",
+            "printf x | xargs -n 1 python3 parse.py",
+            "parallel echo {} ::: a b",
+            "parallel -j 4 echo hi ::: a b",
+            "parallel gzip ::: a b",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        assert_everyday_allowed(&root);
     }
 
     /// `bash evil.sh` was allowed whatever evil.sh held: only a `-c`
