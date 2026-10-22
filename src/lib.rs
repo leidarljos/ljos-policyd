@@ -1302,9 +1302,13 @@ fn entered(
         // The shell takes the first entry it can enter, an empty one being
         // `dir`, or else `dir`; an entry that names no directory the line
         // shows may be any, and the walk goes on past it, as it does past
-        // one the line may enter only by name or only resolved.
+        // one the line may enter only by name or only resolved. A `$` in
+        // an entry was expanded when CDPATH was set, from a HOME the line
+        // may have changed since.
         for entry in cdpath.split(':') {
-            let d = path_from(entry, dir, home)
+            let d = Some(entry)
+                .filter(|e| !e.contains('$'))
+                .and_then(|e| path_from(e, dir, home))
                 .unwrap_or_else(|| UNTRACKED.into())
                 .join(to);
             if is_untracked(&d) {
