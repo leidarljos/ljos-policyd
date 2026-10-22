@@ -102,3 +102,39 @@ fn reads_a_runner_where_a_cdpath_set_on_the_cd_enters() {
     }
     let _ = std::fs::remove_dir_all(work.parent().unwrap());
 }
+
+/// A `CDPATH` the line sets earlier, alone or with `export` and the like,
+/// is searched by a later `cd`, unless a subshell set it.
+#[test]
+fn reads_a_runner_where_a_cdpath_set_earlier_enters() {
+    let work = work_and_lib("cdpath-set");
+    for line in [
+        "export CDPATH=../lib; cd proj && make clean-all",
+        "CDPATH=../lib; cd proj; make clean-all",
+        "{ CDPATH=../lib; }; cd proj && make clean-all",
+        "declare -x CDPATH=../lib && cd proj && make clean-all",
+        "CDPATH=/nowhere; CDPATH+=:../lib; cd proj && make clean-all",
+        "true && CDPATH=../lib; cd proj && make clean-all",
+        "false || CDPATH=../lib; cd proj && make clean-all",
+        "export CDPATH=../lib; bash -c 'cd proj && make clean-all'",
+        "CDPATH=../lib :; cd proj && make clean-all",
+        "export CDPATH=\"$PWD/../lib\"; cd proj && make clean-all",
+        "read CDPATH < list; cd proj && make clean-all",
+        ": ${CDPATH:=../lib}; cd proj && make clean-all",
+        "for CDPATH in ../lib; do cd proj && make clean-all; done",
+    ] {
+        let v = check(&work, None, line);
+        assert!(v.starts_with("deny\t"), "{line}: {v}");
+    }
+    for line in [
+        "CDPATH=../lib | true; cd proj && make clean-all",
+        "(CDPATH=../lib); cd proj && make clean-all",
+        "CDPATH=../lib & cd proj && make clean-all",
+        "CDPATH=../lib; unset CDPATH; cd proj && make clean-all",
+        "export CDPATH=../lib; cd ./proj && make clean-all",
+        "echo $CDPATH ${CDPATH:-none}; cd proj && make clean-all",
+    ] {
+        assert_eq!(check(&work, None, line), "allow", "{line}");
+    }
+    let _ = std::fs::remove_dir_all(work.parent().unwrap());
+}

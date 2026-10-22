@@ -70,7 +70,13 @@ A =cd= or =pushd= to a relative path whose first part is not =.= or
 =..= may enter that path under any =CDPATH= entry, so the runner after
 it is also read in each entry that holds the path. A =CDPATH= set in
 front of the =cd= (=CDPATH=dir cd x=), or of the shell that runs it, is
-the one searched. An entry with =$=, a backquote or =~= in it names no
+the one searched, as is one the line sets before it, alone or with
+=export=, =declare= and the like (=export CDPATH=dir; cd x=), unless a
+pipeline stage, a subshell or a list sent to the background set it.
+One set where it may not run, past a =&&= or =||=, is searched along
+with the one before it. Another word that may set it (=read CDPATH=,
+=${CDPATH:=dir}=, or an assignment in front of a special builtin such
+as =:=), or an entry with =$=, a backquote or =~= in it, names no
 directory the line shows, so a runner after the =cd= is refused.
 
 =pushd= and =popd= follow the directory stack. =pushd -n= stacks its

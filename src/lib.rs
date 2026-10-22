@@ -208,31 +208,39 @@ fn runner_commands(
     let mut old_failed = Vec::new();
     // Each `pushd`'s directories, and whether it surely ran.
     let mut pushed: Vec<(Vec<std::path::PathBuf>, bool)> = Vec::new();
+    // What the shell's variables hold, and, after an assignment behind
+    // `&&` that may not have run, what they held, for the next `;` or `||`.
+    let mut vars = vars.clone();
+    let mut vars_failed: Option<Vars> = None;
     // Where the list now running started, for a `&` to put back.
-    let mut list = (here.clone(), old.clone(), pushed.clone());
+    let mut list = (here.clone(), old.clone(), pushed.clone(), vars.clone());
     let mut after = ";";
     let mut ran_in = Vec::new();
     for (cmd, end) in ended_commands(argv) {
         if after == "&" {
-            (here, old, pushed) = list.clone();
+            (here, old, pushed, vars) = list.clone();
             failed.clear();
             old_failed.clear();
+            vars_failed = None;
         }
         if matches!(after, ";" | "||") {
             add_dirs(&mut here, failed.drain(..));
             add_dirs(&mut old, old_failed.drain(..));
+            if let Some(was) = vars_failed.take() {
+                vars.merge(was);
+            }
             for p in &mut pushed {
                 p.1 = false;
             }
         }
         if matches!(after, ";" | "&") {
-            list = (here.clone(), old.clone(), pushed.clone());
+            list = (here.clone(), old.clone(), pushed.clone(), vars.clone());
         }
         let piped = after == "|" || end == "|";
         // A `cd` before `&&` holds for what runs after it, unless a `||`
         // before it may have skipped it.
         let gates = end == "&&" && after != "||";
-        after = end;
+        let before = std::mem::replace(&mut after, end);
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
         let run = unwrap_wrappers(&owned).0.to_vec();
         // `env -C DIR` runs its own command, and any script it hands a
@@ -250,8 +258,20 @@ fn runner_commands(
         if depth < MAX_DEPTH {
             for body in cmd.iter().flat_map(|w| substitutions(w)) {
                 for dir in &here {
-                    runner_commands(&shell_words(&body), dir, &old, vars, depth + 1, out);
+                    runner_commands(&shell_words(&body), dir, &old, &vars, depth + 1, out);
                 }
+            }
+        }
+        if !piped {
+            let was = vars.clone();
+            set_vars(&cmd, &mut vars);
+            match before {
+                "||" => vars.merge(was),
+                "&&" => match &mut vars_failed {
+                    Some(f) => f.merge(was),
+                    None => vars_failed = Some(was),
+                },
+                _ => {}
             }
         }
         let words = peel_cd_command_word(&cmd);
@@ -411,6 +431,84 @@ impl Vars {
             let was = slot.take().filter(|_| add).unwrap_or_default();
             *slot = Some(was + if v.contains('~') { "$" } else { v });
         }
+    }
+
+    /// Leave each variable the word `w` may set not shown: one it names
+    /// other than to read it (`$NAME`, `${NAME}`), or sets by default
+    /// (`${NAME:=value}`).
+    fn lose(&mut self, w: &str) {
+        let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        let sets = |name: &str| {
+            w.match_indices(name).any(|(i, _)| {
+                let (pre, post) = (&w[..i], &w[i + name.len()..]);
+                !pre.ends_with(ident)
+                    && !post.starts_with(ident)
+                    && (!pre.ends_with(['$', '{'])
+                        || post.starts_with('=')
+                        || post.starts_with(":="))
+            })
+        };
+        if sets("CDPATH") {
+            self.cdpath = Some("$".into());
+        }
+    }
+
+    /// Hold what either `self` or `other` holds.
+    fn merge(&mut self, other: Vars) {
+        self.cdpath = match (self.cdpath.take(), other.cdpath) {
+            (Some(a), Some(b)) if a != b => Some(format!("{a}:{b}")),
+            (a, b) => a.or(b),
+        };
+    }
+}
+
+/// Keywords that open or continue a compound command; the command after
+/// them runs in this shell.
+const KEYWORDS: [&str; 9] = [
+    "!", "{", "if", "then", "else", "elif", "while", "until", "do",
+];
+
+/// Apply to `vars` what the command `cmd` leaves set in the shell that
+/// runs it: assignments alone set themselves, `export`, `declare` and the
+/// like with plain flags set theirs, and `unset` unsets. A word of any
+/// other command that may set one (`read CDPATH`, `case`'s `CDPATH=dir`,
+/// `${CDPATH:=dir}`) leaves it not shown, as does an assignment in front
+/// of a special builtin, which some shells keep (`CDPATH=dir :`).
+fn set_vars(cmd: &[&str], vars: &mut Vars) {
+    let words = operands(cmd);
+    let front = words
+        .iter()
+        .take_while(|w| is_assignment(w) || KEYWORDS.contains(w))
+        .count();
+    let rest = peel_cd_command_word(&words[front..]);
+    let name = rest.first().map_or("", |w| base_of(w));
+    let args = rest.get(1..).unwrap_or_default();
+    let plain =
+        |a: &&str| !a.starts_with(['-', '+']) || a[1..].chars().all(|c| "-gprx".contains(c));
+    match name {
+        "" => words[..front].iter().for_each(|w| vars.assign(w)),
+        "export" | "readonly" | "declare" | "typeset" | "local" if args.iter().all(plain) => {
+            args.iter().for_each(|a| vars.assign(a));
+        }
+        "unset" if !args.contains(&"-f") => {
+            for a in args {
+                if let Some(slot) = vars.slot(a) {
+                    *slot = None;
+                }
+            }
+        }
+        // A subshell sets nothing here.
+        _ => words[front..]
+            .iter()
+            .filter(|w| !w.starts_with('('))
+            .for_each(|w| vars.lose(w)),
+    }
+    let special = [
+        ":", ".", "source", "eval", "exec", "exit", "export", "readonly", "return", "set", "shift",
+        "times", "trap", "unset", "break", "continue",
+    ];
+    if special.contains(&name) {
+        words[..front].iter().for_each(|w| vars.lose(w));
     }
 }
 
@@ -704,7 +802,7 @@ fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
                     }
                 }
             }
-            "!" | "{" | "if" | "then" | "else" | "elif" | "while" | "until" | "do" => {
+            k if KEYWORDS.contains(&k) => {
                 words = rest;
             }
             _ => return words,
