@@ -5296,6 +5296,40 @@ mod tests {
         }
     }
 
+    /// `eval`, `source` and `.` run a script the walk does not follow, and
+    /// a command word the line does not show may be `cd`, so after one
+    /// that runs in this shell the line is not followed.
+    #[test]
+    fn an_unseen_command_leaves_the_line_untracked() {
+        for line in [
+            "eval cd evil; make clean-all",
+            "eval \"$X\"; make clean-all",
+            "builtin eval cd evil; make clean-all",
+            ". ./env.sh; make clean-all",
+            "source env.sh && make clean-all",
+            "c=cd; $c evil; make clean-all",
+            "$(echo cd) evil; make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("unseen", line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "echo eval source; make clean-all",
+            "eval cd evil | true; make clean-all",
+            "(eval cd evil); make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("unseen", line), Decision::Allow, "{line}");
+        }
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "HOME={dir}; eval \"$X\"; cd ~ && make test",
+            "HOME={dir}; source env.sh; cd ~ && make test",
+            "export HOME=\"$PWD/project\"; $X; cd ~ && make test",
+        ] {
+            let c = entering("unseen", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+    }
+
     /// `command`, `command -p` and `builtin` do not hide `cd`.
     #[test]
     fn follows_a_cd_behind_command_or_builtin() {
