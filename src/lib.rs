@@ -4951,7 +4951,7 @@ mod tests {
         for line in [
             "pushd safe && popd -n; make clean-all",
             "pushd safe && dirs && popd; make clean-all",
-            "pushd evil && pushd ../safe && popd -n; make clean-all",
+            "pushd evil && pushd ../safe && popd -n && make clean-all",
         ] {
             assert_eq!(evil_and_safe("popd-fail", line), Decision::Allow, "{line}");
         }
