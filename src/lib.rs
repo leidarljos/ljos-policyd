@@ -695,7 +695,7 @@ fn walk(
             }
         }
         // A non-interactive bash or sh sources BASH_ENV or ENV in the
-        // child, before the -c script. That text is judged here.
+        // child, before its script. That text is judged here.
         judge_startup(&shown, shell, depth, out, denied);
         if denied.is_some() {
             return;
@@ -1394,8 +1394,9 @@ fn startup_unshown() -> Checked {
 }
 
 /// Judge the `BASH_ENV` or `ENV` file a non-interactive `bash` or `sh`
-/// sources before its `-c` script. The file runs in the child, so a `cd`
-/// in it does not move this shell; the commands are still recorded there.
+/// sources before its script, whether that is a `-c` string, a file
+/// operand or stdin. The file runs in the child, so a `cd` in it does
+/// not move this shell; the commands are still recorded there.
 fn judge_startup(
     cmd: &[&str],
     shell: &Shell,
@@ -1417,9 +1418,6 @@ fn judge_startup(
         "sh" => ("ENV", shell.vars.sh_env_exported),
         _ => return,
     };
-    if shell_script(run).is_none() {
-        return;
-    }
     let value = prefix_startup(cmd, base_of(first), var)
         .map(shown_startup)
         .or_else(|| {
@@ -10192,6 +10190,80 @@ hash -r 2> /dev/null
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
+    }
+
+    /// Lines an agent runs every day, which a fix for script text the
+    /// guard cannot see must leave allowed. `dir` holds `safe/Makefile`.
+    fn assert_everyday_allowed(dir: &std::path::Path) {
+        for line in [
+            "source .venv/bin/activate",
+            "conda activate",
+            "nvm use",
+            "direnv allow",
+            "pyenv init -",
+            "make -C safe test",
+            "git -C repo status",
+            "npm run build",
+            "cargo xtask",
+            "find . -name '*.pyc' -exec rm -rf {} +",
+            "f(){ echo hi; }; f",
+            "./configure && make",
+            "echo x > out.txt; cat out.txt",
+        ] {
+            let c = check_shell_in(&shell_words(line), dir, 0);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+    }
+
+    /// `BASH_ENV=evil.sh bash ok.sh` was allowed: the startup file was
+    /// judged only for a `-c` script, though bash sources it before a
+    /// script file or stdin as well.
+    #[test]
+    fn a_startup_file_is_judged_for_every_script_form() {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-stform", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["evil", "safe", ".venv/bin"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("evil/force.sh"), "git push -f origin\n").unwrap();
+        std::fs::write(root.join("safe/hi.sh"), "echo hi\n").unwrap();
+        std::fs::write(root.join("safe/Makefile"), "test:\n\techo ok\n").unwrap();
+        std::fs::write(
+            root.join(".venv/bin/activate"),
+            include_str!("../tests/fixtures/pyvenv-activate.sh"),
+        )
+        .unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "BASH_ENV=evil/force.sh bash safe/hi.sh",
+            "env BASH_ENV=evil/force.sh bash safe/hi.sh",
+            "export BASH_ENV=evil/force.sh; bash safe/hi.sh",
+            "BASH_ENV=evil/force.sh; export BASH_ENV; bash safe/hi.sh",
+            "ENV=evil/force.sh sh safe/hi.sh",
+            "BASH_ENV=evil/force.sh bash < safe/hi.sh",
+            "export BASH_ENV=evil/force.sh; bash",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
+        }
+        for line in [
+            "BASH_ENV=evil/force.sh bash -s < safe/hi.sh",
+            "echo 'echo hi' | BASH_ENV=evil/force.sh bash",
+            "BASH_ENV=\"$F\" bash safe/hi.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+        }
+        for line in [
+            "bash safe/hi.sh",
+            "BASH_ENV=safe/hi.sh bash safe/hi.sh",
+            "ENV=evil/force.sh bash safe/hi.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        assert_everyday_allowed(&root);
     }
 
     /// `find -exec` runs its payload, and so does a wrapper in front of a

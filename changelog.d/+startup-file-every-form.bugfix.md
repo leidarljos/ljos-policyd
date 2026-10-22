@@ -1,0 +1,1 @@
+A `BASH_ENV` or `ENV` startup file is judged for every form of a non-interactive `bash` or `sh`, not only for a `-c` script: `BASH_ENV=evil.sh bash ok.sh`, `export BASH_ENV=evil.sh; bash ok.sh` and `BASH_ENV=evil.sh bash < ok.sh` were allowed, although the shell sources the file before a script file or stdin as well.
