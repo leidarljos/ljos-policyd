@@ -4946,6 +4946,32 @@ mod tests {
         }
     }
 
+    /// A `shopt` whose option or flags the line does not show, or a
+    /// command word it does not show, may turn `lastpipe` on.
+    #[test]
+    fn an_unshown_shopt_may_turn_lastpipe_on() {
+        for line in [
+            "opt=lastpipe; shopt -s $opt; true | cd evil && make clean-all",
+            "opt=lastpipe; shopt -s \"$opt\"; true | pushd evil && make clean-all",
+            "f=-s; shopt $f lastpipe; true | cd evil && make clean-all",
+            "shopt -s last*; true | cd evil && make clean-all",
+            "s=shopt; $s -s $o; true | cd evil && make clean-all",
+        ] {
+            assert_eq!(
+                evil_and_safe("lastpipe-opt", line),
+                Decision::Deny,
+                "{line}"
+            );
+        }
+        assert_eq!(
+            evil_and_safe(
+                "lastpipe-opt",
+                "shopt -s nullglob; true | cd evil && make clean-all"
+            ),
+            Decision::Allow
+        );
+    }
+
     /// Arithmetic runs in this shell, so `((HOME=5))` or `$((HOME=5))`
     /// leaves `HOME` untracked.
     #[test]
