@@ -308,8 +308,10 @@ domains, and ``domain icloud.com`` ``me.com`` and ``mac.com``.
 ``deny-domain`` in the pack-law file does the same. A ``domain``
 or ``deny-domain`` value has to be a hostname after IDNA. A star,
 a colon, a slash, an at-sign, whitespace, or anything else that
-is not a hostname refuses the file. The detail is the line
-number and not the value. A wildcard is not how to name
+is not a hostname refuses the file. So does a domain a
+recipient cannot have, such as an all-numeric one, in a
+``domain``, ``deny-domain`` or ``address`` value. The detail is
+the line number and not the value. A wildcard is not how to name
 subdomains: ``domain example.test`` already covers
 ``a.example.test``. An ``address`` value with a star, or with a
 character a parsed recipient cannot carry, is refused the same
