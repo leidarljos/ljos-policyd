@@ -118,8 +118,9 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
 /// Every simple command the line runs, wrappers off, with the directory it
 /// runs in: the line split on its separators, then each `-c` script,
 /// `eval` and wrapper inside it, down to [`MAX_DEPTH`]. A `cd`, `pushd`
-/// or `popd` moves the commands after it on the same line; a script
-/// nested in the line starts from `cwd`.
+/// or `popd` moves the commands after it on the same line, unless it runs
+/// in a subshell: a stage of a pipeline, or a list sent to the background
+/// with `&`. A script nested in the line starts from `cwd`.
 fn runner_commands(
     argv: &[String],
     cwd: &std::path::Path,
@@ -129,8 +130,22 @@ fn runner_commands(
     let mut dir = cwd.to_path_buf();
     let mut pushed = Vec::new();
     let mut own = Vec::new();
-    for cmd in commands(argv) {
+    // Where the list now running started, for a `&` to put back.
+    let mut list = (dir.clone(), pushed.clone());
+    let mut after = ";";
+    for (cmd, end) in ended_commands(argv) {
+        if after == "&" {
+            (dir, pushed) = list.clone();
+        }
+        if matches!(after, ";" | "&") {
+            list = (dir.clone(), pushed.clone());
+        }
+        let piped = after == "|" || end == "|";
+        after = end;
         let b = base_of(cmd[0]);
+        if piped && matches!(b, "cd" | "pushd" | "popd") {
+            continue;
+        }
         if b == "popd" {
             dir = pushed.pop().unwrap_or(dir);
             continue;
@@ -1932,22 +1947,30 @@ fn decoded_exec(argv: &[String]) -> bool {
 /// Split a hooked line into its commands at shell separators. A token
 /// ending in `;` closes its command.
 fn commands(argv: &[String]) -> Vec<Vec<&str>> {
-    let mut out: Vec<Vec<&str>> = vec![Vec::new()];
+    ended_commands(argv).into_iter().map(|(c, _)| c).collect()
+}
+
+/// [`commands`], each with the separator that ends it: `;`, `&&`, `||`,
+/// `|`, `&`, or nothing at the end of the line.
+fn ended_commands(argv: &[String]) -> Vec<(Vec<&str>, &str)> {
+    let mut out: Vec<(Vec<&str>, &str)> = vec![(Vec::new(), "")];
     for a in argv.iter().map(String::as_str) {
         if matches!(a, ";" | "&&" | "||" | "|" | "&") {
-            out.push(Vec::new());
+            out.last_mut().expect("one command").1 = a;
+            out.push((Vec::new(), ""));
             continue;
         }
         let closes = a.ends_with(';');
         let tok = a.trim_end_matches(';');
         if !tok.is_empty() {
-            out.last_mut().expect("one command").push(tok);
+            out.last_mut().expect("one command").0.push(tok);
         }
         if closes {
-            out.push(Vec::new());
+            out.last_mut().expect("one command").1 = ";";
+            out.push((Vec::new(), ""));
         }
     }
-    out.retain(|c| !c.is_empty());
+    out.retain(|(c, _)| !c.is_empty());
     out
 }
 
@@ -3585,6 +3608,35 @@ mod tests {
         ] {
             let c = entering("none-cd", &files, line);
             assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+    }
+
+    /// `line` checked from a directory whose Makefile is `MAKEFILE`, beside
+    /// a `safe` project whose `clean-all` only echoes. `missing` is absent.
+    fn leaving(name: &str, line: &str) -> Decision {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(root.join("safe")).expect("dir");
+        std::fs::write(root.join("Makefile"), MAKEFILE).expect("write");
+        std::fs::write(root.join("safe/Makefile"), "clean-all:\n\techo clean\n").expect("write");
+        check_shell_in(&shell_words(line), &root, 0).decision
+    }
+
+    /// A `cd` sent to the background, or run as a pipeline stage, moves
+    /// only its own subshell: the runner after it reads the Makefile here.
+    #[test]
+    fn reads_here_past_a_cd_in_a_subshell() {
+        for line in [
+            "cd safe & make clean-all",
+            "cd safe && true & make clean-all",
+            "cd safe | true && make clean-all",
+            "true | cd safe && make clean-all",
+            "cd safe | make clean-all",
+            "pushd safe | true; make clean-all",
+        ] {
+            assert_eq!(leaving("bg-cd", line), Decision::Deny, "{line}");
+        }
+        for line in ["cd safe && make clean-all", "cd safe && make clean-all &"] {
+            assert_eq!(leaving("bg-cd", line), Decision::Allow, "{line}");
         }
     }
 
