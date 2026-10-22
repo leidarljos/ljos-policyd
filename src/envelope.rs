@@ -1888,6 +1888,54 @@ From: other@example.test\r\n";
         assert_eq!(decimal_digit('0'), '0');
     }
 
+    /// Joiners, variation selectors and a quoted space are closed, so a
+    /// recipient is `recipient-unparsed` and an `address` line that
+    /// contains one does not load.
+    #[test]
+    fn a_joiner_emoji_or_quoted_space_is_refused() {
+        let refused = [
+            "\u{0915}\u{094D}\u{200D}",
+            "\u{0915}\u{094D}\u{200C}",
+            "\u{0645}\u{200C}\u{0631}",
+            "\u{0D85}\u{200D}",
+            "\u{1820}\u{180B}",
+            "\u{1F468}\u{200D}\u{1F469}",
+            "\u{2764}\u{FE0F}",
+            "1\u{FE0F}\u{20E3}",
+            "\u{1F3F4}\u{E0067}\u{E0062}\u{E007F}",
+            "\"john doe\"",
+            "\"john\u{00A0}doe\"",
+        ];
+        for local in refused {
+            let raw = plain(&format!("To: {local}@example.test\r\n"));
+            assert_eq!(codes(&raw, "", ""), vec!["recipient-unparsed"], "{local:?}");
+            let deny = format!("address {local}@example.test\n");
+            let v = verdict(&plain(""), &deny, "");
+            assert_eq!(v.reasons.len(), 1, "{local:?}");
+            assert_eq!(v.reasons[0].code, "deny-file-invalid", "{local:?}");
+            assert_eq!(v.reasons[0].detail, "line 1", "{local:?}");
+        }
+        let accepted = [
+            "\u{0915}\u{093E}",
+            "\u{0915}\u{094D}",
+            "\u{0627}\u{0640}\u{0628}",
+            "\u{4E2D}",
+            "\u{AC00}",
+            "\u{0E01}",
+            "\u{1F600}",
+            "\u{1F44D}\u{1F3FB}",
+            "\u{2764}",
+        ];
+        for local in accepted {
+            let raw = plain(&format!("To: {local}@example.test\r\n"));
+            assert!(
+                codes(&raw, "", "").is_empty(),
+                "{local:?} {:?}",
+                details(&raw, "", "")
+            );
+        }
+    }
+
     #[test]
     fn a_cyrillic_lookalike_domain_is_not_the_identity() {
         // U+0430 is Cyrillic a. NFKC leaves it, and IDNA punycode is not
