@@ -83,7 +83,9 @@ const SCRIPT_DEPTH: usize = 3;
 /// [`check_shell`] with the working directory a task runner would read its
 /// file from. An allowed line that runs `make`, `npm run`, `just` or
 /// `cargo make` is then judged again on each command the target's recipe
-/// runs, so `make clean-all` is refused when its recipe would be.
+/// runs, so `make clean-all` is refused when its recipe would be. A `cd`
+/// or `pushd` before the runner on the line moves where its file is read,
+/// so `cd ~/proj && make clean-all` reads `~/proj/Makefile`.
 fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Checked {
     let table = host_argv_table(argv);
     #[cfg(has_phronesis)]
@@ -96,11 +98,11 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
         return table;
     }
     let mut runs = Vec::new();
-    runner_commands(argv, 0, &mut runs);
-    for run in runs {
-        for line in scripts::resolved(&run, cwd) {
+    runner_commands(argv, cwd, 0, &mut runs);
+    for (run, dir) in runs {
+        for line in scripts::resolved(&run, &dir) {
             let sh = ["sh".to_string(), "-c".to_string(), line.clone()];
-            let c = check_shell_in(&sh, cwd, depth + 1);
+            let c = check_shell_in(&sh, &dir, depth + 1);
             if c.decision != Decision::Allow {
                 return Checked {
                     decision: c.decision,
@@ -113,25 +115,79 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
     table
 }
 
-/// Every simple command the line runs, wrappers off: the line split on
-/// its separators, then each `-c` script, `eval` and wrapper inside it,
-/// down to [`MAX_DEPTH`].
-fn runner_commands(argv: &[String], depth: usize, out: &mut Vec<Vec<String>>) {
+/// Every simple command the line runs, wrappers off, with the directory it
+/// runs in: the line split on its separators, then each `-c` script,
+/// `eval` and wrapper inside it, down to [`MAX_DEPTH`]. A `cd`, `pushd`
+/// or `popd` moves the commands after it on the same line; a script
+/// nested in the line starts from `cwd`.
+fn runner_commands(
+    argv: &[String],
+    cwd: &std::path::Path,
+    depth: usize,
+    out: &mut Vec<(Vec<String>, std::path::PathBuf)>,
+) {
+    let mut dir = cwd.to_path_buf();
+    let mut pushed = Vec::new();
+    let mut own = Vec::new();
     for cmd in commands(argv) {
+        let b = base_of(cmd[0]);
+        if b == "popd" {
+            dir = pushed.pop().unwrap_or(dir);
+            continue;
+        }
+        if b == "cd" || b == "pushd" {
+            if let Some(to) = entered(&cmd[1..], &dir, b == "pushd") {
+                let from = std::mem::replace(&mut dir, to);
+                if b == "pushd" {
+                    pushed.push(from);
+                }
+            }
+            continue;
+        }
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
         let run = unwrap_wrappers(&owned).0.to_vec();
-        if !run.is_empty() && !out.contains(&run) {
-            out.push(run);
+        if run.is_empty() {
+            continue;
         }
+        if !out.iter().any(|(r, d)| *r == run && *d == dir) {
+            out.push((run.clone(), dir.clone()));
+        }
+        own.push(run);
     }
     if depth >= MAX_DEPTH {
         return;
     }
+    // This line's own commands are already in `out` with their directory;
+    // read again from `cwd`, they would be judged in the wrong one.
     for inner in inner_commands(argv) {
-        if inner.as_slice() != argv {
-            runner_commands(&inner, depth + 1, out);
+        if inner.as_slice() != argv && !own.contains(&inner) {
+            runner_commands(&inner, cwd, depth + 1, out);
         }
     }
+}
+
+/// The directory `cd` or `pushd` with `args` enters from `dir`: a path,
+/// `~` or `~/path`, or home for a bare `cd`. A bare `pushd`, `-`, a
+/// stack index, a variable or a substitution names no directory the line
+/// shows, so the caller keeps the one it has.
+fn entered(args: &[&str], dir: &std::path::Path, pushd: bool) -> Option<std::path::PathBuf> {
+    let home = || std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let Some(to) = args
+        .iter()
+        .find(|a| !a.starts_with(['-', '+']) || **a == "-")
+    else {
+        return if pushd { None } else { home() };
+    };
+    if *to == "-" || to.contains(['$', '`']) {
+        return None;
+    }
+    if *to == "~" {
+        return home();
+    }
+    if let Some(rest) = to.strip_prefix("~/") {
+        return home().map(|h| h.join(rest));
+    }
+    (!to.starts_with('~')).then(|| dir.join(to))
 }
 
 fn host_argv_table(argv: &[String]) -> Checked {
@@ -3357,8 +3413,22 @@ mod tests {
         check_shell_in(&argv, &d, 0).decision
     }
 
+    /// `line` checked from an empty directory whose `project` holds
+    /// `files`; `{dir}` in the line is the project's absolute path.
+    fn entering(name: &str, files: &[(&str, &str)], line: &str) -> Checked {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-{name}", std::process::id()));
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).expect("dir");
+        for (f, body) in files {
+            std::fs::write(project.join(f), body).expect("write");
+        }
+        let line = line.replace("{dir}", &project.to_string_lossy());
+        check_shell_in(&shell_words(&line), &root, 0)
+    }
+
     const MAKEFILE: &str = "test:\n\tcargo test\nclean:\n\trm -rf target\nclean-all: clean\n\trm -rf $(HOME)/.cache ~ \nHOME_DIR = ~\n";
     const PACKAGE: &str = r#"{"scripts":{"build":"tsc -p .","nuke":"rm -rf ~/ && echo gone","deploy":"git push --force origin main"}}"#;
+    const JUSTFILE: &str = "build:\n    cargo build\nwipe: build\n    rm -rf ~/\n";
 
     #[test]
     fn refuses_a_make_target_whose_recipe_is_refused() {
@@ -3427,6 +3497,95 @@ mod tests {
             in_dir("none2", "README", "", &["npm", "run", "nuke"]),
             Decision::Allow
         );
+    }
+
+    /// d198 as it is usually written: the line enters the project first,
+    /// and the check runs from somewhere else.
+    #[test]
+    fn refuses_a_make_or_just_target_where_the_line_enters() {
+        let files = [("Makefile", MAKEFILE), ("justfile", JUSTFILE)];
+        for line in [
+            "cd {dir} && make clean-all",
+            "cd project && make clean-all",
+            "cd project; make -s clean-all",
+            "pushd {dir} && make clean-all",
+            "bash -lc 'cd {dir} && make clean-all'",
+            "cd project && just wipe",
+        ] {
+            let c = entering("d198-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        let c = entering("d198-cd", &files, "cd project && make clean-all");
+        assert!(
+            c.token.starts_with("make clean-all runs `rm -rf "),
+            "{}",
+            c.token
+        );
+        assert!(c.token.ends_with(": rm-rf-outside-tmp"), "{}", c.token);
+    }
+
+    /// d199 the same way, for each runner that reads package.json.
+    #[test]
+    fn refuses_a_package_script_where_the_line_enters() {
+        let files = [("package.json", PACKAGE)];
+        for line in [
+            "cd {dir} && npm run nuke",
+            "cd project && pnpm nuke",
+            "cd project && yarn run nuke",
+            "cd project && bun run nuke",
+            "sh -c 'cd {dir} && npm run nuke'",
+        ] {
+            let c = entering("d199-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        let c = entering("d199-cd", &files, "cd project && npm run nuke");
+        assert!(
+            c.token.starts_with("npm run nuke runs `rm -rf ~/"),
+            "{}",
+            c.token
+        );
+        assert_eq!(
+            in_dir("d199-bun", "package.json", PACKAGE, &["bun", "run", "nuke"]),
+            Decision::Deny
+        );
+    }
+
+    #[test]
+    fn allows_a_safe_target_where_the_line_enters() {
+        let files = [
+            ("Makefile", MAKEFILE),
+            ("justfile", JUSTFILE),
+            ("package.json", PACKAGE),
+        ];
+        for line in [
+            "cd project && make test",
+            "cd project && make clean",
+            "cd project && just build",
+            "cd project && npm run build",
+            "cd project && bun run build",
+            "cd project && npm install",
+        ] {
+            let c = entering("safe-cd", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+    }
+
+    /// A directory the line does not show, or one it leaves again, is not
+    /// read, and the runner is judged as before.
+    #[test]
+    fn keeps_todays_verdict_where_the_line_enters_no_project() {
+        let files = [("Makefile", MAKEFILE), ("package.json", PACKAGE)];
+        for line in [
+            "make clean-all",
+            "npm run nuke",
+            "cd project/missing && make clean-all",
+            "cd \"$PROJECT\" && make clean-all",
+            "pushd project && popd && npm run nuke",
+            "(cd project) && make clean-all",
+        ] {
+            let c = entering("none-cd", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
     }
 
     #[test]

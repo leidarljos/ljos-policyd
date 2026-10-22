@@ -31,6 +31,7 @@ pub(crate) fn resolved(run: &[String], cwd: &Path) -> Vec<String> {
         "npm" => node("npm", rest, cwd),
         "pnpm" => node("pnpm", rest, cwd),
         "yarn" => node("yarn", rest, cwd),
+        "bun" => node("bun", rest, cwd),
         "just" => just(rest, cwd),
         "cargo" if rest.first().map(String::as_str) == Some("make") => cargo_make(&rest[1..], cwd),
         "cargo-make" | "makers" => cargo_make(rest, cwd),
@@ -386,7 +387,7 @@ fn node(tool: &str, args: &[String], cwd: &Path) -> Vec<String> {
         let a = args[i].as_str();
         let dir_flag = matches!(
             (tool, a),
-            ("npm", "--prefix") | ("pnpm", "-C") | ("pnpm", "--dir") | ("yarn", "--cwd")
+            ("npm", "--prefix") | ("pnpm", "-C") | ("pnpm", "--dir") | ("yarn" | "bun", "--cwd")
         );
         if dir_flag {
             i += 1;
@@ -406,9 +407,11 @@ fn node(tool: &str, args: &[String], cwd: &Path) -> Vec<String> {
         }
         i += 1;
     }
+    // A bare `bun build` or `bun test` is bun's own bundler or test
+    // runner, so bun is read only through `run`.
     let script = match words.as_slice() {
         ["run" | "run-script" | "rs" | "urn", s, ..] => *s,
-        [s, ..] if !NPM_BUILTINS.contains(s) => *s,
+        [s, ..] if tool != "bun" && !NPM_BUILTINS.contains(s) => *s,
         _ => return Vec::new(),
     };
     let Some(parsed) = load(&dir.join("package.json"), |t| {
@@ -841,6 +844,16 @@ mod tests {
         assert_eq!(resolved(&argv(&["yarn", "nuke"]), &d).len(), 2);
         assert_eq!(resolved(&argv(&["pnpm", "build"]), &d), ["tsc"]);
         assert!(resolved(&argv(&["npm", "install"]), &d).is_empty());
+        assert_eq!(resolved(&argv(&["bun", "run", "nuke"]), &d).len(), 2);
+        let at = d.to_string_lossy();
+        assert_eq!(
+            resolved(
+                &argv(&["bun", "--cwd", &at, "run", "build"]),
+                Path::new("/")
+            ),
+            ["tsc"]
+        );
+        assert!(resolved(&argv(&["bun", "build"]), &d).is_empty());
     }
 
     #[test]
