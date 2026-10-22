@@ -235,31 +235,52 @@ that mailbox, not the whole domain. It also covers that local
 part, one =subaddress= separator, and anything after the
 separator. The separators are the =subaddress= line, or =+-=
 when the line is omitted. =.=, =@=, =%= and =!= are not
-separators. A provider alias family folds both the rule and the
+separators. An =address= rule is also compared by skeleton:
+NFKC, case folded, with every =.=, =_=, =-=, =+= and ===
+removed and nothing cut. A recipient whose skeleton starts with
+the rule's skeleton, at the rule's domain or one in the same
+alias family, is refused, and so is one the folding below
+refuses. This over-blocks on purpose: a rule for =john= also
+refuses =johnny= and =jo.hn-x=, so a provider that ignores a
+character no family lists cannot deliver a denied mailbox.
+A provider alias family folds both the rule and the
 recipient, and adds its separators to the =subaddress= line on
 its domains. =gmail.com= and =googlemail.com= are one
 domain, dots in the local part are ignored, and =+= is a
 separator. On =fastmail.com=, =+= is a separator and a
-mailbox at =<local>@<user>.fastmail.com= (one label, then
-=fastmail.com=) is =<user>@fastmail.com=. A hyphen in that
-label is part of the user name. =proton.me=,
+mailbox at =<local>@<user>.fastmail.com= is
+=<user>+<local>@fastmail.com=. Every label in front of
+=fastmail.com= is the user, and a hyphen there is part of the
+user name. A punycode user label is decoded to Unicode and folded as a
+local part, so =x@xn--bcher-kva.fastmail.com= is
+=bücher+x@fastmail.com=. =proton.me=,
 =protonmail.com=, =protonmail.ch= and =pm.me= are one
 domain, and so are =icloud.com=, =me.com= and =mac.com=,
-each with =+=. =outlook.com=, =hotmail.com=, =live.com=,
-=msn.com= and their country variants are separate domains, each
-with =+=. On =yahoo.com=, its country variants, =ymail.com=
-and =rocketmail.com=, =-= is a separator, and an address rule
+each with =+=. =outlook.*=, =hotmail.*=, =live.*= and
+=msn.*= (every domain with that first label, whatever the
+country suffix) are separate domains, each with =+=. On
+=yahoo.*=, =ymail.*= and =rocketmail.com=, =-= is a
+separator, and an address rule
 is also cut at its first separator, so a rule for one disposable
 address =<base>-<keyword>= covers =<base>= and every keyword.
 An =alias= line adds a family to these:
-=alias <domain>[,<domain>...] <separators> [flag...]=. The
-separators are checked as on the =subaddress= line, and the flags
-are =shared= (the domains are one mailbox), =dots= (dots in
-the local part are ignored), =subdomain= (=<local>@<user>.<domain>=
-is =<user>@<domain>=) and =cut= (the rule is also cut at its
+=alias <domain>[,<domain>...] <separators> [flag...]=. A
+domain may be =<label>.*=, every domain whose first label is
+=<label>=. The separators are checked as on the =subaddress= line, and the flags
+are =shared= (the domains, and the same subdomain of each, are
+one mailbox), =dots= (dots in the local part are ignored),
+=subdomain= (=<local>@<user>.<domain>= is
+=<user><sep><local>@<domain>=, =<sep>= being the line's first
+separator, folded again so =dots= also reaches the user) and =cut= (the rule is also cut at its
 first separator). An =alias= line cannot remove a built-in
-family, and one that does not parse refuses the config. Domain
-rules and =From= are not matched this way. A domain literal (an address
+family, and one that does not parse, or names one domain or flag
+twice, refuses the config. A
+=domain= rule on a domain of a =shared= family covers every
+domain of that family and their subdomains, so =domain gmail.com=
+also refuses =googlemail.com=, =domain pm.me= the other Proton
+domains, and =domain icloud.com= =me.com= and =mac.com=.
+=deny-domain= in the pack-law file does the same. =From= is
+not matched this way. A domain literal (an address
 at =@[ ... ]=) in a watched header is a refusal. An
 all-numeric domain is a refusal, judged after IDNA. That
 includes a dotted quad, a shorter form inet_aton accepts, a
