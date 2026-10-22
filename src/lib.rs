@@ -550,6 +550,20 @@ struct Shell {
     /// does not resolve leaves [`here`][Self::here] [`UNKNOWN`], and a
     /// relative `source` is still read here.
     known: Option<std::path::PathBuf>,
+    /// Literal values a variable used as a command word may hold. `\0`
+    /// means one branch left it unset, so the word may be anything.
+    cmd_values: std::collections::HashMap<String, Vec<String>>,
+    /// Open `if` and `case`. Each branch's values join at `fi` or `esac`.
+    assign_stack: Vec<AssignFrame>,
+}
+
+/// One `if` or `case`, so a variable set in every branch can be read as
+/// those commands and not as a word the line does not show.
+#[derive(Clone)]
+struct AssignFrame {
+    base: std::collections::HashMap<String, Vec<String>>,
+    alts: Vec<std::collections::HashMap<String, Vec<String>>>,
+    had_else: bool,
 }
 
 #[derive(Clone)]
@@ -562,6 +576,8 @@ struct Saved {
     pwd_set: bool,
     left_tree: bool,
     known: Option<std::path::PathBuf>,
+    cmd_values: std::collections::HashMap<String, Vec<String>>,
+    assign_stack: Vec<AssignFrame>,
 }
 
 impl Shell {
@@ -575,6 +591,8 @@ impl Shell {
             pwd_set: self.pwd_set,
             left_tree: self.left_tree,
             known: self.known.clone(),
+            cmd_values: self.cmd_values.clone(),
+            assign_stack: self.assign_stack.clone(),
         }
     }
 
@@ -587,6 +605,8 @@ impl Shell {
         self.pwd_set = saved.pwd_set;
         self.left_tree = saved.left_tree;
         self.known = saved.known;
+        self.cmd_values = saved.cmd_values;
+        self.assign_stack = saved.assign_stack;
     }
 
     /// The directory, the stack and `HOME` / `CDPATH` are no longer known.
@@ -906,6 +926,8 @@ fn runner_commands(
         } else {
             Some(inn.cwd.to_path_buf())
         },
+        cmd_values: initial_cmd_values(),
+        assign_stack: Vec::new(),
     };
     walk(argv, &mut shell, depth, out, denied);
 }
@@ -1096,6 +1118,7 @@ fn walk(
             let was = shell.vars.clone();
             set_vars(&shown, &mut shell.vars);
             note_startup(&shown, &mut shell.vars);
+            note_cmd_values(&shown, shell);
             match before {
                 "||" => shell.vars.merge(was),
                 "&&" => match &mut vars_failed {
@@ -1201,7 +1224,11 @@ fn walk(
                 return;
             }
             Sourced::No => {
-                if in_shell && shell.follow_unseen && (bare_unseen(&cmd) || blinds_functions(&cmd))
+                if in_shell
+                    && shell.follow_unseen
+                    && (bare_unseen(&cmd) || blinds_functions(&cmd))
+                    && !assigned_command_keeps(&cmd, &shell.cmd_values)
+                    && !shown_eval_keeps(&cmd, &shell.cmd_values, 0)
                 {
                     shell.lose();
                 }
@@ -1853,6 +1880,255 @@ fn bare_unseen(cmd: &[&str]) -> bool {
             && !injects_no_command(&w)
             && (matches!(base_of(&w), "eval" | "source" | ".") || w.contains(['$', '`']))
     }) || trap_moves(cmd)
+}
+
+/// `SHELL` from the environment when it is an absolute path. `$SHELL`
+/// then runs that program. It does not move this shell. An assignment
+/// on the line replaces it.
+fn initial_cmd_values() -> std::collections::HashMap<String, Vec<String>> {
+    let mut out = std::collections::HashMap::new();
+    if let Ok(v) = std::env::var("SHELL") {
+        if v.starts_with('/') && !v.contains(['$', '`', ' ', '\n']) {
+            out.insert("SHELL".into(), vec![v]);
+        }
+    }
+    out
+}
+
+/// `if` / `elif` / `else` / `fi` and `case` / `esac` when that word is the
+/// command, not an argument (`echo if`).
+fn branch_keyword<'a>(cmd: &[&'a str]) -> Option<&'a str> {
+    let words = operands(cmd);
+    let mut i = 0;
+    while i < words.len() && is_assignment(words[i]) {
+        i += 1;
+    }
+    match words.get(i).copied() {
+        Some(w @ ("if" | "elif" | "else" | "fi" | "case" | "esac")) => Some(w),
+        _ => None,
+    }
+}
+
+fn assign_sides(w: &str) -> Option<(String, String)> {
+    let end = w.find(|c: char| !c.is_ascii_alphanumeric() && c != '_')?;
+    if end == 0 || w[..end].chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let rest = &w[end..];
+    let value = rest.strip_prefix('=')?;
+    Some((w[..end].to_string(), value.to_string()))
+}
+
+/// Record a bare assignment, and join the values each branch of an `if`
+/// or `case` may leave. A later `$name` is that command only when every
+/// branch shows one.
+fn note_cmd_values(cmd: &[&str], shell: &mut Shell) {
+    match branch_keyword(cmd) {
+        Some("if" | "case") => shell.assign_stack.push(AssignFrame {
+            base: shell.cmd_values.clone(),
+            alts: Vec::new(),
+            had_else: false,
+        }),
+        Some("else") => {
+            if let Some(frame) = shell.assign_stack.last_mut() {
+                frame.had_else = true;
+                frame.alts.push(std::mem::take(&mut shell.cmd_values));
+            }
+            if let Some(frame) = shell.assign_stack.last() {
+                shell.cmd_values.clone_from(&frame.base);
+            }
+        }
+        Some("elif") => {
+            if let Some(frame) = shell.assign_stack.last_mut() {
+                frame.alts.push(std::mem::take(&mut shell.cmd_values));
+            }
+            if let Some(frame) = shell.assign_stack.last() {
+                shell.cmd_values.clone_from(&frame.base);
+            }
+        }
+        Some("fi" | "esac") => {
+            if let Some(mut frame) = shell.assign_stack.pop() {
+                frame.alts.push(std::mem::take(&mut shell.cmd_values));
+                if !frame.had_else {
+                    frame.alts.push(frame.base.clone());
+                }
+                shell.cmd_values = union_assigns(&frame.base, &frame.alts);
+            }
+        }
+        _ => {}
+    }
+    // `then NAME=cmd` and `else NAME=cmd` are assignments. The keyword
+    // is syntax. A prefix on a real command (`NAME=cmd echo`) is not.
+    let words = operands(cmd);
+    let mut i = 0;
+    while i < words.len() && (is_assignment(words[i]) || keyword_at(&words, i)) {
+        i += 1;
+    }
+    if i != words.len() {
+        return;
+    }
+    for w in words {
+        if let Some((name, value)) = assign_sides(w) {
+            shell.cmd_values.insert(name, vec![value]);
+        } else if let Some(name) = w.split(['+', '[', '=']).next().filter(|n| !n.is_empty()) {
+            // `NAME+=x` and `NAME[i]=x` do not show the whole value.
+            shell.cmd_values.insert(name.to_string(), vec!["\0".into()]);
+        }
+    }
+}
+
+fn union_assigns(
+    base: &std::collections::HashMap<String, Vec<String>>,
+    alts: &[std::collections::HashMap<String, Vec<String>>],
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut names: Vec<String> = base.keys().cloned().collect();
+    for alt in alts {
+        for name in alt.keys() {
+            if !names.iter().any(|n| n == name) {
+                names.push(name.clone());
+            }
+        }
+    }
+    let mut out = std::collections::HashMap::new();
+    for name in names {
+        let mut vals = Vec::new();
+        let mut unset = false;
+        for alt in alts {
+            match alt.get(&name).or_else(|| base.get(&name)) {
+                Some(v) => {
+                    for s in v {
+                        if !vals.contains(s) {
+                            vals.push(s.clone());
+                        }
+                    }
+                }
+                None => unset = true,
+            }
+        }
+        if unset {
+            vals.push("\0".into());
+        }
+        if !vals.is_empty() {
+            out.insert(name, vals);
+        }
+    }
+    out
+}
+
+/// `$name` or `${name}` and nothing after it.
+fn var_command_name(w: &str) -> Option<&str> {
+    let rest = w.strip_prefix('$')?;
+    if let Some(name) = rest.strip_prefix('{') {
+        let name = name.strip_suffix('}')?;
+        return var_name(name);
+    }
+    var_name(rest).filter(|_| rest.len() + 1 == w.len())
+}
+
+fn var_name(name: &str) -> Option<&str> {
+    (!name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    .then_some(name)
+}
+
+/// Whether every value `cmd`'s command word may hold leaves this shell
+/// where it is. `c=cd` does not. `as_echo='printf %s\n'` does.
+/// `eval` of a script the line shows, when every command in it leaves
+/// this shell where it is. `eval cd` does not. `eval test ...` does.
+fn shown_eval_keeps(
+    cmd: &[&str],
+    values: &std::collections::HashMap<String, Vec<String>>,
+    depth: usize,
+) -> bool {
+    if depth > 4 {
+        return false;
+    }
+    let words = operands(cmd);
+    let mut i = 0;
+    while i < words.len() && (is_assignment(words[i]) || keyword_at(&words, i)) {
+        i += 1;
+    }
+    let run = peel_cd_command_word(&words[i..]);
+    let Some((w, args)) = run.split_first() else {
+        return false;
+    };
+    if base_of(w) != "eval" {
+        return false;
+    }
+    // A function defined in the script does not run its body. A call does.
+    let script = shell_words(&args.join(" "));
+    let (top, defs) = lift_functions(&script);
+    if top.iter().any(|w| w == "\0lose") {
+        return false;
+    }
+    let funcs: FnMap = defs.into_iter().collect();
+    let bodies: std::collections::HashMap<String, Vec<String>> = funcs
+        .iter()
+        .map(|(n, b)| (n.clone(), b.words.clone()))
+        .collect();
+    let mut memo = std::collections::HashMap::new();
+    let mut stack = std::collections::HashSet::new();
+    ended_commands(&top).iter().all(|(c, _)| {
+        if let Some(name) = called_fn(c, &funcs) {
+            let body = funcs.get(&name).map(|b| b.words.as_slice()).unwrap_or(&[]);
+            return body_keeps(body, &bodies, &mut memo, &mut stack);
+        }
+        if moves_shell(c) || trap_moves(c) {
+            return false;
+        }
+        if assigned_command_keeps(c, values) || shown_eval_keeps(c, values, depth + 1) {
+            return true;
+        }
+        !bare_unseen(c)
+    })
+}
+
+fn assigned_command_keeps(
+    cmd: &[&str],
+    values: &std::collections::HashMap<String, Vec<String>>,
+) -> bool {
+    let Some(head) = head_word(cmd) else {
+        return false;
+    };
+    let Some(name) = var_command_name(&head) else {
+        return false;
+    };
+    values
+        .get(name)
+        .is_some_and(|got| command_values_keep(got, values, 0))
+}
+
+fn command_values_keep(
+    values: &[String],
+    map: &std::collections::HashMap<String, Vec<String>>,
+    depth: usize,
+) -> bool {
+    if depth > 4 {
+        return false;
+    }
+    values.iter().all(|v| {
+        if v.contains('\0') {
+            return false;
+        }
+        let words = shell_words(v);
+        let cmd: Vec<&str> = words.iter().map(String::as_str).collect();
+        if cmd.is_empty() || moves_shell(&cmd) || trap_moves(&cmd) {
+            return false;
+        }
+        let Some(head) = head_word(&cmd) else {
+            return true;
+        };
+        if let Some(name) = var_command_name(&head) {
+            return map
+                .get(name)
+                .is_some_and(|vs| command_values_keep(vs, map, depth + 1));
+        }
+        if is_plain_subshell(&head) || injects_no_command(&head) {
+            return true;
+        }
+        !(matches!(base_of(&head), "eval" | "source" | ".") || head.contains(['$', '`']))
+    })
 }
 
 /// Whether `cmd` is a `trap` whose action moves the shell or is
@@ -14422,6 +14698,36 @@ hash -r 2> /dev/null
             "$(echo cd) evil; make clean-all",
         ] {
             assert_eq!(evil_and_safe("sublose", line), Decision::Deny, "{line}");
+        }
+    }
+
+    /// `$as_echo` is the command configure just assigned: `printf`, `print`
+    /// or `sh -c`. Each of those leaves this shell where it is, including
+    /// when the assignments sit in the branches of one `if`. A branch
+    /// that assigns `cd`, or an `if` with no `else`, still may move it.
+    #[test]
+    fn a_variable_command_keeps_the_directory_when_every_value_does() {
+        for line in [
+            "as_echo='printf %s\\n'; $as_echo hi; make -C safe clean-all",
+            "if true; then as_echo='print -r --'; elif true; then as_echo='printf %s\\n'; else as_echo='sh -c $as_echo_body as_echo'; fi; $as_echo hi; make -C safe clean-all",
+            "c=echo; $c; make -C safe clean-all",
+            "c=cd; c=echo; $c; make -C safe clean-all",
+            "eval test x = x; make -C safe clean-all",
+            "do eval test x\\${as_var+set} = xset; make -C safe clean-all",
+            "builtin eval test x = x; make -C safe clean-all",
+            "as_run=a $SHELL; make -C safe clean-all",
+            "$as_echo hi | as_run=a $SHELL; make -C safe clean-all",
+        ] {
+            assert_eq!(evil_and_safe("cmdvar", line), Decision::Allow, "{line}");
+        }
+        for line in [
+            "c=cd; $c evil; make clean-all",
+            "if true; then c=cd; else c=echo; fi; $c evil; make clean-all",
+            "if true; then c=echo; fi; $c; make clean-all",
+            "c=eval; $c cd evil; make clean-all",
+            "SHELL=cd; $SHELL evil; make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("cmdvar", line), Decision::Deny, "{line}");
         }
     }
 }
