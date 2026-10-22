@@ -122,6 +122,7 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
         left_tree: false,
         files: &files,
         known: None,
+        script_cwd_moved: false,
     };
     runner_commands(argv, &inn, 0, &mut runs, &mut denied);
     if let Some(c) = denied {
@@ -808,11 +809,7 @@ fn note_script_var(cmd: &[String], files: &Files) {
         let Some((name, value)) = assign_sides(w) else {
             continue;
         };
-        let script = !value.contains(['`', '\0'])
-            && (value == "$0"
-                || value == "${0}"
-                || value.ends_with("$0")
-                || value.ends_with("${0}"));
+        let script = names_this_script(&value);
         if script {
             files.script_vars.insert(name);
         } else {
@@ -822,12 +819,17 @@ fn note_script_var(cmd: &[String], files: &Files) {
 }
 
 /// Whether `cmd` reads the script being judged: `<$0`, or `<$name` when
-/// every value of `name` is `$0` or a path that ends in it.
+/// every value of `name` is exactly `$0`. A path that only ends in `$0`
+/// is a different file. After `cd`, the relative path is no longer `$0`.
 fn reads_script_stdin(
     cmd: &[String],
     values: &std::collections::HashMap<String, Vec<String>>,
     script_vars: &std::collections::HashSet<String>,
+    trust: bool,
 ) -> bool {
+    if !trust {
+        return false;
+    }
     cmd.iter().any(|w| {
         let body = redirection_body(w);
         let Some(target) = body.strip_prefix('<').filter(|t| !t.starts_with('<')) else {
@@ -846,7 +848,7 @@ fn script_source(
     values: &std::collections::HashMap<String, Vec<String>>,
     script_vars: &std::collections::HashSet<String>,
 ) -> bool {
-    if target == "$0" || target == "${0}" {
+    if names_this_script(target) {
         return true;
     }
     let Some(name) = target.strip_prefix('$') else {
@@ -864,18 +866,21 @@ fn script_source(
     if script_vars.contains(name) {
         return true;
     }
-    values.get(name).is_some_and(|vs| {
-        !vs.is_empty()
-            && vs.iter().all(|v| {
-                !v.contains(['\0', '`'])
-                    && (v == "$0" || v == "${0}" || v.ends_with("$0") || v.ends_with("${0}"))
-            })
-    })
+    values
+        .get(name)
+        .is_some_and(|vs| !vs.is_empty() && vs.iter().all(|v| names_this_script(v)))
 }
 
-/// Whether `cmd` is `sed` or `cat` and a `sed` program's replacements
-/// add no command text (`&-`, `\1`, nothing). A letter, `$` or a
-/// backtick in a replacement is a new command.
+/// `value` is the script being judged and nothing else. A path that
+/// only ends in `$0` (`evil/$0`) is a different file.
+fn names_this_script(value: &str) -> bool {
+    matches!(value, "$0" | "${0}")
+}
+
+/// Whether `cmd` is `sed` or `cat` copying the script it reads on stdin.
+/// `cat` with a file argument prints that file instead. `sed -f`, `sed
+/// -i` and a program that inserts, executes or uncomments are a different
+/// script.
 fn filter_keeps_script(cmd: &[String]) -> bool {
     let words: Vec<&str> = cmd.iter().map(String::as_str).collect();
     let words = operands(&words);
@@ -887,19 +892,156 @@ fn filter_keeps_script(cmd: &[String]) -> bool {
         return false;
     };
     match base_of(w) {
-        "cat" => true,
-        "sed" => rest[1..].iter().all(|p| !sed_inserts_command(p)),
+        "cat" => cat_copies_stdin(&rest[1..]),
+        "sed" => sed_copies_stdin(&rest[1..]),
         _ => false,
     }
 }
 
-fn sed_inserts_command(program: &str) -> bool {
+/// `cat` of stdin only. A path argument is the file `cat` prints.
+fn cat_copies_stdin(args: &[&str]) -> bool {
+    args.iter().all(|a| is_redirection(a) || *a == "--")
+}
+
+/// `sed` reading stdin. `-f` and `-i` are refused. A program is kept
+/// only by [`sed_program_changes`].
+fn sed_copies_stdin(args: &[&str]) -> bool {
+    let mut i = 0;
+    let mut saw_program = false;
+    while i < args.len() {
+        let a = args[i];
+        if is_redirection(a) {
+            i += 1;
+            continue;
+        }
+        if a == "--" {
+            i += 1;
+            while i < args.len() {
+                if is_redirection(args[i]) {
+                    i += 1;
+                    continue;
+                }
+                if saw_program || sed_program_changes(args[i]) {
+                    return false;
+                }
+                saw_program = true;
+                i += 1;
+            }
+            return true;
+        }
+        if let Some(rest) = a.strip_prefix("--") {
+            if let Some(prog) = rest.strip_prefix("expression=") {
+                if sed_program_changes(prog) {
+                    return false;
+                }
+                saw_program = true;
+                i += 1;
+                continue;
+            }
+            if rest == "expression" {
+                i += 1;
+                let Some(prog) = args.get(i).copied().filter(|p| !is_redirection(p)) else {
+                    return false;
+                };
+                if sed_program_changes(prog) {
+                    return false;
+                }
+                saw_program = true;
+                i += 1;
+                continue;
+            }
+            if matches!(rest, "quiet" | "silent" | "posix" | "regexp-extended") {
+                i += 1;
+                continue;
+            }
+            return false;
+        }
+        if let Some(flags) = a.strip_prefix('-').filter(|s| !s.is_empty()) {
+            let bytes = flags.as_bytes();
+            let mut j = 0;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'n' | b'E' | b'r' => j += 1,
+                    b'e' => {
+                        let inline = &flags[j + 1..];
+                        let prog = if inline.is_empty() {
+                            i += 1;
+                            let Some(p) = args.get(i).copied().filter(|p| !is_redirection(p))
+                            else {
+                                return false;
+                            };
+                            p
+                        } else {
+                            inline
+                        };
+                        if sed_program_changes(prog) {
+                            return false;
+                        }
+                        saw_program = true;
+                        break;
+                    }
+                    _ => return false,
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if saw_program || sed_program_changes(a) {
+            return false;
+        }
+        saw_program = true;
+        i += 1;
+    }
+    true
+}
+
+/// Whether `program` can insert text, run a command, or turn a comment
+/// into a command. `s/[$]LINENO.*/&-/` does not. `s/^# //`, `y/#/ /`,
+/// `i`, `a`, `c` and `e` do.
+fn sed_program_changes(program: &str) -> bool {
     let b = program.as_bytes();
     let mut i = 0;
     let mut at_cmd = true;
     while i < b.len() {
         let c = b[i];
-        if at_cmd && c.is_ascii_whitespace() {
+        if at_cmd && matches!(c, b' ' | b'\t' | b'\r') {
+            i += 1;
+            continue;
+        }
+        if at_cmd && c == b'#' {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if at_cmd && (c.is_ascii_digit() || c == b'$') {
+            i += 1;
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i < b.len() && b[i] == b',' {
+                i += 1;
+            }
+            continue;
+        }
+        if at_cmd && (c == b'/' || c == b'\\') {
+            let delim = if c == b'\\' {
+                if i + 1 >= b.len() {
+                    return true;
+                }
+                i += 1;
+                b[i]
+            } else {
+                b'/'
+            };
+            i += 1;
+            i = skip_sed_part(b, i, delim);
+            if i < b.len() && b[i] == b',' {
+                i += 1;
+            }
+            continue;
+        }
+        if at_cmd && c == b'!' {
             i += 1;
             continue;
         }
@@ -908,27 +1050,124 @@ fn sed_inserts_command(program: &str) -> bool {
                 return true;
             };
             i += 2;
+            let pat_at = i;
             i = skip_sed_part(b, i, delim);
-            let start = i;
+            let pat_end = i.saturating_sub(1).max(pat_at);
+            let repl_at = i;
             i = skip_sed_part(b, i, delim);
-            let repl = &program[start..i.saturating_sub(1).max(start)];
-            if repl
-                .chars()
-                .any(|ch| ch.is_ascii_alphabetic() || ch == '$' || ch == '`')
-            {
+            let repl_end = i.saturating_sub(1).max(repl_at);
+            let pattern = &program[pat_at..pat_end.min(program.len())];
+            let repl = &program[repl_at..repl_end.min(program.len())];
+            if sed_subst_changes(c, pattern, repl) {
                 return true;
             }
             at_cmd = false;
             continue;
         }
+        if at_cmd && matches!(c, b'{' | b'}') {
+            i += 1;
+            at_cmd = true;
+            continue;
+        }
+        if at_cmd && matches!(c, b'b' | b't' | b':') {
+            i += 1;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            at_cmd = false;
+            continue;
+        }
+        if at_cmd
+            && matches!(
+                c,
+                b'n' | b'N'
+                    | b'd'
+                    | b'D'
+                    | b'p'
+                    | b'P'
+                    | b'h'
+                    | b'H'
+                    | b'g'
+                    | b'G'
+                    | b'x'
+                    | b'q'
+                    | b'l'
+                    | b'='
+            )
+        {
+            i += 1;
+            at_cmd = false;
+            continue;
+        }
         if c == b'\n' || c == b';' {
             at_cmd = true;
-        } else if !c.is_ascii_whitespace() {
-            at_cmd = false;
+            i += 1;
+            continue;
         }
-        i += 1;
+        if at_cmd {
+            return true;
+        }
+        // A flag after `s///`. `e` runs the replacement as a command.
+        if matches!(c, b'g' | b'p' | b'I') || c.is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        return true;
     }
     false
+}
+
+/// `y` that moves `#`, or `s` whose replacement adds a command or can
+/// delete a `#`. Autoconf's lineno substitutions copy the line or delete
+/// only the marker they added.
+fn sed_subst_changes(kind: u8, pattern: &str, repl: &str) -> bool {
+    if kind == b'y' {
+        let from = sed_piece_chars(pattern);
+        let to = sed_piece_chars(repl);
+        if from.len() != to.len() {
+            return true;
+        }
+        return from.into_iter().zip(to).any(|(a, b)| a == '#' && b != '#');
+    }
+    if autoconf_lineno_subst(pattern, repl) {
+        return false;
+    }
+    if repl
+        .chars()
+        .any(|ch| ch.is_ascii_alphabetic() || ch == '$' || ch == '`')
+    {
+        return true;
+    }
+    let can_match_hash = pattern.contains(['#', '.', '[']) || pattern.contains('\\');
+    let keeps_hash = repl.contains('#') || repl.contains('&');
+    can_match_hash && !keeps_hash
+}
+
+/// The `s` commands a generated configure uses to number `$LINENO`.
+/// The group-copy form keeps both sides of the newline it joined.
+fn autoconf_lineno_subst(pattern: &str, repl: &str) -> bool {
+    (pattern == "[$]LINENO.*" && repl == "&-")
+        || (pattern == "-\\n.*" && repl.is_empty())
+        || (pattern.starts_with("[$]LINENO\\([^")
+            && pattern.ends_with("].*\\n\\)\\(.*\\)")
+            && repl == "\\2\\1\\2"
+            && !pattern.contains('#')
+            && pattern.matches('(').count() == 2)
+}
+
+fn sed_piece_chars(piece: &str) -> Vec<char> {
+    let mut out = Vec::new();
+    let mut chars = piece.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(n) = chars.next() {
+                out.push(n);
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn skip_sed_part(b: &[u8], mut i: usize, delim: u8) -> usize {
@@ -1013,6 +1252,9 @@ struct Shell {
     halted: bool,
     /// The pipeline so far reads the script being judged on stdin.
     script_pipe: bool,
+    /// A `cd` has run in this shell. `$0` is the path the script was
+    /// started with, so a later read of it is a different file.
+    script_cwd_moved: bool,
 }
 
 /// One `if` or `case`, so a variable set in every branch can be read as
@@ -1103,6 +1345,9 @@ struct ShellIn<'a> {
     files: &'a Files,
     /// The last directory a caller could name, when `cwd` itself is not.
     known: Option<std::path::PathBuf>,
+    /// The caller has run `cd` in this script. `$0` is the path it was
+    /// started with, so a later read is a different file.
+    script_cwd_moved: bool,
 }
 
 /// `words` with each function definition replaced by a marker, in order.
@@ -1336,6 +1581,7 @@ fn replay_subshell(
             left_tree: shell.left_tree,
             files: &shell.files,
             known: shell.known.clone(),
+            script_cwd_moved: shell.script_cwd_moved,
         };
         runner_commands(body, &inn, depth, out, denied);
         if denied.is_some() {
@@ -1399,6 +1645,7 @@ fn runner_commands(
         assign_stack: Vec::new(),
         halted: false,
         script_pipe: false,
+        script_cwd_moved: inn.script_cwd_moved,
     };
     walk(argv, &mut shell, depth, out, denied);
 }
@@ -1698,6 +1945,7 @@ fn walk(
                             left_tree: left,
                             files: &files,
                             known: shell.known.clone(),
+                            script_cwd_moved: shell.script_cwd_moved,
                         };
                         runner_commands(&words, &inn, depth + 1, out, denied);
                         if denied.is_some() {
@@ -1769,7 +2017,12 @@ fn walk(
         note_script_var(&owned, &shell.files);
         let reads_script = {
             let files = shell.files.borrow();
-            reads_script_stdin(&owned, &shell.cmd_values, &files.script_vars)
+            reads_script_stdin(
+                &owned,
+                &shell.cmd_values,
+                &files.script_vars,
+                !shell.script_cwd_moved,
+            )
         };
         let pipe = shell.script_pipe || reads_script;
         if pipe && end != "|" && filter_keeps_script(&owned) {
@@ -1838,6 +2091,12 @@ fn walk(
         // A pipeline stage runs in a subshell, so it cannot move this
         // shell. The last stage can, once `lastpipe` is on.
         let in_shell = !piped || (shell.lastpipe && end != "|");
+        // `$0` names the script from the directory it was started in.
+        // After `cd` in this shell, a read of it is a different file. A
+        // pipeline or `&` runs in its own directory and leaves this one.
+        if in_shell && end != "&" && matches!(b, "cd" | "pushd" | "popd") {
+            shell.script_cwd_moved = true;
+        }
         // `exit` in this shell does not return. A background `exit &` does
         // not, and a function named `exit` is the function.
         if in_shell && end != "&" && command_exits(&cmd) && called_fn(&cmd, &shell.funcs).is_none()
@@ -2176,6 +2435,7 @@ fn walk(
                     left_tree: shell.left_tree,
                     files: &shell.files,
                     known: shell.known.clone(),
+                    script_cwd_moved: shell.script_cwd_moved,
                 };
                 runner_commands(&inner, &inn, depth + 1, out, denied);
                 shell.files.borrow_mut().data = was;
@@ -12484,6 +12744,7 @@ hash -r 2> /dev/null
                 left_tree: false,
                 files: &files,
                 known: None,
+                script_cwd_moved: false,
             };
             runner_commands(&shell_words(line), &inn, 0, &mut runs, &mut denied);
             let dirs: Vec<_> = runs
@@ -15585,6 +15846,45 @@ hash -r 2> /dev/null
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+        }
+    }
+
+    /// A filter of `$0` is that script only when it cannot insert text,
+    /// uncomment a line, or read a different file. `sed` `i`/`a`/`c`/`e`,
+    /// `sed -f`, a `y` or `s` that drops `#`, `cat` with a file argument,
+    /// a variable that merely ends in `$0`, and `$0` after `cd` are not.
+    #[test]
+    fn a_rewrite_of_the_script_cannot_change_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = startup_root("rewrit0");
+        let h = "# Generated by GNU Autoconf 2.71\n";
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        let write = |name: &str, body: &str| {
+            let p = root.join(name);
+            if let Some(dir) = p.parent() {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            std::fs::write(&p, body).unwrap();
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&p, perm).unwrap();
+        };
+        std::fs::write(root.join("evil.sed"), "1i git push -f\n").unwrap();
+        write("evil/configure", "git push -f\n");
+        for body in [
+            "# git push -f\nsed 's/^# //' <$0 >$as_me.lineno\n. \"./$as_me.lineno\"\n",
+            "#git push -f\nsed 'y/#/ /' <$0 >$as_me.lineno\n. \"./$as_me.lineno\"\n",
+            "sed '1i git push -f' <$0 >$as_me.lineno\n. \"./$as_me.lineno\"\n",
+            "sed '1e git push -f' <$0 >$as_me.lineno\n. \"./$as_me.lineno\"\n",
+            "sed -f evil.sed <$0 >$as_me.lineno\n. \"./$as_me.lineno\"\n",
+            "cat evil/force.sh <$0 >$as_me.lineno\n. \"./$as_me.lineno\"\n",
+            "v=evil/$0\nsed '' <$v >$as_me.lineno\n. \"./$as_me.lineno\"\n",
+            "as_myself=$0\ncd evil\nsed '' <$as_myself >$as_me.lineno\n. \"./$as_me.lineno\"\n",
+            "as_myself=$0\ncd evil\n( sed '' <$as_myself >$as_me.lineno; . \"./$as_me.lineno\" )\n",
+            "( cd evil; sed '' <$0 >$as_me.lineno; . \"./$as_me.lineno\" )\n",
+        ] {
+            write("configure", &format!("{h}{body}"));
+            assert_eq!(at("sh configure").decision, Decision::Deny, "{body}");
         }
     }
 
