@@ -540,14 +540,17 @@ fn written_reason(script: &str, w: &Written) -> String {
     match &w.path {
         None if !w.loose => format!(
             "{script}: `{}` may name it; write to a literal path",
-            w.word
+            quoted_body(&w.word)
         ),
         Some(dir) if w.loose => format!(
             "{script}: `{}` may write any file under {}",
-            w.word,
+            quoted_body(&w.word),
             dir.display()
         ),
-        None => format!("{script}: `{}` may write any file where it runs", w.word),
+        None => format!(
+            "{script}: `{}` may write any file where it runs",
+            quoted_body(&w.word)
+        ),
         Some(_) => script.to_string(),
     }
 }
@@ -3575,8 +3578,10 @@ fn union_assigns(
     out
 }
 
-/// `$name` or `${name}` and nothing after it.
+/// `$name` or `${name}` and nothing after it. Quotes kept around a
+/// `$` still name that variable.
 fn var_command_name(w: &str) -> Option<&str> {
+    let w = quoted_body(w);
     let rest = w.strip_prefix('$')?;
     if let Some(name) = rest.strip_prefix('{') {
         let name = name.strip_suffix('}')?;
@@ -4411,8 +4416,8 @@ fn source_operand(cmd: &[&str]) -> Option<String> {
     if !matches!(base_of(w), "source" | ".") {
         return None;
     }
-    let file = *args.first()?;
-    (!file.is_empty()).then(|| (*file).to_string())
+    let file = quoted_body(args.first()?);
+    (!file.is_empty()).then(|| file.to_string())
 }
 
 /// Whether `path` is a rewrite of the script being judged. Sourcing it
@@ -5708,7 +5713,7 @@ fn entered(
             .then(|| p.canonicalize().unwrap_or(p));
         by_name.into_iter().chain(resolved)
     };
-    let Some(to) = at.map(|i| args[i]) else {
+    let Some(to) = at.map(|i| quoted_body(args[i])) else {
         let bare = home_from(set.home.as_deref(), dir);
         return if pushd { None } else { bare }
             .into_iter()
@@ -5916,6 +5921,8 @@ fn tilde_home(home: Option<&str>) -> Cow<'_, str> {
 /// `dir`. Another variable or a substitution names no directory the line
 /// shows, and `~-` or a stack entry (`~1`) one the line does not follow.
 fn path_from(to: &str, dir: &std::path::Path, home: Option<&str>) -> Option<std::path::PathBuf> {
+    // `"$HOME"` is `$HOME`. The quotes only say the expansion is one word.
+    let to = quoted_body(to);
     // `{sub,}`, `su?` and `su[b]` are not directories. The shell expands
     // them before `cd`, and the walk does not follow that expansion.
     if brace_expands(to) || to.contains(['*', '?', '[']) {
@@ -6619,11 +6626,12 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
         }
         let mut owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
         if let Some(first) = owned.first_mut() {
-            let name = first
+            let body = quoted_body(first);
+            let name = body
                 .trim_start_matches('$')
                 .trim_start_matches('{')
                 .trim_end_matches('}');
-            if first.starts_with('$') {
+            if body.starts_with('$') {
                 if let Some((_, v)) = names.iter().rev().find(|(k, _)| k == name) {
                     let mut words = shell_words(v);
                     if !words.is_empty() {
@@ -6636,7 +6644,7 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
         // The shell expands a `-S` string before env splits it.
         if let Walk::Split(at, taken, _) = wrapper_walk(&owned) {
             for w in &mut owned[at..at + taken] {
-                *w = with_names(w, &names, argv);
+                *w = with_names(quoted_body(w), &names, argv);
             }
             out.push((i, owned.clone()));
         }
@@ -7600,8 +7608,8 @@ fn read_reaches(shells: &[u32], set_at: usize, use_at: usize) -> bool {
 
 struct ReadHit {
     name: String,
-    /// One string per line the producer wrote. `None` when that text
-    /// is not on the line.
+    /// The field this name took from each line. The last name keeps the
+    /// rest of the line. `None` when that text is not on the line.
     values: Option<Vec<String>>,
     at: usize,
 }
@@ -7628,28 +7636,150 @@ fn read_text(ended: &[(Vec<String>, String)], i: usize, cmd: &[String]) -> Optio
 }
 
 fn read_lines(text: &str) -> Vec<String> {
-    let mut lines: Vec<String> = text
-        .split('\n')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if lines.is_empty() {
-        lines.push(String::new());
+    // A trailing newline ends the last record. It is not another line.
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    if body.is_empty() {
+        return vec![String::new()];
     }
-    lines
+    body.split('\n').map(|s| s.to_string()).collect()
+}
+
+/// `IFS` after the pure assignments this shell has run. A prefix on
+/// `read` does not remain: `read` is not a special builtin.
+fn shell_ifs(ended: &[(Vec<String>, String)], shells: &[u32], at: usize) -> String {
+    let mut ifs = " \t\n".to_string();
+    let Some(&shell) = shells.get(at) else {
+        return ifs;
+    };
+    for (i, (cmd, _)) in ended.iter().enumerate().take(at) {
+        if shells.get(i) != Some(&shell) || cmd.is_empty() {
+            continue;
+        }
+        if !cmd.iter().all(|w| is_assignment(w)) {
+            continue;
+        }
+        for w in cmd {
+            apply_ifs_assign(w, &mut ifs);
+        }
+    }
+    ifs
+}
+
+/// `IFS=` replaces the value. `IFS+=` appends. Anything else is left.
+fn apply_ifs_assign(w: &str, ifs: &mut String) -> bool {
+    if let Some(v) = w.strip_prefix("IFS=") {
+        *ifs = v.to_string();
+        true
+    } else if let Some(v) = w.strip_prefix("IFS+=") {
+        ifs.push_str(v);
+        true
+    } else {
+        false
+    }
+}
+
+/// The `IFS` `read` splits on: this shell's value, then a prefix
+/// assignment on the `read` itself (`while IFS=: read x y`).
+fn read_input_ifs(
+    ended: &[(Vec<String>, String)],
+    shells: &[u32],
+    at: usize,
+    cmd: &[String],
+) -> String {
+    let mut ifs = shell_ifs(ended, shells, at);
+    let run = unwrap_wrappers(cmd).0;
+    let Some(head) = run.first() else {
+        return ifs;
+    };
+    if !matches!(base_of(head), "read" | "mapfile" | "readarray") {
+        return ifs;
+    }
+    if let Some(read_at) = cmd.iter().position(|w| std::ptr::eq(w, head)) {
+        for w in &cmd[..read_at] {
+            apply_ifs_assign(w, &mut ifs);
+        }
+    }
+    ifs
+}
+
+/// One field per name, the way `read` assigns them. Leading and trailing
+/// IFS whitespace is dropped. Each name but the last takes the text up to
+/// the next IFS character; a whitespace delimiter swallows the run after
+/// it, and any other delimiter is one character. The last name keeps the
+/// rest, delimiters included.
+fn read_fields(line: &str, nvars: usize, ifs: &str) -> Vec<String> {
+    if nvars == 0 {
+        return Vec::new();
+    }
+    let ws: Vec<char> = ifs.chars().filter(|c| c.is_whitespace()).collect();
+    let is_ws = |c: char| ws.contains(&c);
+    let is_ifs = |c: char| ifs.contains(c);
+    let chars: Vec<char> = line.chars().collect();
+    let mut end = chars.len();
+    while end > 0 && is_ws(chars[end - 1]) {
+        end -= 1;
+    }
+    let mut i = 0;
+    while i < end && is_ws(chars[i]) {
+        i += 1;
+    }
+    let mut fields = Vec::with_capacity(nvars);
+    for var_i in 0..nvars {
+        if var_i + 1 == nvars {
+            fields.push(chars[i..end].iter().collect());
+            break;
+        }
+        if i >= end {
+            fields.push(String::new());
+            continue;
+        }
+        let start = i;
+        while i < end && !is_ifs(chars[i]) {
+            i += 1;
+        }
+        fields.push(chars[start..i].iter().collect());
+        if i >= end {
+            continue;
+        }
+        if is_ws(chars[i]) {
+            while i < end && is_ws(chars[i]) {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    fields
 }
 
 fn read_hits(ended: &[(Vec<String>, String)]) -> Vec<ReadHit> {
+    let shells = command_shells(ended);
     let mut out = Vec::new();
     for (i, (cmd, _)) in ended.iter().enumerate() {
         let Some(tail) = read_command(cmd) else {
             continue;
         };
-        let values = read_text(ended, i, cmd).map(|t| read_lines(&t));
-        for name in read_var_names(&tail) {
+        let names = read_var_names(&tail);
+        if names.is_empty() {
+            continue;
+        }
+        let cols = read_text(ended, i, cmd).map(|t| {
+            let ifs = read_input_ifs(ended, &shells, i, cmd);
+            let mut cols = vec![Vec::new(); names.len()];
+            for line in read_lines(&t) {
+                let fields = read_fields(&line, names.len(), &ifs);
+                for (k, field) in fields.into_iter().enumerate() {
+                    if let Some(col) = cols.get_mut(k) {
+                        col.push(field);
+                    }
+                }
+            }
+            cols
+        });
+        for (k, name) in names.into_iter().enumerate() {
             out.push(ReadHit {
                 name,
-                values: values.clone(),
+                values: cols.as_ref().map(|c| c.get(k).cloned().unwrap_or_default()),
                 at: i,
             });
         }
@@ -7727,14 +7857,63 @@ fn read_var_names(run: &[String]) -> Vec<String> {
     }
 }
 
-fn word_replaced(word: &str, name: &str, value: &str) -> Option<String> {
-    if word == format!("${name}") || word == format!("${{{name}}}") {
-        return Some(value.to_string());
+/// `value` in place of a bare `$name` or `${name}`. A double-quoted
+/// expansion is one word. An unquoted one splits on `ifs`. A word that
+/// only partly expands the name is not the command the line shows.
+fn expand_read_word(word: &str, name: &str, value: &str, ifs: &str) -> Option<Vec<String>> {
+    if !expands(word, name) {
+        return Some(vec![word.to_string()]);
     }
-    if expands(word, name) {
+    let quoted = word.starts_with('"') && word.ends_with('"');
+    let body = quoted_body(word);
+    let pure = body == format!("${name}") || body == format!("${{{name}}}");
+    if !pure {
         return None;
     }
-    Some(word.to_string())
+    if quoted {
+        Some(vec![value.to_string()])
+    } else {
+        Some(split_unquoted(value, ifs))
+    }
+}
+
+/// The words an unquoted expansion of `value` becomes. An empty `ifs`
+/// does not split. Leading and trailing IFS whitespace drops out, and a
+/// run of IFS whitespace is one break.
+fn split_unquoted(value: &str, ifs: &str) -> Vec<String> {
+    if ifs.is_empty() {
+        return vec![value.to_string()];
+    }
+    let ws: Vec<char> = ifs.chars().filter(|c| c.is_whitespace()).collect();
+    let is_ws = |c: char| ws.contains(&c);
+    let is_delim = |c: char| ifs.contains(c);
+    let chars: Vec<char> = value.chars().collect();
+    let mut i = 0;
+    while i < chars.len() && is_ws(chars[i]) {
+        i += 1;
+    }
+    let mut out = Vec::new();
+    while i < chars.len() {
+        let start = i;
+        while i < chars.len() && !is_delim(chars[i]) {
+            i += 1;
+        }
+        out.push(chars[start..i].iter().collect());
+        if i >= chars.len() {
+            break;
+        }
+        if is_ws(chars[i]) {
+            while i < chars.len() && is_ws(chars[i]) {
+                i += 1;
+            }
+        } else {
+            i += 1;
+            while i < chars.len() && is_ws(chars[i]) {
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// `while read x; do rm -rf "$x"; done`. A `printf` or `echo` piped into
@@ -7777,12 +7956,22 @@ fn read_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Opt
             shown = None;
             break;
         }
-        let benign: Vec<String> = run
-            .iter()
-            .map(|w| word_replaced(w, name, "/tmp/fed-arg").unwrap_or_else(|| w.clone()))
-            .collect();
-        if let Some(c) = benign_denial(&benign, &[], moved, bound) {
-            return Some(c);
+        let ifs = shell_ifs(&ended, &shells, use_at);
+        let mut benign = Vec::new();
+        let mut benign_ok = true;
+        for w in &run {
+            match expand_read_word(w, name, "/tmp/fed-arg", " \t\n") {
+                Some(parts) => benign.extend(parts),
+                None => {
+                    benign_ok = false;
+                    benign.push(w.clone());
+                }
+            }
+        }
+        if benign_ok {
+            if let Some(c) = benign_denial(&benign, &[], moved, bound) {
+                return Some(c);
+            }
         }
         let mut lines = Vec::new();
         let mut ok = true;
@@ -7790,8 +7979,8 @@ fn read_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Opt
             let mut line = Vec::new();
             for (c, sep) in &ended {
                 for w in c {
-                    match word_replaced(w, name, value) {
-                        Some(n) => line.push(n),
+                    match expand_read_word(w, name, value, &ifs) {
+                        Some(parts) => line.extend(parts),
                         None => ok = false,
                     }
                 }
@@ -9335,18 +9524,34 @@ fn decode_ansi_c_quoted(chars: &[char], i: &mut usize, out: &mut String) {
     }
 }
 
+/// `$name` or `${name}` with nothing else in the word.
+fn pure_param(w: &str) -> bool {
+    let Some(rest) = w.strip_prefix('$') else {
+        return false;
+    };
+    if let Some(name) = rest.strip_prefix('{') {
+        return name.strip_suffix('}').is_some_and(is_name);
+    }
+    is_name(rest)
+}
+
 /// A script split into words the way a shell would: quotes group, a
 /// backslash escapes the next character outside single quotes, a
 /// backslash and the newline after it drop out, a `#` that starts a word
 /// comments out the rest of its line, and `;`, `&&`, `||`, `|` and `&`
 /// stand as words of their own. The `&` of a redirection (`2>&1`, `<&3`,
-/// `&>log`) stays in its word.
+/// `&>log`) stays in its word. A double-quoted `$name` or `${name}` keeps
+/// its quotes so a later split can tell `"$x"` from `$x`.
 fn shell_words(script: &str) -> Vec<String> {
     let chars: Vec<char> = script.chars().collect();
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut word = false;
     let (mut single, mut double) = (false, false);
+    // A double-quoted `$` keeps its quotes, so a later split can tell
+    // `"$x"` from `$x`. A quoted word with no `$` stays bare.
+    let mut dq_at: Option<usize> = None;
+    let mut dq_dollar = false;
     let mut i = 0;
     // Here-documents opened on the command just finished, read from the
     // next line. A body is not the script that follows it: a quote in
@@ -9383,7 +9588,25 @@ fn shell_words(script: &str) -> Vec<String> {
                 word = true;
             }
             '"' if !single => {
-                double = !double;
+                if double {
+                    double = false;
+                    // Only a quoted `$name` or `${name}` keeps its quotes.
+                    // A longer quoted value is the text inside, as before.
+                    if dq_dollar {
+                        if let Some(at) = dq_at {
+                            if pure_param(&cur[at..]) {
+                                cur.insert(at, '"');
+                                cur.push('"');
+                            }
+                        }
+                    }
+                    dq_at = None;
+                    dq_dollar = false;
+                } else {
+                    double = true;
+                    dq_at = Some(cur.len());
+                    dq_dollar = false;
+                }
                 word = true;
             }
             '&' if !single
@@ -9435,6 +9658,9 @@ fn shell_words(script: &str) -> Vec<String> {
                 }
             }
             c => {
+                if double && c == '$' {
+                    dq_dollar = true;
+                }
                 cur.push(c);
                 word = true;
             }
@@ -11434,7 +11660,7 @@ fn lease_push_guarded(argv: &[String]) -> bool {
 
 /// A command word that is still a parameter expansion (`$g`, `${GIT}`).
 fn unresolved(base: &str) -> bool {
-    base.starts_with('$')
+    quoted_body(base).starts_with('$')
 }
 
 /// Git's subcommand and the words after it, past global options such as
@@ -12330,7 +12556,16 @@ fn command_body(value: &str) -> Option<&str> {
 }
 
 /// `$name` or `${name}`, and not `${name:-default}`.
+/// `"$name"` with the quotes `shell_words` kept around a `$`.
+fn quoted_body(w: &str) -> &str {
+    w.strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .filter(|s| !s.is_empty() && !s.contains('"'))
+        .unwrap_or(w)
+}
+
 fn bare_var(w: &str) -> Option<&str> {
+    let w = quoted_body(w);
     let w = w.strip_prefix('$')?;
     if let Some(name) = w.strip_prefix('{') {
         let name = name.strip_suffix('}')?;
@@ -17756,6 +17991,38 @@ hash -r 2> /dev/null
         );
         assert_eq!(
             v("shopt -s lastpipe; x=/; printf '/tmp/a\\n' | read x; rm -rf \"$x\""),
+            "allow"
+        );
+    }
+
+    /// Each name takes one field. The last keeps the rest of the line.
+    /// An unquoted expansion splits on the shell's IFS; a quoted one
+    /// stays one word. `IFS=` in front of `read` does not outlive it.
+    #[test]
+    fn a_read_gives_each_name_one_field() {
+        let v = |s: &str| verdict(&shell_words(s));
+        assert_eq!(
+            shell_words("rm -rf \"$x\" $x"),
+            ["rm", "-rf", "\"$x\"", "$x"]
+        );
+        for line in [
+            "printf '/tmp/a /\\n' | while read x y; do rm -rf \"$y\"; done",
+            "printf '/tmp/a:/\\n' | while IFS=: read x y; do rm -rf \"$y\"; done",
+            "printf '/tmp/a/ /home\\n' | while read x; do rm -rf $x; done",
+            "read x y <<< '/tmp/a /'; rm -rf \"$y\"",
+        ] {
+            assert_eq!(v(line), "deny\trm-rf-outside-tmp", "{line}");
+        }
+        assert_eq!(
+            v("printf '/tmp/x --force\\n' | while read a b; do git push $b; done"),
+            "deny\tgit-force-push"
+        );
+        assert_eq!(
+            v("printf '/tmp/a/ /home\\n' | while read x; do rm -rf \"$x\"; done"),
+            "allow"
+        );
+        assert_eq!(
+            v("printf '/tmp/a \\n' | while read x y; do rm -rf \"$x\"; done"),
             "allow"
         );
     }
