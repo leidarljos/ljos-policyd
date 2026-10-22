@@ -1656,8 +1656,9 @@ fn judge_startup(
     replay_subshell(&words, shell, depth + 1, out, denied);
 }
 
-/// Judge the file a shell runs as its script (`bash ok.sh`) as a sourced
-/// file is judged. It runs in the child, so a `cd` in it does not move
+/// Judge the file a shell runs as its script (`bash ok.sh`), or the file
+/// on its stdin (`sh < ok.sh`), as a sourced file is judged. It runs in
+/// the child, so a `cd` in it does not move
 /// this shell. A file that is not there runs nothing.
 fn judge_script_file(
     cmd: &[&str],
@@ -1672,7 +1673,11 @@ fn judge_script_file(
     let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
     let owned = split_env_strings(&owned).into_owned();
     let (run, _) = unwrap_wrappers(&owned);
-    let Some(op) = shell_file_operand(run) else {
+    let op = shell_file_operand(run).or_else(|| match shell_stdin(run) {
+        Some((Fed::File(file), _)) => Some(file),
+        _ => None,
+    });
+    let Some(op) = op else {
         return;
     };
     if op.starts_with(['<', '>']) || op == "-" || is_stdin_source(op) {
@@ -4221,8 +4226,28 @@ enum Fed<'a> {
     Text(&'a str),
     /// A heredoc, whose lines are already commands of the line.
     Heredoc,
+    /// The file a `<`, `0<` or `<>` redirection opens, which the walk
+    /// reads.
+    File(&'a str),
     /// Nothing the line shows: a pipe, or the stdin it inherits.
     Unshown,
+}
+
+/// The file the redirection `a`, with `next` after it, opens on stdin:
+/// `<file`, `< file`, `0<file`, `<>file`. A here-string, a heredoc and a
+/// duplicated descriptor (`<&3`) are not one. The flag says the file is
+/// the next word.
+fn stdin_redirect<'a>(a: &'a str, next: Option<&'a str>) -> Option<(&'a str, bool)> {
+    let rest = a.strip_prefix('0').unwrap_or(a).strip_prefix('<')?;
+    if rest.starts_with(['<', '&', '(']) {
+        return None;
+    }
+    let rest = rest.strip_prefix('>').unwrap_or(rest);
+    if rest.is_empty() {
+        next.map(|n| (n, true))
+    } else {
+        Some((rest, false))
+    }
 }
 
 /// For a shell that reads its script from stdin, having no `-c` script
@@ -4235,7 +4260,7 @@ fn shell_stdin(run: &[String]) -> Option<(Fed<'_>, bool)> {
         return None;
     }
     let mut fed = Fed::Unshown;
-    let mut it = args.iter().map(String::as_str);
+    let mut it = args.iter().map(String::as_str).peekable();
     while let Some(a) = it.next() {
         let body = redirection_body(a);
         if let Some(text) = body.strip_prefix("<<<") {
@@ -4246,6 +4271,11 @@ fn shell_stdin(run: &[String]) -> Option<(Fed<'_>, bool)> {
             });
         } else if body.starts_with("<<") {
             fed = Fed::Heredoc;
+        } else if let Some((file, ate)) = stdin_redirect(a, it.peek().copied()) {
+            if ate {
+                it.next();
+            }
+            fed = Fed::File(file);
         }
     }
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -4283,6 +4313,7 @@ fn unshown_stdin_script(argv: &[String]) -> bool {
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
         match shell_stdin(unwrap_wrappers(&owned).0) {
             Some((Fed::Text(text), _)) => text.contains(['$', '`']),
+            Some((Fed::File(file), _)) => file.starts_with(['<', '>']) || !literal_text(file),
             Some((Fed::Unshown, dash_s)) => after_pipe || dash_s,
             _ => false,
         }
@@ -5545,8 +5576,8 @@ fn runs_a_saved_file(cmd: &[String], saved: &[String]) -> bool {
 }
 
 /// The files a command runs as a program, by the words that name them:
-/// a command word with a `/` in it, and the script operand of a shell,
-/// `source`, `.` or an interpreter.
+/// a command word with a `/` in it, the script operand of a shell,
+/// `source`, `.` or an interpreter, and the file on a shell's stdin.
 fn ran_paths(cmd: &[String]) -> Vec<&str> {
     let cmd = peeled(cmd);
     let Some(at) = command_at(cmd) else {
@@ -5569,6 +5600,8 @@ fn ran_paths(cmd: &[String]) -> Vec<&str> {
     };
     if let Some((w, false)) = program_word(&cmd[at + 1..], inline, valued) {
         out.push(w);
+    } else if let Some((Fed::File(file), _)) = shell_stdin(&cmd[at..]) {
+        out.push(file);
     }
     out
 }
@@ -11640,6 +11673,52 @@ hash -r 2> /dev/null
             "busybox ash -c 'echo ok'",
             "busybox ls",
             "busybox hush missing.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        assert_everyday_allowed(&root);
+    }
+
+    /// `sh <evil.sh` was allowed: a shell with no script operand reads
+    /// its script from stdin, and only a pipe, a here-string or a heredoc
+    /// was taken for that stdin. A file redirected there is the script.
+    #[test]
+    fn a_file_on_a_shells_stdin_is_its_script() {
+        let root = startup_root("stdinfile");
+        std::fs::write(root.join("hi.sh"), "echo hi\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "sh <evil/force.sh",
+            "sh 0<evil/force.sh",
+            "sh < evil/force.sh",
+            "bash -s < evil/force.sh",
+            "bash -s -- a b < evil/force.sh",
+            "busybox ash <evil/force.sh",
+            "echo hi | sh < evil/force.sh",
+            "cd evil && sh < force.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
+        }
+        for line in ["sh < \"$F\"", "sh < <(cat evil/force.sh)"] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+        }
+        let c = at("cp evil/force.sh hi.sh; sh < hi.sh");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(
+            c.token.starts_with("script-written-on-line: "),
+            "{}",
+            c.token
+        );
+        for line in [
+            "sh < hi.sh",
+            "sh < missing.sh",
+            "cat < evil/force.sh",
+            "bash 3< evil/force.sh -c 'echo ok'",
+            "sh -c 'echo ok' < evil/force.sh",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
