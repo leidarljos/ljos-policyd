@@ -4934,6 +4934,29 @@ mod tests {
         );
     }
 
+    /// A `popd` that fails, on a word it does not take or a stack it
+    /// cannot pop, leaves the line in a directory it does not follow.
+    #[test]
+    fn a_failing_popd_leaves_the_line_untracked() {
+        for line in [
+            "pushd evil && popd x; make clean-all",
+            "pushd evil && popd +x; make clean-all",
+            "pushd evil && popd -q; make clean-all",
+            "pushd evil && popd -n x; make clean-all",
+            "pushd evil && dirs -c && popd; make clean-all",
+            "pushd safe && popd && popd; make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("popd-fail", line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "pushd safe && popd -n; make clean-all",
+            "pushd safe && dirs && popd; make clean-all",
+            "pushd evil && pushd ../safe && popd -n; make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("popd-fail", line), Decision::Allow, "{line}");
+        }
+    }
+
     /// With `HOME` unset, `~` is the passwd home, as bash expands it, while
     /// a bare `cd` fails and stays.
     #[cfg(unix)]
