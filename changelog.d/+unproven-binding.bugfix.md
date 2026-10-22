@@ -1,0 +1,1 @@
+A value is known only from a plain assignment. `export`, `read`, `for`, `eval` and the other binders do not prove it, an `IFS` assignment turns variable suffixes off, and `$0` is the script only for a marked `sh FILE` or `./FILE`. An `rm` does not clear a file it names.

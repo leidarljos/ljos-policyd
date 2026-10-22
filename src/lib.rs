@@ -128,7 +128,7 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
         files: &files,
         known: None,
         script_cwd_moved: false,
-        removals_live: true,
+        trust_argv0: false,
         cmd_values: &cmd_values,
     };
     runner_commands(argv, &inn, 0, &mut runs, &mut denied);
@@ -292,8 +292,6 @@ struct LineFiles {
     data: bool,
     written: Vec<Written>,
     ran: Vec<(Option<std::path::PathBuf>, String, Vec<usize>, Ran)>,
-    /// `rm` operands, with the command that removes them.
-    removed: Vec<(String, Vec<usize>)>,
     /// Variables whose value is the script being judged (`$0`).
     script_vars: std::collections::HashSet<String>,
 }
@@ -505,14 +503,15 @@ impl LineFiles {
     /// A rewrite of the script being judged (`sed <$0 >$as_me.lineno`
     /// then `. "./$as_me.lineno"`) is that script. `$$` is only digits,
     /// so `conf$$.file` stays in the directory and is not a later
-    /// `./configure`; once `rm` has removed it, it is not a later run
-    /// either. A bare `$x` or `"$LOG"` can be any path, so it still is.
+    /// `./configure`. An `rm` of the path does not make it go away: the
+    /// program can fail, and the file is still there to be read. A bare
+    /// `$x` or `"$LOG"` can be any path, so it still is.
     fn scratch_of_this_run(
         &self,
         w: &Written,
         run: &str,
         run_path: &Option<std::path::PathBuf>,
-        run_id: &[usize],
+        _run_id: &[usize],
     ) -> bool {
         if w.loose {
             return false;
@@ -528,15 +527,9 @@ impl LineFiles {
         if !cwd_confined(&w.word) {
             return false;
         }
-        if !shape_overlaps(&w.word, run) {
-            return true;
-        }
-        self.removed.iter().any(|(rm, id)| {
-            same_scratch_word(rm, &w.word)
-                && w.id.as_slice() < id.as_slice()
-                && id.as_slice() <= run_id
-                && !same_scratch_word(&w.word, run)
-        })
+        // Overlapping the path that runs is not scratch. Nothing the
+        // line deletes is treated as gone.
+        !shape_overlaps(&w.word, run)
     }
 }
 
@@ -777,70 +770,6 @@ fn any_overlap(after_any: &[PathPart], other: &[PathPart], depth: u32) -> bool {
             parts_overlap(after_any, rest, depth + 1) || any_overlap(after_any, rest, depth + 1)
         }
     }
-}
-
-/// Operands `rm` or `rmdir` deletes. Flags are not files.
-fn removal_words(cmd: &[String]) -> Vec<String> {
-    let words: Vec<&str> = cmd.iter().map(String::as_str).collect();
-    let words = operands(&words);
-    let front = (0..words.len())
-        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
-        .count();
-    let rest = peel_cd_command_word(&words[front..]);
-    let Some((w, args)) = rest.split_first() else {
-        return Vec::new();
-    };
-    if !matches!(base_of(w), "rm" | "rmdir") {
-        return Vec::new();
-    }
-    args.iter()
-        .copied()
-        .skip_while(|a| *a != "--" && a.starts_with('-'))
-        .filter(|a| *a != "--" && !a.starts_with('-') && !is_redirection(a))
-        .map(|a| a.to_string())
-        .collect()
-}
-
-/// `if`, `while`, `for` and `case` open a compound command. `fi`, `done`
-/// and `esac` close one. An `rm` in there does not run on every pass, so
-/// it does not clear a file. `{ ... }` does run, and is not counted.
-fn compound_delta(cmd: &[&str]) -> i32 {
-    let mut i = 0;
-    while i < cmd.len()
-        && (is_assignment(cmd[i])
-            || matches!(
-                cmd[i],
-                "!" | "{" | "}" | "time" | "then" | "else" | "elif" | "do"
-            ))
-    {
-        i += 1;
-    }
-    if cmd.get(i).is_some_and(|w| *w == "-p") && i > 0 && cmd[i - 1] == "time" {
-        i += 1;
-    }
-    match cmd.get(i).copied() {
-        Some("if" | "while" | "until" | "for" | "case" | "select") => 1,
-        Some("fi" | "done" | "esac") => -1,
-        _ => 0,
-    }
-}
-
-/// `rm` or `rmdir` after it has been redefined. `command rm` is the
-/// function or the alias too: the line no longer shows the real program.
-fn removal_shadowed(cmd: &[String], shell: &Shell) -> bool {
-    let words: Vec<&str> = cmd.iter().map(String::as_str).collect();
-    let words = operands(&words);
-    let front = (0..words.len())
-        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
-        .count();
-    let rest = peel_cd_command_word(&words[front..]);
-    let Some(name) = rest.first().map(|w| base_of(w)) else {
-        return false;
-    };
-    if !matches!(name, "rm" | "rmdir") {
-        return false;
-    }
-    shell.funcs.contains_key(name) || shell.aliases.iter().any(|(k, _)| k == name)
 }
 
 /// Record a variable set to the script being judged (`name=$0`,
@@ -1304,12 +1233,13 @@ struct Shell {
     /// A `cd` has run in this shell. `$0` is the path the script was
     /// started with, so a later read of it is a different file.
     script_cwd_moved: bool,
-    /// This walk may treat an `rm` as deleting the file. A nested walk
-    /// of a command that may not run does not.
-    removals_live: bool,
-    /// The command now being read runs unconditionally. A subshell of
-    /// one that does not must not clear a file either.
-    rm_gate: bool,
+    /// `$0` is the file this walk was started on (`sh FILE` or `./FILE`
+    /// with the autoconf marker). False under `-c`, in a sourced file,
+    /// and after `BASH_ARGV0`, `eval` or `trap`. Not saved: a branch
+    /// that drops it does not put it back.
+    trust_argv0: bool,
+    /// `trust_argv0` was dropped and stays dropped for this walk.
+    trust_dropped: bool,
 }
 
 /// One `if` or `case`, so a variable set in every branch can be read as
@@ -1403,9 +1333,9 @@ struct ShellIn<'a> {
     /// The caller has run `cd` in this script. `$0` is the path it was
     /// started with, so a later read is a different file.
     script_cwd_moved: bool,
-    /// An `rm` in this walk deletes the file. False when the command
-    /// that started the walk may not run.
-    removals_live: bool,
+    /// `$0` names the file this walk was started on. A `-c` script and a
+    /// sourced file do not get that.
+    trust_argv0: bool,
     /// Values a `$name` in this walk may hold. A nested script starts
     /// from the environment. A re-walk of a command in this shell keeps
     /// the values that command saw.
@@ -1873,6 +1803,7 @@ fn replay_subshell(
     body: &[String],
     shell: &Shell,
     depth: usize,
+    trust_argv0: bool,
     out: &mut Vec<(Vec<String>, std::path::PathBuf, bool)>,
     denied: &mut Option<Checked>,
 ) {
@@ -1891,7 +1822,7 @@ fn replay_subshell(
             files: &shell.files,
             known: shell.known.clone(),
             script_cwd_moved: shell.script_cwd_moved,
-            removals_live: shell.removals_live && shell.rm_gate,
+            trust_argv0,
             cmd_values: &shell.cmd_values,
         };
         runner_commands(body, &inn, depth, out, denied);
@@ -1957,8 +1888,8 @@ fn runner_commands(
         halted: false,
         script_pipe: false,
         script_cwd_moved: inn.script_cwd_moved,
-        removals_live: inn.removals_live,
-        rm_gate: true,
+        trust_argv0: inn.trust_argv0,
+        trust_dropped: false,
     };
     walk(argv, &mut shell, depth, out, denied);
 }
@@ -2154,12 +2085,6 @@ fn walk(
     // anywhere in it counts as made before the loop.
     let mut loops = Vec::new();
     let mut spans = Vec::new();
-    // Open `if` / `while` / `for` / `case`. An `rm` in one of them may
-    // not run, so it does not clear a file written on the line.
-    let mut compound = 0i32;
-    // Whether each command's `rm` runs. A later walk of that command
-    // alone must not clear a file the command itself may skip.
-    let mut rm_live = Vec::new();
     // Values each command's expansions see, so a later walk of that
     // command still knows which file `. ./$x` names.
     let mut cmd_at = Vec::new();
@@ -2238,21 +2163,6 @@ fn walk(
         }
         shell.files.borrow_mut().cmd.clone_from(&id);
         ran_in.push((at.clone(), shell.old.clone(), set.clone(), id.clone()));
-        let text = data[ci] || pat;
-        if !text {
-            compound = (compound + compound_delta(&cmd)).max(0);
-        }
-        // `||`, `&&`, `&` and a compound command can skip this `rm`.
-        // A nested walk of the same command must skip it too.
-        let live = shell.removals_live
-            && !text
-            && compound == 0
-            && !matches!(before, "||" | "&&")
-            && end != "&";
-        shell.rm_gate = live;
-        // The command word itself. A nested walk of this `rm` does not
-        // see the alias or function that hid it.
-        rm_live.push(live && !removal_shadowed(&owned, shell));
         // A subshell or substitution in the command runs where the
         // command does, and a `cd` inside it moves only itself.
         let mark = shell.files.borrow().written.len();
@@ -2284,7 +2194,7 @@ fn walk(
                             files: &files,
                             known: shell.known.clone(),
                             script_cwd_moved: shell.script_cwd_moved,
-                            removals_live: live,
+                            trust_argv0: shell.trust_argv0,
                             cmd_values: &shell.cmd_values,
                         };
                         runner_commands(&words, &inn, depth + 1, out, denied);
@@ -2354,16 +2264,27 @@ fn walk(
         // reads or removes is scratch, not a new script. The read is a
         // filter of the script being judged; `$$` cannot leave the
         // directory.
-        note_script_var(&owned, &shell.files);
+        if shell.trust_argv0 {
+            note_script_var(&owned, &shell.files);
+        }
+        let trusted = shell.trust_argv0 && !shell.script_cwd_moved;
         let reads_script = {
             let files = shell.files.borrow();
-            reads_script_stdin(
-                &owned,
-                &shell.cmd_values,
-                &files.script_vars,
-                !shell.script_cwd_moved,
-            )
+            reads_script_stdin(&owned, &shell.cmd_values, &files.script_vars, trusted)
         };
+        // `$0` under `-c`, after `eval` / `trap` / `BASH_ARGV0`, or in a
+        // sourced file is not the script being judged. The file it names
+        // is not shown.
+        if !trusted {
+            let other = {
+                let files = shell.files.borrow();
+                reads_script_stdin(&owned, &shell.cmd_values, &files.script_vars, true)
+            };
+            if other {
+                *denied = Some(script_unread("$0"));
+                return;
+            }
+        }
         let pipe = shell.script_pipe || reads_script;
         if pipe && end != "|" && filter_keeps_script(&owned) {
             let mut files = shell.files.borrow_mut();
@@ -2371,15 +2292,6 @@ fn walk(
                 if w.id == id && !w.loose {
                     w.rewrite = true;
                 }
-            }
-        }
-        // A function or alias named `rm` is not the program that deletes
-        // the file. `command rm` is that function too.
-        if live && !removal_shadowed(&owned, shell) {
-            let mut files = shell.files.borrow_mut();
-            let id = files.cmd.clone();
-            for word in removal_words(&owned) {
-                files.removed.push((word, id.clone()));
             }
         }
         shell.script_pipe = end == "|" && pipe;
@@ -2482,19 +2394,44 @@ fn walk(
                     let lastpipe = shell.lastpipe;
                     let pwd_set = shell.pwd_set;
                     let follow = shell.follow_unseen;
+                    let trust = shell.trust_argv0;
+                    // `$0` in a sourced file is not that file.
+                    shell.trust_argv0 = false;
                     shell.follow_unseen = false;
                     walk(&words, shell, depth, out, denied);
                     if denied.is_some() {
                         return;
                     }
                     note_halt(shell, &mut groups.sides);
+                    if !shell.trust_dropped {
+                        shell.trust_argv0 = trust;
+                    }
                     shell.lastpipe = lastpipe;
                     shell.pwd_set = pwd_set;
                     shell.follow_unseen = follow;
                 } else if in_shell {
+                    // The file is not followed, but a `$0` read in it is
+                    // still a file the line does not show.
+                    let saved = shell.save();
+                    let trust = shell.trust_argv0;
+                    let dropped = shell.trust_dropped;
+                    shell.trust_argv0 = false;
+                    walk(&words, shell, depth, out, denied);
+                    if denied.is_some() {
+                        return;
+                    }
+                    let dropped_now = shell.trust_dropped;
+                    shell.restore(saved);
+                    if dropped_now {
+                        shell.trust_argv0 = false;
+                        shell.trust_dropped = true;
+                    } else {
+                        shell.trust_argv0 = trust;
+                        shell.trust_dropped = dropped;
+                    }
                     shell.lose();
                 } else if keeps {
-                    replay_subshell(&words, shell, depth, out, denied);
+                    replay_subshell(&words, shell, depth, false, out, denied);
                     if denied.is_some() {
                         return;
                     }
@@ -2506,7 +2443,7 @@ fn walk(
                         *denied = Some(c);
                         return;
                     }
-                    replay_subshell(words, shell, depth, out, denied);
+                    replay_subshell(words, shell, depth, false, out, denied);
                     if denied.is_some() {
                         return;
                     }
@@ -2562,7 +2499,7 @@ fn walk(
                 }
                 let fork = !in_shell || body.subshell;
                 if fork {
-                    replay_subshell(&body.words, shell, depth, out, denied);
+                    replay_subshell(&body.words, shell, depth, shell.trust_argv0, out, denied);
                 } else if shell.fn_depth >= FUNC_DEPTH || shell.stack.contains(&name) {
                     shell.lose();
                 } else {
@@ -2781,13 +2718,16 @@ fn walk(
             // A nested script does not inherit an unexported assignment.
             // The command itself does: `. ./$x` was already judged with
             // these values, and this walk must see the same file.
-            let own = source_operand(&refs).is_some_and(|p| p.contains('$'))
-                && unwrapped_command(&argv, i).is_some_and(|r| r == inner);
+            let same = unwrapped_command(&argv, i).is_some_and(|r| r == inner);
+            let own = source_operand(&refs).is_some_and(|p| p.contains('$')) && same;
             let values = if own {
                 cmd_at.get(i).unwrap_or(&fresh)
             } else {
                 &fresh
             };
+            // A re-walk of this command is still this script. A nested
+            // `-c` or `eval` is not, so `$0` is not the file there.
+            let trust = same && shell.trust_argv0;
             for dir in dirs {
                 shell.files.borrow_mut().cmd.clone_from(id);
                 shell.files.borrow_mut().data = was || data.get(i).copied().unwrap_or(false);
@@ -2801,7 +2741,7 @@ fn walk(
                     files: &shell.files,
                     known: shell.known.clone(),
                     script_cwd_moved: shell.script_cwd_moved,
-                    removals_live: rm_live.get(i).copied().unwrap_or(false),
+                    trust_argv0: trust,
                     cmd_values: values,
                 };
                 runner_commands(&inner, &inn, depth + 1, out, denied);
@@ -3239,9 +3179,287 @@ fn assign_sides(w: &str) -> Option<(String, String)> {
     Some((w[..end].to_string(), value.to_string()))
 }
 
+/// The prefix assignments, the command name and its arguments. Owned so
+/// the slices `operands` builds do not have to outlive this call.
+fn command_parts(cmd: &[&str]) -> (Vec<String>, String, Vec<String>) {
+    let words = operands(cmd);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    let rest = peel_cd_command_word(&words[front..]);
+    let name = rest.first().copied().map(base_of).unwrap_or("").to_string();
+    let args = rest
+        .get(1..)
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let prefixes = words[..front]
+        .iter()
+        .copied()
+        .filter(|w| is_assignment(w))
+        .map(str::to_string)
+        .collect();
+    (prefixes, name, args)
+}
+
+/// `NAME`, `NAME=value` or `NAME+=value`. A flag is not a name.
+fn binding_name(w: &str) -> Option<&str> {
+    if w.starts_with(['-', '+']) {
+        return None;
+    }
+    if let Some((name, _, _)) = assignment_of(w) {
+        return Some(name);
+    }
+    is_name(w).then_some(w)
+}
+
+/// The name `let` assigns in one argument (`x=1`, `++x`, `x++`).
+fn let_name(arg: &str) -> Option<String> {
+    let arg = arg.trim_start_matches(['+', '-']);
+    let end = arg
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(arg.len());
+    let name = &arg[..end];
+    is_name(name).then(|| name.to_string())
+}
+
+/// The word after `flag`, or the text stuck to it (`-vname`).
+fn flag_name<'a>(args: &'a [&'a str], flag: &str) -> Option<&'a str> {
+    for (i, a) in args.iter().enumerate() {
+        let Some(rest) = a.strip_prefix(flag) else {
+            continue;
+        };
+        if rest.is_empty() {
+            return args.get(i + 1).copied().filter(|n| is_name(n));
+        }
+        return is_name(rest).then_some(rest);
+    }
+    None
+}
+
+/// Names an arithmetic assignment writes (`((x=1))`, `$((x+=1))`).
+fn arith_targets(text: &str) -> Vec<String> {
+    let b = text.as_bytes();
+    let mut names = Vec::new();
+    let mut i = 0;
+    while i + 1 < b.len() {
+        if b[i] != b'(' || b[i + 1] != b'(' {
+            i += 1;
+            continue;
+        }
+        let mut depth = 0;
+        let mut j = i;
+        while j + 1 < b.len() {
+            if b[j] == b'(' && b[j + 1] == b'(' {
+                depth += 1;
+                j += 2;
+                continue;
+            }
+            if b[j] == b')' && b[j + 1] == b')' {
+                depth -= 1;
+                j += 2;
+                if depth == 0 {
+                    break;
+                }
+                continue;
+            }
+            j += 1;
+        }
+        let body = &text[i..j.min(text.len())];
+        let bytes = body.as_bytes();
+        let mut k = 0;
+        while k < bytes.len() {
+            if bytes[k].is_ascii_alphabetic() || bytes[k] == b'_' {
+                let start = k;
+                k += 1;
+                while k < bytes.len() && (bytes[k].is_ascii_alphanumeric() || bytes[k] == b'_') {
+                    k += 1;
+                }
+                let name = &body[start..k];
+                if is_name(name) && arith_writes(body, name) && !names.iter().any(|n| n == name) {
+                    names.push(name.to_string());
+                }
+                continue;
+            }
+            k += 1;
+        }
+        i = j.max(i + 2);
+    }
+    names
+}
+
+/// Names this command binds other than by a plain `NAME=value`. The value
+/// is not what the line shows.
+fn opaque_bound(cmd: &[&str]) -> Vec<String> {
+    let (prefixes, name, args) = command_parts(cmd);
+    let mut out = Vec::new();
+    const SPECIAL: &[&str] = &[
+        ":", ".", "source", "eval", "exec", "exit", "export", "readonly", "return", "set", "shift",
+        "times", "trap", "unset", "break", "continue",
+    ];
+    let name = name.as_str();
+    let arg_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+    let args = arg_ref.as_slice();
+    if SPECIAL.contains(&name) {
+        for w in &prefixes {
+            if let Some((n, _, _)) = assignment_of(w) {
+                out.push(n.to_string());
+            }
+        }
+    }
+    if matches!(
+        name,
+        "export" | "readonly" | "declare" | "typeset" | "local"
+    ) {
+        for a in args {
+            if let Some(n) = binding_name(a) {
+                out.push(n.to_string());
+            }
+        }
+    }
+    match name {
+        "read" | "mapfile" | "readarray" => {
+            let found: Vec<String> = args
+                .iter()
+                .copied()
+                .filter(|a| is_name(a))
+                .map(str::to_string)
+                .collect();
+            if found.is_empty() {
+                out.push(if name == "read" {
+                    "REPLY".into()
+                } else {
+                    "MAPFILE".into()
+                });
+            } else {
+                out.extend(found);
+            }
+        }
+        "getopts" => {
+            let mut i = 0;
+            while i < args.len() {
+                let a = args[i];
+                if a == "--" {
+                    i += 1;
+                    break;
+                }
+                if a == "-o" || a.starts_with('-') {
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+            i += 1;
+            while i < args.len() {
+                if is_name(args[i]) {
+                    out.push(args[i].to_string());
+                }
+                i += 1;
+            }
+        }
+        "for" | "select" => {
+            if let Some(n) = args.first().copied().filter(|a| is_name(a)) {
+                out.push(n.to_string());
+            }
+        }
+        "printf" | "wait" => {
+            let flag = if name == "printf" { "-v" } else { "-p" };
+            if let Some(n) = flag_name(args, flag) {
+                out.push(n.to_string());
+            }
+        }
+        "let" => {
+            for a in args {
+                if let Some(n) = let_name(a) {
+                    out.push(n);
+                }
+            }
+        }
+        "coproc" => {
+            out.push("COPROC".into());
+            if let Some(n) = args.first().copied().filter(|a| is_name(a)) {
+                out.push(n.to_string());
+            }
+        }
+        _ => {}
+    }
+    for w in cmd {
+        for n in arith_targets(w) {
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+    }
+    out
+}
+
+/// Names `${name=value}` or `${name:=value}` assigns. The line does not
+/// show that the name was unset, so the value is not known.
+fn default_bound(cmd: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    for w in cmd {
+        let bytes = w.as_bytes();
+        let mut i = 0;
+        while i + 2 < bytes.len() {
+            if bytes[i] == b'$' && bytes[i + 1] == b'{' {
+                if let Some(end) = w[i + 2..].find('}') {
+                    let body = &w[i + 2..i + 2 + end];
+                    if let Some((name, _)) = default_assign(body) {
+                        if !out.iter().any(|n| n == name) {
+                            out.push(name.to_string());
+                        }
+                    }
+                    i += end + 3;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `IFS` is set, unset or bound. A later expansion can split on it.
+fn command_sets_ifs(cmd: &[&str]) -> bool {
+    let (prefixes, name, args) = command_parts(cmd);
+    if name == "unset" && args.iter().any(|a| a == "IFS") {
+        return true;
+    }
+    if prefixes
+        .iter()
+        .any(|w| assignment_of(w).is_some_and(|(n, _, _)| n == "IFS"))
+    {
+        return true;
+    }
+    opaque_bound(cmd).iter().any(|n| n == "IFS")
+}
+
+/// `eval` or `trap` can change `$0`, and so can any binding of `BASH_ARGV0`.
+fn drops_argv0(cmd: &[&str]) -> bool {
+    let (_, name, _) = command_parts(cmd);
+    if name == "eval" || name == "trap" {
+        return true;
+    }
+    if opaque_bound(cmd).iter().any(|n| n == "BASH_ARGV0") {
+        return true;
+    }
+    cmd.iter()
+        .any(|w| assignment_of(w).is_some_and(|(n, _, _)| n == "BASH_ARGV0"))
+}
+
+fn note_argv0_trust(cmd: &[&str], shell: &mut Shell) {
+    if drops_argv0(cmd) {
+        shell.trust_argv0 = false;
+        shell.trust_dropped = true;
+        shell.files.borrow_mut().script_vars.clear();
+    }
+}
+
 /// Record a bare assignment, and join the values each branch of an `if`
 /// or `case` may leave. A later `$name` is that command only when every
-/// branch shows one.
+/// branch shows one. A binding that is not a plain `NAME=value` leaves
+/// the name unknown.
 fn note_cmd_values(cmd: &[&str], shell: &mut Shell) {
     match branch_keyword(cmd) {
         Some("if" | "case") => shell.assign_stack.push(AssignFrame {
@@ -3278,23 +3496,37 @@ fn note_cmd_values(cmd: &[&str], shell: &mut Shell) {
         _ => {}
     }
     // `then NAME=cmd` and `else NAME=cmd` are assignments. The keyword
-    // is syntax. A prefix on a real command (`NAME=cmd echo`) is not.
+    // is syntax. A prefix on a real command (`NAME=cmd echo`) is not:
+    // it does not stay set. A prefix on a special builtin does stay, and
+    // that value is not recorded here; the name is unknown instead.
     let words = operands(cmd);
     let mut i = 0;
     while i < words.len() && (is_assignment(words[i]) || keyword_at(&words, i)) {
         i += 1;
     }
-    if i != words.len() {
-        return;
-    }
-    for w in words {
-        if let Some((name, value)) = assign_sides(w) {
-            shell.cmd_values.insert(name, vec![value]);
-        } else if let Some(name) = w.split(['+', '[', '=']).next().filter(|n| !n.is_empty()) {
-            // `NAME+=x` and `NAME[i]=x` do not show the whole value.
-            shell.cmd_values.insert(name.to_string(), vec!["\0".into()]);
+    if i == words.len() {
+        for w in words {
+            if let Some((name, value)) = assign_sides(w) {
+                shell.cmd_values.insert(name, vec![value]);
+            } else if let Some(name) = w.split(['+', '[', '=']).next().filter(|n| !n.is_empty()) {
+                // `NAME+=x` and `NAME[i]=x` do not show the whole value.
+                shell.cmd_values.insert(name.to_string(), vec!["\0".into()]);
+            }
         }
     }
+    for name in opaque_bound(cmd) {
+        shell.cmd_values.insert(name, vec!["\0".into()]);
+    }
+    for name in default_bound(cmd) {
+        shell.cmd_values.insert(name, vec!["\0".into()]);
+    }
+    // `eval` can assign any name, including `IFS`.
+    if command_parts(cmd).1 == "eval" {
+        for v in shell.cmd_values.values_mut() {
+            *v = vec!["\0".into()];
+        }
+    }
+    note_argv0_trust(cmd, shell);
 }
 
 fn union_assigns(
@@ -4546,7 +4778,7 @@ fn judge_startup(
     }
     let mut aliases = shell.aliases.clone();
     let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
-    replay_subshell(&words, shell, depth + 1, out, denied);
+    replay_subshell(&words, shell, depth + 1, false, out, denied);
 }
 
 /// Judge the file a shell runs as its script (`bash ok.sh`), or the file
@@ -4604,7 +4836,14 @@ fn judge_script_file(
         }
         let mut aliases = shell.aliases.clone();
         let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
-        replay_subshell(&words, shell, depth + 1, out, denied);
+        replay_subshell(
+            &words,
+            shell,
+            depth + 1,
+            generated_by_autoconf(&text),
+            out,
+            denied,
+        );
         if denied.is_some() {
             return;
         }
@@ -4654,7 +4893,7 @@ fn judge_procsub(
     }
     let mut aliases = shell.aliases.clone();
     let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
-    replay_subshell(&words, shell, depth, out, denied);
+    replay_subshell(&words, shell, depth, false, out, denied);
 }
 
 /// Judge a file the command runs by its path (`./build.sh`, `exec sub/x`,
@@ -4723,7 +4962,14 @@ fn judge_direct_exec(
         }
         let mut aliases = shell.aliases.clone();
         let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
-        replay_subshell(&words, shell, depth + 1, out, denied);
+        replay_subshell(
+            &words,
+            shell,
+            depth + 1,
+            generated_by_autoconf(&text),
+            out,
+            denied,
+        );
         if denied.is_some() {
             return;
         }
@@ -4769,7 +5015,7 @@ fn judge_produced_command(
         }
         let mut aliases = shell.aliases.clone();
         let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
-        replay_subshell(&words, shell, depth + 1, out, denied);
+        replay_subshell(&words, shell, depth + 1, false, out, denied);
         if denied.is_some() {
             return;
         }
@@ -10788,13 +11034,43 @@ struct Scratch {
     /// directory is not a single tracked one: a symlink there would be
     /// followed, so the name is refused.
     root: Option<std::path::PathBuf>,
+    /// `IFS` was assigned or `eval` ran. A variable suffix can split.
+    ifs_assigned: bool,
 }
 
 impl Scratch {
     fn observe(&mut self, argv: &[String]) {
-        for w in argv {
-            self.observe_word(w);
+        for cmd in commands(argv) {
+            for w in &cmd {
+                self.observe_word(w);
+            }
+            if command_sets_ifs(&cmd) {
+                self.ifs_assigned = true;
+            }
+            for name in opaque_bound(&cmd) {
+                self.poison(&name);
+            }
+            if command_parts(&cmd).1 == "eval" {
+                self.poison_all();
+            }
         }
+    }
+
+    /// The name no longer has a value the script shows.
+    fn poison(&mut self, name: &str) {
+        self.vars.insert(name.to_string(), None);
+        self.suffixes.insert(name.to_string(), false);
+    }
+
+    /// `eval` can change every name, and `IFS`.
+    fn poison_all(&mut self) {
+        for v in self.vars.values_mut() {
+            *v = None;
+        }
+        for s in self.suffixes.values_mut() {
+            *s = false;
+        }
+        self.ifs_assigned = true;
     }
 
     fn observe_word(&mut self, w: &str) {
@@ -10971,10 +11247,10 @@ impl Scratch {
             if bytes[i] == b'$' && bytes[i + 1] == b'{' {
                 if let Some(end) = w[i + 2..].find('}') {
                     let body = &w[i + 2..i + 2 + end];
-                    if let Some((name, value)) = default_assign(body) {
-                        if !self.vars.contains_key(name) {
-                            self.note(name, value, false);
-                        }
+                    if let Some((name, _)) = default_assign(body) {
+                        // `${name:=value}` assigns when the name is unset.
+                        // The line does not show that it was unset.
+                        self.poison(name);
                     }
                     i += end + 3;
                     continue;
@@ -11170,6 +11446,10 @@ fn operand_suffix_ok(rest: &str, bound: &Scratch) -> bool {
     }
     if !rest.contains('$') {
         return true;
+    }
+    // `IFS=:` makes `conftst$x` with `x=a:..` into `conftsta` and `..`.
+    if bound.ifs_assigned {
+        return false;
     }
     bare_var(rest).is_some_and(|n| bound.suffixes.get(n) == Some(&true))
 }
@@ -13926,7 +14206,7 @@ hash -r 2> /dev/null
                 files: &files,
                 known: None,
                 script_cwd_moved: false,
-                removals_live: true,
+                trust_argv0: false,
                 cmd_values: &cmd_values,
             };
             runner_commands(&shell_words(line), &inn, 0, &mut runs, &mut denied);
@@ -17092,27 +17372,20 @@ hash -r 2> /dev/null
     }
 
     /// Configure writes scratch in the directory it is running in and
-    /// reads or removes it in the same run. `$as_me.lineno` is a `sed`
-    /// of the script being judged, then sourced. `conf$$.file` is
-    /// created and removed, and `$$` is only digits, so it is not some
-    /// other script. A path the line does not pin down (`$x`, `"$LOG"`)
-    /// still taints a later script, and a `sed` that inserts a command
-    /// is still that command.
+    /// reads it in the same run. `conf$$.file` is only digits in the
+    /// name, so it is not `./ok.sh`. A path the line does not pin down
+    /// (`$x`, `"$LOG"`) still taints a later script, and a `sed` that
+    /// inserts a command is still that command. `$0` is not this line:
+    /// that trust belongs to a marked script file.
     #[test]
     fn configure_scratch_the_script_reads_or_removes_is_not_a_new_script() {
         let root = startup_root("cfgscratch");
         std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
         std::fs::write(root.join("configure"), "echo ok\n").unwrap();
         let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
-        for line in [
-            "sed 's/[$]LINENO.*/&-/' <$0 >$as_me.lineno\n. \"./$as_me.lineno\"\n",
-            "as_myself=$0\nsed 's/[$]LINENO.*/&-/' <$as_myself >$as_me.lineno\n. \"./$as_me.lineno\"\n",
-            "echo >conf$$.file\nrm -f conf$$.file\nsh ./ok.sh\n",
-            "echo >conf$$.file\nrm -f conf$$.file\nsh ./ok.sh\nsed 's/[$]LINENO.*/&-/' <$0 >$as_me.lineno\n. \"./$as_me.lineno\"\n",
-        ] {
-            let c = at(line);
-            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
-        }
+        let line = "echo >conf$$.file\nrm -f conf$$.file\nsh ./ok.sh\n";
+        let c = at(line);
+        assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         for line in [
             "echo 'git push -f' > $x; sh $x",
             "echo start > \"$LOG\"; sh ./configure",
@@ -17163,9 +17436,9 @@ hash -r 2> /dev/null
         }
     }
 
-    /// An `rm` clears a file it wrote only when that `rm` runs. One in
-    /// `if`, after `||` or `&&`, in the background, or after `rm` is a
-    /// function or an alias does not.
+    /// An `rm` does not clear a file. The program can fail, and a removal
+    /// that does not run deletes nothing, so the file written on the line
+    /// is still there to be read.
     #[test]
     fn an_rm_that_does_not_run_does_not_clear_the_file() {
         use std::os::unix::fs::PermissionsExt;
@@ -17185,25 +17458,131 @@ hash -r 2> /dev/null
             "rm -f conf.sh &",
             "rm() { :; }\nrm -f conf.sh",
             "alias rm=:; rm -f conf.sh",
+            "rm -f conf.sh",
+            "{ rm -f conf.sh; }",
+            "rm -f conf.sh && echo gone",
+            "PATH=/nonexist rm -f conf.sh",
+            "rm -i conf.sh </dev/null",
+            "hash -p /bin/true rm\nrm -f conf.sh",
         ] {
             write(&format!(
                 "as_me=conf\necho 'git push -f' > conf.sh\n{mid}\n. \"./$as_me.sh\"\n"
             ));
             let c = at("sh ./s.sh");
             assert_eq!(c.decision, Decision::Deny, "{mid}: {}", c.token);
-            assert!(!c.token.starts_with("script-unread:"), "{mid}: {}", c.token);
+            assert!(
+                c.token.contains("script-written-on-line"),
+                "{mid}: {}",
+                c.token
+            );
         }
-        write("as_me=conf\necho 'git push -f' > conf.sh\nrm -f conf.sh\n. \"./$as_me.sh\"\n");
-        let c = at("sh ./s.sh");
+    }
+
+    /// A binding other than plain `NAME=value` does not prove the value.
+    /// `export`, `declare`, `read`, `printf -v`, `for`, `eval`, `let`,
+    /// `${x:=}` and a prefix on `:` leave the name unknown, so `. "./$x"`
+    /// is not the file an earlier assignment named. `IFS` turns off a
+    /// variable suffix. `$0` is the script only for `sh FILE` or `./FILE`
+    /// when the autoconf marker is there, and `eval`, `trap`, `BASH_ARGV0`
+    /// or a sourced file drop it.
+    #[test]
+    fn an_unproven_binding_is_not_the_value() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = startup_root("unproven");
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        let write = |name: &str, body: &str| {
+            let p = root.join(name);
+            if let Some(dir) = p.parent() {
+                std::fs::create_dir_all(dir).unwrap();
+            }
+            std::fs::write(&p, body).unwrap();
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&p, perm).unwrap();
+        };
+        write("ok.sh", "echo ok\n");
+        write("evil.sh", "git push -f\n");
+        write("sub/s.sh", "git push -f\n");
+        let c = at("x=ok.sh; . \"./$x\"");
         assert_eq!(c.decision, Decision::Allow, "{}", c.token);
-        write("as_me=conf\necho 'git push -f' > conf.sh\n{ rm -f conf.sh; }\n. \"./$as_me.sh\"\n");
-        let c = at("sh ./s.sh");
+        let c = at("x=evil.sh; . \"./$x\"");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(c.token.contains("git-force-push"), "{}", c.token);
+        for body in [
+            "x=ok.sh\nexport x=evil.sh\n. \"./$x\"\n",
+            "x=ok.sh\ndeclare x=evil.sh\n. \"./$x\"\n",
+            "x=ok.sh\ntypeset -n x=evil.sh\n. \"./$x\"\n",
+            "x=ok.sh\nprintf -v x %s evil.sh\n. \"./$x\"\n",
+            "x=ok.sh\nread x\n. \"./$x\"\n",
+            "x=ok.sh\ngetopts ab: x\n. \"./$x\"\n",
+            "x=ok.sh\n: ${x:=evil.sh}\n. \"./$x\"\n",
+            "x=ok.sh\neval x=evil.sh\n. \"./$x\"\n",
+            "x=ok.sh\nfor x in evil.sh; do . \"./$x\"; done\n",
+            "x=ok.sh\nlet x=1\n. \"./$x\"\n",
+            "x=ok.sh\n: $((x=1))\n. \"./$x\"\n",
+            "x=ok.sh\nx=evil.sh :\n. \"./$x\"\n",
+            "x=ok.sh\ncoproc x { echo; }\n. \"./$x\"\n",
+        ] {
+            write("s.sh", body);
+            let c = at("sh ./s.sh");
+            assert_eq!(c.decision, Decision::Deny, "{body}: {}", c.token);
+        }
+        let h = "# Generated by GNU Autoconf 2.71\n";
+        write("suffix.sh", &format!("{h}x=a\nrm -rf conftst$x\n"));
+        let c = at("sh ./suffix.sh");
         assert_eq!(c.decision, Decision::Allow, "{}", c.token);
-        write(
-            "as_me=conf\necho 'git push -f' > conf.sh\nrm -f conf.sh && echo gone\n. \"./$as_me.sh\"\n",
+        for body in [
+            "x=a\nIFS=:\nrm -rf conftst$x\n",
+            "x=a:..\nIFS=:\nrm -rf conftst$x\n",
+            "x=a\nfor x in 'a ..'; do rm -rf conftst$x; done\n",
+            "x=a\nprintf -v x %s 'a ..'\nrm -rf conftst$x\n",
+            "x=a\nread x\nrm -rf conftst$x\n",
+            "x=a\n: $((x=1))\nrm -rf conftst$x\n",
+            "IFS=:\nrm -rf conftest*\n",
+        ] {
+            write("suffix.sh", &format!("{h}{body}"));
+            let c = at("sh ./suffix.sh");
+            let want = if body.starts_with("IFS=:") {
+                Decision::Allow
+            } else {
+                Decision::Deny
+            };
+            assert_eq!(c.decision, want, "{body}: {}", c.token);
+            if want == Decision::Deny {
+                assert_eq!(c.token, "rm-rf-outside-tmp", "{body}: {}", c.token);
+            }
+        }
+        let dance = "\
+as_myself=$0
+sed 's/[$]LINENO.*/&-/' <$as_myself >$as_me.lineno
+. \"./$as_me.lineno\"
+";
+        write("configure", &format!("{h}{dance}"));
+        for line in ["sh ./configure", "./configure"] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        let c = check_shell_in(&["sh".into(), "-c".into(), dance.into()], &root, 0);
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        let c = check_shell_in(
+            &["sh".into(), "-c".into(), dance.into(), "sub/s.sh".into()],
+            &root,
+            0,
         );
-        let c = at("sh ./s.sh");
-        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        write("s.sh", &format!("{h}{dance}"));
+        write("bash", "git push -f\n");
+        let c = check_shell_in(&["bash".into(), "-c".into(), ". ./s.sh".into()], &root, 0);
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        for body in ["BASH_ARGV0=sub/s.sh\n", "eval true\n", "trap 'true' EXIT\n"] {
+            write("configure", &format!("{h}{body}{dance}"));
+            let c = at("sh ./configure");
+            assert_eq!(c.decision, Decision::Deny, "{body}: {}", c.token);
+        }
+        write("other.sh", &format!("{h}{dance}"));
+        write("configure", &format!("{h}. ./other.sh\n"));
+        let c = at("sh ./configure");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
     }
 
     /// `#` starts a comment only at the start of a word. After `)` that
