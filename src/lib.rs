@@ -6738,6 +6738,28 @@ mod tests {
         }
     }
 
+    /// A `case` arm runs the command after its pattern.
+    #[test]
+    fn a_case_arm_does_not_hide_a_force_push() {
+        for script in [
+            "x=a; case \"$x\" in a) git push --force ;; esac",
+            "case $1 in a) echo a;; b|c) git push -f;; esac",
+            "case $1 in (a) git push -f;; esac",
+            "case $1 in\n  a | b) git push -f\n  ;;\nesac",
+        ] {
+            assert_eq!(
+                v(&["bash", "-c", script]),
+                "deny\tgit-force-push",
+                "{script}"
+            );
+        }
+        assert_eq!(v(&["bash", "-c", "case $1 in a) echo a;; esac"]), "allow");
+        assert_eq!(
+            evil_and_safe("case-cd", "case $1 in a) cd evil;; esac; make clean-all"),
+            Decision::Deny
+        );
+    }
+
     #[test]
     fn a_shell_script_does_not_hide_a_recursive_delete() {
         assert!(v(&["sh", "-c", "rm -rf /home/u/x"]).starts_with("deny"));
