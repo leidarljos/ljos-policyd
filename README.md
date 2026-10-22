@@ -184,7 +184,9 @@ domains are one domain, and dots in the local part are ignored.
 On an address rule for `fastmail.com`, a mailbox at
 `<local>@<user>.fastmail.com` (one label, then `fastmail.com`)
 is `<user>@fastmail.com`. A hyphen in that label is part of the
-user name. Domain rules and `From` are not matched this way.
+user name. A decoded user label that contains ZWJ or ZWNJ is not
+used; the `xn--` form is kept. Domain rules and `From` are not
+matched this way.
 An address at `@[ ... ]` is a
 domain literal and is a refusal. So is a domain that is not a
 hostname after IDNA, such as one with an underscore, a `!` or a
@@ -203,7 +205,24 @@ refusal. A local part that contains a default ignorable code point,
 a noncharacter, an unassigned or private-use code point, a format
 or control character, or a space separator is a refusal. A
 zero-width space or a braille blank is still removed before the
-address is compared.
+address is compared. A decimal digit is the ASCII digit of the
+same value, so `user` and U+0661 is `user1`. ASCII `0` is not
+`o`. An enclosing mark is removed with the nonspacing marks. A
+spacing mark whose base is ASCII is a refusal; one on a
+non-ASCII base stays.
+A local part that mixes Latin with Cyrillic or Greek is
+`mixed-script`, the same rule as a domain label. The whole local
+part is one label. A local part wholly in Cyrillic or Greek is a
+different mailbox and is not folded to the Latin it looks like.
+A format character is a refusal, so a Devanagari, Persian or
+Sinhala local part that uses ZWJ or ZWNJ is `recipient-unparsed`,
+and so is an emoji ZWJ sequence, a keycap (digit, VS16, U+20E3)
+or a tag flag. A variation selector is a refusal, including VS16
+after an emoji and a Mongolian free variation selector. A quoted
+space is a refusal, whether the space is ASCII or NBSP. Plain
+Devanagari, including a virama with no joiner, Arabic including
+tatweel, CJK, Hangul, Thai, a single emoji, and an emoji with a
+skin tone are still addresses.
 A recipient domain, or a domain on a header checked against the
 deny file, is refused when one of its labels mixes Latin with
 Cyrillic or Greek after NFKC and IDNA.
@@ -220,9 +239,12 @@ change is refused.
 
 The deny file's lines are `address`, `domain`, `handle`, `term` and
 `pair`. This check uses `address` and `domain`. The other three can
-share the file and are ignored here. The pack-law file's lines are
-`deny-domain`. A line that would allow a domain is not a rule, and
-the file is refused.
+share the file and are ignored here. An `address` line whose local
+part this check would refuse, such as a joiner, VS16 or a quoted
+space, does not load. The file is `deny-file-invalid` and every
+send is refused. The pack-law file's lines are `deny-domain`. A
+line that would allow a domain is not a rule, and the file is
+refused.
 
 A message over 1 MiB, a control character in the header block,
 U+0085, U+2028 or U+2029 in that block, a header line over 998

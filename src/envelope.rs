@@ -9,6 +9,8 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use icu_casemap::{CaseMapper, CaseMapperBorrowed};
+use icu_locale_core::LanguageIdentifier;
 use icu_properties::props::{DefaultIgnorableCodePoint, GeneralCategory, NoncharacterCodePoint};
 use icu_properties::{CodePointMapData, CodePointSetData};
 use unicode_normalization::UnicodeNormalization;
@@ -158,6 +160,9 @@ fn check_argv_recipients(config: &Config, recipients: &[String], reasons: &mut V
         if let Some(shown) = mixed_script_domain(&addr.domain) {
             reasons.push(reason("mixed-script", format!("argv {shown}")));
         }
+        if local_mixes_latin(&addr.local) {
+            reasons.push(reason("mixed-script", format!("argv {}", addr.key())));
+        }
         if address_denied(&addr, config) {
             reasons.push(reason("argv-recipient-denied", addr.key()));
         }
@@ -169,10 +174,11 @@ fn check_argv_recipients(config: &Config, recipients: &[String], reasons: &mut V
     }
 }
 
+#[derive(Clone)]
 struct NormAddr {
     /// Deny-file form: NFKC, a zero-width space or braille blank removed,
-    /// local part lowercased, domain in IDNA ASCII. A closed code point
-    /// is not a form.
+    /// local part lowercased, a decimal digit mapped to ASCII, domain
+    /// in IDNA ASCII. A closed code point is not a form.
     local: String,
     domain: String,
     /// The mailbox as written, before that folding. `From` is compared
@@ -187,6 +193,7 @@ impl NormAddr {
     }
 }
 
+#[derive(Clone)]
 struct Config {
     identity: NormAddr,
     deny_addresses: BTreeSet<String>,
@@ -202,6 +209,113 @@ struct Config {
 }
 
 fn load_config(path: &Path) -> Result<Config, MailReason> {
+    // One deny file judged for every code point re-reads the same bytes.
+    // Parsing them again does not change the verdict. The bytes are the
+    // key, so a test that rewrites a file still loads the new text.
+    #[cfg(test)]
+    if let Some(config) = cached_config(path) {
+        return Ok(config);
+    }
+    let config = load_config_uncached(path)?;
+    #[cfg(test)]
+    store_cached_config(path, &config);
+    Ok(config)
+}
+
+#[cfg(test)]
+struct ConfigCache {
+    conf_path: PathBuf,
+    conf: Vec<u8>,
+    deny_path: PathBuf,
+    deny: Vec<u8>,
+    law_path: PathBuf,
+    law: Vec<u8>,
+    config: Config,
+}
+
+#[cfg(test)]
+fn config_cache() -> &'static std::thread::LocalKey<std::cell::RefCell<Option<ConfigCache>>> {
+    thread_local! {
+        static CACHE: std::cell::RefCell<Option<ConfigCache>> = const { std::cell::RefCell::new(None) };
+    }
+    &CACHE
+}
+
+#[cfg(test)]
+fn cached_config(path: &Path) -> Option<Config> {
+    let conf = std::fs::read(path).ok()?;
+    let (deny_path, law_path) = config_cache().with(|slot| {
+        let slot = slot.borrow();
+        let slot = slot.as_ref()?;
+        if slot.conf_path == path && slot.conf == conf {
+            Some((slot.deny_path.clone(), slot.law_path.clone()))
+        } else {
+            None
+        }
+    })?;
+    let deny = std::fs::read(&deny_path).ok()?;
+    let law = std::fs::read(&law_path).ok()?;
+    config_cache().with(|slot| {
+        let slot = slot.borrow();
+        let slot = slot.as_ref()?;
+        if slot.conf_path == path && slot.conf == conf && slot.deny == deny && slot.law == law {
+            Some(slot.config.clone())
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(test)]
+fn store_cached_config(path: &Path, config: &Config) {
+    let Ok(conf) = std::fs::read(path) else {
+        return;
+    };
+    let Ok(text) = std::str::from_utf8(&conf) else {
+        return;
+    };
+    let Some((deny_path, law_path)) = side_files(text, path) else {
+        return;
+    };
+    let Ok(deny) = std::fs::read(&deny_path) else {
+        return;
+    };
+    let Ok(law) = std::fs::read(&law_path) else {
+        return;
+    };
+    config_cache().with(|slot| {
+        *slot.borrow_mut() = Some(ConfigCache {
+            conf_path: path.to_path_buf(),
+            conf,
+            deny_path,
+            deny,
+            law_path,
+            law,
+            config: config.clone(),
+        });
+    });
+}
+
+/// The deny file and the pack-law file named by a config that has
+/// already loaded. A line this cannot read is not cached.
+#[cfg(test)]
+fn side_files(text: &str, config: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut deny = None;
+    let mut law = None;
+    for line in text.lines() {
+        let Some((key, value)) = rule_line(line).ok().flatten() else {
+            continue;
+        };
+        match key {
+            "deny-file" => deny = Some(resolve(config, value)),
+            "pack-law" => law = Some(resolve(config, value)),
+            _ => {}
+        }
+    }
+    Some((deny?, law?))
+}
+
+fn load_config_uncached(path: &Path) -> Result<Config, MailReason> {
     let text = read_text(path).map_err(|()| reason("config-unreadable", "config"))?;
     let mut identity = None;
     let mut deny_file = None;
@@ -570,6 +684,9 @@ fn check_named(
                     if let Some(shown) = mixed_script_domain(&addr.domain) {
                         hits.push((true, format!("{name} {shown}")));
                     }
+                    if local_mixes_latin(&addr.local) {
+                        hits.push((true, format!("{name} {}", addr.key())));
+                    }
                     if address_denied(&addr, config)
                         || domain_denied(&addr.domain, &config.deny_domains, &config.aliases)
                         || domain_denied(&addr.domain, &config.pack_domains, &config.aliases)
@@ -628,6 +745,9 @@ fn check_recipients(message: &Message, config: &Config, reasons: &mut Vec<MailRe
                     for addr in list {
                         if let Some(shown) = mixed_script_domain(&addr.domain) {
                             reasons.push(reason("mixed-script", format!("{name} {shown}")));
+                        }
+                        if local_mixes_latin(&addr.local) {
+                            reasons.push(reason("mixed-script", format!("{name} {}", addr.key())));
                         }
                         if address_denied(&addr, config) {
                             reasons.push(reason(
@@ -757,15 +877,17 @@ const TRANSPARENT: &[char] = &['.', '_', '-', '+', '='];
 /// An empty skeleton is refused at load: `starts_with("")` is true.
 const MIN_SKELETON: usize = 3;
 
-/// NFD, combining marks (general category Mn) removed, case folded
-/// twice, marks removed again, then NFC, with every `TRANSPARENT`
-/// character removed and nothing cut. `normalize_local` has already
-/// composed, so the decomposition runs here on the rule and the
-/// recipient: `abc` + U+0301 + `x` is `abćx` by then, and the mark
-/// has to come off or the prefix never sees `abc`. Case folding İ
-/// produces i and U+0307, so the second strip is what makes that one
-/// skeleton with i. One upper-then-lower leaves capital sharp s as
-/// ß, so the fold runs again and ß becomes ss. A recipient whose
+/// NFD, nonspacing marks (Mn) and enclosing marks (Me) removed, case
+/// folded twice, marks removed again, then NFC, with every
+/// `TRANSPARENT` character removed and nothing cut. `normalize_local`
+/// has already composed, so the decomposition runs here on the rule
+/// and the recipient: `abc` + U+0301 + `x` is `abćx` by then, and the
+/// mark has to come off or the prefix never sees `abc`. An enclosing
+/// mark such as U+20DD or U+0488 does not decompose, and leaving it in
+/// the skeleton made `oth<U+20DD>er` miss a rule for `other`. Case
+/// folding İ produces i and U+0307, so the second strip is what makes
+/// that one skeleton with i. One upper-then-lower leaves capital sharp
+/// s as ß, so the fold runs again and ß becomes ss. A recipient whose
 /// skeleton starts with a rule's skeleton, at that domain or one in
 /// the same family, is denied. This over-blocks on purpose: `john`
 /// also denies `johnny` and `jo.hn-x`, so a provider that ignores a
@@ -783,18 +905,73 @@ fn strip_marks(local: &str) -> String {
     let category = CodePointMapData::<GeneralCategory>::new();
     local
         .nfd()
-        .filter(|c| category.get(*c) != GeneralCategory::NonspacingMark)
+        .filter(|c| {
+            !matches!(
+                category.get(*c),
+                GeneralCategory::NonspacingMark | GeneralCategory::EnclosingMark
+            )
+        })
         .collect()
 }
 
+/// A spacing mark (Mc) whose base is an ASCII character. The skeleton
+/// keeps Mc, so U+0903 after `h` is a different local part from `h`
+/// and misses the rule. Devanagari and other non-ASCII bases keep the
+/// mark: it is part of that spelling.
+fn spacing_mark_on_ascii(local: &str) -> bool {
+    let category = CodePointMapData::<GeneralCategory>::new();
+    let mut ascii_base = false;
+    for c in local.chars() {
+        match category.get(c) {
+            GeneralCategory::SpacingMark if ascii_base => return true,
+            GeneralCategory::NonspacingMark
+            | GeneralCategory::EnclosingMark
+            | GeneralCategory::SpacingMark => {}
+            _ => ascii_base = c.is_ascii() && !c.is_ascii_control(),
+        }
+    }
+    false
+}
+
 /// NFKC, then uppercase, then lowercase, then NFKC again.
+///
+/// Case mapping is ICU's full mapping for the root locale, not
+/// `char::to_lowercase`. The toolchain's tables are an older Unicode
+/// and leave letters such as U+A7DD unchanged.
 fn casefold(local: &str) -> String {
-    let folded: String = local
-        .nfkc()
-        .flat_map(char::to_uppercase)
-        .flat_map(char::to_lowercase)
-        .collect();
+    let nfkc: String = local.nfkc().collect();
+    let folded = icu_lower(&icu_upper(&nfkc));
     folded.nfkc().collect()
+}
+
+fn icu_upper(s: &str) -> String {
+    icu_map(s, |cm, ch| {
+        cm.uppercase_to_string(ch, &LanguageIdentifier::UNKNOWN)
+    })
+}
+
+fn icu_lower(s: &str) -> String {
+    icu_map(s, |cm, ch| {
+        cm.lowercase_to_string(ch, &LanguageIdentifier::UNKNOWN)
+    })
+}
+
+/// One character at a time. The string mapping is context sensitive, so
+/// a final sigma and a medial one become different letters and a rule
+/// for `abσ` misses `abσx`. The per-character mapping is what the
+/// skeleton already compared, and it still folds a letter the
+/// toolchain leaves unchanged.
+fn icu_map(
+    s: &str,
+    map: impl for<'a> Fn(CaseMapperBorrowed<'static>, &'a str) -> std::borrow::Cow<'a, str>,
+) -> String {
+    let cm = CaseMapper::new();
+    let mut out = String::with_capacity(s.len());
+    let mut buf = [0u8; 4];
+    for ch in s.chars() {
+        out.push_str(&map(cm, ch.encode_utf8(&mut buf)));
+    }
+    out
 }
 
 fn same_family(domain: &str, other: &str, families: &[AliasFamily]) -> bool {
@@ -860,6 +1037,7 @@ const ALIAS_FAMILIES: &[&str] = &[
     "ymail.*,rocketmail.com - cut",
 ];
 
+#[derive(Clone)]
 struct AliasFamily {
     domains: Vec<String>,
     separators: String,
@@ -1067,7 +1245,9 @@ fn normalize_mailbox(mailbox: &Mailbox) -> Option<NormAddr> {
 /// the ones the reference names. Every other closed code point refuses
 /// the local part, before NFKC and after it: U+2000 to U+200A become a
 /// plain space, and a space the parser let through a quoted local part
-/// is still closed.
+/// is still closed. A decimal digit then becomes the ASCII digit of the
+/// same value, so a rule for `user1` meets `user` plus U+0661. ASCII `0`
+/// stays `0`.
 fn normalize_local(raw: &str) -> Option<String> {
     let sets = unicode_sets();
     let stripped: String = raw.chars().filter(|c| !is_documented_fold(*c)).collect();
@@ -1080,15 +1260,52 @@ fn normalize_local(raw: &str) -> Option<String> {
         .collect();
     if folded
         .chars()
-        .any(|c| local_closed(&sets, c) || c.is_control())
+        .any(|c| local_closed(&sets, c) || mail::unicode_control(c))
     {
         return None;
     }
-    let lower: String = folded.chars().flat_map(|c| c.to_lowercase()).collect();
+    // After NFKC, so a compatibility form that opens into an ASCII base
+    // plus a spacing mark is caught too. The pre-NFKC spelling is
+    // checked as well: composition must not hide the mark.
+    if spacing_mark_on_ascii(&stripped) || spacing_mark_on_ascii(&folded) {
+        return None;
+    }
+    let lower = map_decimal_digits(&icu_lower(&folded));
     if lower.is_empty() {
         return None;
     }
     Some(lower)
+}
+
+/// First code point of each Unicode 18 decimal-digit block. The next
+/// nine are the digits 1 to 9. Every `Nd` scalar is in one of these
+/// blocks, and the blocks are contiguous.
+const DECIMAL_ZERO: &[u32] = &[
+    0x30, 0x660, 0x6F0, 0x7C0, 0x966, 0x9E6, 0xA66, 0xAE6, 0xB66, 0xBE6, 0xC66, 0xCE6, 0xD66,
+    0xDE6, 0xE50, 0xED0, 0xF20, 0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80, 0x1A90,
+    0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0, 0xAA50, 0xABF0, 0xFF10,
+    0x104A0, 0x10D30, 0x10D40, 0x11066, 0x110F0, 0x11136, 0x111D0, 0x112F0, 0x11450, 0x114D0,
+    0x11650, 0x116C0, 0x116D0, 0x116DA, 0x11730, 0x118E0, 0x11950, 0x11BF0, 0x11C50, 0x11D50,
+    0x11DA0, 0x11DE0, 0x11F50, 0x16130, 0x16A60, 0x16AC0, 0x16B50, 0x16D70, 0x1CCF0, 0x1D7CE,
+    0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1E140, 0x1E2F0, 0x1E4F0, 0x1E5F1, 0x1E950, 0x1FBF0,
+];
+
+fn decimal_digit(c: char) -> char {
+    let cp = u32::from(c);
+    let found = DECIMAL_ZERO.partition_point(|zero| *zero <= cp);
+    if found == 0 {
+        return c;
+    }
+    let value = cp - DECIMAL_ZERO[found - 1];
+    if value < 10 {
+        char::from(b'0' + value as u8)
+    } else {
+        c
+    }
+}
+
+fn map_decimal_digits(local: &str) -> String {
+    local.chars().map(decimal_digit).collect()
 }
 
 /// A deny-file or pack-law domain. `None` when a recipient domain could
@@ -1105,7 +1322,7 @@ fn rule_domain(raw: &str) -> Option<String> {
 }
 
 fn forbidden_in_domain(c: char) -> bool {
-    matches!(c, '*' | ':' | '/' | '@') || c.is_whitespace()
+    matches!(c, '*' | ':' | '/' | '@') || mail::unicode_space(c)
 }
 
 /// LDH labels of 1 to 63 characters, no leading or trailing hyphen, and
@@ -1154,7 +1371,7 @@ fn address_rule_can_match(mailbox: &Mailbox, addr: &NormAddr) -> bool {
 /// `@`, `%` and `!` are routes the parser refuses. A control other than
 /// a tab cannot be in a parsed local part either.
 fn recipient_local_char(c: char) -> bool {
-    !matches!(c, '@' | '%' | '!' | '*') && (!c.is_control() || c == '\t')
+    !matches!(c, '@' | '%' | '!' | '*') && (!mail::unicode_control(c) || c == '\t')
 }
 
 /// NFKC, then IDNA, so a fullwidth label and a punycode label of the same
@@ -1181,7 +1398,7 @@ fn normalize_domain(raw: &str) -> Option<String> {
     }
     if folded
         .chars()
-        .any(|c| c.is_control() || c.is_whitespace() || domain_closed(&sets, c))
+        .any(|c| mail::unicode_control(c) || mail::unicode_space(c) || domain_closed(&sets, c))
     {
         return None;
     }
@@ -1217,6 +1434,14 @@ fn mixed_script_domain(domain: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Latin together with Cyrillic or Greek in a normalized local part.
+/// The whole local part is one label: a dot does not open a second
+/// one. A local part wholly in Cyrillic or Greek is a different
+/// mailbox, and it is not folded onto the Latin it looks like.
+fn local_mixes_latin(local: &str) -> bool {
+    label_mixes_latin(local)
 }
 
 fn label_mixes_latin(label: &str) -> bool {
@@ -1576,6 +1801,139 @@ From: other@example.test\r\n";
             "{:?}",
             details(&raw, "", "")
         );
+    }
+
+    /// The same script rule as a domain label. The lookalike is refused
+    /// rather than folded, so it does not become the Latin mailbox.
+    #[test]
+    fn a_local_part_that_mixes_latin_with_cyrillic_or_greek_is_refused() {
+        let deny = "address other@example.test\n";
+        let cyr = plain("To: oth\u{0435}r@example.test\r\n");
+        assert_eq!(codes(&cyr, deny, ""), vec!["mixed-script"]);
+        assert_eq!(
+            details(&cyr, deny, ""),
+            vec!["to oth\u{0435}r@example.test"]
+        );
+        let greek = plain("To: oth\u{03BF}r@example.test\r\n");
+        assert_eq!(codes(&greek, "", ""), vec!["mixed-script"]);
+        let reply = plain("Reply-To: us\u{03BF}r@example.test\r\n");
+        assert_eq!(codes(&reply, "", ""), vec!["mixed-script"]);
+        assert_eq!(
+            codes_argv(&plain(""), "", "", &["us\u{043E}r@example.test"]),
+            vec!["mixed-script"]
+        );
+        let whole = plain("To: \u{043F}\u{0440}\u{0438}\u{043C}\u{0435}\u{0440}@example.test\r\n");
+        assert!(
+            codes(&whole, "", "").is_empty(),
+            "{:?}",
+            details(&whole, "", "")
+        );
+        let greek_whole = plain("To: \u{03B1}\u{03B2}\u{03B3}@example.test\r\n");
+        assert!(
+            codes(&greek_whole, "", "").is_empty(),
+            "{:?}",
+            details(&greek_whole, "", "")
+        );
+    }
+
+    /// U+0661 and U+0967 are digit 1. ASCII 0 is not letter o.
+    #[test]
+    fn a_decimal_digit_folds_to_its_ascii_value() {
+        let deny = "address user1@example.test\n";
+        let arabic = plain("To: user\u{0661}@example.test\r\n");
+        assert_eq!(codes(&arabic, deny, ""), vec!["recipient-address-denied"]);
+        let devanagari = plain("To: user\u{0967}@example.test\r\n");
+        assert_eq!(
+            codes(&devanagari, deny, ""),
+            vec!["recipient-address-denied"]
+        );
+        let rule = "address user\u{0661}@example.test\n";
+        let ascii = plain("To: user1@example.test\r\n");
+        assert_eq!(codes(&ascii, rule, ""), vec!["recipient-address-denied"]);
+        let zero = plain("To: 0ther@example.test\r\n");
+        assert!(
+            codes(&zero, "address other@example.test\n", "").is_empty(),
+            "{:?}",
+            details(&zero, "address other@example.test\n", "")
+        );
+        let letter = plain("To: other@example.test\r\n");
+        assert!(
+            codes(&letter, "address 0ther@example.test\n", "").is_empty(),
+            "{:?}",
+            details(&letter, "address 0ther@example.test\n", "")
+        );
+    }
+
+    #[test]
+    fn decimal_digit_blocks_are_every_decimal_number() {
+        let category = CodePointMapData::<GeneralCategory>::new();
+        let mut found = Vec::new();
+        for cp in 0..=0x10FFFF {
+            if let Some(c) = char::from_u32(cp) {
+                if category.get(c) == GeneralCategory::DecimalNumber {
+                    found.push(cp);
+                }
+            }
+        }
+        let mut expect = Vec::new();
+        for &zero in DECIMAL_ZERO {
+            for i in 0..10 {
+                expect.push(zero + i);
+                let c = char::from_u32(zero + i).unwrap();
+                assert_eq!(decimal_digit(c), char::from(b'0' + i as u8));
+            }
+        }
+        assert_eq!(found, expect);
+        assert_eq!(decimal_digit('o'), 'o');
+        assert_eq!(decimal_digit('0'), '0');
+    }
+
+    /// Joiners, variation selectors and a quoted space are closed, so a
+    /// recipient is `recipient-unparsed` and an `address` line that
+    /// contains one does not load.
+    #[test]
+    fn a_joiner_emoji_or_quoted_space_is_refused() {
+        let refused = [
+            "\u{0915}\u{094D}\u{200D}",
+            "\u{0915}\u{094D}\u{200C}",
+            "\u{0645}\u{200C}\u{0631}",
+            "\u{0D85}\u{200D}",
+            "\u{1820}\u{180B}",
+            "\u{1F468}\u{200D}\u{1F469}",
+            "\u{2764}\u{FE0F}",
+            "1\u{FE0F}\u{20E3}",
+            "\u{1F3F4}\u{E0067}\u{E0062}\u{E007F}",
+            "\"john doe\"",
+            "\"john\u{00A0}doe\"",
+        ];
+        for local in refused {
+            let raw = plain(&format!("To: {local}@example.test\r\n"));
+            assert_eq!(codes(&raw, "", ""), vec!["recipient-unparsed"], "{local:?}");
+            let deny = format!("address {local}@example.test\n");
+            let v = verdict(&plain(""), &deny, "");
+            assert_eq!(v.reasons.len(), 1, "{local:?}");
+            assert_eq!(v.reasons[0].code, "deny-file-invalid", "{local:?}");
+            assert_eq!(v.reasons[0].detail, "line 1", "{local:?}");
+        }
+        let accepted = [
+            "\u{0915}\u{093E}",
+            "\u{0915}\u{094D}",
+            "\u{0627}\u{0640}\u{0628}",
+            "\u{4E2D}",
+            "\u{AC00}",
+            "\u{0E01}",
+            "\u{1F600}",
+            "\u{1F44D}\u{1F3FB}",
+            "\u{2764}",
+        ];
+        for local in accepted {
+            let raw = plain(&format!("To: {local}@example.test\r\n"));
+            assert!(
+                codes(&raw, "", "").is_empty(),
+                "{local:?} {:?}",
+                details(&raw, "", "")
+            );
+        }
     }
 
     #[test]
@@ -2555,13 +2913,24 @@ pair left right
     /// other spelling through.
     #[test]
     fn skeleton_prefix_matches_casefold_edges_both_ways() {
-        let hit = |to: &str, rule: &str| {
+        let verdict = |to: &str, rule: &str| {
             codes(
                 &plain(&format!("To: {to}\r\n")),
                 &format!("address {rule}\n"),
                 "",
-            ) == vec!["recipient-address-denied"]
+            )
         };
+        // A Greek letter beside Latin is `mixed-script` as well as a
+        // skeleton match. The address result is what this test checks.
+        let hit = |to: &str, rule: &str| {
+            let got = verdict(to, rule);
+            got.iter().any(|c| c == "recipient-address-denied")
+                && got
+                    .iter()
+                    .all(|c| c == "recipient-address-denied" || c == "mixed-script")
+        };
+        let not_this_rule =
+            |to: &str, rule: &str| verdict(to, rule).iter().all(|c| c == "mixed-script");
         let groups: &[&[&str]] = &[
             &[
                 "mai",
@@ -2609,24 +2978,17 @@ pair left right
                         "rule {rule_local} recipient {recip}x"
                     );
                     assert!(
-                        codes(
-                            &plain(&format!("To: {recip}@other.test\r\n")),
-                            &format!("address {rule}\n"),
-                            ""
-                        )
-                        .is_empty(),
+                        not_this_rule(&format!("{recip}@other.test"), &rule),
                         "rule {rule_local} other domain {recip}"
                     );
                 }
             }
             let first = group[0];
             assert!(
-                codes(
-                    &plain(&format!("To: x{first}@example.test\r\n")),
-                    &format!("address {first}@example.test\n"),
-                    ""
-                )
-                .is_empty(),
+                not_this_rule(
+                    &format!("x{first}@example.test"),
+                    &format!("{first}@example.test")
+                ),
                 "prefix is at the start: {first}"
             );
         }
@@ -2664,12 +3026,10 @@ pair left right
                 "{short}"
             );
             assert!(
-                codes(
-                    &plain(&format!("To: {short}x@example.test\r\n")),
-                    &format!("address {short}@example.test\n"),
-                    ""
-                )
-                .is_empty(),
+                not_this_rule(
+                    &format!("{short}x@example.test"),
+                    &format!("{short}@example.test")
+                ),
                 "{short}x"
             );
         }
@@ -3086,108 +3446,141 @@ pair left right
         }
     }
 
-    /// Every code point in a local part is refused, or the skeleton it
-    /// leaves is denied by an address rule for that skeleton. None is
-    /// accepted and missed. A surrogate is not a scalar value, so the
-    /// UTF-8 decoder refuses those bytes.
+    /// An enclosing mark stays in the local part and used to miss the
+    /// rule. It comes off in the skeleton, so the rule matches. A
+    /// spacing mark on an ASCII base is not that letter, and is refused.
+    /// The same mark on a Devanagari base is part of the spelling.
     #[test]
-    fn every_code_point_in_a_local_part_is_refused_or_denied_by_its_skeleton() {
-        let sets = unicode_sets();
-        let other = rule_config("other");
-        let mut config = rule_config("other");
-        let base = skeleton("other");
-        let mut bare = String::new();
-        let mut quoted = String::new();
+    fn an_enclosing_or_spacing_mark_does_not_hide_a_denied_address() {
+        let deny = "address other@example.test\n";
+        for mark in ['\u{20DD}', '\u{0488}'] {
+            let raw = plain(&format!("To: oth{mark}er@example.test\r\n"));
+            assert_eq!(
+                codes(&raw, deny, ""),
+                vec!["recipient-address-denied"],
+                "U+{:04X}",
+                u32::from(mark)
+            );
+            assert!(
+                codes(&plain(&format!("To: oth{mark}er@example.test\r\n")), "", "").is_empty(),
+                "U+{:04X} refused when nothing is denied",
+                u32::from(mark)
+            );
+        }
+        let visarga = plain("To: oth\u{0903}er@example.test\r\n");
+        assert_eq!(codes(&visarga, deny, ""), vec!["recipient-unparsed"]);
+        assert_eq!(codes(&visarga, "", ""), vec!["recipient-unparsed"]);
+        let devanagari = plain("To: \u{0915}\u{0903}@example.test\r\n");
+        assert!(
+            codes(&devanagari, "", "").is_empty(),
+            "{:?}",
+            details(&devanagari, "", "")
+        );
+    }
+
+    /// Every scalar is placed in a local part and judged by
+    /// `check_mail_bytes` against one deny file, `address
+    /// other@example.test`. An allow is only a letter, number,
+    /// punctuation or symbol in the general category. That category
+    /// comes from ICU, not from `local_closed`. A surrogate is not a
+    /// scalar, so the UTF-8 decoder refuses those bytes.
+    #[test]
+    fn every_code_point_in_a_local_part_is_refused_or_visible() {
+        use icu_properties::props::GeneralCategoryGroup;
+        let visible = GeneralCategoryGroup::Letter
+            .union(GeneralCategoryGroup::Number)
+            .union(GeneralCategoryGroup::Punctuation)
+            .union(GeneralCategoryGroup::Symbol);
+        let category = CodePointMapData::<GeneralCategory>::new();
+        let dir = std::env::temp_dir().join(format!("policyd-cps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("deny.txt"), "address other@example.test\n").unwrap();
+        std::fs::write(dir.join("law.txt"), "").unwrap();
+        std::fs::write(
+            dir.join("mail.conf"),
+            format!("identity {IDENTITY}\ndeny-file deny.txt\npack-law law.txt\n"),
+        )
+        .unwrap();
+        let conf = dir.join("mail.conf");
+        let allowed = check_mail_bytes(
+            b"From: mailseat@example.test\r\nTo: othxer@example.test\r\n\r\n",
+            &conf,
+        );
+        assert!(
+            !allowed.is_refused(),
+            "deny file did not load: {:?}",
+            allowed.reasons.iter().map(|r| r.code).collect::<Vec<_>>()
+        );
+        let mut msg = String::new();
         for cp in 0..=0x10FFFF {
             let Some(ch) = char::from_u32(cp) else {
-                assert_eq!(
-                    surrogate_verdict(cp).reasons[0].code,
-                    "message-invalid",
-                    "U+{cp:04X}"
-                );
+                let v = check_mail_bytes(&surrogate_message(cp), &conf);
+                assert_eq!(v.reasons[0].code, "message-invalid", "U+{cp:04X}");
                 continue;
             };
-            let Some(mailbox) = placed_local(ch, &mut bare, &mut quoted) else {
-                continue;
-            };
-            let Some(addr) = normalize_mailbox(&mailbox) else {
-                continue;
-            };
-            assert!(
-                !local_closed(&sets, ch),
-                "U+{cp:04X} is closed and was accepted"
-            );
-            let skel = skeleton(&addr.local);
-            if skel == base {
-                assert!(
-                    address_denied(&addr, &other),
-                    "U+{cp:04X} folded away and missed"
-                );
+            msg.clear();
+            msg.push_str("From: mailseat@example.test\r\nTo: ");
+            // Quote when the atom parser would not keep the character, so
+            // the deny path sees it in the local part. `"`, `\`, CR and
+            // LF cannot sit inside quotes; the header or the parser
+            // refuses those bytes on their own.
+            let quote = !local_atom_char(ch) && !matches!(ch, '"' | '\\' | '\r' | '\n');
+            if quote {
+                msg.push('"');
+            }
+            msg.push_str("oth");
+            msg.push(ch);
+            msg.push_str("er");
+            if quote {
+                msg.push('"');
+            }
+            msg.push_str("@example.test\r\n\r\n");
+            let v = check_mail_bytes(msg.as_bytes(), &conf);
+            if v.is_refused() {
                 continue;
             }
-            let rule = normalize_local(&skel)
-                .unwrap_or_else(|| panic!("U+{cp:04X} skeleton {skel:?} is not a local part"));
-            install_rule(&mut config, &rule);
+            let cat = category.get(ch);
             assert!(
-                address_denied(&addr, &config),
-                "U+{cp:04X} accepted and missed, skeleton {skel:?}"
+                visible.contains(cat),
+                "U+{cp:04X} {cat:?} accepted and not denied"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn rule_config(local: &str) -> Config {
-        let mut config = Config {
-            identity: normalize_identity(IDENTITY).unwrap(),
-            deny_addresses: std::collections::BTreeSet::new(),
-            deny_prefixes: std::collections::BTreeSet::new(),
-            deny_domains: std::collections::BTreeSet::new(),
-            pack_domains: std::collections::BTreeSet::new(),
-            subaddress: "+-=".to_string(),
-            aliases: builtin_families().unwrap(),
-        };
-        install_rule(&mut config, local);
-        config
-    }
-
-    fn install_rule(config: &mut Config, local: &str) {
-        config.deny_addresses.clear();
-        config.deny_prefixes.clear();
-        let key = format!("{local}@example.test");
-        if skeleton(local).chars().count() >= MIN_SKELETON {
-            config.deny_prefixes.insert(key.clone());
+    /// The same shape `is_atext` keeps in an unquoted local part, plus
+    /// `.`, which a dot-atom keeps between the letters.
+    fn local_atom_char(ch: char) -> bool {
+        if ch.is_ascii() {
+            return ch.is_ascii_alphanumeric()
+                || matches!(
+                    ch,
+                    '!' | '#'
+                        | '$'
+                        | '%'
+                        | '&'
+                        | '\''
+                        | '*'
+                        | '+'
+                        | '-'
+                        | '.'
+                        | '/'
+                        | '='
+                        | '?'
+                        | '^'
+                        | '_'
+                        | '`'
+                        | '{'
+                        | '|'
+                        | '}'
+                        | '~'
+                );
         }
-        config.deny_addresses.insert(key);
+        !mail::unicode_control(ch) && !mail::unicode_space(ch)
     }
 
-    fn placed_local(ch: char, bare: &mut String, quoted: &mut String) -> Option<Mailbox> {
-        bare.clear();
-        bare.push_str("oth");
-        bare.push(ch);
-        bare.push_str("er@example.test");
-        if let Some(mailbox) = mailbox_keeping(bare, ch) {
-            return Some(mailbox);
-        }
-        if matches!(ch, '"' | '\\' | '\r' | '\n') {
-            return None;
-        }
-        quoted.clear();
-        quoted.push('"');
-        quoted.push_str("oth");
-        quoted.push(ch);
-        quoted.push_str("er\"@example.test");
-        mailbox_keeping(quoted, ch)
-    }
-
-    fn mailbox_keeping(spec: &str, ch: char) -> Option<Mailbox> {
-        let list = mail::mailboxes(spec).ok()?;
-        if list.len() == 1 && list[0].domain == "example.test" && list[0].local.contains(ch) {
-            Some(list.into_iter().next().unwrap())
-        } else {
-            None
-        }
-    }
-
-    fn surrogate_verdict(cp: u32) -> MailVerdict {
+    fn surrogate_message(cp: u32) -> Vec<u8> {
         let bytes = [
             0xE0 | ((cp >> 12) as u8),
             0x80 | (((cp >> 6) & 0x3F) as u8),
@@ -3196,7 +3589,7 @@ pair left right
         let mut msg = Vec::from(&b"From: mailseat@example.test\r\nTo: oth"[..]);
         msg.extend_from_slice(&bytes);
         msg.extend_from_slice(b"er@example.test\r\n\r\n");
-        check_mail_bytes(&msg, std::path::Path::new("/no/such"))
+        msg
     }
 
     #[test]
@@ -3375,6 +3768,24 @@ pair left right
         let v = check_mail_bytes(&[0xff, 0xfe], &dir.join("mail.conf"));
         assert_eq!(v.reasons[0].code, "message-invalid");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ICU properties, `unicode-normalization` and the case mapping are
+    /// Unicode 18.0.0. The toolchain's `char` tables are not read on
+    /// this path: they leave these letters unchanged.
+    #[test]
+    fn the_deny_path_uses_unicode_18() {
+        assert_eq!(icu_properties_data::unicode_tag!(), "18.0.0");
+        assert_eq!(unicode_normalization::UNICODE_VERSION, (18, 0, 0));
+        for (upper, lower) in [
+            ('\u{A7DD}', "\u{0277}"),
+            ('\u{AB6C}', "\u{AB4B}"),
+            ('\u{1DF40}', "\u{1DF41}"),
+        ] {
+            let cp = u32::from(upper);
+            assert_eq!(icu_lower(&upper.to_string()), lower, "U+{cp:04X}");
+            assert_eq!(casefold(&upper.to_string()), lower, "U+{cp:04X}");
+        }
     }
 
     #[test]

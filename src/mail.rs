@@ -7,7 +7,22 @@
 //! check refuses from what this read; it does not decide the address by
 //! which copy of `From` a later reader might keep.
 
+use icu_properties::props::{BinaryProperty, GeneralCategory, WhiteSpace};
+use icu_properties::CodePointMapData;
 use unicode_normalization::UnicodeNormalization;
+
+/// General category Cc. The deny path reads this from ICU, not from
+/// `char::is_control`, so the table is the same Unicode as the other
+/// properties.
+pub(crate) fn unicode_control(c: char) -> bool {
+    CodePointMapData::<GeneralCategory>::new().get(c) == GeneralCategory::Control
+}
+
+/// Unicode White_Space. The deny path reads this from ICU, not from
+/// `char::is_whitespace`.
+pub(crate) fn unicode_space(c: char) -> bool {
+    WhiteSpace::for_char(c)
+}
 
 /// A header whose value is unfolded. The name is lower case.
 #[derive(Debug)]
@@ -352,7 +367,10 @@ fn encoded_words_are_display_safe(span: &str) -> Result<bool, ()> {
     while i < bytes.len() {
         if bytes[i] == b'=' && bytes.get(i + 1) == Some(&b'?') {
             let (word, n) = take_encoded_word(&span[i..])?;
-            if word.chars().any(|c| is_addr_special(c) || c.is_control()) {
+            if word
+                .chars()
+                .any(|c| is_addr_special(c) || unicode_control(c))
+            {
                 return Ok(false);
             }
             i += n;
@@ -486,7 +504,7 @@ fn b64_decode(text: &str) -> Result<Vec<u8>, ()> {
         }
     }
     let bytes = text.as_bytes();
-    if bytes.is_empty() || bytes.len() % 4 != 0 {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
         return Err(());
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
@@ -1089,7 +1107,7 @@ fn is_atext(c: char) -> bool {
                     | '~'
             );
     }
-    !c.is_control() && !c.is_whitespace()
+    !unicode_control(c) && !unicode_space(c)
 }
 
 #[cfg(test)]
