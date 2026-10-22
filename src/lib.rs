@@ -698,20 +698,28 @@ fn walk(
         // A pipeline stage runs in a subshell, so it cannot move this
         // shell. The last stage can, once `lastpipe` is on.
         let in_shell = !piped || (shell.lastpipe && end != "|");
-        if in_shell {
-            let read = {
-                let dir = match shell.here.as_slice() {
-                    [d] if !is_untracked(d) => Some(d.as_path()),
-                    _ => None,
-                };
-                sourced(&cmd, dir, &shell.aliases)
+        // `source` runs the file. The deny rules see that text here, in
+        // the same walk that tracks the directory, whether or not the
+        // file can move this shell. A pipeline stage's source moves only
+        // its own subshell.
+        let read = {
+            let dir = match shell.here.as_slice() {
+                [d] if !is_untracked(d) => Some(d.as_path()),
+                _ => None,
             };
-            match read {
-                Sourced::Keeps(words) => {
-                    // The scan already accepted this file. Case arms and a
-                    // discarded substitution look like commands the walk
-                    // cannot see, and that would drop the directory and
-                    // turn `lastpipe` on for whatever the line runs next.
+            sourced(&cmd, dir, &shell.aliases)
+        };
+        match read {
+            Sourced::Read { keeps, words } => {
+                if let Some(c) = judge_body(&words, shell) {
+                    *denied = Some(c);
+                    return;
+                }
+                if in_shell && keeps {
+                    // Case arms and a discarded substitution look like
+                    // commands the walk cannot see, and that would drop
+                    // the directory and turn `lastpipe` on for the rest
+                    // of the line. The scan already accepted the file.
                     let lastpipe = shell.lastpipe;
                     let pwd_set = shell.pwd_set;
                     let follow = shell.follow_unseen;
@@ -723,12 +731,24 @@ fn walk(
                     shell.lastpipe = lastpipe;
                     shell.pwd_set = pwd_set;
                     shell.follow_unseen = follow;
-                }
-                Sourced::Loses => shell.lose(),
-                Sourced::No => {
-                    if shell.follow_unseen && (bare_unseen(&cmd) || blinds_functions(&cmd)) {
-                        shell.lose();
+                } else if in_shell {
+                    shell.lose();
+                } else if keeps {
+                    replay_subshell(&words, shell, depth, out, denied);
+                    if denied.is_some() {
+                        return;
                     }
+                }
+            }
+            Sourced::Loses => {
+                if in_shell {
+                    shell.lose();
+                }
+            }
+            Sourced::No => {
+                if in_shell && shell.follow_unseen && (bare_unseen(&cmd) || blinds_functions(&cmd))
+                {
+                    shell.lose();
                 }
             }
         }
@@ -1174,12 +1194,12 @@ fn trap_moves(cmd: &[&str]) -> bool {
 enum Sourced {
     /// The command is not a `source` or `.` of a literal path.
     No,
-    /// The file can be read and its text leaves the shell where it was.
-    /// The words are the file, aliases expanded, so a function it defines
-    /// or calls is judged with the line.
-    Keeps(Vec<String>),
-    /// The file cannot be read, or its text may move the shell or set
-    /// `HOME`, `CDPATH` or `PWD`.
+    /// The file was read. `keeps` when its text leaves the shell where it
+    /// was. `words` is the file, aliases expanded, so a function it
+    /// defines or calls is judged with the line, and the deny rules see
+    /// the same words.
+    Read { keeps: bool, words: Vec<String> },
+    /// The file cannot be read, or the path is not one literal file.
     Loses,
 }
 
@@ -1198,10 +1218,9 @@ fn sourced(cmd: &[&str], cwd: Option<&std::path::Path>, aliases: &[(String, Stri
         return Sourced::Loses;
     };
     let scan = scan_script(&text, aliases);
-    if scan.keeps {
-        Sourced::Keeps(scan.words)
-    } else {
-        Sourced::Loses
+    Sourced::Read {
+        keeps: scan.keeps,
+        words: scan.words,
     }
 }
 
@@ -9007,6 +9026,69 @@ hash -r 2> /dev/null
             "source .venv/bin/activate && true | cd evil && make clean-all",
         ] {
             let c = check(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+    }
+
+    /// A sourced file runs in this shell, so its text is judged by the
+    /// same rules as the line. `source ../evil/force.sh` was allowed when
+    /// the file's only command was `git push -f` or `make -C ../evil
+    /// clean-all`, because the deny rules never saw the file.
+    #[test]
+    fn a_sourced_file_is_judged_as_the_line_is() {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-srcbody", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sub = root.join("sub");
+        for d in ["sub", "evil", "safe", "repo", ".venv/bin"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("evil/Makefile"), MAKEFILE).unwrap();
+        std::fs::write(root.join("evil/force.sh"), "git push -f origin\n").unwrap();
+        std::fs::write(root.join("evil/make.sh"), "make -C ../evil clean-all\n").unwrap();
+        std::fs::write(root.join("safe/Makefile"), "test:\n\techo ok\n").unwrap();
+        std::fs::write(
+            root.join("safe/package.json"),
+            r#"{"scripts":{"build":"echo build"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".venv/bin/activate"),
+            include_str!("../tests/fixtures/pyvenv-activate.sh"),
+        )
+        .unwrap();
+        let at = |dir: &std::path::Path, line: &str| check_shell_in(&shell_words(line), dir, 0);
+        for line in [
+            "source ../evil/force.sh",
+            ". ../evil/force.sh",
+            "source ../evil/force.sh && echo ok",
+            "bash -c 'source ../evil/force.sh'",
+        ] {
+            let c = at(&sub, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
+        }
+        let c = at(&sub, "source ../evil/make.sh");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(
+            c.token
+                .starts_with("make -C ../evil clean-all runs `rm -rf "),
+            "{}",
+            c.token
+        );
+        assert!(c.token.ends_with(": rm-rf-outside-tmp"), "{}", c.token);
+        for line in [
+            "source .venv/bin/activate && make -C safe test",
+            "conda activate",
+            "nvm use",
+            "direnv allow",
+            "pyenv init -",
+            "make -C safe test",
+            "git -C repo status",
+            "npm run build",
+            "cargo xtask",
+            "f() { echo hi; }; f",
+        ] {
+            let c = at(&root, line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
     }
