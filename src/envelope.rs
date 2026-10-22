@@ -841,6 +841,28 @@ From: other@example.test\r\n";
     }
 
     #[test]
+    fn percent_hack_and_bang_path_locals_are_refused() {
+        let deny = "address evil@example.test\ndomain blocked.test\n";
+        let law = "deny-domain packblocked.test\n";
+        let percent = "From: mailseat@example.test\r\nTo: a%blocked.test@localhost\r\n\r\n";
+        assert_eq!(codes(percent, deny, law), vec!["recipient-unparsed"]);
+        let bang = "From: mailseat@example.test\r\nTo: blocked.test!a@localhost\r\n\r\n";
+        assert_eq!(codes(bang, deny, law), vec!["recipient-unparsed"]);
+        assert_eq!(
+            codes(&plain("Cc: a%blocked.test@localhost\r\n"), deny, law),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("Reply-To: a!b@example.test\r\n"), deny, law),
+            vec!["reply-to-unparsed"]
+        );
+        // A quoted local part holds the characters literally. It is not
+        // the unquoted form Postfix rewrites.
+        assert!(codes(&plain("To: \"a%blocked.test\"@example.test\r\n"), deny, law).is_empty());
+        assert!(codes(&plain("To: \"blocked.test!a\"@example.test\r\n"), deny, law).is_empty());
+    }
+
+    #[test]
     fn a_source_route_is_refused() {
         let deny = "address evil@example.test\ndomain blocked.test\n";
         let law = "deny-domain packblocked.test\n";

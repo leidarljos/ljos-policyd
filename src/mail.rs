@@ -829,6 +829,13 @@ fn parse_dot_atom(s: &str) -> Result<(String, usize), AddressFault> {
             local.push('.');
             continue;
         }
+        // `%` is the percent hack and `!` is a bang path. Postfix
+        // rewrites both when the domain is local and then relays to
+        // the rewritten address. A quoted local part may still hold
+        // either character: that form is not rewritten.
+        if c == '%' || c == '!' {
+            return Err(AddressFault);
+        }
         if !is_atext(c) {
             return Err(AddressFault);
         }
@@ -1053,6 +1060,27 @@ From: other@example.test\r\n\
         assert!(mailboxes("a@[192.000.002.001]").is_err());
         assert!(mailboxes("<a@[mx.blocked.test]>").is_err());
         assert!(mailboxes("<@[192.0.2.1]:a@example.test>").is_err());
+    }
+
+    #[test]
+    fn an_unquoted_percent_or_bang_is_not_a_mailbox() {
+        assert!(mailboxes("a%blocked.test@localhost").is_err());
+        assert!(mailboxes("blocked.test!a@localhost").is_err());
+        assert!(mailboxes("<a%b@example.test>").is_err());
+        assert_eq!(
+            mailboxes("\"a%b\"@example.test").unwrap(),
+            vec![Mailbox {
+                local: "a%b".into(),
+                domain: "example.test".into(),
+            }]
+        );
+        assert_eq!(
+            mailboxes("\"a!b\"@example.test").unwrap(),
+            vec![Mailbox {
+                local: "a!b".into(),
+                domain: "example.test".into(),
+            }]
+        );
     }
 
     #[test]

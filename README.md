@@ -157,7 +157,9 @@ stay clear of an identity in the deny file. Any `Resent-*` header
 is a refusal, and so is any `Apparently-To`. `To`, `Cc` and `Bcc` are refused
 when that domain, or a parent of it, is named by the deny file or by
 the pack-law file. An address at `@[ ... ]` is a domain literal and
-is a refusal. A source route (`<@host:mailbox>`) is a refusal. A recipient domain, or a domain on a header checked
+is a refusal. A source route (`<@host:mailbox>`) is a refusal.
+`%` or `!` in an unquoted local part is a refusal. A quoted local
+part may hold either character. A recipient domain, or a domain on a header checked
 against the deny file, is refused when one of its labels mixes
 Latin with Cyrillic or Greek after NFKC and IDNA.
 
