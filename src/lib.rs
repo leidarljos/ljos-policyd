@@ -10681,6 +10681,11 @@ impl Seat {
             if let Some(root) = roots.get(i) {
                 next.root = root.clone();
             }
+            // The mark belongs to the feeder. A later command on the line
+            // is not that command, so its copy of the same word stays.
+            if !command_is_feeder(&expanded, i) {
+                next.fed_marks.clear();
+            }
             let c = self.check_at(&inner, depth + 1, &next, moved);
             if c.decision != Decision::Allow {
                 return c;
@@ -13339,10 +13344,71 @@ fn rm_recursive(cmd: &[&str]) -> bool {
 /// the pack still sees every other word. A secret or a force push on the
 /// same line is unchanged. The directory is the one the command runs in
 /// after `cd`, the same one [`delete_ok`] uses.
+/// Whether command `i` is an `xargs` or `parallel`. Its unwrapped body
+/// still carries the replace mark; a later command does not.
+#[cfg(has_phronesis)]
+fn command_is_feeder(argv: &[String], i: usize) -> bool {
+    commands(argv).into_iter().nth(i).is_some_and(|cmd| {
+        cmd.iter()
+            .any(|w| matches!(base_of(w), "xargs" | "parallel"))
+    })
+}
+
+/// Words a replace mark may be rewritten in. On a line, only the feeder's
+/// own words. On the unwrapped command the walk hands down alone, every
+/// word, because that argv is the command.
+#[cfg(any(test, has_phronesis))]
+fn mark_rewrite_mask(argv: &[String], has_marks: bool) -> Vec<bool> {
+    let feed = feeder_word(argv);
+    if feed.iter().any(|f| *f) || !has_marks {
+        feed
+    } else {
+        vec![true; argv.len()]
+    }
+}
+
+/// Words that belong to an `xargs` or `parallel` command. A replace mark
+/// is one of those words. The same text later on the line is not.
+#[cfg(any(test, has_phronesis))]
+fn feeder_word(argv: &[String]) -> Vec<bool> {
+    let mut flags = vec![false; argv.len()];
+    let mut cur: Vec<usize> = Vec::new();
+    let take = |cur: &mut Vec<usize>, flags: &mut [bool]| {
+        let is_feeder = cur
+            .iter()
+            .any(|&i| matches!(base_of(argv[i].trim_end_matches(';')), "xargs" | "parallel"));
+        if is_feeder {
+            for &i in cur.iter() {
+                flags[i] = true;
+            }
+        }
+        cur.clear();
+    };
+    for (i, a) in argv.iter().enumerate() {
+        if matches!(a.as_str(), ";" | "&&" | "||" | "|" | "&") {
+            take(&mut cur, &mut flags);
+            continue;
+        }
+        let closes = a.ends_with(';');
+        if !a.trim_end_matches(';').is_empty() {
+            cur.push(i);
+        }
+        if closes {
+            take(&mut cur, &mut flags);
+        }
+    }
+    take(&mut cur, &mut flags);
+    flags
+}
+
 #[cfg(has_phronesis)]
 fn argv_for_pack(argv: &[String], bound: &Scratch, moved: bool) -> Vec<String> {
     let mut out = argv.to_vec();
-    for w in &mut out {
+    let feed = mark_rewrite_mask(argv, !bound.fed_marks.is_empty());
+    for (i, w) in out.iter_mut().enumerate() {
+        if !feed[i] {
+            continue;
+        }
         let bare = w.trim_end_matches(';');
         if bound.fed_marks.iter().any(|m| m == bare) && !pack_delete_ok(bare, moved) {
             let semi = w.ends_with(';');
@@ -18392,6 +18458,34 @@ hash -r 2> /dev/null
         assert_eq!(v("wipe -r /"), "deny\trm-rf-outside-tmp");
         assert_eq!(v("strace rm -rf /"), "deny\trm-rf-outside-tmp");
         assert_eq!(v("xargs git checkout --"), "deny\toperand-unshown");
+    }
+
+    /// An `xargs -I` mark is a word of that `xargs`. The same word in a
+    /// later command is still that command's operand.
+    #[test]
+    fn an_xargs_mark_stops_at_the_feeder() {
+        let argv = shell_words("printf '/tmp/a\\n' | xargs -I/ echo /; rm -rf /");
+        let feed = feeder_word(&argv);
+        let slashes: Vec<usize> = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.as_str() == "/")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(slashes.len(), 2, "{argv:?}");
+        assert!(feed[slashes[0]], "{argv:?}");
+        assert!(!feed[slashes[1]], "{argv:?}");
+        let rm = argv.iter().position(|w| w == "rm").unwrap();
+        assert_eq!(argv[rm + 2], "/");
+        assert!(!feed[rm + 2]);
+        let mask = mark_rewrite_mask(&argv, true);
+        assert!(mask[slashes[0]] && !mask[slashes[1]]);
+        // The walk then judges `rm -rf {}` on its own. That argv is the
+        // command, so the mark is still rewritten there.
+        let body = shell_words("rm -rf {}");
+        let body_mask = mark_rewrite_mask(&body, true);
+        assert!(body_mask.iter().any(|f| *f));
+        assert!(!mark_rewrite_mask(&body, false).iter().any(|f| *f));
     }
 
     /// `{}` in `find -exec` is a path find walks, and `-print0 | xargs -0`
