@@ -6754,7 +6754,7 @@ fn find_payloads(cmd: &[String]) -> Vec<Vec<String>> {
             while i < cmd.len() && !find_terminator(&cmd[i]) {
                 i += 1;
             }
-            out.push(cmd[start..i].to_vec());
+            out.push(peeled_payload(&cmd[start..i]));
             if i < cmd.len() {
                 i += 1;
             }
@@ -6763,6 +6763,20 @@ fn find_payloads(cmd: &[String]) -> Vec<Vec<String>> {
         }
     }
     out
+}
+
+/// `env`, `nice`, `timeout` and `bash -c` are not the program find runs.
+/// The command after them is, and a shell `-c` string is that command's
+/// words.
+fn peeled_payload(payload: &[String]) -> Vec<String> {
+    let run = unwrap_wrappers(payload).0.to_vec();
+    if let Some(script) = shell_script(&run) {
+        let words = shell_words(script);
+        if !words.is_empty() {
+            return words;
+        }
+    }
+    run
 }
 
 /// A find payload whose command word the line does not show: empty,
@@ -18109,6 +18123,28 @@ hash -r 2> /dev/null
         let v = |s: &str| verdict(&shell_words(s));
         for line in ["parallel 'rm -rf' ::: /", "parallel 'rm -rf {}' ::: /"] {
             assert_eq!(v(line), "deny\trm-rf-outside-tmp", "{line}");
+        }
+    }
+
+    /// `find -exec env rm` runs `rm`, not `env`. A shell `-c` string is
+    /// the command find runs.
+    #[test]
+    fn a_find_exec_wrapper_is_not_the_command() {
+        let v = |s: &str| verdict(&shell_words(s));
+        for line in [
+            "find / -exec env rm -rf {} \\;",
+            "find / -exec nice rm -rf {} \\;",
+            "find / -exec timeout 5 rm -rf {} \\;",
+            "find / -exec bash -c 'rm -rf {}' \\;",
+        ] {
+            let got = v(line);
+            assert!(
+                got == "deny\toperand-unshown"
+                    || got.starts_with("deny\tfind-delete")
+                    || got == "deny\trm-rf-outside-tmp"
+                    || got == "deny\tfind-exec-unshown",
+                "{line}: {got}"
+            );
         }
     }
 
