@@ -5035,6 +5035,27 @@ mod tests {
         }
     }
 
+    /// A `cd` or `pushd` to a path the line does not show leaves the line
+    /// in a directory it does not follow, rather than where it was.
+    #[test]
+    fn a_cd_to_an_unshown_path_is_untracked() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "PWD={dir}; cd \"$PWD\" && make clean-all",
+            "cd \"$X\" && make test",
+            "pushd \"${X}\" && make test",
+            "cd `pwd` && make test",
+            "pushd -n \"$X\" && popd && make test",
+        ] {
+            let c = entering("unshown-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        for line in ["cd \"$PWD\" && make test", "cd \"$X\" && ls"] {
+            let c = entering("unshown-cd", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+    }
+
     /// `command`, `command -p` and `builtin` do not hide `cd`.
     #[test]
     fn follows_a_cd_behind_command_or_builtin() {
