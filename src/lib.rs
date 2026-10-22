@@ -5644,6 +5644,39 @@ mod tests {
         }
     }
 
+    /// The shell's `cd` takes `..` off the path by name unless it is told
+    /// `-P`, so `lnk/..` is where the line started even when `lnk` links
+    /// into `safe`. The last of `-L` and `-P` wins, and after `set -P`
+    /// either may hold. A `..` after a part that is not there fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_cd_takes_dot_dot_off_by_name() {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-logical", std::process::id()));
+        std::fs::create_dir_all(root.join("safe/inner")).expect("dir");
+        let _ = std::fs::remove_file(root.join("lnk"));
+        std::os::unix::fs::symlink(root.join("safe/inner"), root.join("lnk")).expect("link");
+        for line in [
+            "cd lnk/.. && make clean-all",
+            "cd -L lnk/.. && make clean-all",
+            "cd -P -L lnk/.. && make clean-all",
+            "cd ./lnk/../. && make clean-all",
+            "cd lnk && cd .. && make clean-all",
+            "pushd lnk/.. && make clean-all",
+            "set -P; cd lnk/.. && make clean-all",
+            "cd missing/../safe; make clean-all",
+        ] {
+            assert_eq!(leaving("logical", line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "cd -P lnk/.. && make clean-all",
+            "cd -LP lnk/.. && make clean-all",
+            "set -P; cd -P lnk/.. && make clean-all",
+            "cd safe/inner/.. && make clean-all",
+        ] {
+            assert_eq!(leaving("logical", line), Decision::Allow, "{line}");
+        }
+    }
+
     /// An assignment, `NAME=value` or `NAME+=value`, in front of `cd`,
     /// `pushd`, `popd` or a task runner does not hide it.
     #[test]
