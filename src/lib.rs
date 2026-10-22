@@ -217,7 +217,7 @@ fn runner_commands(
     let mut after = ";";
     let mut ran_in = Vec::new();
     // `$PWD` follows the line's directory unless the line sets it.
-    let pwd_set = argv.iter().any(|w| may_set(w, "PWD")) || writes_pwd(argv);
+    let pwd_set = writes_pwd(argv);
     // With `shopt -s lastpipe` anywhere on the line, the last stage of a
     // pipeline may run in this shell.
     let lastpipe =
