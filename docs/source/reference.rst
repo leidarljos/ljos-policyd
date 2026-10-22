@@ -84,6 +84,12 @@ with the one before it. Another word that may set it (``read CDPATH``,
 as ``:``), or an entry with ``$``, a backquote or ``~`` in it, names no
 directory the line shows, so a runner after the ``cd`` is refused.
 
+``HOME`` is followed the same way: a bare ``cd`` enters the one set in
+front of it (``HOME=dir cd``) or earlier on the line (``export HOME=dir;
+cd``), and ``~`` expands from the one set before the command. A ``HOME``
+that may hold either of two values, or one the line does not show
+(``HOME=$(mktemp -d) cd``), leaves the runner after the ``cd`` refused.
+
 ``pushd`` and ``popd`` follow the directory stack. ``pushd -n`` stacks its
 directory without entering it, ``pushd +N`` and ``-N`` enter the entry they
 bring to the top, and a bare ``popd`` enters the entry under the top,

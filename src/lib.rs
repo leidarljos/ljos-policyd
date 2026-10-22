@@ -246,7 +246,10 @@ fn runner_commands(
         // `env -C DIR` runs its own command, and any script it hands a
         // shell, in DIR, and moves nothing after it.
         let wrappers = &owned[..owned.len() - run.len()];
-        let at: Vec<_> = here.iter().map(|d| env_dir(wrappers, d)).collect();
+        let at: Vec<_> = here
+            .iter()
+            .map(|d| env_dir(wrappers, d, vars.home.as_deref()))
+            .collect();
         // The command's own assignments hold for it and what it runs.
         let mut set = vars.clone();
         for w in wrappers.iter().filter(|w| is_assignment(w)) {
@@ -327,7 +330,7 @@ fn runner_commands(
             }
             let named: Vec<_> = here
                 .iter()
-                .flat_map(|d| entered(&args, d, pushd, &old, set.cdpath.as_deref()))
+                .flat_map(|d| entered(&args, d, pushd, &old, &set, vars.home.as_deref()))
                 .collect();
             if pushd && (keep || named.is_empty()) {
                 // A directory the line does not name still takes its place
@@ -397,12 +400,13 @@ fn runner_commands(
     }
 }
 
-/// The `CDPATH` a command on the line sees: `None` where it is unset, and
-/// a value with `$` in it, which names no directory, where the line does
-/// not show it.
+/// The `CDPATH` and `HOME` a command on the line sees: `None` where one is
+/// unset, and a value with `$` in it, which names no directory, where the
+/// line does not show it.
 #[derive(Clone)]
 struct Vars {
     cdpath: Option<String>,
+    home: Option<String>,
 }
 
 impl Vars {
@@ -410,12 +414,14 @@ impl Vars {
         let var = |n| std::env::var_os(n).map(|v| v.to_string_lossy().into_owned());
         Vars {
             cdpath: var("CDPATH"),
+            home: var("HOME"),
         }
     }
 
     fn slot(&mut self, name: &str) -> Option<&mut Option<String>> {
         match name {
             "CDPATH" => Some(&mut self.cdpath),
+            "HOME" => Some(&mut self.home),
             _ => None,
         }
     }
@@ -451,14 +457,21 @@ impl Vars {
         if sets("CDPATH") {
             self.cdpath = Some("$".into());
         }
+        if sets("HOME") {
+            self.home = Some("$".into());
+        }
     }
 
-    /// Hold what either `self` or `other` holds.
+    /// Hold what either `self` or `other` holds. Either `CDPATH` is
+    /// searched; a `HOME` that may be either is not shown.
     fn merge(&mut self, other: Vars) {
         self.cdpath = match (self.cdpath.take(), other.cdpath) {
             (Some(a), Some(b)) if a != b => Some(format!("{a}:{b}")),
             (a, b) => a.or(b),
         };
+        if self.home != other.home {
+            self.home = Some("$".into());
+        }
     }
 }
 
@@ -533,28 +546,31 @@ fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
 }
 
 /// The directories `cd` or `pushd` with `args` may enter from `dir`: a
-/// path, `~` or `~/path`, home for a bare `cd`, `old` for `-`, and for a
-/// relative path whose first part is not `.` or `..`, each `cdpath`
-/// entry that holds it. A bare `pushd`, a stack index, a variable or a
-/// substitution names no directory the line shows, so the caller keeps
-/// the one it has.
+/// path, `~` or `~/path` from `home`, the `HOME` of `set` for a bare `cd`,
+/// `old` for `-`, and for a relative path whose first part is not `.` or
+/// `..`, each entry of the `CDPATH` of `set` that holds it. `set` holds
+/// the command's own assignments, which `~` does not see. A bare `pushd`,
+/// a stack index, a variable or a substitution names no directory the
+/// line shows, so the caller keeps the one it has.
 fn entered(
     args: &[&str],
     dir: &std::path::Path,
     pushd: bool,
     old: &[std::path::PathBuf],
-    cdpath: Option<&str>,
+    set: &Vars,
+    home: Option<&str>,
 ) -> Vec<std::path::PathBuf> {
     let Some(&to) = args
         .iter()
         .find(|a| !a.starts_with(['-', '+']) || **a == "-")
     else {
-        return if pushd { None } else { home_dir() }.into_iter().collect();
+        let bare = home_from(set.home.as_deref(), dir);
+        return if pushd { None } else { bare }.into_iter().collect();
     };
     if to == "-" {
         return old.to_vec();
     }
-    let Some(path) = path_from(to, dir) else {
+    let Some(path) = path_from(to, dir, home) else {
         return Vec::new();
     };
     let mut dirs = vec![path];
@@ -563,11 +579,11 @@ fn entered(
             std::path::Path::new(to).components().next(),
             Some(std::path::Component::Normal(_))
         );
-    if let Some(cdpath) = cdpath.filter(|_| searched) {
+    if let Some(cdpath) = set.cdpath.as_deref().filter(|_| searched) {
         // The shell takes the first entry it can enter, or else `dir`; an
         // entry that names no directory the line shows may be any.
         for entry in cdpath.split(':') {
-            let d = path_from(entry, dir)
+            let d = path_from(entry, dir, home)
                 .unwrap_or_else(|| UNTRACKED.into())
                 .join(to);
             if is_untracked(&d) || d.join(".").is_dir() {
@@ -661,22 +677,29 @@ fn popped(stack: &Stack, index: Option<&str>, keep: bool) -> Option<(Stack, bool
     Some((s, moved))
 }
 
-fn home_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(std::path::PathBuf::from)
+/// Where the value `home` of `HOME` lands from `dir`: nowhere when it is
+/// unset or empty, and [`UNTRACKED`] when the line does not show it.
+fn home_from(home: Option<&str>, dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let h = home.filter(|h| !h.is_empty())?;
+    Some(if h.contains(['$', '`']) {
+        UNTRACKED.into()
+    } else {
+        dir.join(h)
+    })
 }
 
-/// Where the path word `to` lands from `dir`: `~` and `~/path` from home,
-/// anything else joined onto `dir`. A variable, a substitution or `~user`
-/// names no directory the line shows.
-fn path_from(to: &str, dir: &std::path::Path) -> Option<std::path::PathBuf> {
+/// Where the path word `to` lands from `dir`: `~` and `~/path` from
+/// `home`, anything else joined onto `dir`. A variable, a substitution or
+/// `~user` names no directory the line shows.
+fn path_from(to: &str, dir: &std::path::Path, home: Option<&str>) -> Option<std::path::PathBuf> {
     if to.contains(['$', '`']) {
         return None;
     }
     if to == "~" {
-        return home_dir();
+        return home_from(home, dir);
     }
     if let Some(rest) = to.strip_prefix("~/") {
-        return home_dir().map(|h| h.join(rest));
+        return home_from(home, dir).map(|h| h.join(rest));
     }
     (!to.starts_with('~')).then(|| dir.join(to))
 }
@@ -732,9 +755,9 @@ fn env_flag<'a>(a: &'a str, next: Option<&'a str>) -> (usize, Option<(char, &'a 
 
 /// The directory a command runs in from `dir` after the runner words
 /// `wrappers` in front of it: the one an `env` `-C` or `--chdir` names, in
-/// any form [`env_flag`] reads, or `dir`. The last of an `env`'s flags
-/// wins, from where that `env` starts.
-fn env_dir(wrappers: &[String], dir: &std::path::Path) -> std::path::PathBuf {
+/// any form [`env_flag`] reads, with `~` from `home`, or `dir`. The last
+/// of an `env`'s flags wins, from where that `env` starts.
+fn env_dir(wrappers: &[String], dir: &std::path::Path, home: Option<&str>) -> std::path::PathBuf {
     let mut at = dir.to_path_buf();
     // Where the `env` whose flags are being read starts.
     let mut from = None;
@@ -759,7 +782,7 @@ fn env_dir(wrappers: &[String], dir: &std::path::Path) -> std::path::PathBuf {
         }
         if let Some(d) = value
             .filter(|(c, _)| *c == 'C')
-            .and_then(|(_, t)| path_from(t, start))
+            .and_then(|(_, t)| path_from(t, start, home))
         {
             at = d;
         }
@@ -4451,6 +4474,44 @@ mod tests {
             leaving("assign-run", "FOO+=1 make clean-all"),
             Decision::Deny
         );
+    }
+
+    /// A `HOME` set in front of a bare `cd`, or of the shell that runs it,
+    /// is the one entered, and one set earlier on the line is also where
+    /// `~` goes; one whose value the line does not show leaves the runner
+    /// after the `cd` refused.
+    #[test]
+    fn reads_a_runner_where_an_assigned_home_enters() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "HOME={dir} cd && make clean-all",
+            "HOME=project cd && make clean-all",
+            "export HOME={dir}; cd && make clean-all",
+            "HOME={dir}; cd ~ && make clean-all",
+            "HOME={dir}; pushd ~/. && make clean-all",
+            "HOME={dir} sh -c 'cd && make clean-all'",
+            "HOME={dir}; env -C ~ make clean-all",
+            "unset HOME; HOME={dir}; cd; make clean-all",
+        ] {
+            let c = entering("home-set", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        for line in [
+            "HOME=$(mktemp -d) cd && make clean-all",
+            "export HOME=$X; cd ~/safe && make clean-all",
+            "HOME=~/safe; cd && make clean-all",
+            "read HOME; cd && make clean-all",
+        ] {
+            assert_eq!(leaving("home-set", line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "HOME=safe cd && make clean-all",
+            "HOME=$X cd safe && make clean-all",
+            "HOME=$X true; cd safe && make clean-all",
+            "echo $HOME ${HOME:-none}; cd safe && make clean-all",
+        ] {
+            assert_eq!(leaving("home-set", line), Decision::Allow, "{line}");
+        }
     }
 
     /// `command`, `command -p` and `builtin` do not hide `cd`.
