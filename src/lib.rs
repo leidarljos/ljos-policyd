@@ -221,8 +221,27 @@ type FnMap = std::collections::HashMap<String, FnBody>;
 #[derive(Default)]
 struct LineFiles {
     cmd: Vec<usize>,
-    written: Vec<(Option<std::path::PathBuf>, Vec<usize>)>,
-    ran: Vec<(Option<std::path::PathBuf>, Vec<usize>)>,
+    written: Vec<Written>,
+    ran: Vec<(Option<std::path::PathBuf>, Vec<usize>, Ran)>,
+}
+
+/// A path a command may write, and its place on the line. A `loose`
+/// write is the directory a command the guard does not know runs in:
+/// it may have made any file under it.
+struct Written {
+    path: Option<std::path::PathBuf>,
+    id: Vec<usize>,
+    loose: bool,
+}
+
+/// How a file is run: by a shell (a script operand, `source`, a startup
+/// file, a file on stdin), as a command word, which is a shell script
+/// unless it is a binary, or as the program of another interpreter.
+#[derive(Clone, Copy, PartialEq)]
+enum Ran {
+    Shell,
+    Exec,
+    Program,
 }
 
 type Files = std::rc::Rc<std::cell::RefCell<LineFiles>>;
@@ -230,7 +249,9 @@ type Files = std::rc::Rc<std::cell::RefCell<LineFiles>>;
 impl LineFiles {
     /// Take what the command `owned` writes and runs. Its redirections
     /// land where the shell is, `here`; what `run` writes or runs lands
-    /// where it runs, `at`.
+    /// where it runs, `at`. A `walked` command, a function the walk
+    /// reads, writes only what its own commands do.
+    #[allow(clippy::too_many_arguments)]
     fn note(
         &mut self,
         owned: &[String],
@@ -239,11 +260,11 @@ impl LineFiles {
         at: &[std::path::PathBuf],
         home: Option<&str>,
         id: &[usize],
+        walked: bool,
     ) {
         self.cmd = id.to_vec();
         for w in redirection_targets(owned) {
-            self.written
-                .extend(placed(w, here, home).into_iter().map(|p| (p, id.to_vec())));
+            self.wrote(w, here, home, false);
         }
         let is_dir = |w: &str| {
             placed(w, at, home)
@@ -252,32 +273,68 @@ impl LineFiles {
                 .any(|p| p.is_dir())
         };
         for w in program_writes(run, &is_dir) {
-            self.written
-                .extend(placed(&w, at, home).into_iter().map(|p| (p, id.to_vec())));
+            self.wrote(&w, at, home, false);
         }
+        if !walked && may_write_anywhere(run, at, home) {
+            self.wrote(".", at, home, true);
+        }
+        let run = peeled(run);
+        let word = command_at(run).map(|i| run[i].as_str());
+        let program = word
+            .map(base_of)
+            .is_some_and(|b| !SHELLS.contains(&b) && stdin_interpreter(b).is_some());
         for w in ran_paths(run) {
-            self.ran_from(w, at, home);
+            let how = if Some(w) == word {
+                Ran::Exec
+            } else if program {
+                Ran::Program
+            } else {
+                Ran::Shell
+            };
+            self.ran_from(w, at, home, how);
+        }
+    }
+
+    fn wrote(&mut self, w: &str, dirs: &[std::path::PathBuf], home: Option<&str>, loose: bool) {
+        for path in placed(w, dirs, home) {
+            self.written.push(Written {
+                path,
+                id: self.cmd.clone(),
+                loose,
+            });
         }
     }
 
     /// Take the script `w`, as read from each of `dirs`, as run by the
     /// command now read.
-    fn ran_from(&mut self, w: &str, dirs: &[std::path::PathBuf], home: Option<&str>) {
-        let id = self.cmd.clone();
-        self.ran
-            .extend(placed(w, dirs, home).into_iter().map(|p| (p, id.clone())));
+    fn ran_from(&mut self, w: &str, dirs: &[std::path::PathBuf], home: Option<&str>, how: Ran) {
+        for p in placed(w, dirs, home) {
+            let how = match &p {
+                Some(path)
+                    if how == Ran::Exec && matches!(read_script(path), ScriptText::Binary) =>
+                {
+                    Ran::Program
+                }
+                _ if how == Ran::Exec => Ran::Shell,
+                _ => how,
+            };
+            self.ran.push((p, self.cmd.clone(), how));
+        }
     }
 
     /// A script some command runs after another command on the line may
     /// have written it: the same path, one under a directory written, or
     /// either one not shown. A write by the command that holds the run
-    /// in its script only opens the file before that script starts.
+    /// in its script only opens the file before that script starts. A
+    /// loose write counts only for a script a shell runs from a path the
+    /// line shows.
     fn written_then_run(&self) -> Option<String> {
-        self.ran.iter().find_map(|(r, rid)| {
+        self.ran.iter().find_map(|(r, rid, how)| {
             self.written
                 .iter()
-                .filter(|(_, wid)| wid < rid && !rid.starts_with(wid))
-                .find(|(w, _)| match (r, w) {
+                .filter(|w| &w.id < rid && !rid.starts_with(&w.id))
+                .filter(|w| !w.loose || (*how == Ran::Shell && r.is_some()))
+                .find(|w| match (r, &w.path) {
                     (Some(r), Some(w)) => r.starts_with(w),
                     _ => true,
                 })
@@ -792,6 +849,7 @@ fn walk(
             }
         }
         // After the substitutions, which run before the command does.
+        let walked = called_fn(&cmd, &shell.funcs).is_some();
         shell.files.borrow_mut().note(
             &owned,
             &run,
@@ -799,6 +857,7 @@ fn walk(
             &at,
             shell.vars.home.as_deref(),
             &id,
+            walked,
         );
         let shown: Vec<_> = cmd.iter().map(|w| with_pwd(w, pwd)).collect();
         let shown: Vec<&str> = shown.iter().map(|w| &**w).collect();
@@ -1644,7 +1703,7 @@ fn judge_startup(
     shell
         .files
         .borrow_mut()
-        .ran_from(&value, &shell.here, shell.vars.home.as_deref());
+        .ran_from(&value, &shell.here, shell.vars.home.as_deref(), Ran::Shell);
     let path = std::path::Path::new(&value);
     let full = if path.is_absolute() {
         path.to_path_buf()
@@ -1760,10 +1819,12 @@ fn judge_procsub(
     };
     let mut text = String::new();
     for path in &paths {
-        shell
-            .files
-            .borrow_mut()
-            .ran_from(path, &shell.here, shell.vars.home.as_deref());
+        shell.files.borrow_mut().ran_from(
+            path,
+            &shell.here,
+            shell.vars.home.as_deref(),
+            Ran::Shell,
+        );
         let Some(part) = read_shown_file(path, shell) else {
             *denied = Some(procsub_unshown_denial());
             return;
@@ -5874,6 +5935,84 @@ fn tee_paths(cmd: &[String]) -> Vec<&str> {
         }
     }
     out
+}
+
+/// Commands known to change no file but by a redirection the line
+/// shows, or only by removing one or changing its mode, which leaves
+/// no script with new text.
+const NON_WRITERS: &str = "echo printf cat grep egrep fgrep rg ls test [ [[ true false : cd \
+    pushd popd dirs pwd which type hash read mapfile readarray export \
+    unset set shopt shift local declare typeset readonly alias unalias \
+    exit return break continue wait jobs umask ulimit getopts let kill \
+    sleep wc head tail cut tr diff cmp stat file basename dirname \
+    realpath readlink date id whoami uname printenv seq expr mkdir rm \
+    rmdir touch chmod { } ( ) ! then do else elif fi done esac trap";
+
+/// Commands whose writes [`program_writes`] names, or that the walk
+/// reads into: a shell's script, `source`, `eval`.
+const SHOWN_WRITERS: &str = "cp mv ln install tee curl wget dd eval source .";
+
+/// `git` subcommands that leave the work tree alone.
+const GIT_READS: &str = "status log diff show rev-parse ls-files ls-tree grep describe \
+    blame branch tag remote fetch shortlog reflog cat-file rev-list \
+    for-each-ref show-ref version help config";
+
+/// Whether `run` may write files the line does not name: anything the
+/// guard does not know to write nothing, or only what it names. A
+/// command word with a `/` that is a script is read by the walk; a
+/// binary may do anything.
+fn may_write_anywhere(run: &[String], at: &[std::path::PathBuf], home: Option<&str>) -> bool {
+    let run = peeled(run);
+    let Some(i) = command_at(run) else {
+        return false;
+    };
+    let word = run[i].as_str();
+    let args: Vec<&str> = run[i + 1..].iter().map(String::as_str).collect();
+    let b = base_of(word);
+    match b {
+        "sed" => !sed_in_place(&args) && args.iter().any(|a| a.contains(['w', 'W'])),
+        "perl" if perl_in_place(&args) => false,
+        "sort" => args
+            .iter()
+            .any(|a| a.starts_with("-o") || a.starts_with("--output")),
+        "find" => find_writes(&args, at, home),
+        "git" => git_subcommand(&run[i..]).is_none_or(|(c, _)| !listed(GIT_READS, c)),
+        _ if listed(NON_WRITERS, b) || listed(SHOWN_WRITERS, b) || SHELLS.contains(&b) => false,
+        // A subshell and a function definition are read by the walk, and
+        // a word with a glob in the place of a command is a case arm.
+        _ if word.starts_with('(') || marker_index(word).is_some() => false,
+        _ if !word.contains('/') && word.contains(['*', '?']) => false,
+        _ if word.contains('/') => placed(word, at, home)
+            .into_iter()
+            .any(|p| p.is_none_or(|p| matches!(read_script(&p), ScriptText::Binary))),
+        _ => true,
+    }
+}
+
+fn listed(list: &str, word: &str) -> bool {
+    list.split_whitespace().any(|w| w == word)
+}
+
+/// Whether a `find` writes past what it deletes: a `-fprint` file, or a
+/// command `-exec` runs that may.
+fn find_writes(args: &[&str], at: &[std::path::PathBuf], home: Option<&str>) -> bool {
+    let mut words = args.iter();
+    while let Some(a) = words.next() {
+        if a.starts_with("-fprint") || *a == "-fls" {
+            return true;
+        }
+        if matches!(*a, "-exec" | "-execdir" | "-ok" | "-okdir") {
+            let cmd: Vec<String> = words
+                .by_ref()
+                .take_while(|w| !matches!(**w, ";" | "\\;" | "+"))
+                .map(|w| (*w).to_string())
+                .collect();
+            if may_write_anywhere(&cmd, at, home) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The words that name the files a command writes as a program: what
@@ -12108,9 +12247,6 @@ hash -r 2> /dev/null
         for line in [
             "dd if=ok.sh of=/dev/null; sh ok.sh",
             "dd if=ok.sh of=copy.img; sh ok.sh",
-            "perl -pe 's/a/b/' ok.sh > out.txt; sh ok.sh",
-            "perl -ne 'print' ok.sh; source ok.sh",
-            "perl -Mstrict -ne 'print' ok.sh; sh ok.sh",
             "install -d build; sh ok.sh",
         ] {
             let c = at(line);
@@ -12154,5 +12290,51 @@ hash -r 2> /dev/null
                 c.token
             );
         }
+    }
+
+    #[test]
+    fn a_command_the_guard_does_not_know_may_write_any_script() {
+        let root = startup_root("unknownw");
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::copy("/bin/true", root.join("target/debug/app")).unwrap();
+        std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "rsync -a evil/ . ; sh ok.sh",
+            "tar xf a.tar; sh ok.sh",
+            "unzip a.zip && bash ok.sh",
+            "patch -p1 < x.diff; source ok.sh",
+            "git checkout evil -- ok.sh; sh ok.sh",
+            "git apply x.diff && . ok.sh",
+            "python3 -c 'open(\"ok.sh\", \"w\")'; sh ok.sh",
+            "ruby -e 1; sh ok.sh",
+            "node -e 1; sh ok.sh",
+            "make; sh ok.sh",
+            "./target/debug/app; sh ok.sh",
+            "find . -exec mv {} ok.sh \\; ; sh ok.sh",
+            "sed -n 'w ok.sh' evil/force.sh; sh ok.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(
+                c.token.starts_with("script-written-on-line: "),
+                "{line}: {}",
+                c.token
+            );
+        }
+        for line in [
+            "git status && sh ok.sh",
+            "git -C . log; sh ok.sh",
+            "grep -q ok ok.sh && sh ok.sh",
+            "ls; cat ok.sh; sh ok.sh",
+            "find . -name '*.pyc' -exec rm -f {} + ; sh ok.sh",
+            "cargo build && ./target/debug/app",
+            "make && cargo test",
+            "sh ok.sh; make",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        assert_everyday_allowed(&root);
     }
 }
