@@ -239,16 +239,31 @@ fn runner_commands(
 /// shows, so the caller keeps the one it has.
 fn entered(args: &[&str], dir: &std::path::Path, pushd: bool) -> Option<std::path::PathBuf> {
     let home = || std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let Some(to) = args
-        .iter()
-        .find(|a| !a.starts_with(['-', '+']) || **a == "-")
-    else {
+    let mut to = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if is_redirection(a) {
+            i += 1;
+            let rest = a.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+            if rest.chars().all(|c| matches!(c, '>' | '<' | '&' | '-')) && i < args.len() {
+                i += 1;
+            }
+            continue;
+        }
+        if !a.starts_with(['-', '+']) || a == "-" {
+            to = Some(a);
+            break;
+        }
+        i += 1;
+    }
+    let Some(to) = to else {
         return if pushd { None } else { home() };
     };
-    if *to == "-" || to.contains(['$', '`']) {
+    if to == "-" || to.contains(['$', '`']) {
         return None;
     }
-    if *to == "~" {
+    if to == "~" {
         return home();
     }
     if let Some(rest) = to.strip_prefix("~/") {
@@ -3849,6 +3864,20 @@ mod tests {
             "cd safe && pushd .. && popd && make clean-all",
         ] {
             assert_eq!(leaving("fail-cd", line), Decision::Allow, "{line}");
+        }
+    }
+
+    /// Redirections before the `cd` target are not directory names.
+    #[test]
+    fn skips_redirections_before_a_cd_target() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "cd 2>/dev/null project && make clean-all",
+            "cd > /dev/null project && make clean-all",
+            "cd </dev/null project && make clean-all",
+        ] {
+            let c = entering("redir-target-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
         }
     }
 
