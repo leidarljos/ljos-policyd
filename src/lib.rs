@@ -1211,8 +1211,9 @@ struct Shell {
     /// subshell or a `&` puts the rest back, so it is not [`Saved`].
     files: Files,
     /// The last directory the walk could name. A later `cd` whose target
-    /// does not resolve leaves [`here`][Self::here] [`UNKNOWN`], and a
-    /// relative `source` is still read here.
+    /// does not resolve leaves [`here`][Self::here] [`UNKNOWN`]. A
+    /// relative `source` is not read from here: the directory is not the
+    /// one the command runs in.
     known: Option<std::path::PathBuf>,
     /// Literal values a variable used as a command word may hold. `\0`
     /// means one branch left it unset, so the word may be anything.
@@ -2383,7 +2384,6 @@ fn walk(
                 &shell.here,
                 shell.vars.home.as_deref(),
                 &shell.aliases,
-                shell.known.as_deref(),
                 &shell.cmd_values,
                 &files,
             )
@@ -4338,7 +4338,6 @@ fn sourced(
     dirs: &[std::path::PathBuf],
     home: Option<&str>,
     aliases: &[(String, String)],
-    known: Option<&std::path::Path>,
     values: &std::collections::HashMap<String, Vec<String>>,
     files: &LineFiles,
 ) -> Sourced {
@@ -4352,11 +4351,11 @@ fn sourced(
         return Sourced::Unread(script_unread(&path));
     };
     if paths.len() == 1 {
-        return source_one(&paths[0], dirs, home, aliases, known);
+        return source_one(&paths[0], dirs, home, aliases);
     }
     let mut bodies = Vec::new();
     for path in &paths {
-        match source_one(path, dirs, home, aliases, known) {
+        match source_one(path, dirs, home, aliases) {
             Sourced::Unread(c) => return Sourced::Unread(c),
             Sourced::Read { words, text, .. } => bodies.push((words, text)),
             Sourced::Loses(more) => bodies.extend(more),
@@ -4371,30 +4370,13 @@ fn source_one(
     dirs: &[std::path::PathBuf],
     home: Option<&str>,
     aliases: &[(String, String)],
-    known: Option<&std::path::Path>,
 ) -> Sourced {
     let mut texts = match script_texts(path, dirs, home) {
         Ok(t) => t,
-        Err(c) => {
-            // Every directory is one the line did not resolve. The file
-            // is still the one in the last directory the walk could name,
-            // when that file is there to be read.
-            let Some(known) = known.filter(|_| dirs.iter().all(|d| is_unknown(d))) else {
-                return Sourced::Unread(c);
-            };
-            match script_texts(path, &[known.to_path_buf()], home) {
-                Ok(mut t) if t.len() == 1 => {
-                    let text = t.remove(0).1;
-                    let scan = scan_script(&text, aliases);
-                    return Sourced::Read {
-                        keeps: scan.keeps,
-                        words: scan.words,
-                        text,
-                    };
-                }
-                _ => return Sourced::Unread(c),
-            }
-        }
+        // A directory the line did not resolve is not a place to read a
+        // relative file. The last directory the walk could name is not
+        // the one this command runs in.
+        Err(c) => return Sourced::Unread(c),
     };
     let one = dirs.len() == 1 || path.starts_with(['/', '~']);
     if one && texts.len() == 1 {
@@ -5934,8 +5916,9 @@ fn tilde_home(home: Option<&str>) -> Cow<'_, str> {
 /// `dir`. Another variable or a substitution names no directory the line
 /// shows, and `~-` or a stack entry (`~1`) one the line does not follow.
 fn path_from(to: &str, dir: &std::path::Path, home: Option<&str>) -> Option<std::path::PathBuf> {
-    // `{sub,}` is not a directory. The shell expands it before `cd`.
-    if brace_expands(to) {
+    // `{sub,}`, `su?` and `su[b]` are not directories. The shell expands
+    // them before `cd`, and the walk does not follow that expansion.
+    if brace_expands(to) || to.contains(['*', '?', '[']) {
         return None;
     }
     let (head, rest) = to.split_once('/').unwrap_or((to, ""));
@@ -16098,7 +16081,6 @@ hash -r 2> /dev/null
     fn assert_everyday_allowed(dir: &std::path::Path) {
         for line in [
             "source .venv/bin/activate",
-            "cd \"$X\" && source .venv/bin/activate",
             "conda activate",
             "nvm use",
             "direnv allow",
@@ -17749,37 +17731,43 @@ sed 's/[$]LINENO.*/&-/' <$as_myself >$as_me.lineno
         }
     }
 
-    /// `cd "$X"` does not name a directory, so the walk cannot follow a
-    /// runner there. A relative `source` is still the file in the last
-    /// directory the walk could name, read when it is there.
+    /// `cd` with a variable, a glob or a brace does not name a directory.
+    /// `source` and `make` after it are not the file in the last directory
+    /// the walk could name. A literal `cd` of a directory that is not
+    /// there fails and the shell stays.
     #[test]
-    fn an_unresolved_cd_still_sources_the_last_known_file() {
+    fn an_unresolved_cd_is_not_a_directory() {
         use std::os::unix::fs::PermissionsExt;
         let root = startup_root("cdsrc");
+        std::fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        std::fs::write(root.join(".venv/bin/activate"), "echo ok\n").unwrap();
         std::fs::write(root.join("evil.sh"), "git push -f origin\n").unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/Makefile"), "test:\n\tgit push -f\n").unwrap();
+        std::fs::write(root.join("Makefile"), "test:\n\techo ok\n").unwrap();
         let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
         for line in [
             "cd \"$X\" && source .venv/bin/activate",
             "cd \"$X\" && . .venv/bin/activate",
-        ] {
-            let c = at(line);
-            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
-        }
-        let c = at("cd \"$X\" && source evil.sh");
-        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
-        assert!(c.token.contains("git-force-push"), "{}", c.token);
-        for line in [
+            "cd \"$X\" && source evil.sh",
             "cd \"$X\" && source x.sh",
             "cd \"$X\" && sh x.sh",
             "cd \"$X\" && ./hi.sh",
+            "cd su? && make test",
+            "cd su[b] && make test",
+            "cd {sub,} && make test",
+            "pushd su? && make test",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
-            assert!(c.token.starts_with("script-unread:"), "{line}: {}", c.token);
+            assert!(
+                c.token.starts_with("script-unread:") || c.token.contains("untracked directory"),
+                "{line}: {}",
+                c.token
+            );
         }
-        let c = at("cd \"$X\" && make test");
-        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
-        assert!(c.token.contains("untracked directory"), "{}", c.token);
+        let c = at("cd missing && make test");
+        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
         let hidden = root.join("hidden.sh");
         std::fs::write(&hidden, "echo hi\n").unwrap();
         let mut perm = std::fs::metadata(&hidden).unwrap().permissions();
@@ -17883,7 +17871,6 @@ sed 's/[$]LINENO.*/&-/' <$as_myself >$as_me.lineno
             "xargs -I{} echo {}",
             "find . -name '*.pyc' -exec rm -f {} +",
             "source .venv/bin/activate",
-            "cd \"$X\" && source .venv/bin/activate",
             "conda activate",
             "nvm use",
             "direnv allow",
