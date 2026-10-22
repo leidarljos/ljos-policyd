@@ -14034,6 +14034,25 @@ mod tests {
         assert_eq!(c.decision, Decision::Allow, "{}", c.token);
     }
 
+    /// Make takes an unambiguous prefix of a long option. A prefix of one
+    /// that names a file, a directory or a recipe is not that option, and
+    /// a name make does not have is not a diagnostic it prints and ignores.
+    #[test]
+    fn a_make_long_option_prefix_fails_closed() {
+        let v = |s: &str| verdict(&shell_words(s));
+        for line in [
+            "make --fi=evil.mk all",
+            "make --makef evil.mk",
+            "make --dir=sub",
+            "make --direc sub",
+            "make --ev='$(shell rm -rf ~)'",
+            "make --environment",
+            "make --what=all",
+        ] {
+            assert_eq!(v(line), "deny\tmake-flags-unshown", "{line}");
+        }
+    }
+
     #[test]
     fn allows_a_safe_make_target() {
         assert_eq!(
