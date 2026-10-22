@@ -236,8 +236,10 @@ part, one =subaddress= separator, and anything after the
 separator. The separators are the =subaddress= line, or =+-=
 when the line is omitted. =.=, =@=, =%= and =!= are not
 separators. An =address= rule is also compared by skeleton:
-NFKC, case folded, with every =.=, =_=, =-=, =+= and ===
-removed and nothing cut. A recipient whose skeleton starts with
+NFKC, case folded twice, with a combining dot above and every
+=.=, =_=, =-=, =+= and === removed and nothing cut.
+The second fold turns capital sharp s into ss, and dropping the
+dot makes İ and i one skeleton. A recipient whose skeleton starts with
 the rule's skeleton, at the rule's domain or one in the same
 alias family, is refused, and so is one the folding below
 refuses. This over-blocks on purpose: a rule for =john= also
