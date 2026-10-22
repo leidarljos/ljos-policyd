@@ -1,0 +1,1 @@
+A recipient or reply domain whose label mixes Latin with Cyrillic or Greek is a lookalike of a name it is not. The check reads each label after NFKC and IDNA, including a punycode form of the same label, and refuses the mix.

@@ -156,7 +156,9 @@ clear of an identity in the deny file. Any `Resent-*` header is a
 refusal. `To`, `Cc` and `Bcc` are refused
 when that domain, or a parent of it, is named by the deny file or by
 the pack-law file. An address at `@[ ... ]` is a domain literal and
-is a refusal.
+is a refusal. A recipient domain, or a domain on a header checked
+against the deny file, is refused when one of its labels mixes
+Latin with Cyrillic or Greek after NFKC and IDNA.
 
 A domain is compared after NFKC and IDNA, so a fullwidth spelling and
 the punycode form are the same domain. ASCII case is folded. A

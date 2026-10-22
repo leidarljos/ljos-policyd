@@ -369,8 +369,11 @@ fn check_named(
             Parsed::Unparsed => unparsed = true,
             Parsed::Mailboxes(list) => {
                 for addr in list {
+                    if let Some(shown) = mixed_script_domain(&addr.domain) {
+                        hits.push((true, format!("{name} {shown}")));
+                    }
                     if addresses.contains(&addr.key()) || domain_denied(&addr.domain, domains) {
-                        hits.push(addr.key());
+                        hits.push((false, addr.key()));
                     }
                 }
             }
@@ -382,8 +385,12 @@ fn check_named(
     if unparsed {
         reasons.push(reason(unparsed_code, name));
     }
-    for hit in hits {
-        reasons.push(reason(denied_code, hit));
+    for (mixed, hit) in hits {
+        if mixed {
+            reasons.push(reason("mixed-script", hit));
+        } else {
+            reasons.push(reason(denied_code, hit));
+        }
     }
 }
 
@@ -405,6 +412,9 @@ fn check_recipients(message: &Message, config: &Config, reasons: &mut Vec<MailRe
                 Parsed::Unparsed => reasons.push(reason("recipient-unparsed", name)),
                 Parsed::Mailboxes(list) => {
                     for addr in list {
+                        if let Some(shown) = mixed_script_domain(&addr.domain) {
+                            reasons.push(reason("mixed-script", format!("{name} {shown}")));
+                        }
                         if domain_denied(&addr.domain, &config.deny_domains)
                             || domain_denied(&addr.domain, &config.pack_domains)
                         {
@@ -496,6 +506,75 @@ fn normalize_domain(raw: &str) -> Option<String> {
         return None;
     }
     idna::domain_to_ascii(folded).ok().filter(|d| !d.is_empty())
+}
+
+/// Latin together with Cyrillic or Greek in one label, after NFKC and
+/// IDNA. `domain` is the ASCII form, so a punycode label is decoded
+/// before the scripts are read. The returned string is the Unicode
+/// form, for the reason.
+fn mixed_script_domain(domain: &str) -> Option<String> {
+    let (unicode, result) = idna::domain_to_unicode(domain);
+    if result.is_err() {
+        return Some(domain.to_string());
+    }
+    if unicode.split('.').any(label_mixes_latin) {
+        Some(if unicode.is_empty() {
+            domain.to_string()
+        } else {
+            unicode
+        })
+    } else {
+        None
+    }
+}
+
+fn label_mixes_latin(label: &str) -> bool {
+    let mut latin = false;
+    let mut other = false;
+    for c in label.chars() {
+        if is_latin_letter(c) {
+            latin = true;
+        } else if is_greek_letter(c) || is_cyrillic_letter(c) {
+            other = true;
+        }
+        if latin && other {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_latin_letter(c: char) -> bool {
+    c.is_alphabetic()
+        && matches!(
+            c,
+            'A'..='Z'
+                | 'a'..='z'
+                | '\u{00C0}'..='\u{00D6}'
+                | '\u{00D8}'..='\u{00F6}'
+                | '\u{00F8}'..='\u{024F}'
+                | '\u{0250}'..='\u{02AF}'
+                | '\u{1E00}'..='\u{1EFF}'
+                | '\u{2C60}'..='\u{2C7F}'
+                | '\u{A720}'..='\u{A7FF}'
+                | '\u{AB30}'..='\u{AB6F}'
+        )
+}
+
+fn is_greek_letter(c: char) -> bool {
+    c.is_alphabetic() && matches!(c, '\u{0370}'..='\u{03FF}' | '\u{1F00}'..='\u{1FFF}')
+}
+
+fn is_cyrillic_letter(c: char) -> bool {
+    c.is_alphabetic()
+        && matches!(
+            c,
+            '\u{0400}'..='\u{04FF}'
+                | '\u{0500}'..='\u{052F}'
+                | '\u{1C80}'..='\u{1C8F}'
+                | '\u{2DE0}'..='\u{2DFF}'
+                | '\u{A640}'..='\u{A69F}'
+        )
 }
 
 /// Characters a reader skips and a comparison must not treat as part of a
@@ -662,6 +741,42 @@ From: other@example.test\r\n";
         assert!(codes(raw, "", "").is_empty());
         let raw = "From: \u{FF4D}\u{FF41}\u{FF49}\u{FF4C}\u{FF53}\u{FF45}\u{FF41}\u{FF54}@example.test\r\n";
         assert!(codes(raw, "", "").is_empty(), "{:?}", details(raw, "", ""));
+    }
+
+    #[test]
+    fn a_label_that_mixes_latin_with_cyrillic_or_greek_is_refused() {
+        let cyr = "ex\u{0430}mple.test";
+        let raw = plain(&format!("To: a@{cyr}\r\n"));
+        assert_eq!(codes(&raw, "", ""), vec!["mixed-script"]);
+        assert!(details(&raw, "", "")[0].starts_with("to "));
+        let greek = "ex\u{03B1}mple.test";
+        let raw = plain(&format!("Reply-To: a@{greek}\r\n"));
+        assert_eq!(codes(&raw, "", ""), vec!["mixed-script"]);
+        let puny = idna::domain_to_ascii("ex\u{0430}mple.test").unwrap();
+        let raw = plain(&format!("Cc: a@{puny}\r\n"));
+        assert_eq!(codes(&raw, "", ""), vec!["mixed-script"]);
+        let raw = plain(&format!("Errors-To: a@{greek}\r\n"));
+        assert_eq!(codes(&raw, "", ""), vec!["mixed-script"]);
+        // One script in the label is not this refusal. A Cyrillic label
+        // beside a Latin label is two labels.
+        let raw = plain("To: a@\u{043F}\u{0440}\u{0438}\u{043C}\u{0435}\u{0440}.test\r\n");
+        assert!(
+            codes(&raw, "", "").is_empty(),
+            "{:?}",
+            details(&raw, "", "")
+        );
+        let raw = plain("To: a@b\u{00FC}cher.test\r\n");
+        assert!(
+            codes(&raw, "", "").is_empty(),
+            "{:?}",
+            details(&raw, "", "")
+        );
+        let raw = plain("To: a@\u{043F}\u{0440}\u{0438}\u{043C}\u{0435}\u{0440}.example.test\r\n");
+        assert!(
+            codes(&raw, "", "").is_empty(),
+            "{:?}",
+            details(&raw, "", "")
+        );
     }
 
     #[test]

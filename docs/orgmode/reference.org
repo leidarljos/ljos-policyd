@@ -216,7 +216,9 @@ clear of a deny-file identity (=address=, or a mailbox at a
 =Bcc= are refused when the domain or a parent
 of it is named by the deny file or by a =deny-domain= line in the
 pack-law file. A domain literal (an address at =@[ ... ]=) in a
-watched header is a refusal.
+watched header is a refusal. A recipient domain, or a domain on a
+header checked against the deny file, is refused when one label
+mixes Latin with Cyrillic or Greek after NFKC and IDNA.
 
 A fullwidth spelling and the punycode form compare as the same domain.
 A homoglyph that NFKC and IDNA leave alone does not. ASCII case is
@@ -244,6 +246,7 @@ that cannot be read is a refusal.
 | =return-receipt-to-denied= | Return-Receipt-To names a deny-file identity |
 | =return-receipt-to-unparsed= | Return-Receipt-To does not parse |
 | =resent-header= | a Resent-* header is present |
+| =mixed-script= | a label mixes Latin with Cyrillic or Greek |
 | =recipient-domain-denied= | To, Cc or Bcc is at a denied domain |
 | =header-control= | a control character in the header block |
 | =header-line-ending= | the header block mixes CRLF and a bare LF |
