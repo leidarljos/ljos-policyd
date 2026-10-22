@@ -13,6 +13,7 @@ pub mod util_capnp;
 #[path = "schema/policy_capnp.rs"]
 pub mod policy_capnp;
 
+mod mail;
 mod scripts;
 
 use std::borrow::Cow;
