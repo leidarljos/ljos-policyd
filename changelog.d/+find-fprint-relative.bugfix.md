@@ -1,0 +1,1 @@
+`find -fprint` may name `/dev/null`, `/dev/stdout`, `/dev/stderr`, or a plain relative path. A redirection to that path is already allowed. An absolute path outside `/tmp` and `/var/tmp` stays refused.

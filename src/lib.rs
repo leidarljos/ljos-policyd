@@ -13042,10 +13042,13 @@ fn under_tmp(p: &str) -> bool {
 }
 
 /// `find -fprint`, `-fprint0`, `-fprintf` or `-fls` names a file that is
-/// not a literal path under `/tmp` or `/var/tmp`. Each of those predicates
-/// creates or truncates that file. The command inside `-exec` is not a
-/// find predicate, and neither is an `-exec` that is only another test's
-/// argument (`-name -exec`).
+/// not a literal path under `/tmp` or `/var/tmp`, a plain relative path,
+/// or `/dev/null`, `/dev/stdout` or `/dev/stderr`. Each of those predicates
+/// creates or truncates that file. A plain relative path is the file a
+/// redirection would write, which the rest of the table allows. An
+/// absolute path outside `/tmp` stays refused. The command inside `-exec`
+/// is not a find predicate, and neither is an `-exec` that is only
+/// another test's argument (`-name -exec`).
 fn find_print_off_tmp(argv: &[String]) -> bool {
     commands(argv)
         .iter()
@@ -13127,7 +13130,7 @@ fn scan_find(cmd: &[&str]) -> FindScan {
         }
         if matches!(w, "-fprint" | "-fprint0" | "-fls" | "-fprintf") {
             let file = cmd.get(i + 1).copied();
-            if !file.is_some_and(literal_under_tmp) {
+            if !file.is_some_and(find_file_ok) {
                 out.write = true;
             }
             i += 1;
@@ -13225,8 +13228,13 @@ fn find_takes_one(w: &str) -> bool {
         )
 }
 
-fn literal_under_tmp(p: &str) -> bool {
-    literal_text(p) && under_tmp(p)
+/// A file `find -fprint` may create: under `/tmp`, a plain relative path
+/// (no `..`), or a device a redirection may already target.
+fn find_file_ok(p: &str) -> bool {
+    literal_text(p)
+        && (under_tmp(p)
+            || plain_relative(p)
+            || matches!(p, "/dev/null" | "/dev/stdout" | "/dev/stderr"))
 }
 
 /// `find ... -delete`, or `-exec rm` (also `-execdir`, `-ok`, `shred`,
@@ -18460,8 +18468,10 @@ hash -r 2> /dev/null
     }
 
     /// `-fprint`, `-fprint0`, `-fprintf` and `-fls` create or truncate the
-    /// file they name. A path that is not under `/tmp` or `/var/tmp` is
-    /// refused. The words of `-exec` are that command, not find predicates.
+    /// file they name. An absolute path outside `/tmp` and `/var/tmp` is
+    /// refused. A plain relative path is allowed, as a redirection to that
+    /// path is, and so are `/dev/null`, `/dev/stdout` and `/dev/stderr`.
+    /// The words of `-exec` are that command, not find predicates.
     #[test]
     fn find_fprint_outside_tmp_is_a_write() {
         let v = |s: &str| verdict(&shell_words(s));
@@ -18470,8 +18480,11 @@ hash -r 2> /dev/null
             "find / -fprint0 /etc/x",
             "find / -fprintf /etc/x '%p\\n'",
             "find / -fls /etc/x",
-            "find . -fprint out",
             "find /tmp -fprint /etc/x",
+            "find . -fprint /etc/x",
+            "find . -fprint ../out",
+            "find . -fprint foo/../../etc/x",
+            "find . -fprint /dev/tty",
             "find / -fprint /tmp/../etc/x",
             "find / -fprint \"$f\"",
             "find / -fprint",
@@ -18500,6 +18513,18 @@ hash -r 2> /dev/null
             "find /tmp -printf '%p\\n'",
             "find /tmp -name x -fprint /tmp/out",
             "find . -exec echo -fprint /etc/x \\;",
+            // A redirection to a relative path or these devices is allowed,
+            // and `-fprint` creates that same file.
+            "find . -fprint out",
+            "find . -fls out",
+            "find . -name '*.c' -fprint files.txt",
+            "find . -fprint ./src/out.txt",
+            "find . -fprint /dev/null",
+            "find . -fprint /dev/stdout",
+            "find . -fprint /dev/stderr",
+            "find . -fprint0 /dev/null",
+            "find . -fprintf /dev/stderr '%p\\n'",
+            "find / -fls /dev/null",
             // `-fprint` is the filename `-name` matches, not a predicate.
             "find . -name -fprint",
             "find \"$dir\" -name x",
