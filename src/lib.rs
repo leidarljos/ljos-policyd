@@ -2308,6 +2308,22 @@ fn host_argv_table_at(argv: &[String], depth: usize, moved: bool) -> Checked {
     if own.decision != Decision::Allow {
         return own;
     }
+    // A find payload or a parallel command the line does not show can be
+    // any program. Refuse it before the commands the line does show.
+    if find_exec_unshown(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: Cow::Borrowed("find-exec-unshown"),
+        };
+    }
+    if parallel_command_unshown(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: Cow::Borrowed("parallel-command-unshown"),
+        };
+    }
     for inner in inner_commands(argv)
         .into_iter()
         .filter(|_| depth < MAX_DEPTH)
@@ -2512,14 +2528,134 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
                     .iter()
                     .map(|l| (i, shell_words(l))),
             );
-        } else {
+        } else if base_of(&run[0]) == ":::" {
+            // `parallel ::: 'git push -f'`: with no command in front, each
+            // argument is a shell command.
+            for a in &run[1..] {
+                if a == ":::" || a == "::::" {
+                    break;
+                }
+                out.extend(script_lines(a, 0).iter().map(|l| (i, shell_words(l))));
+            }
+        } else if base_of(&run[0]) != "::::" {
             if let Some(action) = trap_action(run) {
                 out.extend(script_lines(action, 0).iter().map(|l| (i, shell_words(l))));
+            }
+            for payload in find_payloads(run) {
+                if !payload_unshown(&payload) {
+                    out.push((i, subst_find_braces(&payload)));
+                }
             }
             out.push((i, run.to_vec()));
         }
     }
     out
+}
+
+/// Whether `w` ends a `find -exec` payload. A quoted or escaped `;` is
+/// still the terminator find reads, and `shell_words` keeps it as `';'`.
+fn find_terminator(w: &str) -> bool {
+    matches!(w, ";" | "';'" | "\";" | "\\;" | "+" | "'+'" | "\"+\"")
+}
+
+/// The commands `find -exec`, `-execdir`, `-ok` and `-okdir` run. The
+/// words after the predicate, up to `;` or `+`, are the command. With no
+/// terminator the rest of the line is that command.
+fn find_payloads(cmd: &[String]) -> Vec<Vec<String>> {
+    if cmd.first().is_none_or(|w| base_of(w) != "find") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i < cmd.len() {
+        if matches!(cmd[i].as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
+            i += 1;
+            let start = i;
+            while i < cmd.len() && !find_terminator(&cmd[i]) {
+                i += 1;
+            }
+            out.push(cmd[start..i].to_vec());
+            if i < cmd.len() {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// A find payload whose command word the line does not show: empty,
+/// `{}` (the path find fills in), `$cmd`, or a glob. The program find
+/// runs could be anything.
+fn payload_unshown(payload: &[String]) -> bool {
+    let Some(head) = payload.first() else {
+        return true;
+    };
+    let head = base_of(head);
+    head.is_empty() || head.contains(['$', '`', '*', '?', '[', '~', '\n', '{'])
+}
+
+/// `{}` and the GNU find braces in an argument are the path find
+/// substitutes. The line does not name it, so the path rules read a file
+/// under `/tmp` while the command itself is still judged.
+fn subst_find_braces(payload: &[String]) -> Vec<String> {
+    payload
+        .iter()
+        .enumerate()
+        .map(|(n, w)| if n == 0 { w.clone() } else { subst_find_arg(w) })
+        .collect()
+}
+
+fn subst_find_arg(w: &str) -> String {
+    const MARK: &str = "/tmp/find-arg";
+    let mut w = w.replace("{}", MARK);
+    for tok in ["{//}", "{.}", "{/}", "{%}", "{#}"] {
+        w = w.replace(tok, MARK);
+    }
+    w
+}
+
+/// A `find` on the line whose `-exec` payload does not show its command.
+fn find_exec_unshown(argv: &[String]) -> bool {
+    each_unwrapped(argv)
+        .iter()
+        .any(|run| find_payloads(run).iter().any(|p| payload_unshown(p)))
+}
+
+/// `parallel ::: TEXT` runs TEXT, and `parallel :::: FILE` runs the lines
+/// of FILE. A value the line does not show, or a file of commands, is
+/// unknown. A command in front of `:::` is the wrapper's own command.
+fn parallel_command_unshown(argv: &[String]) -> bool {
+    each_unwrapped(argv).iter().any(|run| {
+        let Some(head) = run.first() else {
+            return false;
+        };
+        match base_of(head) {
+            ":::" => run[1..].iter().any(|a| a == "::::" || !shown_script(a)),
+            "::::" => true,
+            _ => false,
+        }
+    })
+}
+
+/// A script written out in the line: no parameter, glob or `~`.
+fn shown_script(s: &str) -> bool {
+    !s.is_empty() && !s.contains(['$', '`', '*', '?', '[', '~', '\n'])
+}
+
+/// Each command of `argv` past its wrappers, as [`unwrap_wrappers`]
+/// leaves it.
+fn each_unwrapped(argv: &[String]) -> Vec<Vec<String>> {
+    commands(argv)
+        .into_iter()
+        .filter_map(|cmd| {
+            let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+            let owned = split_env_strings(&owned).into_owned();
+            let (run, _) = unwrap_wrappers(&owned);
+            (!run.is_empty()).then(|| run.to_vec())
+        })
+        .collect()
 }
 
 /// The script `trap` runs on each signal it names: its first operand,
@@ -2780,6 +2916,34 @@ const RUNNERS: &[(&str, &[&str])] = &[
             "--max-args",
             "--max-procs",
             "--arg-file",
+        ],
+    ),
+    (
+        "parallel",
+        &[
+            "-j",
+            "--jobs",
+            "-S",
+            "--sshlogin",
+            "--sshloginfile",
+            "-a",
+            "--arg-file",
+            "--argsep",
+            "-d",
+            "--delimiter",
+            "--colsep",
+            "-C",
+            "-I",
+            "--replace",
+            "-n",
+            "-N",
+            "--max-args",
+            "--timeout",
+            "--delay",
+            "--joblog",
+            "--halt",
+            "--workdir",
+            "--wd",
         ],
     ),
     ("watch", &["-n", "--interval", "-d"]),
@@ -9374,6 +9538,82 @@ hash -r 2> /dev/null
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+    }
+
+    /// `find -exec` runs its payload, and so does a wrapper in front of a
+    /// command. `find . -exec git push -f ';'` was allowed: only an `-exec`
+    /// of `rm`, `shred` or `unlink` was judged. A payload whose command
+    /// word the line does not show is unknown.
+    #[test]
+    fn a_find_exec_payload_is_judged_as_a_command() {
+        let line = |s: &str| verdict(&shell_words(s));
+        for s in [
+            "find . -exec git push -f ';'",
+            "find . -exec git push -f \\;",
+            "find . -exec git push --force {} +",
+            "find . -exec sh -c 'git push -f' ';'",
+            "find . -execdir git push -f \\;",
+            "find . -ok git push -f {} \\;",
+            "find . -okdir sh -c 'git push --force' {} +",
+            "find . \\( -name x -exec git push -f \\; \\)",
+            "bash -c \"find . -exec git push -f ';'\"",
+            "parallel git push -f",
+            "parallel -j 4 git push -f",
+            "parallel --jobs 2 git push --force",
+            "parallel -j4 git push -f",
+            "parallel ::: 'git push -f'",
+            "xargs git push -f",
+            "xargs -n 1 git push -f",
+            "env git push -f",
+            "nohup git push -f",
+            "timeout 5 git push -f",
+            "nice -n 10 git push -f",
+            "stdbuf -oL git push -f",
+            "stdbuf -o L git push -f",
+            "setsid git push -f",
+            "command git push -f",
+            "command -p git push -f",
+            "builtin git push -f",
+            "exec git push -f",
+            "exec -a git git push -f",
+        ] {
+            assert_eq!(line(s), "deny\tgit-force-push", "{s}");
+        }
+        for s in ["sudo git push -f", "doas git push -f"] {
+            assert_eq!(line(s), "deny\tsudo", "{s}");
+        }
+        for s in [
+            "find . -exec {} \\;",
+            "find . -exec \"$cmd\" \\;",
+            "find . -execdir {} +",
+            "parallel ::: \"$cmd\"",
+            "parallel :::: cmds.txt",
+        ] {
+            let got = line(s);
+            assert!(got.starts_with("deny\t"), "{s}: {got}");
+        }
+        for s in [
+            "find . -exec echo {} \\;",
+            "find . -exec grep x {} +",
+            "find . -name '*.pyc' -exec rm -rf {} +",
+            "find /tmp/build -exec rm {} +",
+            "parallel echo hi",
+            "parallel -j 4 echo hi ::: a b",
+            "xargs echo hi",
+            "stdbuf -oL echo hi",
+            "setsid echo hi",
+            "conda activate",
+            "nvm use",
+            "direnv allow",
+            "pyenv init -",
+            "make -C safe test",
+            "git -C repo status",
+            "npm run build",
+            "cargo xtask",
+            "f() { echo hi; }; f",
+        ] {
+            assert_eq!(line(s), "allow", "{s}");
         }
     }
 
