@@ -6,11 +6,15 @@
 
 =ljos-policyd check|exec|capnp|version -- argv...=
 
+=ljos-policyd check-mail --config PATH= reads one RFC 5322 message on
+stdin. See "Outbound mail" below.
+
 | Verb | Meaning |
 |---+---|
 | =check= | print =allow= or =deny<TAB>reason=; exit 2 on deny |
 | =capnp= | write a packed Cap'n =PolicyDecision= to stdout; exit 2 on deny |
 | =exec= | same text verdict; on allow, run argv; on deny, print the verdict on stderr and exit 2 |
+| =check-mail= | JSON =allow= or =deny= for one message on stdin; exit 2 when it refuses |
 | =version= | print =ljos-policyd <semver> (phronesis)= or =ljos-policyd <semver> (host table)= |
 
 A leading =--= after the verb is optional and is stripped.
@@ -194,6 +198,48 @@ the code and keeps the reason. Release binaries link phronesis 0.2.5.
 A build without the library uses the host table and does not apply
 these limits.
 
+* Outbound mail
+
+=check-mail= prints one JSON object and only refuses. =allow= means
+this check found nothing to refuse. A send still needs its own grant.
+
+The config is lines of =identity=, =deny-file= and =pack-law=. A
+relative path is read from the config file's directory. =identity= is
+the one address =From= must be, after folding, encoded-word decoding,
+NFKC and IDNA. A second =From= is a refusal. The mailbox is the
+address in angle brackets. =Reply-To=, =Sender= and =Return-Path= must
+stay clear of a deny-file identity (=address=, or a mailbox at a
+=domain=). =To=, =Cc= and =Bcc= are refused when the domain or a parent
+of it is named by the deny file or by a =deny-domain= line in the
+pack-law file.
+
+A fullwidth spelling and the punycode form compare as the same domain.
+A homoglyph that NFKC and IDNA leave alone does not. ASCII case is
+folded, and a character a reader skips is removed before the
+comparison. =handle=, =term= and =pair= may share the deny file and
+are ignored here. A pack-law line that would allow a domain refuses
+the file. A message over 1 MiB, a control character in the header
+block, or a config that cannot be read is a refusal.
+
+| Code | When |
+|---+---|
+| =from-missing= | no From |
+| =duplicate-from= | more than one From |
+| =from-not-identity= | From is not the configured identity |
+| =from-unparsed= | From does not parse as one mailbox |
+| =encoded-word= | an encoded-word in a watched header did not decode |
+| =reply-to-denied= | Reply-To names a deny-file identity |
+| =sender-denied= | Sender names a deny-file identity |
+| =return-path-denied= | Return-Path names a deny-file identity |
+| =recipient-domain-denied= | To, Cc or Bcc is at a denied domain |
+| =header-control= | a control character in the header block |
+| =message-too-large= | the message is over 1 MiB |
+| =message-invalid= | the bytes are not a header block |
+| =config-unreadable= | the config path cannot be read |
+| =config-invalid= | the config is missing a key or names an unknown one |
+| =deny-file-invalid= | a deny-file line is not one of the known kinds |
+| =pack-law-invalid= | the pack-law file has a line other than deny-domain |
+
 * Environment the seat reads
 
 These are not read by this binary. They are how =ljos= finds it.
@@ -207,8 +253,8 @@ These are not read by this binary. They are how =ljos= finds it.
 
 | Code | Meaning |
 |---+---|
-| 0 | allow, or =exec= of a process that exited 0 |
-| 2 | deny, missing verb, or empty usage |
+| 0 | allow, check-mail with nothing to refuse, or =exec= of a process that exited 0 |
+| 2 | deny, a check-mail refusal, missing verb, or empty usage |
 | 127 | =exec= could not spawn the program |
 | other | =exec= of a process that exited with that code |
 

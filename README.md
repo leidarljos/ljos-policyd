@@ -121,7 +121,53 @@ without the library reports `host table`, and the doctor warns about it.
 | `check -- ARGV` | prints `allow`, or `deny`, a tab and the reason | 0 |
 | `exec -- ARGV` | runs ARGV only if the verdict is allow | ARGV's status; 2 on deny |
 | `capnp -- ARGV` | writes a packed Cap'n Proto `PolicyDecision` | 0 |
+| `check-mail --config PATH` | reads one RFC 5322 message on stdin and prints a JSON allow or deny | 0 when nothing was refused; 2 when it refuses |
 | `version` | the version and the backend | 0 |
+
+## Outbound mail
+
+`check-mail` reads one message on stdin and the config at `PATH`. It
+prints one JSON object. `allow` means this check found nothing to
+refuse. A send still needs its own grant: this check only refuses.
+
+```console
+$ ljos-policyd check-mail --config mail.conf < message.eml
+{"verdict":"allow","reasons":[]}
+```
+
+The config is one key per line. `identity` is the address `From` must
+be. `deny-file` and `pack-law` name the other two files. A relative
+path is read from the directory of the config file.
+
+```
+identity mailseat@example.test
+deny-file deny.txt
+pack-law law.txt
+```
+
+`From` has to be that one address. The mailbox is the address in
+angle brackets, after a folded line is joined and an encoded-word is
+decoded. A second `From`, a `From` that does not parse, or any other
+address is a refusal. `Reply-To`, `Sender` and `Return-Path` must stay
+clear of an identity in the deny file. `To`, `Cc` and `Bcc` are refused
+when that domain, or a parent of it, is named by the deny file or by
+the pack-law file.
+
+A domain is compared after NFKC and IDNA, so a fullwidth spelling and
+the punycode form are the same domain. ASCII case is folded. A
+character a reader skips, such as a zero-width space, is removed
+before the comparison. A homoglyph that those two passes leave alone
+stays a different domain, so it is not the configured identity.
+
+The deny file's lines are `address`, `domain`, `handle`, `term` and
+`pair`. This check uses `address` and `domain`. The other three can
+share the file and are ignored here. The pack-law file's lines are
+`deny-domain`. A line that would allow a domain is not a rule, and
+the file is refused.
+
+A message over 1 MiB, a control character in the header block, or a
+config that cannot be read is a refusal. The body is not part of this
+check.
 
 ## How ljos uses it
 
