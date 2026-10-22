@@ -166,19 +166,19 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
                 )),
             };
         }
-        let lines = match scripts::resolved(&run, &dir) {
-            scripts::Recipes::Closed(token) => {
+        let (lines, at) = match scripts::resolved_at(&run, &dir) {
+            (scripts::Recipes::Closed(token), _) => {
                 return Checked {
                     decision: Decision::Deny,
                     code: PolicyReason::ShellDangerousRunner,
                     token: Cow::Borrowed(token),
                 };
             }
-            scripts::Recipes::Lines(lines) => lines,
+            (scripts::Recipes::Lines(lines), at) => (lines, at),
         };
         for line in &lines {
             let sh = ["sh".to_string(), "-c".to_string(), line.clone()];
-            let c = check_shell_in(&sh, &dir, depth + 1);
+            let c = check_shell_in(&sh, &at, depth + 1);
             if c.decision != Decision::Allow {
                 return Checked {
                     decision: c.decision,
@@ -192,7 +192,7 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
         if lines.len() > 1 {
             let whole: Vec<String> = lines.iter().map(|l| format!("(\n{l}\n)")).collect();
             let sh = ["sh".to_string(), "-c".to_string(), whole.join("\n")];
-            let c = check_shell_in(&sh, &dir, depth + 1);
+            let c = check_shell_in(&sh, &at, depth + 1);
             if c.decision != Decision::Allow {
                 return Checked {
                     decision: c.decision,
@@ -15881,6 +15881,30 @@ hash -r 2> /dev/null
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
             assert_eq!(c.token, token, "{line}");
         }
+    }
+
+    /// `make -C build` reads the makefile in `build`, and a recipe there
+    /// is judged there. CMake's `$(MAKE) -f CMakeFiles/Makefile2` names
+    /// that file under `build`, not in the directory make was started
+    /// from. A dangerous recipe in that file is still refused.
+    #[test]
+    fn make_dash_c_judges_recipes_in_that_directory() {
+        let root = startup_root("makec");
+        let build = root.join("build");
+        std::fs::create_dir_all(build.join("CMakeFiles")).unwrap();
+        std::fs::write(
+            build.join("Makefile"),
+            "all:\n\t$(MAKE) -f CMakeFiles/Makefile2 all\n",
+        )
+        .unwrap();
+        std::fs::write(build.join("CMakeFiles/Makefile2"), "all:\n\techo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        let c = at("make -C build");
+        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
+        std::fs::write(build.join("CMakeFiles/Makefile2"), "all:\n\trm -rf /\n").unwrap();
+        let c = at("make -C build");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(c.token.contains("rm-rf-outside-tmp"), "{}", c.token);
     }
 
     /// A `case` pattern is not a command. `*[!_$as_cr_alnum]* )` holds a
