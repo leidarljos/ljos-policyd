@@ -1,0 +1,1 @@
+A deny-file address blocked that mailbox in Reply-To and not in To, Cc or Bcc, so the message could be sent straight to an address the file had refused. The same address is a refusal in those recipient headers. It is still that mailbox, not the whole domain.

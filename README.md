@@ -154,14 +154,17 @@ only, and an encoded addr-spec is a refusal. A second `From`, a
 `Disposition-Notification-To`, `Return-Receipt-To`,
 `Delivery-Receipt-To`, `Mail-Followup-To` and `Mail-Reply-To` must
 stay clear of an identity in the deny file. Any `Resent-*` header
-is a refusal, and so is any `Apparently-To`. `To`, `Cc` and `Bcc` are refused
-when that domain, or a parent of it, is named by the deny file or by
-the pack-law file. An address at `@[ ... ]` is a domain literal and
-is a refusal. A source route (`<@host:mailbox>`) is a refusal.
-`%` or `!` in an unquoted local part is a refusal. A quoted local
-part may hold either character. A recipient domain, or a domain on a header checked
-against the deny file, is refused when one of its labels mixes
-Latin with Cyrillic or Greek after NFKC and IDNA.
+is a refusal, and so is any `Apparently-To`. `To`, `Cc` and `Bcc`
+are refused when the mailbox is an `address` line in the deny
+file, and when that domain, or a parent of it, is named by the
+deny file or by the pack-law file. An `address` line is that
+mailbox, not the whole domain. An address at `@[ ... ]` is a
+domain literal and is a refusal. A source route
+(`<@host:mailbox>`) is a refusal. `%` or `!` in an unquoted local
+part is a refusal. A quoted local part may hold either character.
+A recipient domain, or a domain on a header checked against the
+deny file, is refused when one of its labels mixes Latin with
+Cyrillic or Greek after NFKC and IDNA.
 
 A domain is compared after NFKC and IDNA, so a fullwidth spelling and
 the punycode form are the same domain. ASCII case is folded. A

@@ -441,6 +441,12 @@ fn check_recipients(message: &Message, config: &Config, reasons: &mut Vec<MailRe
                         if let Some(shown) = mixed_script_domain(&addr.domain) {
                             reasons.push(reason("mixed-script", format!("{name} {shown}")));
                         }
+                        if config.deny_addresses.contains(&addr.key()) {
+                            reasons.push(reason(
+                                "recipient-address-denied",
+                                format!("{name} {}", addr.key()),
+                            ));
+                        }
                         if domain_denied(&addr.domain, &config.deny_domains)
                             || domain_denied(&addr.domain, &config.pack_domains)
                         {
@@ -1053,10 +1059,29 @@ pair left right
         );
     }
 
+    /// The address is that mailbox in To, Cc and Bcc. A different
+    /// mailbox at the same domain is not this rule.
     #[test]
-    fn an_address_rule_is_not_a_recipient_domain_rule() {
+    fn an_address_rule_blocks_that_recipient() {
+        let deny = "address evil@example.test\n";
+        let raw = "From: mailseat@example.test\r\nTo: evil@example.test\r\n\r\n";
+        assert_eq!(codes(raw, deny, ""), vec!["recipient-address-denied"]);
+        assert_eq!(details(raw, deny, ""), vec!["to evil@example.test"]);
+        assert_eq!(
+            codes(&plain("Cc: evil@example.test\r\n"), deny, ""),
+            vec!["recipient-address-denied"]
+        );
+        assert_eq!(
+            codes(&plain("Bcc: Evil@Example.test\r\n"), deny, ""),
+            vec!["recipient-address-denied"]
+        );
+        assert!(codes(&plain("To: person@example.test\r\n"), deny, "").is_empty());
         let deny = "address other@blocked.test\n";
         assert!(codes(&plain("To: person@blocked.test\r\n"), deny, "").is_empty());
+        assert_eq!(
+            codes(&plain("To: other@blocked.test\r\n"), deny, ""),
+            vec!["recipient-address-denied"]
+        );
         assert_eq!(
             codes(&plain("Reply-To: Other@Blocked.test\r\n"), deny, ""),
             vec!["reply-to-denied"]
