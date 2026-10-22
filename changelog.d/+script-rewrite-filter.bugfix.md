@@ -1,0 +1,1 @@
+A `sed` or `cat` of `$0` was the script being judged, so the copy could be sourced without being read. `sed` `i`, `a`, `c` and `e`, `sed -f`, a `y` or `s` that drops `#`, and `cat` with a file argument write a different script. A variable counts only when it is exactly `$0`, and a `cd` drops that trust.
