@@ -245,7 +245,13 @@ impl LineFiles {
             self.written
                 .extend(placed(w, here, home).into_iter().map(|p| (p, id.to_vec())));
         }
-        for w in program_writes(run) {
+        let is_dir = |w: &str| {
+            placed(w, at, home)
+                .into_iter()
+                .flatten()
+                .any(|p| p.is_dir())
+        };
+        for w in program_writes(run, &is_dir) {
             self.written
                 .extend(placed(&w, at, home).into_iter().map(|p| (p, id.to_vec())));
         }
@@ -5873,7 +5879,7 @@ fn tee_paths(cmd: &[String]) -> Vec<&str> {
 /// The words that name the files a command writes as a program: what
 /// `tee`, `curl` and `wget` save, the target of `cp`, `mv` and `ln`,
 /// and each file of a `sed -i`.
-fn program_writes(run: &[String]) -> Vec<String> {
+fn program_writes(run: &[String], is_dir: &dyn Fn(&str) -> bool) -> Vec<String> {
     let mut out = fetched_paths(run);
     out.extend(tee_paths(run).into_iter().map(str::to_string));
     let Some((head, args)) = run.split_first() else {
@@ -5882,7 +5888,9 @@ fn program_writes(run: &[String]) -> Vec<String> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let args = operands(&args);
     match base_of(head) {
-        "cp" | "mv" | "ln" | "install" => out.extend(copy_target(&args, base_of(head) == "ln")),
+        "cp" | "mv" | "ln" | "install" => {
+            out.extend(copy_target(&args, base_of(head) == "ln", is_dir))
+        }
         "sed" if sed_in_place(&args) => out.extend(sed_files(&args)),
         "perl" if perl_in_place(&args) => out.extend(perl_files(&args)),
         "dd" => out.extend(
@@ -5939,12 +5947,16 @@ fn perl_files(args: &[&str]) -> Vec<String> {
     out
 }
 
-/// The path a `cp`, `mv` or `ln` writes: the directory `-t` names, else
-/// its last operand. An `ln` with one operand makes a link of that name
-/// where it runs.
-fn copy_target(args: &[&str], ln: bool) -> Option<String> {
+/// The paths a `cp`, `mv`, `ln` or `install` writes. Into a directory
+/// (`-t`, a trailing `/`, several sources, or one `is_dir` names) each
+/// source lands as `dir/name`, unless the copy is recursive and may
+/// fill the directory. An `ln` with one operand makes a link of that
+/// name where it runs.
+fn copy_target(args: &[&str], ln: bool, is_dir: &dyn Fn(&str) -> bool) -> Vec<String> {
     let mut ops = Vec::new();
     let mut target = None;
+    let mut no_target = false;
+    let mut recursive = false;
     let mut words = args.iter().copied();
     let mut end = false;
     while let Some(a) = words.next() {
@@ -5956,22 +5968,48 @@ fn copy_target(args: &[&str], ln: bool) -> Option<String> {
             end = true;
         } else if let Some(t) = a.strip_prefix("--target-directory") {
             target = t.strip_prefix('=').or_else(|| words.next());
-        } else if matches!(a, "-S" | "--suffix") {
+        } else if matches!(a, "--suffix" | "--mode" | "--owner" | "--group") {
             words.next();
-        } else if let Some(t) = a
-            .strip_prefix('-')
-            .filter(|f| !f.starts_with('-'))
-            .and_then(|f| f.find('t').map(|k| &f[k + 1..]))
-        {
-            target = if t.is_empty() { words.next() } else { Some(t) };
+        } else if a == "--no-target-directory" {
+            no_target = true;
+        } else if matches!(a, "--recursive" | "--archive") {
+            recursive = true;
+        } else if let Some(f) = a.strip_prefix('-').filter(|f| !f.starts_with('-')) {
+            for (k, c) in f.char_indices() {
+                no_target |= c == 'T';
+                recursive |= matches!(c, 'r' | 'R' | 'a');
+                if matches!(c, 't' | 'S' | 'm' | 'o' | 'g') {
+                    let v = &f[k + 1..];
+                    let v = if v.is_empty() { words.next() } else { Some(v) };
+                    if c == 't' {
+                        target = v;
+                    }
+                    break;
+                }
+            }
         }
     }
-    match (target, ops.as_slice()) {
-        (Some(t), _) => Some(t.to_string()),
-        (None, [one]) if ln => Some(base_of(one).to_string()),
-        (None, [_, .., last]) => Some((*last).to_string()),
-        _ => None,
+    let name = |src: &str| base_of(src.trim_end_matches('/')).to_string();
+    let (dir, sources) = match (target, ops.as_slice()) {
+        (Some(t), _) => (t, &ops[..]),
+        (None, [one]) if ln => return vec![name(one)],
+        (None, [srcs @ .., last]) if !srcs.is_empty() => {
+            let into = !no_target && (srcs.len() > 1 || last.ends_with('/') || is_dir(last));
+            if !into {
+                return vec![(*last).to_string()];
+            }
+            (*last, srcs)
+        }
+        _ => return Vec::new(),
+    };
+    if recursive {
+        return vec![dir.to_string()];
     }
+    let dir = dir.trim_end_matches('/');
+    sources
+        .iter()
+        .map(|s| format!("{dir}/{}", name(s)))
+        .collect()
 }
 
 /// Whether a `sed` with `args` edits its files in place.
@@ -12079,5 +12117,42 @@ hash -r 2> /dev/null
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
         assert_everyday_allowed(&root);
+    }
+
+    #[test]
+    fn a_copy_into_a_directory_writes_its_name_there() {
+        let root = startup_root("copyinto");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("configure"), "echo configured\n").unwrap();
+        std::fs::write(root.join("config.mk"), "CC = cc\n").unwrap();
+        std::fs::write(root.join("bin/run.sh"), "echo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "cp config.mk . && sh ./configure",
+            "cp config.mk bin && sh bin/run.sh",
+            "mv config.mk bin/ ; sh ./configure",
+            "ln -s ../config.mk bin && sh bin/run.sh",
+            "install -t bin config.mk && sh bin/run.sh",
+            "cp config.mk configure.bak bin && sh bin/run.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for line in [
+            "cp evil/force.sh . && sh ./force.sh",
+            "cp evil/force.sh bin && sh bin/force.sh",
+            "mv evil/force.sh bin/run.sh; sh bin/run.sh",
+            "cp -T evil bin && sh bin/run.sh",
+            "cp -r evil bin && sh bin/run.sh",
+            "ln -sf ../evil/force.sh bin/ && . bin/force.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(
+                c.token.starts_with("script-written-on-line: "),
+                "{line}: {}",
+                c.token
+            );
+        }
     }
 }
