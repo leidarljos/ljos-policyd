@@ -1603,19 +1603,260 @@ fn judge_body_in(words: &[String], shell: &Shell, autoconf: bool) -> Option<Chec
     if words.is_empty() {
         return None;
     }
+    let (mut moved, mut parent) = script_place(shell, "");
+    if leaves_tree(words, 0) {
+        moved = true;
+    }
+    parent.autoconf = autoconf;
+    judge_words(words, moved, &parent)
+}
+
+/// Where a script runs, and whether a `cd` in it can leave the tree.
+/// `text` supplies the words `leaves_tree` reads; an empty text uses none.
+fn script_place(shell: &Shell, text: &str) -> (bool, Scratch) {
+    let words = if text.is_empty() {
+        Vec::new()
+    } else {
+        shell_words(text)
+    };
     let moved =
-        shell.left_tree || shell.here.iter().any(|d| is_untracked(d)) || leaves_tree(words, 0);
+        shell.left_tree || shell.here.iter().any(|d| is_untracked(d)) || leaves_tree(&words, 0);
     let root = match shell.here.as_slice() {
         [d] if !is_untracked(d) => Some(d.clone()),
         _ => None,
     };
     let parent = Scratch {
-        autoconf,
+        autoconf: generated_by_autoconf(text),
         root,
         ..Scratch::default()
     };
-    let c = host_argv_table_at(words, 0, moved, &parent);
-    (c.decision != Decision::Allow).then_some(c)
+    (moved, parent)
+}
+
+/// The deny rules on `words`, then on every subshell and substitution
+/// those words hold. A word `( git push -f )` is one word to the table;
+/// its body is a script, judged the same way [`judge_script_text`] judges
+/// a file.
+fn judge_words(words: &[String], moved: bool, parent: &Scratch) -> Option<Checked> {
+    if words.is_empty() {
+        return None;
+    }
+    let c = host_argv_table_at(words, 0, moved, parent);
+    if c.decision != Decision::Allow {
+        return Some(c);
+    }
+    for w in words {
+        for body in substitutions(w) {
+            if let Some(c) = judge_script_text_at(&body, 0, moved, parent) {
+                return Some(c);
+            }
+        }
+    }
+    None
+}
+
+/// Judge `text` by the same split a shell's `-c` script gets: the whole
+/// text, then each subshell and substitution inside it, down to
+/// [`MAX_DEPTH`]. One parser for a file and for `sh -c`.
+fn judge_script_text(text: &str, shell: &Shell) -> Option<Checked> {
+    let (moved, parent) = script_place(shell, text);
+    judge_script_text_at(text, 0, moved, &parent)
+}
+
+fn judge_script_text_at(
+    text: &str,
+    depth: usize,
+    moved: bool,
+    parent: &Scratch,
+) -> Option<Checked> {
+    if depth >= MAX_DEPTH {
+        return Some(script_file_unshown());
+    }
+    for line in script_lines(text, 0) {
+        let words = shell_words(&line);
+        if words.is_empty() {
+            continue;
+        }
+        let c = host_argv_table_at(&words, depth, moved, parent);
+        if c.decision != Decision::Allow {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// `sh -c "$(cat s.sh)"` and `eval "$(cat s.sh)"` run the bytes `cat`
+/// writes. A literal path is that file. Anything else `cat` might read
+/// is a script the line does not show.
+enum Produced {
+    Not,
+    Paths(Vec<String>),
+    Unshown,
+}
+
+fn command_script_unshown() -> Checked {
+    Checked {
+        decision: Decision::Deny,
+        code: PolicyReason::ShellDangerousRunner,
+        token: Cow::Borrowed("command-script-unshown"),
+    }
+}
+
+fn script_file_unshown() -> Checked {
+    Checked {
+        decision: Decision::Deny,
+        code: PolicyReason::ShellDangerousRunner,
+        token: Cow::Borrowed("script-file-unshown"),
+    }
+}
+
+/// The body of `script` when the whole string is one `$(...)` or one
+/// backtick command. Quotes, a second command and a trailing word are
+/// not that: the shell would not run the substitution as the script.
+fn whole_command_sub(script: &str) -> Option<String> {
+    let script = script.trim();
+    if script.is_empty() {
+        return None;
+    }
+    let chars: Vec<char> = script.chars().collect();
+    let tick = chars[0] == '`';
+    let dollar = chars[0] == '$' && chars.get(1) == Some(&'(');
+    if !tick && !dollar {
+        return None;
+    }
+    if nested_end(&chars, 0) != chars.len() {
+        return None;
+    }
+    let mut bodies = substitutions(script);
+    (bodies.len() == 1).then(|| bodies.pop().unwrap())
+}
+
+/// Whether `word` is a command substitution whose output is a `cat` of
+/// literal paths ([`Produced::Paths`]), a `cat` whose bytes are not
+/// shown ([`Produced::Unshown`]), or not a `cat` script ([`Produced::Not`]).
+fn produced_script(word: &str) -> Produced {
+    let Some(body) = whole_command_sub(word) else {
+        return Produced::Not;
+    };
+    let words = shell_words(&body);
+    let cmds = commands(&words);
+    let cat_of = |cmd: &[&str]| -> (bool, Option<Vec<String>>) {
+        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        let owned = split_env_strings(&owned).into_owned();
+        let (inner, handed) = unwrap_wrappers(&owned);
+        if handed.is_some() {
+            return (false, None);
+        }
+        let Some(head) = inner.first() else {
+            return (false, None);
+        };
+        if base_of(head) != "cat" {
+            return (false, None);
+        }
+        (true, cat_paths(&inner[1..]))
+    };
+    if cmds.len() == 1 {
+        let (is_cat, paths) = cat_of(&cmds[0]);
+        if !is_cat {
+            return Produced::Not;
+        }
+        return match paths {
+            Some(paths) => Produced::Paths(paths),
+            None => Produced::Unshown,
+        };
+    }
+    if cmds.iter().any(|c| cat_of(c).0) {
+        return Produced::Unshown;
+    }
+    Produced::Not
+}
+
+/// The command word of `cmd`, when it is a `cat` substitution the shell
+/// runs as the command. An argument `$(cat s.sh)` is not the script.
+fn produced_of_command(cmd: &[&str]) -> Produced {
+    let words = operands(cmd);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    let rest = peel_cd_command_word(&words[front..]);
+    rest.first().map_or(Produced::Not, |w| produced_script(w))
+}
+
+fn produced_dirs(
+    root: Option<&std::path::Path>,
+    paths: &[String],
+) -> Result<Vec<std::path::PathBuf>, Checked> {
+    if let Some(root) = root {
+        return Ok(vec![root.to_path_buf()]);
+    }
+    if paths.iter().any(|p| !p.starts_with('/')) {
+        let word = paths.first().map(String::as_str).unwrap_or("script");
+        return Err(script_unread(word));
+    }
+    Ok(vec![std::path::PathBuf::from("/")])
+}
+
+/// One concatenation of `paths` per directory, the bytes `cat` would
+/// write there. A missing file writes nothing.
+fn cat_texts(
+    paths: &[String],
+    dirs: &[std::path::PathBuf],
+    home: Option<&str>,
+) -> Result<Vec<String>, Checked> {
+    let mut out = Vec::new();
+    for d in dirs {
+        if is_untracked(d) {
+            let word = paths.first().map(String::as_str).unwrap_or("script");
+            return Err(script_unread(word));
+        }
+        let mut text = String::new();
+        for path in paths {
+            for (_, part) in script_texts(path, std::slice::from_ref(d), home)? {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push_str(&part);
+            }
+        }
+        out.push(text);
+    }
+    Ok(out)
+}
+
+/// Read a `$(cat path)` or `` `cat path` `` that is the command `argv`
+/// runs, and judge that file as the script. A `cat` the line does not
+/// show is refused. Nested `cat` stops at [`MAX_DEPTH`].
+fn judge_produced_argv(
+    argv: &[String],
+    depth: usize,
+    moved: bool,
+    parent: &Scratch,
+) -> Option<Checked> {
+    for cmd in commands(argv) {
+        match produced_of_command(&cmd) {
+            Produced::Not => {}
+            Produced::Unshown => return Some(command_script_unshown()),
+            Produced::Paths(paths) => {
+                if depth >= MAX_DEPTH {
+                    return Some(script_file_unshown());
+                }
+                let dirs = match produced_dirs(parent.root.as_deref(), &paths) {
+                    Ok(d) => d,
+                    Err(c) => return Some(c),
+                };
+                let texts = match cat_texts(&paths, &dirs, None) {
+                    Ok(t) => t,
+                    Err(c) => return Some(c),
+                };
+                for text in texts {
+                    if let Some(c) = judge_script_text_at(&text, depth + 1, moved, parent) {
+                        return Some(c);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// The marker on the first two lines of a generated `configure`. It
@@ -2187,6 +2428,12 @@ fn walk(
         if denied.is_some() {
             return;
         }
+        // `sh -c "$(cat s.sh)"` runs s.sh. The directory is the one this
+        // command has reached, so a `make` in that file is read there.
+        judge_produced_command(&shown, shell, depth, out, denied);
+        if denied.is_some() {
+            return;
+        }
         let words = peel_cd_command_word(&shown);
         let b = words.first().map_or("", |w| base_of(w));
         // A pipeline stage runs in a subshell, so it cannot move this
@@ -2222,8 +2469,8 @@ fn walk(
             )
         };
         match read {
-            Sourced::Read { keeps, words } => {
-                if let Some(c) = judge_body(&words, shell) {
+            Sourced::Read { keeps, words, text } => {
+                if let Some(c) = judge_script_text(&text, shell) {
                     *denied = Some(c);
                     return;
                 }
@@ -2254,8 +2501,8 @@ fn walk(
                 }
             }
             Sourced::Loses(bodies) => {
-                for words in &bodies {
-                    if let Some(c) = judge_body(words, shell) {
+                for (words, text) in &bodies {
+                    if let Some(c) = judge_script_text(text, shell) {
                         *denied = Some(c);
                         return;
                     }
@@ -3824,13 +4071,17 @@ enum Sourced {
     No,
     /// The file was read. `keeps` when its text leaves the shell where it
     /// was. `words` is the file, aliases expanded, so a function it
-    /// defines or calls is judged with the line, and the deny rules see
-    /// the same words.
-    Read { keeps: bool, words: Vec<String> },
+    /// defines or calls is judged with the line. `text` is the file as
+    /// read, judged by the same parser as a shell's `-c` script.
+    Read {
+        keeps: bool,
+        words: Vec<String>,
+        text: String,
+    },
     /// The file is missing, or the line may be in several directories:
-    /// the words of each file found, which are judged, though where the
-    /// shell ends up is not followed.
-    Loses(Vec<Vec<String>>),
+    /// the words and text of each file found, which are judged, though
+    /// where the shell ends up is not followed.
+    Loses(Vec<(Vec<String>, String)>),
     /// The file cannot be judged.
     Unread(Checked),
 }
@@ -3867,7 +4118,7 @@ fn sourced(
     for path in &paths {
         match source_one(path, dirs, home, aliases, known) {
             Sourced::Unread(c) => return Sourced::Unread(c),
-            Sourced::Read { words, .. } => bodies.push(words),
+            Sourced::Read { words, text, .. } => bodies.push((words, text)),
             Sourced::Loses(more) => bodies.extend(more),
             Sourced::No => return Sourced::Unread(script_unread(path)),
         }
@@ -3893,10 +4144,12 @@ fn source_one(
             };
             match script_texts(path, &[known.to_path_buf()], home) {
                 Ok(mut t) if t.len() == 1 => {
-                    let scan = scan_script(&t.remove(0).1, aliases);
+                    let text = t.remove(0).1;
+                    let scan = scan_script(&text, aliases);
                     return Sourced::Read {
                         keeps: scan.keeps,
                         words: scan.words,
+                        text,
                     };
                 }
                 _ => return Sourced::Unread(c),
@@ -3905,16 +4158,21 @@ fn source_one(
     };
     let one = dirs.len() == 1 || path.starts_with(['/', '~']);
     if one && texts.len() == 1 {
-        let scan = scan_script(&texts.remove(0).1, aliases);
+        let text = texts.remove(0).1;
+        let scan = scan_script(&text, aliases);
         return Sourced::Read {
             keeps: scan.keeps,
             words: scan.words,
+            text,
         };
     }
     Sourced::Loses(
         texts
             .into_iter()
-            .map(|(_, t)| scan_script(&t, aliases).words)
+            .map(|(_, t)| {
+                let scan = scan_script(&t, aliases);
+                (scan.words, t)
+            })
             .collect(),
     )
 }
@@ -4282,12 +4540,12 @@ fn judge_startup(
         *denied = Some(startup_unshown());
         return;
     }
-    let mut aliases = shell.aliases.clone();
-    let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
-    if let Some(c) = judge_body_in(&words, shell, generated_by_autoconf(&text)) {
+    if let Some(c) = judge_script_text(&text, shell) {
         *denied = Some(c);
         return;
     }
+    let mut aliases = shell.aliases.clone();
+    let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
     replay_subshell(&words, shell, depth + 1, out, denied);
 }
 
@@ -4340,12 +4598,12 @@ fn judge_script_file(
             });
             return;
         }
-        let mut aliases = shell.aliases.clone();
-        let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
-        if let Some(c) = judge_body_in(&words, shell, generated_by_autoconf(&text)) {
+        if let Some(c) = judge_script_text(&text, shell) {
             *denied = Some(c);
             return;
         }
+        let mut aliases = shell.aliases.clone();
+        let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
         replay_subshell(&words, shell, depth + 1, out, denied);
         if denied.is_some() {
             return;
@@ -4390,12 +4648,12 @@ fn judge_procsub(
         }
         text.push_str(&part);
     }
-    let mut aliases = shell.aliases.clone();
-    let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
-    if let Some(c) = judge_body_in(&words, shell, generated_by_autoconf(&text)) {
+    if let Some(c) = judge_script_text(&text, shell) {
         *denied = Some(c);
         return;
     }
+    let mut aliases = shell.aliases.clone();
+    let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
     replay_subshell(&words, shell, depth, out, denied);
 }
 
@@ -4441,35 +4699,79 @@ fn judge_direct_exec(
     for (_, text) in texts {
         let program = shebang_program(&text);
         let interp = program.and_then(|p| interpreter_flag(p).map(|f| (p, f)));
-        let words = match (program, interp) {
-            (Some(_), Some((p, flag))) => vec![p.to_string(), flag.to_string(), text.clone()],
-            (Some(p), None) if !SHELLS.contains(&p) => {
-                *denied = Some(script_unread(word));
+        if let Some((p, flag)) = interp {
+            let words = vec![p.to_string(), flag.to_string(), text.clone()];
+            let (moved, parent) = script_place(shell, "");
+            let c = host_argv_table_at(&words, 0, moved, &parent);
+            if c.decision != Decision::Allow {
+                *denied = Some(c);
                 return;
             }
-            _ if depth >= MAX_DEPTH => {
-                *denied = Some(Checked {
-                    decision: Decision::Deny,
-                    code: PolicyReason::ShellDangerousRunner,
-                    token: Cow::Borrowed("script-file-unshown"),
-                });
-                return;
-            }
-            _ => {
-                let mut aliases = shell.aliases.clone();
-                expand_aliases_with(&shell_words(&text), &mut aliases).into_owned()
-            }
-        };
-        let hint = interp.is_none() && generated_by_autoconf(&text);
-        if let Some(c) = judge_body_in(&words, shell, hint) {
+            continue;
+        }
+        if program.is_some_and(|p| !SHELLS.contains(&p)) {
+            *denied = Some(script_unread(word));
+            return;
+        }
+        if depth >= MAX_DEPTH {
+            *denied = Some(script_file_unshown());
+            return;
+        }
+        if let Some(c) = judge_script_text(&text, shell) {
             *denied = Some(c);
             return;
         }
-        if interp.is_none() {
-            replay_subshell(&words, shell, depth + 1, out, denied);
-            if denied.is_some() {
-                return;
-            }
+        let mut aliases = shell.aliases.clone();
+        let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
+        replay_subshell(&words, shell, depth + 1, out, denied);
+        if denied.is_some() {
+            return;
+        }
+    }
+}
+
+/// `$(cat path)` or `` `cat path` `` when that substitution is the command.
+/// The file is the script, read from the directory the command runs in.
+/// A `cd` in it moves only the child, same as a script file.
+fn judge_produced_command(
+    cmd: &[&str],
+    shell: &Shell,
+    depth: usize,
+    out: &mut Vec<(Vec<String>, std::path::PathBuf, bool)>,
+    denied: &mut Option<Checked>,
+) {
+    if denied.is_some() {
+        return;
+    }
+    let paths = match produced_of_command(cmd) {
+        Produced::Not => return,
+        Produced::Unshown => {
+            *denied = Some(command_script_unshown());
+            return;
+        }
+        Produced::Paths(paths) => paths,
+    };
+    if depth >= MAX_DEPTH {
+        *denied = Some(script_file_unshown());
+        return;
+    }
+    let texts = match cat_texts(&paths, &shell.here, shell.vars.home.as_deref()) {
+        Ok(t) => t,
+        Err(c) => {
+            *denied = Some(c);
+            return;
+        }
+    };
+    for text in texts {
+        if let Some(c) = judge_script_text(&text, shell) {
+            *denied = Some(c);
+            return;
+        }
+        let mut aliases = shell.aliases.clone();
+        let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
+        replay_subshell(&words, shell, depth + 1, out, denied);
+        if denied.is_some() {
+            return;
         }
     }
 }
@@ -5668,6 +5970,9 @@ fn host_argv_table_at(argv: &[String], depth: usize, moved: bool, parent: &Scrat
             code: PolicyReason::ShellDangerousRunner,
             token: Cow::Borrowed("procsub-script-unshown"),
         };
+    }
+    if let Some(c) = judge_produced_argv(argv, depth, moved, &bound) {
+        return c;
     }
     own
 }
@@ -8379,7 +8684,69 @@ impl Seat {
                 return c;
             }
         }
+        if let Some(c) = self.produced_pack(argv, depth, &bound, moved) {
+            return c;
+        }
         own
+    }
+
+    /// The pack on a script `$(cat path)` runs, the same files the host
+    /// table reads in [`judge_produced_argv`].
+    fn produced_pack(
+        &self,
+        argv: &[String],
+        depth: usize,
+        parent: &Scratch,
+        moved: bool,
+    ) -> Option<Checked> {
+        for cmd in commands(argv) {
+            match produced_of_command(&cmd) {
+                Produced::Not => {}
+                Produced::Unshown => return Some(command_script_unshown()),
+                Produced::Paths(paths) => {
+                    if depth >= MAX_DEPTH {
+                        return Some(script_file_unshown());
+                    }
+                    let dirs = match produced_dirs(parent.root.as_deref(), &paths) {
+                        Ok(d) => d,
+                        Err(c) => return Some(c),
+                    };
+                    let texts = match cat_texts(&paths, &dirs, None) {
+                        Ok(t) => t,
+                        Err(c) => return Some(c),
+                    };
+                    for text in texts {
+                        if let Some(c) = self.pack_text(&text, depth + 1, parent, moved) {
+                            return Some(c);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn pack_text(
+        &self,
+        text: &str,
+        depth: usize,
+        parent: &Scratch,
+        moved: bool,
+    ) -> Option<Checked> {
+        if depth >= MAX_DEPTH {
+            return Some(script_file_unshown());
+        }
+        for line in script_lines(text, 0) {
+            let words = shell_words(&line);
+            if words.is_empty() {
+                continue;
+            }
+            let c = self.check_at(&words, depth, parent, moved);
+            if c.decision != Decision::Allow {
+                return Some(c);
+            }
+        }
+        None
     }
 }
 
@@ -14065,6 +14432,67 @@ hash -r 2> /dev/null
         ] {
             assert_eq!(v(&["sh", "-c", script]), "allow", "{script}");
         }
+    }
+
+    /// A script file was one flat argv, so `( git push -f )` and
+    /// `$(git push -f)` inside it never met the rules a `sh -c` string
+    /// meets. The file is that string. `sh -c "$(cat s.sh)"` and
+    /// `eval "$(cat s.sh)"` run the file `cat` reads.
+    #[test]
+    fn a_script_file_is_judged_as_its_text() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = startup_root("scripttext");
+        let bodies = [
+            "( git push -f )",
+            "( rm -rf ~ )",
+            "echo $(rm -rf ~)",
+            "$(git push -f)",
+            "x=$(git push -f)",
+        ];
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for (i, body) in bodies.iter().enumerate() {
+            let name = format!("s{i}.sh");
+            let path = root.join(&name);
+            std::fs::write(&path, format!("{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            for line in [
+                format!("sh ./{name}"),
+                format!("./{name}"),
+                format!(". ./{name}"),
+            ] {
+                let c = at(&line);
+                assert_eq!(c.decision, Decision::Deny, "{line} ({body}): {}", c.token);
+            }
+        }
+        std::fs::write(root.join("evil.sh"), "git push -f\n").unwrap();
+        for line in [
+            r#"sh -c "$(cat evil.sh)""#,
+            r#"eval "$(cat evil.sh)""#,
+            r#"sh -c '`cat evil.sh`'"#,
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
+        }
+        std::fs::write(root.join("safe.sh"), "echo ok\n").unwrap();
+        for line in [
+            r#"sh -c "$(cat safe.sh)""#,
+            r#"eval "$(cat safe.sh)""#,
+            "echo $(cat evil.sh)",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for line in [r#"sh -c "$(cat "$x")""#, r#"eval "$(cat "$x.sh")""#] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(
+                c.token.contains("command-script-unshown"),
+                "{line}: {}",
+                c.token
+            );
+        }
+        assert_everyday_allowed(&root);
     }
 
     /// A `case` arm runs the command after its pattern.

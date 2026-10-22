@@ -1,0 +1,1 @@
+A script file was judged as one flat argv, so a subshell or a substitution in the file never met the deny rules. A file and a shell's `-c` text are the same parse. `sh -c "$(cat s.sh)"` and `eval "$(cat s.sh)"` read that file, and a `cat` whose path is not shown is refused.
