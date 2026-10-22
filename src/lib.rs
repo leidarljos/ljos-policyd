@@ -4913,6 +4913,30 @@ mod tests {
         }
     }
 
+    /// Under `shopt -s lastpipe` a `cd`, `pushd` or `popd` in the last
+    /// stage of a pipeline may move this shell, so the line is not
+    /// followed past it.
+    #[test]
+    fn a_lastpipe_stage_loses_where_the_line_is() {
+        for line in [
+            "shopt -s lastpipe; true | cd evil && make clean-all",
+            "shopt -s lastpipe; true | pushd evil && make clean-all",
+            "shopt -s lastpipe; pushd safe && pushd ../evil && true | dirs -c; popd; make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("lastpipe-cd", line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "true | cd evil && make clean-all",
+            "shopt -s lastpipe; cd evil | true && make clean-all",
+        ] {
+            assert_eq!(
+                evil_and_safe("lastpipe-cd", line),
+                Decision::Allow,
+                "{line}"
+            );
+        }
+    }
+
     /// Arithmetic runs in this shell, so `((HOME=5))` or `$((HOME=5))`
     /// leaves `HOME` untracked.
     #[test]
