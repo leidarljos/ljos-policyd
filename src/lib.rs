@@ -117,6 +117,7 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
     let funcs = FnMap::new();
     let old = [oldpwd];
     let files = Files::default();
+    let cmd_values = initial_cmd_values();
     let inn = ShellIn {
         cwd,
         oldpwd: &old,
@@ -128,6 +129,7 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
         known: None,
         script_cwd_moved: false,
         removals_live: true,
+        cmd_values: &cmd_values,
     };
     runner_commands(argv, &inn, 0, &mut runs, &mut denied);
     if let Some(c) = denied {
@@ -1404,6 +1406,10 @@ struct ShellIn<'a> {
     /// An `rm` in this walk deletes the file. False when the command
     /// that started the walk may not run.
     removals_live: bool,
+    /// Values a `$name` in this walk may hold. A nested script starts
+    /// from the environment. A re-walk of a command in this shell keeps
+    /// the values that command saw.
+    cmd_values: &'a std::collections::HashMap<String, Vec<String>>,
 }
 
 /// `words` with each function definition replaced by a marker, in order.
@@ -1644,6 +1650,7 @@ fn replay_subshell(
             known: shell.known.clone(),
             script_cwd_moved: shell.script_cwd_moved,
             removals_live: shell.removals_live && shell.rm_gate,
+            cmd_values: &shell.cmd_values,
         };
         runner_commands(body, &inn, depth, out, denied);
         if denied.is_some() {
@@ -1701,7 +1708,7 @@ fn runner_commands(
         } else {
             Some(inn.cwd.to_path_buf())
         },
-        cmd_values: initial_cmd_values(),
+        cmd_values: inn.cmd_values.clone(),
         names: std::collections::HashMap::new(),
         name_frames: Vec::new(),
         assign_stack: Vec::new(),
@@ -1911,6 +1918,9 @@ fn walk(
     // Whether each command's `rm` runs. A later walk of that command
     // alone must not clear a file the command itself may skip.
     let mut rm_live = Vec::new();
+    // Values each command's expansions see, so a later walk of that
+    // command still knows which file `. ./$x` names.
+    let mut cmd_at = Vec::new();
     let ended = ended_commands(&argv);
     let (heredocs, data) = heredoc_bodies(&ended);
     let pattern_skip = case_pattern_skips(&argv);
@@ -1955,6 +1965,7 @@ fn walk(
         // before it may have skipped it.
         let gates = end == "&&" && after != "||";
         let before = std::mem::replace(&mut after, end);
+        cmd_at.push(shell.cmd_values.clone());
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
         let owned = split_env_strings(&owned).into_owned();
         let run = unwrap_wrappers(&owned).0.to_vec();
@@ -2032,6 +2043,7 @@ fn walk(
                             known: shell.known.clone(),
                             script_cwd_moved: shell.script_cwd_moved,
                             removals_live: live,
+                            cmd_values: &shell.cmd_values,
                         };
                         runner_commands(&words, &inn, depth + 1, out, denied);
                         if denied.is_some() {
@@ -2196,13 +2208,18 @@ fn walk(
         // the same walk that tracks the directory, whether or not the
         // file can move this shell. A pipeline stage's source moves only
         // its own subshell.
-        let read = sourced(
-            &cmd,
-            &shell.here,
-            shell.vars.home.as_deref(),
-            &shell.aliases,
-            shell.known.as_deref(),
-        );
+        let read = {
+            let files = shell.files.borrow();
+            sourced(
+                &cmd,
+                &shell.here,
+                shell.vars.home.as_deref(),
+                &shell.aliases,
+                shell.known.as_deref(),
+                &shell.cmd_values,
+                &files,
+            )
+        };
         match read {
             Sourced::Read { keeps, words } => {
                 if let Some(c) = judge_body(&words, shell) {
@@ -2502,6 +2519,7 @@ fn walk(
     if depth >= MAX_DEPTH {
         return;
     }
+    let fresh = initial_cmd_values();
     for (i, inner) in inner_commands_expanded(&argv) {
         if data.get(i).copied().unwrap_or(false) || pattern_skip.get(i).copied().unwrap_or(false) {
             continue;
@@ -2511,6 +2529,17 @@ fn walk(
                 continue;
             };
             let was = shell.files.borrow().data;
+            let refs: Vec<&str> = inner.iter().map(String::as_str).collect();
+            // A nested script does not inherit an unexported assignment.
+            // The command itself does: `. ./$x` was already judged with
+            // these values, and this walk must see the same file.
+            let own = source_operand(&refs).is_some_and(|p| p.contains('$'))
+                && unwrapped_command(&argv, i).is_some_and(|r| r == inner);
+            let values = if own {
+                cmd_at.get(i).unwrap_or(&fresh)
+            } else {
+                &fresh
+            };
             for dir in dirs {
                 shell.files.borrow_mut().cmd.clone_from(id);
                 shell.files.borrow_mut().data = was || data.get(i).copied().unwrap_or(false);
@@ -2525,6 +2554,7 @@ fn walk(
                     known: shell.known.clone(),
                     script_cwd_moved: shell.script_cwd_moved,
                     removals_live: rm_live.get(i).copied().unwrap_or(false),
+                    cmd_values: values,
                 };
                 runner_commands(&inner, &inn, depth + 1, out, denied);
                 shell.files.borrow_mut().data = was;
@@ -3804,22 +3834,54 @@ enum Sourced {
     Unread(Checked),
 }
 
-/// `source FILE` or `. FILE` when `FILE` is a literal path, read from
-/// each directory the line may be in. One directory and one file is
-/// followed; several directories or a missing file lose the line, and a
-/// file the guard cannot read, or a relative path in a directory the
-/// walk does not follow, is refused.
+/// `source FILE` or `. FILE`, read from each directory the line may be
+/// in. A variable is the path the script assigns, and each of those
+/// files is judged. One the line does not show is refused. A rewrite of
+/// the script being judged is that script, not a new one. One directory
+/// and one file is followed; several directories or a missing file lose
+/// the line, and a file the guard cannot read, or a relative path in a
+/// directory the walk does not follow, is refused.
 fn sourced(
     cmd: &[&str],
     dirs: &[std::path::PathBuf],
     home: Option<&str>,
     aliases: &[(String, String)],
     known: Option<&std::path::Path>,
+    values: &std::collections::HashMap<String, Vec<String>>,
+    files: &LineFiles,
 ) -> Sourced {
-    let Some(path) = literal_source_path(cmd) else {
+    let Some(path) = source_operand(cmd) else {
         return Sourced::No;
     };
-    let mut texts = match script_texts(&path, dirs, home) {
+    if path_is_rewrite(&path, files) {
+        return Sourced::No;
+    }
+    let Some(paths) = resolve_source_paths(&path, values) else {
+        return Sourced::Unread(script_unread(&path));
+    };
+    if paths.len() == 1 {
+        return source_one(&paths[0], dirs, home, aliases, known);
+    }
+    let mut bodies = Vec::new();
+    for path in &paths {
+        match source_one(path, dirs, home, aliases, known) {
+            Sourced::Unread(c) => return Sourced::Unread(c),
+            Sourced::Read { words, .. } => bodies.push(words),
+            Sourced::Loses(more) => bodies.extend(more),
+            Sourced::No => return Sourced::Unread(script_unread(path)),
+        }
+    }
+    Sourced::Loses(bodies)
+}
+
+fn source_one(
+    path: &str,
+    dirs: &[std::path::PathBuf],
+    home: Option<&str>,
+    aliases: &[(String, String)],
+    known: Option<&std::path::Path>,
+) -> Sourced {
+    let mut texts = match script_texts(path, dirs, home) {
         Ok(t) => t,
         Err(c) => {
             // Every directory is one the line did not resolve. The file
@@ -3828,7 +3890,7 @@ fn sourced(
             let Some(known) = known.filter(|_| dirs.iter().all(|d| is_unknown(d))) else {
                 return Sourced::Unread(c);
             };
-            match script_texts(&path, &[known.to_path_buf()], home) {
+            match script_texts(path, &[known.to_path_buf()], home) {
                 Ok(mut t) if t.len() == 1 => {
                     let scan = scan_script(&t.remove(0).1, aliases);
                     return Sourced::Read {
@@ -3854,6 +3916,146 @@ fn sourced(
             .map(|(_, t)| scan_script(&t, aliases).words)
             .collect(),
     )
+}
+
+/// The operand of `source` or `.`, including one the line builds from a
+/// variable. `None` when the command is not a source.
+fn source_operand(cmd: &[&str]) -> Option<String> {
+    let words = operands(cmd);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    let rest = peel_cd_command_word(&words[front..]);
+    let (w, args) = rest.split_first()?;
+    if !matches!(base_of(w), "source" | ".") {
+        return None;
+    }
+    let file = *args.first()?;
+    (!file.is_empty()).then(|| (*file).to_string())
+}
+
+/// Whether `path` is a rewrite of the script being judged. Sourcing it
+/// is that script, not a file the line wrote.
+fn path_is_rewrite(path: &str, files: &LineFiles) -> bool {
+    files
+        .written
+        .iter()
+        .any(|w| w.rewrite && same_scratch_word(&w.word, path))
+}
+
+/// The paths `source` opens. A literal path is itself. `$name` and
+/// `${name}` are the values the script assigns, and every value must be
+/// one path piece. A substitution, a glob or a value the line does not
+/// show is `None`.
+fn resolve_source_paths(
+    path: &str,
+    values: &std::collections::HashMap<String, Vec<String>>,
+) -> Option<Vec<String>> {
+    if path.contains(['`', '*', '?', '[']) || path.contains("$(") {
+        return None;
+    }
+    if !path.contains('$') {
+        return Some(vec![path.to_string()]);
+    }
+    let parts = source_parts(path)?;
+    let mut acc = vec![String::new()];
+    for part in parts {
+        match part {
+            SourcePart::Lit(s) => {
+                for a in &mut acc {
+                    a.push_str(&s);
+                }
+            }
+            SourcePart::Var(name) => {
+                let vals = values.get(&name)?;
+                if vals.is_empty() || vals.iter().any(|v| !source_piece(v)) {
+                    return None;
+                }
+                let mut next = Vec::new();
+                for a in &acc {
+                    for v in vals {
+                        if next.len() == 8 {
+                            return None;
+                        }
+                        let mut s = a.clone();
+                        s.push_str(v);
+                        next.push(s);
+                    }
+                }
+                acc = next;
+            }
+        }
+    }
+    if acc.iter().any(|p| p.is_empty() || p.contains('$')) {
+        return None;
+    }
+    Some(acc)
+}
+
+enum SourcePart {
+    Lit(String),
+    Var(String),
+}
+
+fn source_parts(path: &str) -> Option<Vec<SourcePart>> {
+    let chars: Vec<char> = path.chars().collect();
+    let mut parts = Vec::new();
+    let mut lit = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '$' {
+            lit.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        if !lit.is_empty() {
+            parts.push(SourcePart::Lit(std::mem::take(&mut lit)));
+        }
+        i += 1;
+        if i >= chars.len() {
+            return None;
+        }
+        let name = if chars[i] == '{' {
+            i += 1;
+            let start = i;
+            while i < chars.len() && chars[i] != '}' {
+                i += 1;
+            }
+            if i >= chars.len() {
+                return None;
+            }
+            let name: String = chars[start..i].iter().collect();
+            i += 1;
+            name
+        } else {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            if start == i {
+                return None;
+            }
+            chars[start..i].iter().collect()
+        };
+        if !is_name(&name) {
+            return None;
+        }
+        parts.push(SourcePart::Var(name));
+    }
+    if !lit.is_empty() {
+        parts.push(SourcePart::Lit(lit));
+    }
+    Some(parts)
+}
+
+/// One path piece a sourced variable may hold. `/` joins directories.
+/// A space, a glob or another expansion does not.
+fn source_piece(v: &str) -> bool {
+    !v.is_empty()
+        && v != "\0"
+        && !v.contains([
+            '$', '`', '*', '?', '[', '~', '\n', ' ', '\t', ';', '|', '&', '(', ')',
+        ])
 }
 
 /// A startup-file value the line shows as a path, or `"$"` when it does
@@ -4341,17 +4543,8 @@ fn head_word(cmd: &[&str]) -> Option<String> {
 /// glob or backquote. `None` when the command is not one, or the path is
 /// not shown (`source $X`, `source *.sh`).
 fn literal_source_path(cmd: &[&str]) -> Option<String> {
-    let words = operands(cmd);
-    let front = (0..words.len())
-        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
-        .count();
-    let rest = peel_cd_command_word(&words[front..]);
-    let (w, args) = rest.split_first()?;
-    if !matches!(base_of(w), "source" | ".") {
-        return None;
-    }
-    let file = *args.first()?;
-    (!file.is_empty() && !file.contains(['$', '`', '*', '?', '['])).then(|| file.to_string())
+    let file = source_operand(cmd)?;
+    (!file.contains(['$', '`', '*', '?', '['])).then_some(file)
 }
 
 /// How large a script is read. A generated `configure` runs to a few
@@ -5559,6 +5752,15 @@ fn alias_defs(cmd: &[&str]) -> Vec<(String, String)> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// The command at `i` once wrappers are peeled, as
+/// [`inner_commands_expanded`] re-walks it. A nested script is not this.
+fn unwrapped_command(argv: &[String], i: usize) -> Option<Vec<String>> {
+    let cmd = commands(argv).into_iter().nth(i)?;
+    let owned: Vec<String> = cmd.into_iter().map(str::to_string).collect();
+    let owned = split_env_strings(&owned).into_owned();
+    Some(unwrap_wrappers(&owned).0.to_vec())
 }
 
 /// [`inner_commands_at`] on a line whose aliases are already expanded.
@@ -12237,9 +12439,6 @@ mod tests {
             "source hidden.sh && make test",
             "source evals.sh && make test",
             "source missing.sh && make test",
-            "source $X && make test",
-            "source \"$X\" && make test",
-            "source *.sh && make test",
             ". ./missing.sh && make test",
             "source funcs.sh && evil && make test",
             "source calls.sh && make test",
@@ -12251,6 +12450,15 @@ mod tests {
                 "{line}: {}",
                 c.token
             );
+        }
+        for line in [
+            "source $X && make test",
+            "source \"$X\" && make test",
+            "source *.sh && make test",
+        ] {
+            let c = check(&root, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.starts_with("script-unread:"), "{line}: {}", c.token);
         }
         let c = check(&root.join("sub"), "eval cd ../evil; make clean-all");
         assert_eq!(c.decision, Decision::Deny);
@@ -13042,6 +13250,7 @@ hash -r 2> /dev/null
             let vars = Vars::from_env();
             let funcs = FnMap::new();
             let files = Files::default();
+            let cmd_values = initial_cmd_values();
             let inn = ShellIn {
                 cwd: &root,
                 oldpwd: &[],
@@ -13053,6 +13262,7 @@ hash -r 2> /dev/null
                 known: None,
                 script_cwd_moved: false,
                 removals_live: true,
+                cmd_values: &cmd_values,
             };
             runner_commands(&shell_words(line), &inn, 0, &mut runs, &mut denied);
             let dirs: Vec<_> = runs
@@ -16220,18 +16430,23 @@ hash -r 2> /dev/null
             "alias rm=:; rm -f conf.sh",
         ] {
             write(&format!(
-                "as_me=$(echo conf)\necho 'git push -f' > conf.sh\n{mid}\n. \"./$as_me.sh\"\n"
+                "as_me=conf\necho 'git push -f' > conf.sh\n{mid}\n. \"./$as_me.sh\"\n"
             ));
-            assert_eq!(at("sh ./s.sh").decision, Decision::Deny, "{mid}");
+            let c = at("sh ./s.sh");
+            assert_eq!(c.decision, Decision::Deny, "{mid}: {}", c.token);
+            assert!(!c.token.starts_with("script-unread:"), "{mid}: {}", c.token);
         }
+        write("as_me=conf\necho 'git push -f' > conf.sh\nrm -f conf.sh\n. \"./$as_me.sh\"\n");
+        let c = at("sh ./s.sh");
+        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
+        write("as_me=conf\necho 'git push -f' > conf.sh\n{ rm -f conf.sh; }\n. \"./$as_me.sh\"\n");
+        let c = at("sh ./s.sh");
+        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
         write(
-            "as_me=$(echo conf)\necho 'git push -f' > conf.sh\nrm -f conf.sh\n. \"./$as_me.sh\"\n",
+            "as_me=conf\necho 'git push -f' > conf.sh\nrm -f conf.sh && echo gone\n. \"./$as_me.sh\"\n",
         );
-        assert_eq!(at("sh ./s.sh").decision, Decision::Allow);
-        write("as_me=$(echo conf)\necho 'git push -f' > conf.sh\n{ rm -f conf.sh; }\n. \"./$as_me.sh\"\n");
-        assert_eq!(at("sh ./s.sh").decision, Decision::Allow);
-        write("as_me=$(echo conf)\necho 'git push -f' > conf.sh\nrm -f conf.sh && echo gone\n. \"./$as_me.sh\"\n");
-        assert_eq!(at("sh ./s.sh").decision, Decision::Allow);
+        let c = at("sh ./s.sh");
+        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
     }
 
     /// `#` starts a comment only at the start of a word. After `)` that
@@ -17170,21 +17385,48 @@ rm -rf libconftest.dylib*\n",
         );
     }
 
-    /// Configure's `|| { . "./$as_me.lineno"; exit; }` sources a path the
+    /// `. "./$x"` with `x` set to a file is that file. An unbound name,
+    /// a glob or a value that can split is not a path the line shows.
+    #[test]
+    fn a_source_of_a_variable_is_the_file_it_names() {
+        let root = startup_root("srcvar");
+        std::fs::write(root.join("evil.cache"), "git push -f\n").unwrap();
+        std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "x=evil.cache; . \"./$x\"",
+            "x=evil.cache; . \"$x\"",
+            "x=./evil.cache; . \"$x\"",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
+        }
+        let c = at("x=ok.sh; . \"./$x\"");
+        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
+        for line in [". \"./$x\"", ". \"$x\"", "x='a b'; . \"$x\"", "source *.sh"] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.starts_with("script-unread:"), "{line}: {}", c.token);
+        }
+    }
+
+    /// Configure's `|| { eval "$not_shown"; exit; }` runs a command the
     /// line does not show and then exits. That `exit` does not fall
     /// through, so `lose` on that side must not move the commands that
-    /// run only when the other side did. The same source without `exit`
-    /// still drops the directory. A command before `exit` is still judged.
+    /// run only when the other side did. The same command without `exit`
+    /// still drops the directory. A source of a variable is the file it
+    /// names, or refused when the line does not show the path.
     #[test]
     fn an_exiting_or_side_does_not_drop_the_directory() {
         let root = startup_root("orexit");
         std::fs::write(root.join("evil/Makefile"), MAKEFILE).unwrap();
         let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
         for line in [
-            "eval 'test \"x$a\" = \"x$a\"' || { . \"./$as_me.lineno\"; exit; }; make -C safe test",
-            "eval 'test lineno' || {\n  . \"./$as_me.lineno\"\n  exit\n}\nmake -C safe test",
+            "eval 'test \"x$a\" = \"x$a\"' || { eval \"$not_shown\"; exit; }; make -C safe test",
+            "eval 'test lineno' || {\n  eval \"$not_shown\"\n  exit\n}\nmake -C safe test",
             "as_fn_exit ()\n{\n  exit $1\n}\neval 'test x' || { cd evil; as_fn_exit 1; }; make clean-all",
-            "as_fn_exit ()\n{\n  exit $1\n}\neval 'test x' || {\n  true || as_fn_exit 1\n  . \"./$as_me.lineno\"\n  exit\n}\nmake -C safe test",
+            "as_fn_exit ()\n{\n  exit $1\n}\neval 'test x' || {\n  true || as_fn_exit 1\n  eval \"$not_shown\"\n  exit\n}\nmake -C safe test",
             "false && exit; make -C safe test",
             "cd evil && { exit; }; make clean-all",
         ] {
@@ -17192,21 +17434,15 @@ rm -rf libconftest.dylib*\n",
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
         for (line, token) in [
-            (
-                ". \"./$as_me.lineno\"; make -C safe test",
-                "untracked directory",
-            ),
+            (". \"./$as_me.lineno\"; make -C safe test", "script-unread:"),
             (
                 "eval true || { . \"./$as_me.lineno\"; }; make -C safe test",
-                "untracked directory",
+                "script-unread:",
             ),
             ("eval true || { git push -f; exit; }", "git-force-push"),
             ("false && exit; git push -f", "git-force-push"),
             ("exit; git push -f", "git-force-push"),
-            (
-                "(exit); . \"./$x\"; make -C safe test",
-                "untracked directory",
-            ),
+            ("(exit); . \"./$x\"; make -C safe test", "script-unread:"),
             ("cd evil || { exit; }; make clean-all", "rm-rf-outside-tmp"),
         ] {
             let c = at(line);

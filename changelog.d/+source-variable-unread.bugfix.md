@@ -1,0 +1,1 @@
+`. "./$x"` and `. "$x"` dropped the directory without reading the file. The path is the value the script assigns, and that file is judged. A substitution, a glob or a value the line does not show is refused.
