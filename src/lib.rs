@@ -17,7 +17,7 @@ mod envelope;
 mod mail;
 mod scripts;
 
-pub use envelope::{check_mail_bytes, MailReason, MailVerdict, MAIL_MESSAGE_MAX};
+pub use envelope::{check_mail_argv, check_mail_bytes, MailReason, MailVerdict, MAIL_MESSAGE_MAX};
 
 use std::borrow::Cow;
 

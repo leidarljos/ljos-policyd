@@ -7,12 +7,12 @@ use std::path::Path;
 use std::process::{self, Command};
 
 use ljos_policyd::{
-    check_mail_bytes, check_shell, encode_decision, verdict, MailVerdict, MAIL_MESSAGE_MAX,
+    check_mail_argv, check_shell, encode_decision, verdict, MailVerdict, MAIL_MESSAGE_MAX,
 };
 
 fn usage() {
     eprintln!("usage: ljos-policyd check|exec|capnp|version -- argv...");
-    eprintln!("usage: ljos-policyd check-mail --config PATH");
+    eprintln!("usage: ljos-policyd check-mail --config PATH [--argv [--] RECIPIENT...]");
 }
 
 fn main() {
@@ -63,7 +63,7 @@ fn main() {
             process::exit(status.code().unwrap_or(127));
         }
         "check-mail" => {
-            let Some(path) = config_path(&args) else {
+            let Some(mail) = mail_args(&args) else {
                 usage();
                 process::exit(2);
             };
@@ -74,7 +74,7 @@ fn main() {
                 println!("{}", v.json());
                 process::exit(2);
             }
-            let v = check_mail_bytes(&buf, Path::new(&path));
+            let v = check_mail_argv(&buf, Path::new(&mail.config), &mail.recipients);
             println!("{}", v.json());
             if v.is_refused() {
                 process::exit(2);
@@ -94,14 +94,83 @@ fn main() {
     }
 }
 
-/// `--config PATH` or `--config=PATH`, and nothing else.
-fn config_path(args: &[String]) -> Option<String> {
-    match args {
-        [flag, path] if flag == "--config" && !path.is_empty() => Some(path.clone()),
-        [only] => only
-            .strip_prefix("--config=")
-            .filter(|path| !path.is_empty())
-            .map(str::to_string),
-        _ => None,
+struct MailArgs {
+    config: String,
+    recipients: Vec<String>,
+}
+
+/// `--config PATH` and, when the caller has extra sendmail recipients,
+/// `--argv` and those recipients. Anything else is a usage error: a
+/// recipient this check does not see is a recipient it cannot refuse.
+fn mail_args(args: &[String]) -> Option<MailArgs> {
+    let mut config = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if let Some(path) = arg.strip_prefix("--config=") {
+            if config.is_some() || path.is_empty() {
+                return None;
+            }
+            config = Some(path.to_string());
+            i += 1;
+            continue;
+        }
+        match arg {
+            "--config" => {
+                if config.is_some() {
+                    return None;
+                }
+                let path = args.get(i + 1)?;
+                if path.is_empty() || path.starts_with('-') {
+                    return None;
+                }
+                config = Some(path.clone());
+                i += 2;
+            }
+            "--argv" => {
+                i += 1;
+                if args.get(i).map(String::as_str) == Some("--") {
+                    i += 1;
+                }
+                return Some(MailArgs {
+                    config: config?,
+                    recipients: args[i..].to_vec(),
+                });
+            }
+            _ => return None,
+        }
+    }
+    Some(MailArgs {
+        config: config?,
+        recipients: Vec::new(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_string()).collect()
+    }
+
+    #[test]
+    fn argv_recipients_are_the_words_after_the_flag() {
+        let got = mail_args(&args(&[
+            "--config",
+            "mail.conf",
+            "--argv",
+            "--",
+            "evil@blocked.test",
+        ]))
+        .unwrap();
+        assert_eq!(got.config, "mail.conf");
+        assert_eq!(got.recipients, vec!["evil@blocked.test".to_string()]);
+        let got = mail_args(&args(&["--config=mail.conf", "--argv", "a@ok.test"])).unwrap();
+        assert_eq!(got.recipients, vec!["a@ok.test".to_string()]);
+        let got = mail_args(&args(&["--config", "mail.conf", "--argv"])).unwrap();
+        assert!(got.recipients.is_empty());
+        assert!(mail_args(&args(&["--config", "mail.conf", "evil@blocked.test"])).is_none());
+        assert!(mail_args(&args(&["--argv", "evil@blocked.test"])).is_none());
     }
 }

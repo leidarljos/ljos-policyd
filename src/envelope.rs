@@ -84,6 +84,17 @@ fn reason(code: &'static str, detail: impl Into<String>) -> MailReason {
 /// `message` is the RFC 5322 bytes. `config_path` names the identity, the
 /// deny file and the pack-law file.
 pub fn check_mail_bytes(message: &[u8], config_path: &Path) -> MailVerdict {
+    check_mail_inner(message, config_path, &[])
+}
+
+/// `recipients` are the addresses a caller would have passed to
+/// `sendmail -t` beside the message. This check does not see those
+/// unless they are passed here. An empty list judges the message only.
+pub fn check_mail_argv(message: &[u8], config_path: &Path, recipients: &[String]) -> MailVerdict {
+    check_mail_inner(message, config_path, recipients)
+}
+
+fn check_mail_inner(message: &[u8], config_path: &Path, recipients: &[String]) -> MailVerdict {
     if message.len() > MAIL_MESSAGE_MAX {
         return MailVerdict::refusal(
             "message-too-large",
@@ -122,7 +133,38 @@ pub fn check_mail_bytes(message: &[u8], config_path: &Path) -> MailVerdict {
     check_recipients(&message, &config, &mut reasons);
     check_resent(&message, &mut reasons);
     check_apparently_to(&message, &mut reasons);
+    check_argv_recipients(&config, recipients, &mut reasons);
     MailVerdict { reasons }
+}
+
+/// Command-line recipients are not in the header block. Each one is
+/// judged as a recipient: a route character, a denied address, or a
+/// denied domain is a refusal.
+fn check_argv_recipients(config: &Config, recipients: &[String], reasons: &mut Vec<MailReason>) {
+    for raw in recipients {
+        let list = match mail::mailboxes(raw) {
+            Ok(list) if list.len() == 1 => list,
+            _ => {
+                reasons.push(reason("argv-recipient-unparsed", raw.clone()));
+                continue;
+            }
+        };
+        let Some(addr) = normalize_mailbox(&list[0]) else {
+            reasons.push(reason("argv-recipient-unparsed", raw.clone()));
+            continue;
+        };
+        if let Some(shown) = mixed_script_domain(&addr.domain) {
+            reasons.push(reason("mixed-script", format!("argv {shown}")));
+        }
+        if address_denied(&addr, &config.deny_addresses, &config.subaddress) {
+            reasons.push(reason("argv-recipient-denied", addr.key()));
+        }
+        if domain_denied(&addr.domain, &config.deny_domains)
+            || domain_denied(&addr.domain, &config.pack_domains)
+        {
+            reasons.push(reason("argv-recipient-denied", addr.domain));
+        }
+    }
 }
 
 struct NormAddr {
@@ -890,6 +932,31 @@ mod tests {
         got
     }
 
+    fn codes_argv(message: &str, deny: &str, law: &str, recipients: &[&str]) -> Vec<String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "policyd-env-argv-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("deny.txt"), deny).unwrap();
+        std::fs::write(dir.join("law.txt"), law).unwrap();
+        std::fs::write(
+            dir.join("mail.conf"),
+            format!("identity {IDENTITY}\ndeny-file deny.txt\npack-law law.txt\n"),
+        )
+        .unwrap();
+        let recipients: Vec<String> = recipients.iter().map(|s| (*s).to_string()).collect();
+        let got = check_mail_argv(message.as_bytes(), &dir.join("mail.conf"), &recipients);
+        let _ = std::fs::remove_dir_all(&dir);
+        got.reasons
+            .into_iter()
+            .map(|r| r.code.to_string())
+            .collect()
+    }
+
     fn codes_with(message: &str, deny: &str, law: &str, extra: &str) -> Vec<String> {
         verdict_with(message, deny, law, extra)
             .reasons
@@ -1616,6 +1683,33 @@ pair left right
             let sub = plain(&format!("{header}: a@sub.packblocked.test\r\n"));
             assert_eq!(codes(&sub, "", law), expect, "{header} sub");
         }
+    }
+
+    /// `sendmail -t recipient` adds the command-line address to the
+    /// header recipients. The message on stdin does not carry it.
+    #[test]
+    fn argv_recipients_are_refused_when_the_headers_are_clean() {
+        let msg = "From: mailseat@example.test\r\nTo: person@ok.test\r\n\r\n";
+        let deny = "domain blocked.test\naddress evil@example.test\n";
+        let law = "deny-domain packblocked.test\n";
+        assert!(codes_argv(msg, deny, law, &[]).is_empty());
+        assert_eq!(
+            codes_argv(msg, deny, law, &["evil@blocked.test"]),
+            vec!["argv-recipient-denied"]
+        );
+        assert_eq!(
+            codes_argv(msg, deny, law, &["a@packblocked.test"]),
+            vec!["argv-recipient-denied"]
+        );
+        assert_eq!(
+            codes_argv(msg, deny, law, &["evil+x@example.test"]),
+            vec!["argv-recipient-denied"]
+        );
+        assert_eq!(
+            codes_argv(msg, deny, law, &["\"a%blocked.test\"@localhost"]),
+            vec!["argv-recipient-unparsed"]
+        );
+        assert!(codes_argv(msg, deny, law, &["person@ok.test"]).is_empty());
     }
 
     #[test]

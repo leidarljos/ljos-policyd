@@ -3,8 +3,8 @@ Command line
 
 ``ljos-policyd check|exec|capnp|version -- argv...``
 
-``ljos-policyd check-mail --config PATH`` reads one RFC 5322 message on
-stdin. See "Outbound mail" below.
+``ljos-policyd check-mail --config PATH [--argv [--] RECIPIENT...]``
+reads one RFC 5322 message on stdin. See "Outbound mail" below.
 
 ================ ========================================================================================
 Verb             Meaning
@@ -212,6 +212,11 @@ Outbound mail
 ``check-mail`` prints one JSON object and only refuses. ``allow`` means
 this check found nothing to refuse. A send still needs its own grant.
 
+The message on stdin is the whole input. A caller must pass no
+recipient arguments to ``sendmail -t``: those addresses are not in
+the message. Pass the same recipients to ``--argv`` and this check
+refuses them as recipients. ``--config`` comes before ``--argv``.
+
 The config is lines of ``identity``, ``deny-file`` and ``pack-law``,
 and an optional ``subaddress`` line. A
 relative path is read from the config file's directory. ``identity`` is
@@ -305,6 +310,8 @@ Code                                     When
 ``recipient-address-denied``             To, Cc or Bcc names a deny-file address
 ``recipient-domain-denied``              To, Cc or Bcc is at a denied domain
 ``recipient-unparsed``                   To, Cc or Bcc does not parse
+``argv-recipient-denied``                an argv recipient is a denied address or domain
+``argv-recipient-unparsed``              an argv recipient does not parse
 ``header-control``                       a control, or U+0085, U+2028 or U+2029
 ``header-line-ending``                   the header block mixes CRLF and a bare LF
 ``header-line-too-long``                 a header line is over 998 octets

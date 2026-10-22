@@ -1,0 +1,1 @@
+check-mail reads the message on stdin and does not see recipients passed to sendmail -t. The caller must pass no recipient arguments, or pass them to `check-mail --argv` so each one is judged as a recipient.

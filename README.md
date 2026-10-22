@@ -121,7 +121,7 @@ without the library reports `host table`, and the doctor warns about it.
 | `check -- ARGV` | prints `allow`, or `deny`, a tab and the reason | 0 |
 | `exec -- ARGV` | runs ARGV only if the verdict is allow | ARGV's status; 2 on deny |
 | `capnp -- ARGV` | writes a packed Cap'n Proto `PolicyDecision` | 0 |
-| `check-mail --config PATH` | reads one RFC 5322 message on stdin and prints a JSON allow or deny | 0 when nothing was refused; 2 when it refuses |
+| `check-mail --config PATH [--argv [--] RECIPIENT...]` | reads one RFC 5322 message on stdin and prints a JSON allow or deny | 0 when nothing was refused; 2 when it refuses |
 | `version` | the version and the backend | 0 |
 
 ## Outbound mail
@@ -134,6 +134,13 @@ refuse. A send still needs its own grant: this check only refuses.
 $ ljos-policyd check-mail --config mail.conf < message.eml
 {"verdict":"allow","reasons":[]}
 ```
+
+The message on stdin is the whole input. `sendmail -t recipient`
+adds that recipient to the ones in the headers, and this check
+does not see it. The caller must pass no recipient arguments, or
+pass the same recipients to
+`check-mail --config PATH --argv [--] RECIPIENT...`. An argv
+recipient is judged as a recipient.
 
 The config is one key per line. `identity` is the address `From` must
 be. `deny-file` and `pack-law` name the other two files. A relative
