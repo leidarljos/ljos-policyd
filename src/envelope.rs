@@ -1144,6 +1144,12 @@ fn recipient_local_char(c: char) -> bool {
 /// both read here, and a name that is not a hostname after IDNA is
 /// `None` for both: a recipient at an underscore or edge-hyphen label is
 /// refused, because no rule could name it.
+///
+/// Each label then gets the case fold of the local-part skeleton, so ß
+/// is ss and dotless ı and dotted İ are i. Marks are kept, and a label
+/// wholly in Cyrillic or Greek is not mapped to the Latin it looks like:
+/// it is a different domain, and only Latin mixed with either script in
+/// one label is refused as `mixed-script`.
 fn normalize_domain(raw: &str) -> Option<String> {
     if raw.contains('@') {
         return None;
@@ -1161,7 +1167,11 @@ fn normalize_domain(raw: &str) -> Option<String> {
     if folded.contains('[') || folded.contains(']') {
         return None;
     }
-    idna::domain_to_ascii(folded)
+    let ascii = idna::domain_to_ascii(folded).ok()?;
+    let (unicode, result) = idna::domain_to_unicode(&ascii);
+    result.ok()?;
+    let folded = casefold(&casefold(&unicode)).replace("i\u{0307}", "i");
+    idna::domain_to_ascii(&folded)
         .ok()
         .filter(|d| is_hostname(d))
 }
@@ -1580,6 +1590,45 @@ From: other@example.test\r\n";
                 "{domain}"
             );
         }
+    }
+
+    /// A domain label gets the case fold a local part does: ß, ẞ, ı
+    /// and İ compare with ss and i, each way round.
+    #[test]
+    fn a_domain_label_is_case_folded_like_a_local_part() {
+        for (written, plain_form) in [
+            ("stra\u{DF}e.test", "strasse.test"),
+            ("STRA\u{1E9E}E.test", "strasse.test"),
+            ("\u{0131}nfo.test", "info.test"),
+            ("\u{0130}nfo.test", "info.test"),
+        ] {
+            for (to, rule) in [(written, plain_form), (plain_form, written)] {
+                let raw = plain(&format!("To: a@{to}\r\n"));
+                assert_eq!(
+                    codes(&raw, &format!("domain {rule}\n"), ""),
+                    vec!["recipient-domain-denied"],
+                    "{to} {rule}"
+                );
+                assert_eq!(
+                    codes(&raw, "", &format!("deny-domain {rule}\n")),
+                    vec!["recipient-domain-denied"],
+                    "{to} {rule}"
+                );
+                assert_eq!(
+                    codes(&raw, &format!("address a@{rule}\n"), ""),
+                    vec!["recipient-address-denied"],
+                    "{to} {rule}"
+                );
+            }
+        }
+        assert_eq!(
+            codes(
+                &plain("To: a@mail.\u{0130}nfo.test\r\n"),
+                "domain info.test\n",
+                ""
+            ),
+            vec!["recipient-domain-denied"]
+        );
     }
 
     #[test]
