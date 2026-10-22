@@ -237,8 +237,11 @@ that cannot be read is a refusal.
 | =from-unparsed= | From does not parse as one mailbox |
 | =encoded-word= | an encoded-word in a watched header did not decode |
 | =reply-to-denied= | Reply-To names a deny-file identity |
+| =reply-to-unparsed= | Reply-To does not parse |
 | =sender-denied= | Sender names a deny-file identity |
+| =sender-unparsed= | Sender does not parse |
 | =return-path-denied= | Return-Path names a deny-file identity |
+| =return-path-unparsed= | Return-Path does not parse |
 | =errors-to-denied= | Errors-To names a deny-file identity |
 | =errors-to-unparsed= | Errors-To does not parse |
 | =disposition-notification-to-denied= | Disposition-Notification-To names a deny-file identity |
@@ -248,13 +251,17 @@ that cannot be read is a refusal.
 | =resent-header= | a Resent-* header is present |
 | =mixed-script= | a label mixes Latin with Cyrillic or Greek |
 | =recipient-domain-denied= | To, Cc or Bcc is at a denied domain |
+| =recipient-unparsed= | To, Cc or Bcc does not parse |
 | =header-control= | a control character in the header block |
 | =header-line-ending= | the header block mixes CRLF and a bare LF |
 | =message-too-large= | the message is over 1 MiB |
 | =message-invalid= | the bytes are not a header block |
 | =config-unreadable= | the config path cannot be read |
 | =config-invalid= | the config is missing a key or names an unknown one |
+| =identity-invalid= | the configured identity is not one mailbox |
+| =deny-file-unreadable= | the deny file cannot be read |
 | =deny-file-invalid= | a deny-file line is not one of the known kinds |
+| =pack-law-unreadable= | the pack-law file cannot be read |
 | =pack-law-invalid= | the pack-law file has a line other than deny-domain |
 
 * Environment the seat reads

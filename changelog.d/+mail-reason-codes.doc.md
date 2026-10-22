@@ -1,0 +1,1 @@
+The reference omitted reason codes check-mail already returns, including an unparsed recipient, an unreadable deny file or pack-law file, and an identity that is not one mailbox. Every code the check can print is listed.
