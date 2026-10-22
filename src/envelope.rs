@@ -307,7 +307,7 @@ fn load_deny(path: &Path, aliases: &[AliasFamily]) -> Result<LoadedDeny, MailRea
     for (idx, line) in text.lines().enumerate() {
         let line_no = idx + 1;
         let Some((key, value)) =
-            rule_line(line).map_err(|()| reason("deny-file-invalid", "deny-file"))?
+            rule_line(line).map_err(|()| reason("deny-file-invalid", format!("line {line_no}")))?
         else {
             continue;
         };
@@ -352,16 +352,16 @@ fn load_deny(path: &Path, aliases: &[AliasFamily]) -> Result<LoadedDeny, MailRea
             }
             "handle" | "term" => {
                 if value.is_empty() {
-                    return Err(reason("deny-file-invalid", "deny-file"));
+                    return Err(reason("deny-file-invalid", format!("line {line_no}")));
                 }
             }
             "pair" => {
                 let mut parts = value.split_whitespace();
                 if parts.next().is_none() || parts.next().is_none() {
-                    return Err(reason("deny-file-invalid", "deny-file"));
+                    return Err(reason("deny-file-invalid", format!("line {line_no}")));
                 }
             }
-            _ => return Err(reason("deny-file-invalid", "deny-file")),
+            _ => return Err(reason("deny-file-invalid", format!("line {line_no}"))),
         }
     }
     Ok(LoadedDeny {
@@ -377,14 +377,14 @@ fn load_pack_law(path: &Path) -> Result<BTreeSet<String>, MailReason> {
     for (idx, line) in text.lines().enumerate() {
         let line_no = idx + 1;
         let Some((key, value)) =
-            rule_line(line).map_err(|()| reason("pack-law-invalid", "pack-law"))?
+            rule_line(line).map_err(|()| reason("pack-law-invalid", format!("line {line_no}")))?
         else {
             continue;
         };
         // A line that would allow a domain is not a rule this check can
         // apply. The file is refused so an allow cannot override a deny.
         if key != "deny-domain" || value.is_empty() {
-            return Err(reason("pack-law-invalid", "pack-law"));
+            return Err(reason("pack-law-invalid", format!("line {line_no}")));
         }
         let domain = rule_domain(value)
             .ok_or_else(|| reason("pack-law-invalid", format!("line {line_no}")))?;
@@ -1807,6 +1807,42 @@ From: other@example.test\r\n";
             ),
             vec!["recipient-domain-denied"]
         );
+    }
+
+    /// The detail is the line, for a bad key as well as a bad value, and
+    /// it does not repeat the value.
+    #[test]
+    fn every_invalid_deny_line_names_its_line() {
+        let clean = "From: mailseat@example.test\r\n";
+        let deny_cases: &[(&str, usize, &str)] = &[
+            ("address\n", 1, "address"),
+            ("nope evil@example.test\n", 1, "nope"),
+            ("handle\n", 1, "handle"),
+            ("term\n", 1, "term"),
+            ("pair onlyone\n", 1, "onlyone"),
+            ("# c\naddress\n", 2, "address"),
+            ("address two@example.test two@example.test\n", 1, "two@"),
+            ("domain\n", 1, "domain"),
+        ];
+        for (deny, line, value) in deny_cases {
+            let v = verdict(clean, deny, "");
+            assert_eq!(v.reasons.len(), 1, "{deny:?}");
+            assert_eq!(v.reasons[0].code, "deny-file-invalid", "{deny:?}");
+            assert_eq!(v.reasons[0].detail, format!("line {line}"), "{deny:?}");
+            assert!(!v.json().contains(value), "{deny:?} {}", v.json());
+        }
+        let law_cases: &[(&str, usize, &str)] = &[
+            ("allow-domain blocked.test\n", 1, "allow-domain"),
+            ("deny-domain\n", 1, "deny-domain"),
+            ("#\n\nnot-a-rule x\n", 3, "not-a-rule"),
+        ];
+        for (law, line, value) in law_cases {
+            let v = verdict(clean, "", law);
+            assert_eq!(v.reasons.len(), 1, "{law:?}");
+            assert_eq!(v.reasons[0].code, "pack-law-invalid", "{law:?}");
+            assert_eq!(v.reasons[0].detail, format!("line {line}"), "{law:?}");
+            assert!(!v.json().contains(value), "{law:?} {}", v.json());
+        }
     }
 
     /// A domain rule on one domain of a shared family is the whole

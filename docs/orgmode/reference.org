@@ -325,7 +325,8 @@ form as the same domain. A homoglyph that NFKC and IDNA leave alone
 does not. ASCII case is folded, and a character a reader skips is
 removed before that comparison. =From= is not compared that way. =handle=, =term= and =pair= may share the deny file and
 are ignored here. A pack-law line that would allow a domain refuses
-the file. A message over 1 MiB, a control character in the header
+the file. The detail of =deny-file-invalid= and =pack-law-invalid=
+is the line number, not the value. A message over 1 MiB, a control character in the header
 block, U+0085, U+2028 or U+2029 in that block, a header line over
 998 octets, a header block that mixes CRLF and a bare LF, or a
 config that cannot be read is a refusal.
@@ -376,9 +377,9 @@ config that cannot be read is a refusal.
 | =config-invalid= | the config is missing a key or names an unknown one |
 | =identity-invalid= | the configured identity is not one mailbox |
 | =deny-file-unreadable= | the deny file cannot be read |
-| =deny-file-invalid= | a deny-file line is not a known kind, a domain is not a hostname, or an address skeleton is empty |
+| =deny-file-invalid= | a deny-file line is not a known kind, a domain is not a hostname, or an address skeleton is empty. The detail is the line number |
 | =pack-law-unreadable= | the pack-law file cannot be read |
-| =pack-law-invalid= | the pack-law file has a line other than deny-domain |
+| =pack-law-invalid= | a pack-law line is not deny-domain, or the domain is not a hostname. The detail is the line number |
 
 * Environment the seat reads
 

@@ -1,0 +1,1 @@
+Every deny-file-invalid and pack-law-invalid error names the line. An unknown key, a missing value and a pack-law line that is not deny-domain only said deny-file or pack-law, so the line had to be found by hand. The detail is still not the value.
