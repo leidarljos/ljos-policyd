@@ -936,10 +936,44 @@ From: other@example.test\r\n";
             codes(&plain("Reply-To: a!b@example.test\r\n"), deny, law),
             vec!["reply-to-unparsed"]
         );
-        // A quoted local part holds the characters literally. It is not
-        // the unquoted form Postfix rewrites.
-        assert!(codes(&plain("To: \"a%blocked.test\"@example.test\r\n"), deny, law).is_empty());
-        assert!(codes(&plain("To: \"blocked.test!a\"@example.test\r\n"), deny, law).is_empty());
+        // Postfix opens the quotes and routes on the character, including
+        // a backslash escape. The quoted form is the same refusal.
+        assert_eq!(
+            codes(&plain("To: \"a%blocked.test\"@localhost\r\n"), deny, law),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("To: \"blocked.test!a\"@localhost\r\n"), deny, law),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("Bcc: \"a@blocked.test\"@localhost\r\n"), deny, law),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(
+                &plain("To: \"a\\@blocked.test\"@example.test\r\n"),
+                deny,
+                law
+            ),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(
+                &plain("Reply-To: \"evil@example.test\"@localhost\r\n"),
+                deny,
+                law
+            ),
+            vec!["reply-to-unparsed"]
+        );
+        assert_eq!(
+            codes(
+                &plain("Disposition-Notification-To: \"a@blocked.test\"@localhost\r\n"),
+                deny,
+                law
+            ),
+            vec!["disposition-notification-to-unparsed"]
+        );
     }
 
     #[test]

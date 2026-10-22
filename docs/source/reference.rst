@@ -235,9 +235,9 @@ is that mailbox, not the whole domain. It also covers a
 ``local+tag`` subaddress of that mailbox. A domain literal (an
 address at ``@[ ... ]``) in a watched header is a refusal. An
 all-numeric domain, such as a dotted quad, is a refusal. A
-source route (``<@host:mailbox>``) is a refusal. ``%`` or ``!``
-in an unquoted local part is a refusal. A quoted local part may
-hold either character. A recipient domain, or a domain on a
+source route (``<@host:mailbox>``) is a refusal. ``@``, ``%`` or
+``!`` in a local part is a refusal, quoted or not, including a
+backslash escape inside the quotes. A recipient domain, or a domain on a
 header checked against the deny file, is refused when one label
 mixes Latin with Cyrillic or Greek after NFKC and IDNA.
 

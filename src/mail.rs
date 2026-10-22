@@ -811,6 +811,11 @@ fn parse_quoted(s: &str) -> Result<(String, usize), AddressFault> {
             if c >= 0x80 {
                 return Err(AddressFault);
             }
+            // A quoted-pair is still the character. Postfix opens the
+            // quotes and routes on it, so the escape is not a hiding place.
+            if is_route_byte(c) {
+                return Err(AddressFault);
+            }
             local.push(c as char);
             escape = false;
             i += 1;
@@ -828,6 +833,7 @@ fn parse_quoted(s: &str) -> Result<(String, usize), AddressFault> {
                 return Ok((local, i + 1));
             }
             c if c < 0x20 && c != b'\t' => return Err(AddressFault),
+            c if is_route_byte(c) => return Err(AddressFault),
             c if c < 0x80 => {
                 local.push(c as char);
                 i += 1;
@@ -863,8 +869,9 @@ fn parse_dot_atom(s: &str) -> Result<(String, usize), AddressFault> {
         }
         // `%` is the percent hack and `!` is a bang path. Postfix
         // rewrites both when the domain is local and then relays to
-        // the rewritten address. A quoted local part may still hold
-        // either character: that form is not rewritten.
+        // the rewritten address. The quoted form is refused in
+        // `parse_quoted`, including a backslash escape: Postfix opens
+        // the quotes before it routes.
         if c == '%' || c == '!' {
             return Err(AddressFault);
         }
@@ -925,6 +932,13 @@ fn numeric_domain(bare: &str) -> bool {
         && folded
             .split('.')
             .all(|label| !label.is_empty() && label.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// `@` routes inside a quoted local part once the quotes are removed,
+/// the same way `%` and `!` do. Postfix does this with
+/// `resolve_dequoted` on, which is the default.
+fn is_route_byte(c: u8) -> bool {
+    matches!(c, b'@' | b'%' | b'!')
 }
 
 fn is_atext(c: char) -> bool {
@@ -1138,20 +1152,13 @@ From: other@example.test\r\n\
         assert!(mailboxes("a%blocked.test@localhost").is_err());
         assert!(mailboxes("blocked.test!a@localhost").is_err());
         assert!(mailboxes("<a%b@example.test>").is_err());
-        assert_eq!(
-            mailboxes("\"a%b\"@example.test").unwrap(),
-            vec![Mailbox {
-                local: "a%b".into(),
-                domain: "example.test".into(),
-            }]
-        );
-        assert_eq!(
-            mailboxes("\"a!b\"@example.test").unwrap(),
-            vec![Mailbox {
-                local: "a!b".into(),
-                domain: "example.test".into(),
-            }]
-        );
+        assert!(mailboxes("\"a%b\"@example.test").is_err());
+        assert!(mailboxes("\"a!b\"@example.test").is_err());
+        assert!(mailboxes("\"a@b\"@example.test").is_err());
+        assert!(mailboxes("\"a\\@blocked.test\"@example.test").is_err());
+        assert!(mailboxes("\"a\\%blocked.test\"@localhost").is_err());
+        assert!(mailboxes("\"blocked.test\\!a\"@localhost").is_err());
+        assert!(mailboxes("\"Two Three\"@example.test").is_ok());
     }
 
     #[test]
