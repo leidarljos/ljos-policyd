@@ -6698,9 +6698,14 @@ impl Seat {
 
     /// The pack on one argv, then on every command the table reads inside
     /// it (wrappers, `sh -c` scripts, substitutions), the same walk as
-    /// [`host_argv_table_at`].
-    fn check_at(&self, argv: &[String], depth: usize) -> Checked {
-        let own = self.check(argv);
+    /// [`host_argv_table_at`]. `parent` is the scratch that walk has
+    /// already recorded, so `rm -rf "$tmp"` inside a trap still names the
+    /// temp the assignment made.
+    fn check_at(&self, argv: &[String], depth: usize, parent: &Scratch, moved: bool) -> Checked {
+        let mut bound = parent.clone();
+        bound.observe(argv);
+        let shown = argv_for_pack(argv, &bound, moved);
+        let own = self.check(&shown);
         if own.decision != Decision::Allow || depth >= MAX_DEPTH {
             return own;
         }
@@ -6708,7 +6713,7 @@ impl Seat {
             if inner.is_empty() || inner.as_slice() == argv {
                 continue;
             }
-            let c = self.check_at(&inner, depth + 1);
+            let c = self.check_at(&inner, depth + 1, &bound, moved);
             if c.decision != Decision::Allow {
                 return c;
             }
@@ -6733,7 +6738,9 @@ fn check_shell_phronesis(argv: &[String]) -> Checked {
             .spawn(move || {
                 for (argv, reply) in rx {
                     let c = match Seat::open() {
-                        Ok(seat) => seat.check_at(&argv, 0),
+                        Ok(seat) => {
+                            seat.check_at(&argv, 0, &Scratch::default(), leaves_tree(&argv, 0))
+                        }
                         Err(c) => c,
                     };
                     let _ = reply.send(c);
@@ -8815,17 +8822,7 @@ fn autoconf_operand(p: &str, bound: &Scratch) -> bool {
 /// does not depend on the directory.
 fn recursive_delete_off_tmp(argv: &[String], moved: bool, bound: &Scratch) -> bool {
     commands(argv).iter().any(|cmd| {
-        let b = base_of(cmd[0]);
-        if b != "rm" && b != "rtrash" {
-            return false;
-        }
-        let recursive = cmd.iter().skip(1).any(|a| {
-            a.starts_with('-') && !a.starts_with("--") && a.contains('r') && a.contains('f')
-        }) || (cmd
-            .iter()
-            .any(|a| matches!(*a, "-r" | "-R" | "--recursive"))
-            && cmd.iter().any(|a| matches!(*a, "-f" | "--force")));
-        if !recursive {
+        if !rm_recursive(cmd) {
             return false;
         }
         !cmd.iter()
@@ -8843,6 +8840,85 @@ fn delete_ok(p: &str, moved: bool, bound: &Scratch) -> bool {
         return true;
     }
     bare_var(p).is_some_and(|name| bound.vars.get(name).copied().flatten() == Some(Hold::Temp))
+}
+
+/// What phronesis v0.2.5's recursive-delete rule allows on its own: a path
+/// under `/tmp` or `/var/tmp`, or, when the line stays in the tree, a build
+/// output directory or a top-level scratch directory. It has no mktemp
+/// binding and no configure scratch name (`conftest*`, `autom4te.cache`).
+#[cfg(has_phronesis)]
+fn pack_delete_ok(p: &str, moved: bool) -> bool {
+    under_tmp(p) || (!moved && (build_output(p) || scratch(p)))
+}
+
+/// `rm` or `rtrash` deleting recursively. The same flag test as
+/// [`recursive_delete_off_tmp`].
+fn rm_recursive(cmd: &[&str]) -> bool {
+    let Some(head) = cmd.first() else {
+        return false;
+    };
+    let b = base_of(head);
+    if b != "rm" && b != "rtrash" {
+        return false;
+    }
+    cmd.iter()
+        .skip(1)
+        .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('r') && a.contains('f'))
+        || (cmd
+            .iter()
+            .any(|a| matches!(*a, "-r" | "-R" | "--recursive"))
+            && cmd.iter().any(|a| matches!(*a, "-f" | "--force")))
+}
+
+/// The argv the pack judges. An operand the host already accepted and the
+/// pack's older rule would refuse is named as `/tmp/policyd-scratch`, so
+/// the pack still sees every other word. A secret or a force push on the
+/// same line is unchanged.
+#[cfg(has_phronesis)]
+fn argv_for_pack(argv: &[String], bound: &Scratch, moved: bool) -> Vec<String> {
+    let mut out = argv.to_vec();
+    let mut cmd: Vec<usize> = Vec::new();
+    let mark = |cmd: &mut Vec<usize>, out: &mut [String]| {
+        let words: Vec<String> = cmd
+            .iter()
+            .map(|&i| out[i].trim_end_matches(';').to_string())
+            .filter(|w| !w.is_empty())
+            .collect();
+        let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+        if rm_recursive(&refs) {
+            for &i in cmd.iter() {
+                let w = out[i].trim_end_matches(';').to_string();
+                if w.is_empty() || w.starts_with('-') || is_redirection(&w) {
+                    continue;
+                }
+                if delete_ok(&w, moved, bound) && !pack_delete_ok(&w, moved) {
+                    let semi = out[i].ends_with(';');
+                    out[i] = if semi {
+                        "/tmp/policyd-scratch;".into()
+                    } else {
+                        "/tmp/policyd-scratch".into()
+                    };
+                }
+            }
+        }
+        cmd.clear();
+    };
+    let mut i = 0;
+    while i < out.len() {
+        if matches!(out[i].as_str(), ";" | "&&" | "||" | "|" | "&") {
+            mark(&mut cmd, &mut out);
+            i += 1;
+            continue;
+        }
+        cmd.push(i);
+        let closes = out[i].ends_with(';');
+        i += 1;
+        if closes {
+            mark(&mut cmd, &mut out);
+        }
+    }
+    mark(&mut cmd, &mut out);
+    out
 }
 
 /// A mode that sets the setuid or setgid bit: an octal mode of four or
@@ -12784,6 +12860,18 @@ hash -r 2> /dev/null
         let script = format!("git push {url}");
         assert_eq!(v(&["sh", "-c", script.as_str()]), line);
         assert_eq!(v(&["env", "FOO=1", "git", "push", url.as_str()]), line);
+        // A scratch rm on the same line is a temp the host already
+        // allowed. The pack still has to see the secret.
+        for beside in [
+            format!("tmp=$(mktemp -d) && rm -rf \"$tmp\" && echo {url}"),
+            format!("rm -rf conftest* && echo {url}"),
+        ] {
+            let got = verdict(&shell_words(&beside));
+            assert!(
+                got.starts_with("deny\tshell-secret-in-argv: "),
+                "{beside} -> {got}"
+            );
+        }
         // The embedded pack is the one loaded, and ordinary work passes.
         let pack = std::env::var("PHRONESIS_JANET_PACK").expect("pack env");
         assert!(
@@ -14621,8 +14709,10 @@ hash -r 2> /dev/null
         assert!(c.token.starts_with("script-unread:"), "{}", c.token);
     }
 
-    // The pack a phronesis build loads keeps its own list of build
-    // output, so the host table is what this reads.
+    /// `conftest*`, `conftest.*` and `autom4te.cache` are scratch a
+    /// configure makes and removes. The pack's recursive-delete rule does
+    /// not name them; the host does, and the words the pack sees for those
+    /// operands are a temp under `/tmp`.
     #[test]
     fn configure_scratch_is_regenerable() {
         let root = startup_root("conftest");
@@ -14633,7 +14723,7 @@ hash -r 2> /dev/null
             "rm -rf conftest.dir conftest ./autom4te.cache/",
             "rm -rf sub/conftest.*",
         ] {
-            let c = host_argv_table(&shell_words(line));
+            let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
         for line in [
