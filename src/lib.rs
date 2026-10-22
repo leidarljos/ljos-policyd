@@ -5800,6 +5800,42 @@ mod tests {
         }
     }
 
+    /// A `set -P` in a sourced file, or `physical` in the `SHELLOPTS` a
+    /// nested bash starts with, resolves the link in each later `cd`.
+    #[cfg(unix)]
+    #[test]
+    fn a_set_p_the_line_does_not_spell_out_still_resolves_the_link() {
+        let root =
+            std::env::temp_dir().join(format!("policyd-lib-{}-physical", std::process::id()));
+        let start = root.join("start");
+        std::fs::create_dir_all(&start).expect("dir");
+        std::fs::create_dir_all(root.join("other/leaf")).expect("dir");
+        std::fs::write(start.join("Makefile"), "clean-all:\n\techo clean\n").expect("write");
+        std::fs::write(root.join("other/Makefile"), MAKEFILE).expect("write");
+        std::fs::write(start.join("p.sh"), "set -P\n").expect("write");
+        std::fs::write(start.join("env.sh"), "export PATH=\"$PATH\"\n").expect("write");
+        let _ = std::fs::remove_file(start.join("lnk"));
+        std::os::unix::fs::symlink(root.join("other/leaf"), start.join("lnk")).expect("link");
+        let decide = |line: &str| check_shell_in(&shell_words(line), &start, 0).decision;
+        for line in [
+            "source ./p.sh; cd lnk/.. && make clean-all",
+            ". ./p.sh && cd lnk/.. && make clean-all",
+            "env SHELLOPTS=physical bash -c 'cd lnk/.. && make clean-all'",
+            "env SHELLOPTS=braceexpand:physical bash -c 'cd lnk/.. && make clean-all'",
+            "env SHELLOPTS=$opts bash -c 'cd lnk/.. && make clean-all'",
+            "export SHELLOPTS; set -P; bash -c 'cd lnk/.. && make clean-all'",
+        ] {
+            assert_eq!(decide(line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "cd lnk/.. && make clean-all",
+            "source ./env.sh; cd lnk/.. && make clean-all",
+            "env SHELLOPTS=errexit bash -c 'cd lnk/.. && make clean-all'",
+        ] {
+            assert_eq!(decide(line), Decision::Allow, "{line}");
+        }
+    }
+
     /// Where the path by name is no directory, bash enters the path as it
     /// stands, through the link: `lnk/../foo` with no `foo` here is the
     /// `foo` beside the link's target, and its Makefile is the one read.
