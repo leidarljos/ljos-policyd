@@ -279,7 +279,11 @@ struct LineFiles {
     /// again on its own.
     data: bool,
     written: Vec<Written>,
-    ran: Vec<(Option<std::path::PathBuf>, Vec<usize>, Ran)>,
+    ran: Vec<(Option<std::path::PathBuf>, String, Vec<usize>, Ran)>,
+    /// `rm` operands, with the command that removes them.
+    removed: Vec<(String, Vec<usize>)>,
+    /// Variables whose value is the script being judged (`$0`).
+    script_vars: std::collections::HashSet<String>,
 }
 
 /// A path a command may write, and its place on the line. A `loose`
@@ -293,6 +297,9 @@ struct Written {
     text: Option<String>,
     /// The word naming the file, or for a loose write the command.
     word: String,
+    /// The bytes are a filter of the script being judged, and the
+    /// filter inserts no command.
+    rewrite: bool,
 }
 
 /// How a file is run: by a shell (a script operand, `source`, a startup
@@ -414,6 +421,7 @@ impl LineFiles {
                 loose,
                 text: None,
                 word: w.to_string(),
+                rewrite: false,
             });
         }
     }
@@ -431,7 +439,7 @@ impl LineFiles {
                 _ if how == Ran::Exec => Ran::Shell,
                 _ => how,
             };
-            self.ran.push((p, self.cmd.clone(), how));
+            self.ran.push((p, w.to_string(), self.cmd.clone(), how));
         }
     }
 
@@ -444,7 +452,7 @@ impl LineFiles {
     /// for one its own command runs.
     fn written_then_run(&self) -> Result<Vec<(String, String)>, String> {
         let mut texts = Vec::new();
-        for (r, rid, how) in &self.ran {
+        for (r, run_word, rid, how) in &self.ran {
             let shown = |p: &Option<std::path::PathBuf>| {
                 p.as_ref().map_or_else(
                     || "a script the line does not show".into(),
@@ -460,6 +468,7 @@ impl LineFiles {
                     (Some(r), Some(w)) => r.starts_with(w),
                     _ => true,
                 })
+                .filter(|w| !self.scratch_of_this_run(w, run_word, r, rid))
                 .peekable();
             if hits.peek().is_none() {
                 continue;
@@ -476,6 +485,46 @@ impl LineFiles {
             }
         }
         Ok(texts)
+    }
+
+    /// Whether `w` is scratch this run creates in the tracked directory
+    /// and then reads or removes, so it is not a new script for `run`.
+    ///
+    /// A rewrite of the script being judged (`sed <$0 >$as_me.lineno`
+    /// then `. "./$as_me.lineno"`) is that script. `$$` is only digits,
+    /// so `conf$$.file` stays in the directory and is not a later
+    /// `./configure`; once `rm` has removed it, it is not a later run
+    /// either. A bare `$x` or `"$LOG"` can be any path, so it still is.
+    fn scratch_of_this_run(
+        &self,
+        w: &Written,
+        run: &str,
+        run_path: &Option<std::path::PathBuf>,
+        run_id: &[usize],
+    ) -> bool {
+        if w.loose {
+            return false;
+        }
+        // A path the line places is that file, or a directory it is in.
+        // Word shape is only for a path the line does not show.
+        if w.path.is_some() && run_path.is_some() {
+            return false;
+        }
+        if w.rewrite && same_scratch_word(&w.word, run) {
+            return true;
+        }
+        if !cwd_confined(&w.word) {
+            return false;
+        }
+        if !shape_overlaps(&w.word, run) {
+            return true;
+        }
+        self.removed.iter().any(|(rm, id)| {
+            same_scratch_word(rm, &w.word)
+                && w.id.as_slice() < id.as_slice()
+                && id.as_slice() <= run_id
+                && !same_scratch_word(&w.word, run)
+        })
     }
 }
 
@@ -496,6 +545,400 @@ fn written_reason(script: &str, w: &Written) -> String {
         None => format!("{script}: `{}` may write any file where it runs", w.word),
         Some(_) => script.to_string(),
     }
+}
+
+/// `w` with quotes and a leading `./` taken off, so `$as_me.lineno` and
+/// `./$as_me.lineno` name one file.
+fn scratch_body(w: &str) -> &str {
+    let w = w.trim_matches(|c| c == '\'' || c == '"');
+    w.strip_prefix("./").unwrap_or(w)
+}
+
+fn same_scratch_word(a: &str, b: &str) -> bool {
+    scratch_body(a) == scratch_body(b)
+}
+
+/// Whether `w` can only name a file in the tracked directory. `$$` is
+/// the pid, which is digits. Any other expansion can hold a slash.
+fn cwd_confined(w: &str) -> bool {
+    let w = scratch_body(w);
+    if w.is_empty() || w.contains('/') || w.split('/').any(|p| p == ".." || p == ".") {
+        return false;
+    }
+    let mut rest = w;
+    while let Some(i) = rest.find('$') {
+        let after = &rest[i + 1..];
+        if let Some(tail) = after.strip_prefix('$') {
+            rest = tail;
+            continue;
+        }
+        return false;
+    }
+    !w.contains('`')
+}
+
+/// A piece of a path word. `$$` is digits. Any other `$name` can be
+/// any text, and the literals around it stay.
+#[derive(Clone, Debug)]
+enum PathPart {
+    Lit(String),
+    Digits,
+    Any,
+}
+
+/// Whether `write` and `run` can expand to the same path. `conf$$.file`
+/// ends in `.file` and `./$as_me.lineno` ends in `.lineno`, so they
+/// cannot. A bare `$cache_file` can be any path, so it can.
+fn shape_overlaps(write: &str, run: &str) -> bool {
+    parts_overlap(&path_parts(write), &path_parts(run), 0)
+}
+
+fn path_parts(w: &str) -> Vec<PathPart> {
+    let w = scratch_body(w);
+    let b = w.as_bytes();
+    let mut out = Vec::new();
+    let mut lit = String::new();
+    let mut i = 0;
+    let flush = |lit: &mut String, out: &mut Vec<PathPart>| {
+        if !lit.is_empty() {
+            out.push(PathPart::Lit(std::mem::take(lit)));
+        }
+    };
+    while i < b.len() {
+        if b[i] == b'$' && b.get(i + 1) == Some(&b'$') {
+            flush(&mut lit, &mut out);
+            out.push(PathPart::Digits);
+            i += 2;
+            continue;
+        }
+        if b[i] == b'$' {
+            flush(&mut lit, &mut out);
+            i += 1;
+            if b.get(i) == Some(&b'{') {
+                i += 1;
+                while i < b.len() && b[i] != b'}' {
+                    i += 1;
+                }
+                if i < b.len() {
+                    i += 1;
+                }
+            } else {
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+            }
+            out.push(PathPart::Any);
+            continue;
+        }
+        lit.push(b[i] as char);
+        i += 1;
+    }
+    flush(&mut lit, &mut out);
+    out
+}
+
+/// Whether some string matches both `a` and `b`. Past the depth bound
+/// the answer stays "yes": a path the line does not pin down still
+/// taints.
+fn parts_overlap(a: &[PathPart], b: &[PathPart], depth: u32) -> bool {
+    if depth > 48 {
+        return true;
+    }
+    match (a.split_first(), b.split_first()) {
+        (None, None) => true,
+        (None, Some((PathPart::Any, _))) | (Some((PathPart::Any, _)), None) => parts_overlap(
+            a.get(1..).unwrap_or(&[]),
+            b.get(1..).unwrap_or(&[]),
+            depth + 1,
+        ),
+        (None, _) | (_, None) => false,
+        (Some((PathPart::Lit(x), ar)), Some((PathPart::Lit(y), br))) => {
+            if x.is_empty() {
+                return parts_overlap(ar, b, depth + 1);
+            }
+            if y.is_empty() {
+                return parts_overlap(a, br, depth + 1);
+            }
+            if let Some(rest) = y.strip_prefix(x.as_str()) {
+                if rest.is_empty() {
+                    parts_overlap(ar, br, depth + 1)
+                } else if rest.starts_with('/') && ar.is_empty() {
+                    true
+                } else {
+                    let mut next = vec![PathPart::Lit(rest.to_string())];
+                    next.extend(br.iter().cloned());
+                    parts_overlap(ar, &next, depth + 1)
+                }
+            } else if let Some(rest) = x.strip_prefix(y.as_str()) {
+                if rest.starts_with('/') && br.is_empty() {
+                    true
+                } else {
+                    let mut next = vec![PathPart::Lit(rest.to_string())];
+                    next.extend(ar.iter().cloned());
+                    parts_overlap(&next, br, depth + 1)
+                }
+            } else {
+                false
+            }
+        }
+        (Some((PathPart::Digits, ar)), Some((PathPart::Lit(y), br))) => {
+            digits_overlap_lit(ar, y, br, depth, true)
+        }
+        (Some((PathPart::Lit(x), ar)), Some((PathPart::Digits, br))) => {
+            digits_overlap_lit(br, x, ar, depth, false)
+        }
+        (Some((PathPart::Digits, ar)), Some((PathPart::Digits, br))) => {
+            parts_overlap(ar, br, depth + 1)
+        }
+        (Some((PathPart::Any, ar)), _) => any_overlap(ar, b, depth),
+        (_, Some((PathPart::Any, br))) => any_overlap(br, a, depth),
+    }
+}
+
+/// `$$` against a literal: at least one digit, then the rest.
+fn digits_overlap_lit(
+    after_digits: &[PathPart],
+    lit: &str,
+    after_lit: &[PathPart],
+    depth: u32,
+    digits_on_left: bool,
+) -> bool {
+    let bytes = lit.as_bytes();
+    let mut n = 0;
+    while n < bytes.len() && bytes[n].is_ascii_digit() {
+        n += 1;
+        let rest = &lit[n..];
+        let tail = if rest.is_empty() {
+            after_lit.to_vec()
+        } else {
+            let mut t = vec![PathPart::Lit(rest.to_string())];
+            t.extend(after_lit.iter().cloned());
+            t
+        };
+        let hit = if digits_on_left {
+            parts_overlap(after_digits, &tail, depth + 1)
+        } else {
+            parts_overlap(&tail, after_digits, depth + 1)
+        };
+        if hit {
+            return true;
+        }
+    }
+    false
+}
+
+/// `$name` eats any prefix of the other pattern, including nothing.
+fn any_overlap(after_any: &[PathPart], other: &[PathPart], depth: u32) -> bool {
+    if parts_overlap(after_any, other, depth + 1) {
+        return true;
+    }
+    match other.split_first() {
+        None => false,
+        Some((PathPart::Lit(s), rest)) => {
+            for n in 1..=s.len() {
+                let tail = if n == s.len() {
+                    rest.to_vec()
+                } else {
+                    let mut t = vec![PathPart::Lit(s[n..].to_string())];
+                    t.extend(rest.iter().cloned());
+                    t
+                };
+                if parts_overlap(after_any, &tail, depth + 1) {
+                    return true;
+                }
+            }
+            false
+        }
+        Some((PathPart::Digits, rest)) => {
+            parts_overlap(after_any, rest, depth + 1)
+                || parts_overlap(
+                    &{
+                        let mut t = vec![PathPart::Digits];
+                        t.extend(after_any.iter().cloned());
+                        t
+                    },
+                    rest,
+                    depth + 1,
+                )
+        }
+        Some((PathPart::Any, rest)) => {
+            parts_overlap(after_any, rest, depth + 1) || any_overlap(after_any, rest, depth + 1)
+        }
+    }
+}
+
+/// Operands `rm` or `rmdir` deletes. Flags are not files.
+fn removal_words(cmd: &[String]) -> Vec<String> {
+    let words: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    let words = operands(&words);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    let rest = peel_cd_command_word(&words[front..]);
+    let Some((w, args)) = rest.split_first() else {
+        return Vec::new();
+    };
+    if !matches!(base_of(w), "rm" | "rmdir") {
+        return Vec::new();
+    }
+    args.iter()
+        .copied()
+        .skip_while(|a| *a != "--" && a.starts_with('-'))
+        .filter(|a| *a != "--" && !a.starts_with('-') && !is_redirection(a))
+        .map(|a| a.to_string())
+        .collect()
+}
+
+/// Record a variable set to the script being judged (`name=$0`,
+/// `name=$dir$0`). A later command substitution is walked on its own
+/// and does not see the assignment, but the file list does.
+fn note_script_var(cmd: &[String], files: &Files) {
+    let words: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    let words = operands(&words);
+    let pure = (0..words.len()).all(|i| is_assignment(words[i]) || keyword_at(&words, i));
+    if !pure {
+        return;
+    }
+    let mut files = files.borrow_mut();
+    for w in cmd {
+        let Some((name, value)) = assign_sides(w) else {
+            continue;
+        };
+        let script = !value.contains(['`', '\0'])
+            && (value == "$0"
+                || value == "${0}"
+                || value.ends_with("$0")
+                || value.ends_with("${0}"));
+        if script {
+            files.script_vars.insert(name);
+        } else {
+            files.script_vars.remove(&name);
+        }
+    }
+}
+
+/// Whether `cmd` reads the script being judged: `<$0`, or `<$name` when
+/// every value of `name` is `$0` or a path that ends in it.
+fn reads_script_stdin(
+    cmd: &[String],
+    values: &std::collections::HashMap<String, Vec<String>>,
+    script_vars: &std::collections::HashSet<String>,
+) -> bool {
+    cmd.iter().any(|w| {
+        let body = redirection_body(w);
+        let Some(target) = body.strip_prefix('<').filter(|t| !t.starts_with('<')) else {
+            return false;
+        };
+        script_source(
+            target.trim_matches(|c| c == '\'' || c == '"'),
+            values,
+            script_vars,
+        )
+    })
+}
+
+fn script_source(
+    target: &str,
+    values: &std::collections::HashMap<String, Vec<String>>,
+    script_vars: &std::collections::HashSet<String>,
+) -> bool {
+    if target == "$0" || target == "${0}" {
+        return true;
+    }
+    let Some(name) = target.strip_prefix('$') else {
+        return false;
+    };
+    let name = name
+        .strip_prefix('{')
+        .and_then(|n| n.strip_suffix('}'))
+        .unwrap_or(name);
+    if var_name(name).is_none()
+        || (target != format!("${name}") && target != format!("${{{name}}}"))
+    {
+        return false;
+    }
+    if script_vars.contains(name) {
+        return true;
+    }
+    values.get(name).is_some_and(|vs| {
+        !vs.is_empty()
+            && vs.iter().all(|v| {
+                !v.contains(['\0', '`'])
+                    && (v == "$0" || v == "${0}" || v.ends_with("$0") || v.ends_with("${0}"))
+            })
+    })
+}
+
+/// Whether `cmd` is `sed` or `cat` and a `sed` program's replacements
+/// add no command text (`&-`, `\1`, nothing). A letter, `$` or a
+/// backtick in a replacement is a new command.
+fn filter_keeps_script(cmd: &[String]) -> bool {
+    let words: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    let words = operands(&words);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    let rest = peel_cd_command_word(&words[front..]);
+    let Some(w) = rest.first() else {
+        return false;
+    };
+    match base_of(w) {
+        "cat" => true,
+        "sed" => rest[1..].iter().all(|p| !sed_inserts_command(p)),
+        _ => false,
+    }
+}
+
+fn sed_inserts_command(program: &str) -> bool {
+    let b = program.as_bytes();
+    let mut i = 0;
+    let mut at_cmd = true;
+    while i < b.len() {
+        let c = b[i];
+        if at_cmd && c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if at_cmd && (c == b's' || c == b'y') {
+            let Some(delim) = b.get(i + 1).copied().filter(|d| !d.is_ascii_whitespace()) else {
+                return true;
+            };
+            i += 2;
+            i = skip_sed_part(b, i, delim);
+            let start = i;
+            i = skip_sed_part(b, i, delim);
+            let repl = &program[start..i.saturating_sub(1).max(start)];
+            if repl
+                .chars()
+                .any(|ch| ch.is_ascii_alphabetic() || ch == '$' || ch == '`')
+            {
+                return true;
+            }
+            at_cmd = false;
+            continue;
+        }
+        if c == b'\n' || c == b';' {
+            at_cmd = true;
+        } else if !c.is_ascii_whitespace() {
+            at_cmd = false;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn skip_sed_part(b: &[u8], mut i: usize, delim: u8) -> usize {
+    while i < b.len() {
+        if b[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        i += 1;
+        if b[i - 1] == delim {
+            break;
+        }
+    }
+    i
 }
 
 /// Where the path word `w` lands from each of `dirs`, as [`path_from`]
@@ -564,6 +1007,8 @@ struct Shell {
     /// `exit` ran here. A side of `||` or `&&` that exits does not fall
     /// through, so the commands after that list keep only the other side.
     halted: bool,
+    /// The pipeline so far reads the script being judged on stdin.
+    script_pipe: bool,
 }
 
 /// One `if` or `case`, so a variable set in every branch can be read as
@@ -949,6 +1394,7 @@ fn runner_commands(
         name_frames: Vec::new(),
         assign_stack: Vec::new(),
         halted: false,
+        script_pipe: false,
     };
     walk(argv, &mut shell, depth, out, denied);
 }
@@ -1312,6 +1758,32 @@ fn walk(
         }
         let shown: Vec<_> = cmd.iter().map(|w| with_pwd(w, pwd)).collect();
         let shown: Vec<&str> = shown.iter().map(|w| &**w).collect();
+        // A file this run creates in the tracked directory and then
+        // reads or removes is scratch, not a new script. The read is a
+        // filter of the script being judged; `$$` cannot leave the
+        // directory.
+        note_script_var(&owned, &shell.files);
+        let reads_script = {
+            let files = shell.files.borrow();
+            reads_script_stdin(&owned, &shell.cmd_values, &files.script_vars)
+        };
+        let pipe = shell.script_pipe || reads_script;
+        if pipe && end != "|" && filter_keeps_script(&owned) {
+            let mut files = shell.files.borrow_mut();
+            for w in &mut files.written {
+                if w.id == id && !w.loose {
+                    w.rewrite = true;
+                }
+            }
+        }
+        {
+            let mut files = shell.files.borrow_mut();
+            let id = files.cmd.clone();
+            for word in removal_words(&owned) {
+                files.removed.push((word, id.clone()));
+            }
+        }
+        shell.script_pipe = end == "|" && pipe;
         if !piped {
             let was = shell.vars.clone();
             set_vars(&shown, &mut shell.vars);
@@ -15025,6 +15497,39 @@ hash -r 2> /dev/null
         );
         let c = at("echo start > build.log; sh ./configure");
         assert_eq!(c.decision, Decision::Allow, "{}", c.token);
+    }
+
+    /// Configure writes scratch in the directory it is running in and
+    /// reads or removes it in the same run. `$as_me.lineno` is a `sed`
+    /// of the script being judged, then sourced. `conf$$.file` is
+    /// created and removed, and `$$` is only digits, so it is not some
+    /// other script. A path the line does not pin down (`$x`, `"$LOG"`)
+    /// still taints a later script, and a `sed` that inserts a command
+    /// is still that command.
+    #[test]
+    fn configure_scratch_the_script_reads_or_removes_is_not_a_new_script() {
+        let root = startup_root("cfgscratch");
+        std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
+        std::fs::write(root.join("configure"), "echo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "sed 's/[$]LINENO.*/&-/' <$0 >$as_me.lineno\n. \"./$as_me.lineno\"\n",
+            "as_myself=$0\nsed 's/[$]LINENO.*/&-/' <$as_myself >$as_me.lineno\n. \"./$as_me.lineno\"\n",
+            "echo >conf$$.file\nrm -f conf$$.file\nsh ./ok.sh\n",
+            "echo >conf$$.file\nrm -f conf$$.file\nsh ./ok.sh\nsed 's/[$]LINENO.*/&-/' <$0 >$as_me.lineno\n. \"./$as_me.lineno\"\n",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for line in [
+            "echo 'git push -f' > $x; sh $x",
+            "echo start > \"$LOG\"; sh ./configure",
+            "sed 's/ok/git push -f/' <$0 >$as_me.lineno\n. \"./$as_me.lineno\"\n",
+            "echo 'git push -f' > conf$$.file; sh conf$$.file",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+        }
     }
 
     #[test]
