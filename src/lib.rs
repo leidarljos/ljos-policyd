@@ -5624,8 +5624,7 @@ fi
 hash -r 2> /dev/null
 "#;
         evil_and_safe("daily", "true");
-        let root =
-            std::env::temp_dir().join(format!("policyd-lib-{}-everyday", std::process::id()));
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-daily", std::process::id()));
         let safe = root.join("safe");
         for d in ["sub", "x", ".venv/bin", "bad/bin"] {
             std::fs::create_dir_all(safe.join(d)).expect("dir");
