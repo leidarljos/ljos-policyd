@@ -5483,6 +5483,32 @@ mod tests {
         );
     }
 
+    /// The shell expands an `env -S` string before env splits it, so a
+    /// value the line assigned is read in its place.
+    #[test]
+    fn env_split_string_reads_a_value_the_line_assigned() {
+        for script in [
+            "CMD=\"git push --force origin main\"; env -S \"${CMD}\"",
+            "CMD='push --force'; env -S \"git $CMD origin main\"",
+        ] {
+            assert!(v(&["bash", "-c", script]).starts_with("deny\t"), "{script}");
+        }
+        assert_eq!(
+            evil_and_safe(
+                "env-split-var",
+                "CMD='-C evil make clean-all'; env -S \"$CMD\""
+            ),
+            Decision::Deny
+        );
+        assert_eq!(
+            evil_and_safe(
+                "env-split-var",
+                "CMD='-C safe make clean-all'; env -S \"$CMD\""
+            ),
+            Decision::Allow
+        );
+    }
+
     /// `pushd -n` stacks a directory without entering it, and `pushd +N`,
     /// `-N` or a bare `pushd` enters the one it brings to the top.
     #[test]
