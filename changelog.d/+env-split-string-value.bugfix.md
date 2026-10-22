@@ -1,0 +1,1 @@
+A `$NAME` or `${NAME}` in an `env -S` string is read as the value the line assigned it, when the line assigns it one value and sets it no other way, since the shell expands the string before env splits it. `CMD="git push --force origin main"; env -S "${CMD}"` is refused, and `env -S "$CMD"` with `CMD='-C evil make clean-all'` reads `evil/Makefile`.

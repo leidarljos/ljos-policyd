@@ -217,10 +217,10 @@ fn runner_commands(
     let mut after = ";";
     let mut ran_in = Vec::new();
     // `$PWD` follows the line's directory unless the line sets it.
-    let pwd_set = argv.iter().any(|w| may_set(w, "PWD"));
+    let pwd_set = writes_pwd(argv);
     // With `shopt -s lastpipe` anywhere on the line, the last stage of a
     // pipeline may run in this shell.
-    let lastpipe = argv.iter().any(|w| w == "lastpipe");
+    let lastpipe = commands(argv).iter().any(|c| may_set_lastpipe(c));
     for (cmd, end) in ended_commands(argv) {
         if after == "&" {
             (here, old, pushed, vars) = list.clone();
@@ -298,14 +298,34 @@ fn runner_commands(
                 vars.home = Some("$".into());
             }
         }
-        let words = peel_cd_command_word(&cmd);
+        let words = peel_cd_command_word(&shown);
         let b = words.first().map_or("", |w| base_of(w));
+        if unseen(&cmd) && (!piped || lastpipe && end != "|") {
+            here = vec![UNTRACKED.into()];
+            old = vec![UNTRACKED.into()];
+            pushed.clear();
+            vars.cdpath = Some("$".into());
+            vars.home = Some("$".into());
+        }
         if piped && matches!(b, "cd" | "pushd" | "popd" | "dirs") {
+            // A last stage that may run here leaves where the line is,
+            // and the stack under it, not followed.
+            if lastpipe && end != "|" {
+                if b != "dirs" {
+                    here = vec![UNTRACKED.into()];
+                    old = vec![UNTRACKED.into()];
+                }
+                pushed.clear();
+            }
             continue;
         }
         if b == "dirs" {
             let args = operands(&words[1..]);
-            if args.iter().any(|a| a.starts_with('-') && a.contains('c')) {
+            if args
+                .iter()
+                .take_while(|a| **a != "--")
+                .any(|a| a.starts_with('-') && a.contains('c'))
+            {
                 pushed.clear();
             }
             continue;
@@ -384,8 +404,8 @@ fn runner_commands(
             }
             // A `cd` that may have failed keeps the directories it left,
             // and one into a directory that is not there, or that lacks
-            // the search bit, moves nothing. One the line does not name
-            // is read as staying, and a `cd -` after it may come back.
+            // the search bit, moves nothing. A bare one with no `HOME`
+            // stays, and a `cd -` after it may come back.
             let mut to = Vec::new();
             add_dirs(
                 &mut to,
@@ -434,12 +454,17 @@ fn runner_commands(
 
 /// The `CDPATH` and `HOME` a command on the line sees: `None` where one is
 /// unset, and a value with `$` in it, which names no directory, where the
-/// line does not show it.
+/// line does not show it. `pwd` is read only by [`writes_pwd`], to see
+/// whether a command writes `PWD`.
 #[derive(Clone)]
 struct Vars {
     cdpath: Option<String>,
     home: Option<String>,
+    pwd: Option<String>,
 }
+
+/// The variables [`Vars`] holds.
+const VAR_NAMES: [&str; 3] = ["CDPATH", "HOME", "PWD"];
 
 impl Vars {
     fn from_env() -> Self {
@@ -447,6 +472,7 @@ impl Vars {
         Vars {
             cdpath: var("CDPATH"),
             home: var("HOME"),
+            pwd: None,
         }
     }
 
@@ -454,6 +480,7 @@ impl Vars {
         match name {
             "CDPATH" => Some(&mut self.cdpath),
             "HOME" => Some(&mut self.home),
+            "PWD" => Some(&mut self.pwd),
             _ => None,
         }
     }
@@ -480,11 +507,10 @@ impl Vars {
     /// other than to read it (`$NAME`, `${NAME}`), or sets by default
     /// (`${NAME:=value}`).
     fn lose(&mut self, w: &str) {
-        if may_set(w, "CDPATH") {
-            self.cdpath = Some("$".into());
-        }
-        if may_set(w, "HOME") {
-            self.home = Some("$".into());
+        for name in VAR_NAMES {
+            if may_set(w, name) {
+                self.lose_target(name);
+            }
         }
     }
 
@@ -500,7 +526,7 @@ impl Vars {
     /// Leave each variable the word `w` sets by default (`${NAME:=value}`,
     /// `${NAME=value}`) not shown.
     fn lose_default(&mut self, w: &str) {
-        for name in ["CDPATH", "HOME"] {
+        for name in VAR_NAMES {
             if w.contains(&format!("${{{name}:=")) || w.contains(&format!("${{{name}=")) {
                 self.lose_target(name);
             }
@@ -520,6 +546,23 @@ impl Vars {
     }
 }
 
+/// Whether a command on the line may write `PWD` in the shell that runs
+/// it, by the rules [`set_vars`] follows for `HOME`.
+fn writes_pwd(argv: &[String]) -> bool {
+    commands(argv).iter().any(|cmd| {
+        if unseen(cmd) {
+            return true;
+        }
+        let mut probe = Vars {
+            cdpath: None,
+            home: None,
+            pwd: Some(UNTRACKED.into()),
+        };
+        set_vars(cmd, &mut probe);
+        probe.pwd.as_deref() != Some(UNTRACKED)
+    })
+}
+
 /// Whether the word `w` names the variable `name` other than to read it
 /// (`$NAME`, `${NAME}`), or sets it by default (`${NAME:=value}`).
 fn may_set(w: &str, name: &str) -> bool {
@@ -530,6 +573,53 @@ fn may_set(w: &str, name: &str) -> bool {
             && !post.starts_with(ident)
             && (!pre.ends_with(['$', '{']) || post.starts_with('=') || post.starts_with(":="))
     })
+}
+
+/// Whether the command `cmd` runs, in the shell that runs it, what the
+/// walk does not follow: `eval`, `source` or `.`, or a command word the
+/// line does not show (`$c dir`), which may be `cd`. After one nothing is
+/// known of where the line is or what `CDPATH`, `HOME` and `PWD` hold.
+fn unseen(cmd: &[&str]) -> bool {
+    let words = operands(cmd);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    peel_cd_command_word(&words[front..])
+        .first()
+        .is_some_and(|w| matches!(base_of(w), "eval" | "source" | ".") || w.contains(['$', '`']))
+}
+
+/// Whether the command `cmd` may turn on `lastpipe`: `shopt -s` or `set
+/// -o` naming it, either with a word the line does not show (`shopt -s
+/// $opt`, `shopt -s last*`), an `eval` of one, or a command word the line
+/// does not show, which may be `shopt`.
+fn may_set_lastpipe(cmd: &[&str]) -> bool {
+    let unshown = |w: &&str| w.contains(['$', '`', '*', '?', '[', '{']);
+    let words = operands(cmd);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    let Some((w, args)) = peel_cd_command_word(&words[front..]).split_first() else {
+        return false;
+    };
+    let flag = |a: &str, c| a.starts_with('-') && !a.starts_with("--") && a.contains(c);
+    match base_of(w) {
+        "shopt" => {
+            args.iter().any(unshown)
+                || (args.iter().any(|a| flag(a, 's')) && args.contains(&"lastpipe"))
+        }
+        "set" => {
+            let opts: Vec<&str> = args.iter().copied().take_while(|a| *a != "--").collect();
+            opts.iter().any(unshown)
+                || opts
+                    .windows(2)
+                    .any(|p| flag(p[0], 'o') && p[1] == "lastpipe")
+        }
+        "eval" => commands(&shell_words(&args.join(" ")))
+            .iter()
+            .any(|c| may_set_lastpipe(c)),
+        _ => unshown(w),
+    }
 }
 
 /// `w` with each `$PWD` and `${PWD}` in it read as `pwd`, the one
@@ -575,7 +665,9 @@ fn set_vars(cmd: &[&str], vars: &mut Vars) {
     }
     // `((...))` and `$((...))` evaluate here and may assign what they name.
     for w in cmd.iter().filter(|w| w.contains("((")) {
-        vars.lose(w);
+        for name in VAR_NAMES.into_iter().filter(|n| arith_writes(w, n)) {
+            vars.lose_target(name);
+        }
     }
     let words = operands(cmd);
     let front = (0..words.len())
@@ -618,6 +710,36 @@ fn set_vars(cmd: &[&str], vars: &mut Vars) {
     if special.contains(&name) {
         words[..front].iter().for_each(|w| vars.lose(w));
     }
+}
+
+/// Whether the arithmetic in `w` may assign `name`: an assignment
+/// operator after it, past any subscript (`HOME=5`, `HOME <<= 1`,
+/// `HOME[0]=1`), or `++` or `--` next to it. Reading it (`$((HOME))`,
+/// `HOME == 1`) does not.
+fn arith_writes(w: &str, name: &str) -> bool {
+    const OPS: [&str; 10] = ["+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "^=", "|="];
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    w.match_indices(name).any(|(i, _)| {
+        let (pre, post) = (&w[..i], &w[i + name.len()..]);
+        if pre.ends_with(ident) || post.starts_with(ident) {
+            return false;
+        }
+        let pre = pre.trim_end();
+        let mut post = post.trim_start();
+        if post.starts_with('[') {
+            // A subscript that does not close may hide anything.
+            let Some(j) = post.find(']') else {
+                return true;
+            };
+            post = post[j + 1..].trim_start();
+        }
+        pre.ends_with("++")
+            || pre.ends_with("--")
+            || post.starts_with("++")
+            || post.starts_with("--")
+            || (post.starts_with('=') && !post.starts_with("=="))
+            || OPS.iter().any(|op| post.starts_with(op))
+    })
 }
 
 /// The words naming what the command `name` with `args` writes in the
@@ -667,9 +789,10 @@ fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
 /// path, `~` or `~/path` from `home`, the `HOME` of `set` for a bare `cd`,
 /// `old` for `-`, and for a relative path whose first part is not `.` or
 /// `..`, each entry of the `CDPATH` of `set` that holds it. `set` holds
-/// the command's own assignments, which `~` does not see. A bare `pushd`,
-/// a stack index, a variable or a substitution names no directory the
-/// line shows, so the caller keeps the one it has.
+/// the command's own assignments, which `~` does not see. A bare `pushd`
+/// or a stack index names nothing, so the caller keeps the directory it
+/// has; a path the line does not show, through a variable, a substitution
+/// or `~user`, may be any, and is [`UNTRACKED`].
 fn entered(
     args: &[&str],
     dir: &std::path::Path,
@@ -689,7 +812,7 @@ fn entered(
         return old.to_vec();
     }
     let Some(path) = path_from(to, dir, home) else {
-        return Vec::new();
+        return vec![UNTRACKED.into()];
     };
     let mut dirs = Vec::new();
     let searched = !to.starts_with('~')
@@ -951,6 +1074,9 @@ fn env_dir(wrappers: &[String], dir: &std::path::Path, home: Option<&str>) -> st
 /// assignment among them is set for that command alone: `FOO=1 cd dir`
 /// and `if FOO=1 cd dir` still move the shell.
 fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
+    // After `command` or `builtin` no word is a keyword: `command time`
+    // runs the time program.
+    let mut looked_up = false;
     loop {
         let Some((w, rest)) = words.split_first() else {
             return words;
@@ -961,6 +1087,7 @@ fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
         }
         match base_of(w) {
             "command" => {
+                looked_up = true;
                 words = rest;
                 while let Some((a, tail)) = words.split_first() {
                     if *a == "--" {
@@ -975,6 +1102,7 @@ fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
                 }
             }
             "builtin" => {
+                looked_up = true;
                 words = rest;
                 if let Some((a, tail)) = words.split_first() {
                     if *a == "--" {
@@ -983,8 +1111,8 @@ fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
                 }
             }
             // `/usr/bin/time` is a program, and runs `cd` in a child.
-            "time" if *w != "time" => return words,
-            k if KEYWORDS.contains(&k) => {
+            "time" if *w != "time" || looked_up => return words,
+            k if KEYWORDS.contains(&k) && !looked_up => {
                 words = rest;
                 if k == "time" && words.first() == Some(&"-p") {
                     words = &words[1..];
@@ -1009,10 +1137,13 @@ const MAX_DEPTH: usize = 4;
 /// working tree, so a relative path no longer says where a delete lands.
 fn host_argv_table_at(argv: &[String], depth: usize, moved: bool) -> Checked {
     let own = host_argv_rules(argv, moved);
-    if own.decision != Decision::Allow || depth >= MAX_DEPTH {
+    if own.decision != Decision::Allow {
         return own;
     }
-    for inner in inner_commands(argv) {
+    for inner in inner_commands(argv)
+        .into_iter()
+        .filter(|_| depth < MAX_DEPTH)
+    {
         if inner.as_slice() == argv {
             continue;
         }
@@ -1020,6 +1151,15 @@ fn host_argv_table_at(argv: &[String], depth: usize, moved: bool) -> Checked {
         if c.decision != Decision::Allow {
             return c;
         }
+    }
+    // What an `env -S` string runs, with a value in it the line does not
+    // show, may be any command.
+    if matches!(wrapper_walk(argv), Walk::Split(_, _, s) if s.contains('$')) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: Cow::Borrowed("env-split-string-unshown"),
+        };
     }
     own
 }
@@ -1074,6 +1214,13 @@ fn inner_commands_at(argv: &[String]) -> Vec<(usize, Vec<String>)> {
                 }
             }
         }
+        // The shell expands a `-S` string before env splits it.
+        if let Walk::Split(at, taken, _) = wrapper_walk(&owned) {
+            for w in &mut owned[at..at + taken] {
+                *w = with_names(w, &names, argv);
+            }
+            out.push((i, owned.clone()));
+        }
         // GNU env runs no `$(...)` in a `-S` string, but one is still read
         // as a script, so a substitution in it is judged as before.
         if let Walk::Split(_, _, s) = wrapper_walk(&owned) {
@@ -1118,6 +1265,45 @@ fn inner_commands_at(argv: &[String]) -> Vec<(usize, Vec<String>)> {
             out.push((i, run.to_vec()));
         }
     }
+    out
+}
+
+/// `w` with each `$NAME` and `${NAME}` whose value the line shows read as
+/// that value: `names` holds one value for it, and no other command on
+/// `argv` may set it. Any other is left as written.
+fn with_names(w: &str, names: &[(String, String)], argv: &[String]) -> String {
+    let known = |name: &str| {
+        let mut vals = names.iter().filter(|(k, _)| k == name).map(|(_, v)| v);
+        let v = vals.next()?;
+        let elsewhere = commands(argv)
+            .iter()
+            .filter(|c| !c.iter().all(|w| is_assignment(w)))
+            .any(|c| c.iter().any(|w| may_set(w, name)));
+        (vals.all(|o| o == v) && !elsewhere).then_some(v)
+    };
+    let mut out = String::new();
+    let mut rest = w;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + 1..];
+        let (name, len) = match rest.strip_prefix('{') {
+            Some(b) => b.find('}').map_or(("", 0), |j| (&b[..j], j + 2)),
+            None => {
+                let n = rest
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .unwrap_or(rest.len());
+                (&rest[..n], n)
+            }
+        };
+        match known(name).filter(|_| !name.is_empty()) {
+            Some(v) => {
+                out.push_str(v);
+                rest = &rest[len..];
+            }
+            None => out.push('$'),
+        }
+    }
+    out.push_str(rest);
     out
 }
 
@@ -1265,19 +1451,32 @@ fn substitutions(script: &str) -> Vec<String> {
 }
 
 /// A `NAME=value` or `NAME+=value` word, where NAME may be an array
-/// element, `NAME[i]`.
+/// element, `NAME[i]`. The subscript ends at its matching `]` and may
+/// hold `=` (`a[b=c]=1`).
 fn is_assignment(w: &str) -> bool {
-    w.split_once('=').is_some_and(|(k, _)| {
-        let k = k.strip_suffix('+').unwrap_or(k);
-        let k = match k.split_once('[') {
-            Some((name, sub)) if sub.ends_with(']') => name,
-            Some(_) => return false,
-            None => k,
+    let end = w
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(w.len());
+    if end == 0 || w.starts_with(|c: char| c.is_ascii_digit()) {
+        return false;
+    }
+    let mut rest = &w[end..];
+    if rest.starts_with('[') {
+        let mut depth = 0;
+        let close = rest.char_indices().find(|&(_, c)| {
+            match c {
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                _ => {}
+            }
+            depth == 0
+        });
+        let Some((i, _)) = close else {
+            return false;
         };
-        !k.is_empty()
-            && !k.starts_with(|c: char| c.is_ascii_digit())
-            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    })
+        rest = &rest[i + 1..];
+    }
+    rest.starts_with('=') || rest.starts_with("+=")
 }
 
 /// Words that run the command after them, with the flags of each that take
@@ -4756,7 +4955,6 @@ mod tests {
             "make clean-all",
             "npm run nuke",
             "cd project/missing && make clean-all",
-            "cd \"$PROJECT\" && make clean-all",
             "pushd project && popd && npm run nuke",
             "(cd project) && make clean-all",
         ] {
@@ -4913,6 +5111,81 @@ mod tests {
         }
     }
 
+    /// Under `shopt -s lastpipe` a `cd`, `pushd` or `popd` in the last
+    /// stage of a pipeline may move this shell, so the line is not
+    /// followed past it.
+    #[test]
+    fn a_lastpipe_stage_loses_where_the_line_is() {
+        for line in [
+            "shopt -s lastpipe; true | cd evil && make clean-all",
+            "shopt -s lastpipe; true | pushd evil && make clean-all",
+            "shopt -s lastpipe; pushd safe && pushd ../evil && true | dirs -c; popd; make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("lastpipe-cd", line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "true | cd evil && make clean-all",
+            "shopt -s lastpipe; cd evil | true && make clean-all",
+        ] {
+            assert_eq!(
+                evil_and_safe("lastpipe-cd", line),
+                Decision::Allow,
+                "{line}"
+            );
+        }
+    }
+
+    /// `lastpipe` is on only where `shopt -s` or `set -o` turns it on; a
+    /// word that only names it does not.
+    #[test]
+    fn only_shopt_or_set_turns_lastpipe_on() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "HOME={dir}; echo lastpipe | read HOME; cd ~ && make test",
+            "unset CDPATH; grep lastpipe notes | read CDPATH; cd project && make test",
+            "shopt -u lastpipe; true | cd project && make clean-all",
+            "set -- lastpipe \"$@\"; true | cd project && make clean-all",
+        ] {
+            let c = entering("lastpipe-named", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+        for line in [
+            "builtin shopt -s extglob lastpipe; true | cd project && make clean-all",
+            "eval 'shopt -s lastpipe'; true | cd project && make clean-all",
+            "set -euo lastpipe; true | cd project && make clean-all",
+            "set $opts; true | cd project && make clean-all",
+        ] {
+            let c = entering("lastpipe-named", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+    }
+
+    /// A `shopt` whose option or flags the line does not show, or a
+    /// command word it does not show, may turn `lastpipe` on.
+    #[test]
+    fn an_unshown_shopt_may_turn_lastpipe_on() {
+        for line in [
+            "opt=lastpipe; shopt -s $opt; true | cd evil && make clean-all",
+            "opt=lastpipe; shopt -s \"$opt\"; true | pushd evil && make clean-all",
+            "f=-s; shopt $f lastpipe; true | cd evil && make clean-all",
+            "shopt -s last*; true | cd evil && make clean-all",
+            "s=shopt; $s -s $o; true | cd evil && make clean-all",
+        ] {
+            assert_eq!(
+                evil_and_safe("lastpipe-opt", line),
+                Decision::Deny,
+                "{line}"
+            );
+        }
+        assert_eq!(
+            evil_and_safe(
+                "lastpipe-opt",
+                "shopt -s nullglob; true | cd evil && make clean-all"
+            ),
+            Decision::Allow
+        );
+    }
+
     /// Arithmetic runs in this shell, so `((HOME=5))` or `$((HOME=5))`
     /// leaves `HOME` untracked.
     #[test]
@@ -4935,6 +5208,33 @@ mod tests {
         assert_eq!(c.decision, Decision::Allow);
     }
 
+    /// Arithmetic that only reads `HOME` leaves it as the line set it;
+    /// an assignment operator after it, or `++` or `--` next to it, writes
+    /// it.
+    #[test]
+    fn an_arithmetic_read_keeps_home() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "HOME={dir}; echo $((HOME)); cd ~ && make test",
+            "HOME={dir}; (( HOME == 1 )); cd ~ && make test",
+            "HOME={dir}; echo $((HOME > 1 ? 1 : 0)); cd ~ && make test",
+        ] {
+            let c = entering("arith-read", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+        for line in [
+            "HOME={dir}; ((HOME=5)); cd ~ && make test",
+            "HOME={dir}; ((HOME++)); cd ~ && make test",
+            "HOME={dir}; ((--HOME)); cd ~ && make test",
+            "HOME={dir}; ((HOME <<= 1)); cd ~ && make test",
+            "HOME={dir}; ((n = 1, HOME |= 2)); cd ~ && make test",
+            "HOME={dir}; ((HOME[0] = 2)); cd ~ && make test",
+        ] {
+            let c = entering("arith-read", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+    }
+
     /// `$PWD` in a value names the one directory the line is in, unless
     /// the line sets `PWD` itself.
     #[test]
@@ -4955,6 +5255,101 @@ mod tests {
             "HOME=$PWDX/project; cd ~ && make test",
         ] {
             let c = entering("pwd-home", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+    }
+
+    /// A `cd` or `pushd` to a path the line does not show leaves the line
+    /// in a directory it does not follow, rather than where it was.
+    #[test]
+    fn a_cd_to_an_unshown_path_is_untracked() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "PWD={dir}; cd \"$PWD\" && make clean-all",
+            "cd \"$X\" && make test",
+            "pushd \"${X}\" && make test",
+            "cd `pwd` && make test",
+            "pushd -n \"$X\" && popd && make test",
+        ] {
+            let c = entering("unshown-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        for line in ["cd \"$PWD\" && make test", "cd \"$X\" && ls"] {
+            let c = entering("unshown-cd", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+    }
+
+    /// A command that writes `PWD` through the name an option holds
+    /// (`printf -vPWD`) sets it, so `$PWD` is no longer the line's
+    /// directory.
+    #[test]
+    fn an_option_that_names_pwd_sets_it() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "printf -vPWD %s {dir}; cd \"$PWD\" && make clean-all",
+            "wait -pPWD; cd \"$PWD\" && make test",
+            "printf -vPWD %s /x; export HOME=\"$PWD/project\"; cd ~ && make test",
+        ] {
+            let c = entering("pwd-option", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+    }
+
+    /// A word that only names `PWD` leaves it the line's directory; an
+    /// assignment, or a command that writes the name it takes, does not.
+    #[test]
+    fn only_a_write_in_this_shell_sets_pwd() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "echo PWD; export HOME=\"$PWD/project\"; cd ~ && make test",
+            "grep -r PWD .; export PWD; export HOME=\"$PWD/project\"; cd ~ && make test",
+            "env PWD=/x true; export HOME=\"$PWD/project\"; cd ~ && make test",
+        ] {
+            let c = entering("pwd-named", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+        for line in [
+            "read PWD; export HOME=\"$PWD/project\"; cd ~ && make test",
+            "unset PWD; export HOME=\"$PWD/project\"; cd ~ && make test",
+            "eval PWD=/x; export HOME=\"$PWD/project\"; cd ~ && make test",
+            "((PWD=1)); export HOME=\"$PWD/project\"; cd ~ && make test",
+        ] {
+            let c = entering("pwd-named", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+    }
+
+    /// `eval`, `source` and `.` run a script the walk does not follow, and
+    /// a command word the line does not show may be `cd`, so after one
+    /// that runs in this shell the line is not followed.
+    #[test]
+    fn an_unseen_command_leaves_the_line_untracked() {
+        for line in [
+            "eval cd evil; make clean-all",
+            "eval \"$X\"; make clean-all",
+            "builtin eval cd evil; make clean-all",
+            ". ./env.sh; make clean-all",
+            "source env.sh && make clean-all",
+            "c=cd; $c evil; make clean-all",
+            "$(echo cd) evil; make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("unseen", line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "echo eval source; make clean-all",
+            "eval cd evil | true; make clean-all",
+            "(eval cd evil); make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("unseen", line), Decision::Allow, "{line}");
+        }
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "HOME={dir}; eval \"$X\"; cd ~ && make test",
+            "HOME={dir}; source env.sh; cd ~ && make test",
+            "export HOME=\"$PWD/project\"; $X; cd ~ && make test",
+        ] {
+            let c = entering("unseen", &files, line);
             assert_eq!(c.decision, Decision::Deny, "{line}");
         }
     }
@@ -5008,6 +5403,23 @@ mod tests {
         assert_eq!(c.decision, Decision::Deny);
     }
 
+    /// A subscript may hold `=`, so `a[b=c]=1` is one assignment, split
+    /// at the `=` after its closing `]`.
+    #[test]
+    fn a_subscript_holding_an_equals_is_an_assignment() {
+        assert!(v(&["a[b=c]=1", "git", "push", "--force", "origin", "main"]).starts_with("deny\t"));
+        for line in [
+            "a[b=c]=1 cd evil && make clean-all",
+            "a[x[0]=1]+=2 pushd evil && make clean-all",
+        ] {
+            assert_eq!(
+                evil_and_safe("subscript-eq", line),
+                Decision::Deny,
+                "{line}"
+            );
+        }
+    }
+
     /// The `time` keyword, with or without `-p`, runs `cd` in this shell.
     #[test]
     fn follows_a_cd_behind_time() {
@@ -5020,6 +5432,27 @@ mod tests {
         }
         assert_eq!(
             leaving("time-cd", "/usr/bin/time cd safe && make clean-all"),
+            Decision::Deny
+        );
+    }
+
+    /// After `command` or `builtin`, `time` is not the keyword: `command
+    /// time cd dir` runs the time program, which runs `cd` in a child.
+    #[test]
+    fn time_after_command_or_builtin_is_a_program() {
+        for line in [
+            "command time cd evil; make clean-all",
+            "builtin time cd evil; make clean-all",
+            "command -p time -p cd evil; make clean-all",
+        ] {
+            assert_eq!(
+                evil_and_safe("command-time", line),
+                Decision::Allow,
+                "{line}"
+            );
+        }
+        assert_eq!(
+            evil_and_safe("command-time", "time command cd evil; make clean-all"),
             Decision::Deny
         );
     }
@@ -5320,6 +5753,53 @@ mod tests {
         );
     }
 
+    /// The shell expands an `env -S` string before env splits it, so a
+    /// value the line assigned is read in its place.
+    #[test]
+    fn env_split_string_reads_a_value_the_line_assigned() {
+        for script in [
+            "CMD=\"git push --force origin main\"; env -S \"${CMD}\"",
+            "CMD='push --force'; env -S \"git $CMD origin main\"",
+        ] {
+            assert!(v(&["bash", "-c", script]).starts_with("deny\t"), "{script}");
+        }
+        assert_eq!(
+            evil_and_safe(
+                "env-split-var",
+                "CMD='-C evil make clean-all'; env -S \"$CMD\""
+            ),
+            Decision::Deny
+        );
+        assert_eq!(
+            evil_and_safe(
+                "env-split-var",
+                "CMD='-C safe make clean-all'; env -S \"$CMD\""
+            ),
+            Decision::Allow
+        );
+    }
+
+    /// An `env -S` string holding a `$` whose value the line does not show
+    /// may run anything, so it is refused.
+    #[test]
+    fn env_split_string_with_an_unshown_value_is_refused() {
+        for argv in [
+            &["env", "-S", "${CMD}"][..],
+            &["bash", "-c", "env -S \"$X\""],
+            &["bash", "-c", "ls; env -iS \"git ${SUB:-push} -f\""],
+            &["bash", "-c", "CMD=ls; read CMD; env -S \"$CMD\""],
+            &["bash", "-c", "CMD=ls; false && CMD=git; env -S \"$CMD\""],
+        ] {
+            assert!(v(argv).starts_with("deny\t"), "{argv:?}");
+        }
+        for argv in [
+            &["env", "-S", "ls -l"][..],
+            &["bash", "-c", "CMD=ls; env -S \"$CMD -l\""],
+        ] {
+            assert_eq!(v(argv), "allow", "{argv:?}");
+        }
+    }
+
     /// `pushd -n` stacks a directory without entering it, and `pushd +N`,
     /// `-N` or a bare `pushd` enters the one it brings to the top.
     #[test]
@@ -5416,6 +5896,24 @@ mod tests {
             ),
             Decision::Allow
         );
+    }
+
+    /// `dirs` takes no option past `--`, so `dirs -- -c` leaves the stack.
+    #[test]
+    fn dirs_stops_reading_options_at_double_dash() {
+        assert_eq!(
+            evil_and_safe(
+                "dirs-dash",
+                "pushd safe && dirs -- -c && popd && make clean-all"
+            ),
+            Decision::Allow
+        );
+        for line in [
+            "pushd safe && dirs -c && popd && make clean-all",
+            "pushd safe && dirs -lc -- && popd && make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("dirs-dash", line), Decision::Deny, "{line}");
+        }
     }
 
     /// A `popd` that fails, on a word it does not take or a stack it

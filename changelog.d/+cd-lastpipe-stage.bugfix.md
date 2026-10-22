@@ -1,0 +1,1 @@
+With `shopt -s lastpipe` on the line, a `cd`, `pushd` or `popd` in the last stage of a pipeline (`true | cd evil && make clean-all`) leaves the directory untracked, and a `dirs` there leaves the stack untracked, since bash may run that stage in the current shell, so a runner after it is refused.

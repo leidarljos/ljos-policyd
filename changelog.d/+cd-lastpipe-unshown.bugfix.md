@@ -1,0 +1,1 @@
+A `shopt` with an option or flag the line does not show (`opt=lastpipe; shopt -s $opt`, `shopt -s last*`), or a command word the line does not show, is taken to turn `lastpipe` on, so a `cd` or an assignment in the last stage of a pipeline after it is not followed.

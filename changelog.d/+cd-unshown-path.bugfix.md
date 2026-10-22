@@ -1,0 +1,1 @@
+A `cd` or `pushd` to a path the line does not show, through a variable, a substitution or `~user` (`PWD=evil; cd "$PWD"`, `cd "$X"`), leaves the line in a directory it does not follow, so a runner after it is refused rather than read where the line was. `$PWD` is still read as the one directory the line is in when the line shows that and does not set `PWD`.
