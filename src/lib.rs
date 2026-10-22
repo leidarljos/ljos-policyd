@@ -552,11 +552,14 @@ fn keyword_at(words: &[&str], i: usize) -> bool {
 /// Apply to `vars` what the command `cmd` leaves set in the shell that
 /// runs it: assignments alone set themselves, `export`, `declare` and the
 /// like with plain flags set theirs, and `unset` unsets. A command that
-/// writes one some other way ([`written`], `${CDPATH:=dir}`) leaves it
+/// writes one some other way ([`written`], `${CDPATH:=dir}`, `{HOME}>f`) leaves it
 /// not shown, as do `let` and `eval` naming it and an assignment in front
 /// of a special builtin, which some shells keep (`CDPATH=dir :`). A word
 /// that only names one (`grep HOME`, `env HOME=dir cmd`) sets nothing.
 fn set_vars(cmd: &[&str], vars: &mut Vars) {
+    for name in cmd.iter().filter_map(|w| fd_variable(w)) {
+        vars.lose_target(name);
+    }
     let words = operands(cmd);
     let front = (0..words.len())
         .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
@@ -635,7 +638,7 @@ fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
         }
         // The `-` of `2>&-` closes the descriptor and is the whole target;
         // only the heredoc `<<-` still wants the next word.
-        let rest = a.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+        let rest = redirection_body(a);
         if rest == "<<-" || rest.chars().all(|c| matches!(c, '>' | '<' | '&' | '|')) {
             words.next();
         }
@@ -2996,8 +2999,25 @@ fn ended_commands(argv: &[String]) -> Vec<(Vec<&str>, &str)> {
 }
 
 fn is_redirection(a: &str) -> bool {
-    let rest = a.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+    let rest = redirection_body(a);
     rest.starts_with('>') || rest.starts_with('<')
+}
+
+/// The redirection word `a` past the descriptor in front of its
+/// operator: digits, `&`, or a `{name}` bash stores the one it opens in.
+fn redirection_body(a: &str) -> &str {
+    let a = fd_variable(a).map_or(a, |n| &a[n.len() + 2..]);
+    a.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&')
+}
+
+/// The variable a `{name}>file` or `{name}<file` redirection sets to the
+/// descriptor it opens.
+fn fd_variable(a: &str) -> Option<&str> {
+    let (name, rest) = a.strip_prefix('{')?.split_once('}')?;
+    let ident = !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    (ident && rest.starts_with(['>', '<'])).then_some(name)
 }
 
 /// True when any `rm` or `rtrash` on the line deletes recursively with an
