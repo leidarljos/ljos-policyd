@@ -3966,6 +3966,31 @@ mod tests {
         }
     }
 
+    /// Sixteen directories fit: after fifteen `cd`s that may fail, a runner
+    /// is read in each directory they enter and in the one the line starts
+    /// in, which went in first.
+    #[test]
+    fn reads_a_runner_in_sixteen_directories() {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-sixteen", std::process::id()));
+        let mut line = String::new();
+        for i in 0..MAX_DIRS {
+            let d = root.join(format!("d{i}"));
+            std::fs::create_dir_all(&d).expect("dir");
+            std::fs::write(d.join("Makefile"), "clean-all:\n\techo clean\n").expect("write");
+            if i > 0 {
+                line.push_str(&format!("cd {} ; ", d.display()));
+            }
+        }
+        line.push_str("make clean-all");
+        std::fs::write(root.join("Makefile"), MAKEFILE).expect("write");
+        let argv = shell_words(&line);
+        assert_eq!(check_shell_in(&argv, &root, 0).decision, Decision::Deny);
+        assert_eq!(
+            check_shell_in(&argv, &root.join("d0"), 0).decision,
+            Decision::Allow
+        );
+    }
+
     /// A subshell or substitution runs where the command holding it runs,
     /// after any `cd` before it on the line.
     #[test]
