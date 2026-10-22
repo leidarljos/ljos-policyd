@@ -9360,16 +9360,20 @@ fn configure_scratch_word(p: &str) -> bool {
 }
 
 /// What an autoconf `configure` makes as it runs and removes again:
-/// `conftest`, `conftest.dir`, the glob `conftest*`, `autom4te.cache`.
-/// They are regenerated on the next run, like build output.
+/// `conftest`, `conftest.dir`, the glob `conftest*`, `confdefs.h`,
+/// `autom4te.cache`. They are regenerated on the next run, like build
+/// output. `confdefs.h` is that header file in the build directory; it
+/// is not a pass for `/` or a home directory.
 fn configure_scratch(p: &str) -> bool {
     let p = p.trim_end_matches('/');
     let (dir, name) = p.rsplit_once('/').unwrap_or(("", p));
     (dir.is_empty() || dir == "." || plain_relative(dir))
-        && (matches!(name, "conftest*" | "conftest.*")
+        && (matches!(name, "conftest*" | "conftest.*" | "confdefs*")
             || (plain_relative(name)
                 && (name == "conftest"
                     || name.starts_with("conftest.")
+                    || name == "confdefs"
+                    || name == "confdefs.h"
                     || name == "autom4te.cache")))
 }
 
@@ -16098,8 +16102,9 @@ make -C safe test
     }
 
     /// The comment a generated configure starts with marks the temps that
-    /// file removes. It is not a pass for `/` or a home directory, and a
-    /// file without it does not get the temps.
+    /// file removes (`a.out`, `config.status`). It is not a pass for `/`
+    /// or a home directory. `confdefs.h` is rebuilt every run, like
+    /// `conftest*`, so that name does not need the header.
     #[test]
     fn a_generated_configure_header_marks_its_temps() {
         use std::os::unix::fs::PermissionsExt;
@@ -16132,15 +16137,26 @@ make -C safe test
         );
         write(
             "note.sh",
-            "# this is not a generated configure\nrm -rf confdefs.h\n",
+            "# this is not a generated configure\nrm -rf a.out\n",
         );
+        for line in [
+            "rm -rf conftest* confdefs.h",
+            "rm -f -r conftest* confdefs.h",
+            "rm -rf confdefs.h",
+            "rm -rf confdefs*",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
         for line in [
             "sh plain.sh",
             "sh root.sh",
             "sh home.sh",
             "sh poison.sh",
             "sh note.sh",
-            "rm -rf confdefs.h",
+            "rm -rf confdefs.h /",
+            "rm -rf ../confdefs.h",
+            "rm -rf \"$HOME\"",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
