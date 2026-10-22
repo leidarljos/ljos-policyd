@@ -700,6 +700,12 @@ fn walk(
         if denied.is_some() {
             return;
         }
+        // `bash <(cat file)` runs the file in the child. The directory
+        // the path is relative to is known only here.
+        judge_procsub(&shown, shell, depth, out, denied);
+        if denied.is_some() {
+            return;
+        }
         let words = peel_cd_command_word(&shown);
         let b = words.first().map_or("", |w| base_of(w));
         // A pipeline stage runs in a subshell, so it cannot move this
@@ -1446,6 +1452,70 @@ fn judge_startup(
         return;
     }
     replay_subshell(&words, shell, depth, out, denied);
+}
+
+/// A `bash <(cat file)` runs `file` as its script, in the child. A `cd`
+/// in the file does not move this shell. `echo` text is judged with the
+/// other commands of the line; only a `cat` of a literal path is read
+/// here, where the directory is known.
+fn judge_procsub(
+    cmd: &[&str],
+    shell: &Shell,
+    depth: usize,
+    out: &mut Vec<(Vec<String>, std::path::PathBuf, bool)>,
+    denied: &mut Option<Checked>,
+) {
+    if denied.is_some() {
+        return;
+    }
+    let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+    let owned = split_env_strings(&owned).into_owned();
+    let (run, _) = unwrap_wrappers(&owned);
+    let ProcKind::Paths(paths) = procsub_of(run) else {
+        return;
+    };
+    let mut text = String::new();
+    for path in &paths {
+        let Some(part) = read_shown_file(path, shell) else {
+            *denied = Some(procsub_unshown_denial());
+            return;
+        };
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&part);
+    }
+    let mut aliases = shell.aliases.clone();
+    let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
+    if let Some(c) = judge_body(&words, shell) {
+        *denied = Some(c);
+        return;
+    }
+    replay_subshell(&words, shell, depth, out, denied);
+}
+
+/// The text of a literal path, read from the one directory the shell is
+/// in. `None` when the path is relative and that directory is not known,
+/// or the file cannot be read.
+fn read_shown_file(path: &str, shell: &Shell) -> Option<String> {
+    let path = std::path::Path::new(path);
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match shell.here.as_slice() {
+            [d] if !is_untracked(d) => d.join(path),
+            _ => return None,
+        }
+    };
+    read_regular_nofollow(&full)
+}
+
+fn procsub_unshown_denial() -> Checked {
+    Checked {
+        decision: Decision::Deny,
+        code: PolicyReason::ShellDangerousRunner,
+        token: Cow::Borrowed("procsub-script-unshown"),
+    }
 }
 
 /// The command word of `cmd`, past assignments, redirections and the
@@ -2352,6 +2422,15 @@ fn host_argv_table_at(argv: &[String], depth: usize, moved: bool) -> Checked {
             token: Cow::Borrowed("shell-stdin-unshown"),
         };
     }
+    // `bash <(echo "$cmd")`: the substitution runs, and its output is the
+    // script. An output the line does not show may be any script.
+    if procsub_script_unshown(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: Cow::Borrowed("procsub-script-unshown"),
+        };
+    }
     own
 }
 
@@ -2544,6 +2623,20 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
             for payload in find_payloads(run) {
                 if !payload_unshown(&payload) {
                     out.push((i, subst_find_braces(&payload)));
+                }
+            }
+            // `bash <(echo git push -f)` runs echo, and bash then runs
+            // echo's output as its script. A `cat` of a path is read in
+            // the walk, which knows the directory.
+            match procsub_of(run) {
+                ProcKind::Not => {}
+                kind => {
+                    if let Some(body) = procsub_body(run) {
+                        out.extend(script_lines(body, 0).iter().map(|l| (i, shell_words(l))));
+                    }
+                    if let ProcKind::Text(text) = kind {
+                        out.extend(script_lines(&text, 0).iter().map(|l| (i, shell_words(l))));
+                    }
                 }
             }
             out.push((i, run.to_vec()));
@@ -3235,6 +3328,253 @@ fn shell_script(run: &[String]) -> Option<&str> {
         }
     }
     None
+}
+
+/// What a process substitution handed to a shell as its script produces.
+enum ProcKind {
+    /// Literal output of `echo` or `printf`, the script the shell runs.
+    Text(String),
+    /// Literal paths `cat` reads. The walk opens them.
+    Paths(Vec<String>),
+    /// The output is not shown: the script could be anything.
+    Unshown,
+    /// This command is not a shell fed a process substitution.
+    Not,
+}
+
+/// The first script operand of a shell that has no `-c` script: the word
+/// bash would open as the program. A redirection is not that operand,
+/// except a `<(...)` or `>(...)` passed as the script path.
+fn shell_file_operand(run: &[String]) -> Option<&str> {
+    if run.first().is_none_or(|w| !SHELLS.contains(&base_of(w))) || shell_script(run).is_some() {
+        return None;
+    }
+    let mut it = run[1..].iter().map(String::as_str);
+    while let Some(a) = it.next() {
+        if is_redirection(a) && !a.starts_with("<(") && !a.starts_with(">(") {
+            let rest = redirection_body(a);
+            if rest == "<<-" || rest.chars().all(|c| matches!(c, '>' | '<' | '&' | '|')) {
+                it.next();
+            }
+            continue;
+        }
+        if a == "--" {
+            return it.next();
+        }
+        if (a.starts_with('-') || a.starts_with('+')) && a.len() >= 2 {
+            if a.starts_with('-') && !a.starts_with("--") && a[1..].contains('s') {
+                return None;
+            }
+            if matches!(a, "--rcfile" | "--init-file")
+                || (!a.starts_with("--") && a.ends_with(['o', 'O']))
+            {
+                it.next();
+            }
+            continue;
+        }
+        return Some(a);
+    }
+    None
+}
+
+/// The body of `<(...)` when that is the shell's script operand.
+fn procsub_body(run: &[String]) -> Option<&str> {
+    let op = shell_file_operand(run)?;
+    let body = op.strip_prefix("<(")?.strip_suffix(')')?;
+    (!body.trim().is_empty()).then_some(body)
+}
+
+/// How a shell reads a process substitution it was given as its script.
+fn procsub_of(run: &[String]) -> ProcKind {
+    let Some(op) = shell_file_operand(run) else {
+        return ProcKind::Not;
+    };
+    if op.starts_with(">(") {
+        return ProcKind::Unshown;
+    }
+    let Some(body) = procsub_body(run) else {
+        return if op.starts_with("<(") {
+            ProcKind::Unshown
+        } else {
+            ProcKind::Not
+        };
+    };
+    let words = shell_words(body);
+    let cmds = commands(&words);
+    if cmds.len() != 1 {
+        return ProcKind::Unshown;
+    }
+    let owned: Vec<String> = cmds[0].iter().map(|s| (*s).to_string()).collect();
+    let owned = split_env_strings(&owned).into_owned();
+    let (inner, handed) = unwrap_wrappers(&owned);
+    if handed.is_some() {
+        return ProcKind::Unshown;
+    }
+    let Some(head) = inner.first() else {
+        return ProcKind::Unshown;
+    };
+    match base_of(head) {
+        "echo" => echo_text(&inner[1..])
+            .map(ProcKind::Text)
+            .unwrap_or(ProcKind::Unshown),
+        "printf" => printf_text(&inner[1..])
+            .map(ProcKind::Text)
+            .unwrap_or(ProcKind::Unshown),
+        "cat" => cat_paths(&inner[1..])
+            .map(ProcKind::Paths)
+            .unwrap_or(ProcKind::Unshown),
+        _ => ProcKind::Unshown,
+    }
+}
+
+/// A shell on the line whose script is a process substitution whose
+/// output is not a literal `echo`, `printf` or `cat` of a path.
+fn procsub_script_unshown(argv: &[String]) -> bool {
+    each_unwrapped(argv)
+        .iter()
+        .any(|run| matches!(procsub_of(run), ProcKind::Unshown))
+}
+
+/// Text with no parameter, command substitution, glob or `~`.
+fn literal_text(s: &str) -> bool {
+    !s.contains(['$', '`', '*', '?', '[', '~', '\n'])
+}
+
+/// The text `echo` writes, when every argument is literal. `-e` escapes
+/// the line does not spell out are unknown.
+fn echo_text(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    let mut escapes = false;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if let Some(flags) = a
+            .strip_prefix('-')
+            .filter(|f| !f.is_empty() && f.chars().all(|c| matches!(c, 'n' | 'e' | 'E')))
+        {
+            if flags.contains('e') {
+                escapes = true;
+            }
+            if flags.contains('E') {
+                escapes = false;
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    let rest = &args[i..];
+    if rest.iter().any(|a| !literal_text(a)) {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for a in rest {
+        if escapes {
+            parts.push(echo_unescape(a)?);
+        } else {
+            parts.push(a.clone());
+        }
+    }
+    Some(parts.join(" "))
+}
+
+fn echo_unescape(s: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some('a') => out.push('\u{7}'),
+            Some('b') => out.push('\u{8}'),
+            Some('e' | 'E') => out.push('\u{1b}'),
+            Some('f') => out.push('\u{c}'),
+            Some('v') => out.push('\u{b}'),
+            Some('c') => return Some(out),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// The text `printf` writes for a literal format of `%s`, `%%` and
+/// simple escapes. Any other conversion, or an argument left over, is
+/// unknown: printf would read the leftover as another format.
+fn printf_text(args: &[String]) -> Option<String> {
+    let args = if args.first().is_some_and(|a| a == "--") {
+        &args[1..]
+    } else {
+        args
+    };
+    if args.first().is_some_and(|a| a.starts_with('-')) {
+        return None;
+    }
+    let (fmt, rest) = args.split_first()?;
+    if !literal_text(fmt) || rest.iter().any(|a| !literal_text(a)) {
+        return None;
+    }
+    render_printf(fmt, rest)
+}
+
+fn render_printf(fmt: &str, args: &[String]) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = fmt.chars();
+    let mut ai = 0;
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('\\') => out.push('\\'),
+                _ => return None,
+            }
+            continue;
+        }
+        if c == '%' {
+            match chars.next() {
+                Some('%') => out.push('%'),
+                Some('s') => {
+                    out.push_str(args.get(ai)?);
+                    ai += 1;
+                }
+                _ => return None,
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    (ai == args.len()).then_some(out)
+}
+
+/// The paths a literal `cat` reads. A flag or a path the line does not
+/// show changes the bytes, so the script is unknown.
+fn cat_paths(args: &[String]) -> Option<Vec<String>> {
+    let mut paths = Vec::new();
+    let mut end = false;
+    for a in args {
+        if !end && a == "--" {
+            end = true;
+            continue;
+        }
+        if !end && a.starts_with('-') {
+            return None;
+        }
+        if a.is_empty() || !literal_text(a) {
+            return None;
+        }
+        paths.push(a.clone());
+    }
+    (!paths.is_empty()).then_some(paths)
 }
 
 /// What the line feeds a shell on stdin.
@@ -9614,6 +9954,74 @@ hash -r 2> /dev/null
             "f() { echo hi; }; f",
         ] {
             assert_eq!(line(s), "allow", "{s}");
+        }
+    }
+
+    /// A shell whose script operand is a process substitution runs the
+    /// substitution's output. `bash <(echo git push -f)` was allowed: the
+    /// substitution was judged only when it downloaded. A literal `echo`
+    /// or `cat` of a file is that script. Anything else is unknown.
+    #[test]
+    fn a_process_substitution_fed_to_a_shell_is_the_script() {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-procsub", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sub = root.join("sub");
+        for d in ["sub", "evil", "safe"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("evil/force.sh"), "git push -f origin\n").unwrap();
+        std::fs::write(root.join("safe/hi.sh"), "echo hi\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &sub, 0);
+        for line in [
+            "bash <(echo git push -f)",
+            "bash <(echo 'git push -f')",
+            "sh <(echo git push --force)",
+            "bash <(echo -n git push -f)",
+            "bash <(printf '%s\\n' 'git push -f')",
+            "bash -- <(echo git push -f)",
+            "env bash <(echo git push -f)",
+            "bash <(cat ../evil/force.sh)",
+            "bash <(cat ../evil/force.sh) extra",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
+        }
+        for line in [
+            "bash <(echo \"$cmd\")",
+            "bash <(echo git push -f \"$x\")",
+            "bash <(cat \"$F\")",
+            "bash <(cat ../evil/missing.sh)",
+            "bash <(date)",
+            "bash <(printf '%s' \"$x\")",
+            "bash <(echo git push -f | cat)",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(
+                c.token.contains("procsub-script-unshown"),
+                "{line}: {}",
+                c.token
+            );
+        }
+        for line in [
+            "bash <(echo echo ok)",
+            "bash <(cat ../safe/hi.sh)",
+            "sh <(echo echo ok)",
+            "cat <(echo git push -f)",
+            "echo $(echo git push -f)",
+            "conda activate",
+            "nvm use",
+            "direnv allow",
+            "pyenv init -",
+            "make -C safe test",
+            "git -C repo status",
+            "npm run build",
+            "cargo xtask",
+            "f() { echo hi; }; f",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
     }
 
