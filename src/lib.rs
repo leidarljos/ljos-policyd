@@ -4765,6 +4765,30 @@ mod tests {
         }
     }
 
+    /// `$PWD` in a value names the one directory the line is in, unless
+    /// the line sets `PWD` itself.
+    #[test]
+    fn pwd_in_an_assigned_home_is_the_line_directory() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "export HOME=\"$PWD/.home\"; cd ~ && make test",
+            "export HOME=\"$PWD/project\"; cd ~ && make test",
+            "cd project && export HOME=\"${PWD}\" && cd && make test",
+        ] {
+            let c = entering("pwd-home", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+        for line in [
+            "export HOME=\"$PWD/project\"; cd ~ && make clean-all",
+            "cd project && HOME=$PWD && cd /tmp && cd && make clean-all",
+            "PWD=/; export HOME=\"$PWD/project\"; cd ~ && make test",
+            "HOME=$PWDX/project; cd ~ && make test",
+        ] {
+            let c = entering("pwd-home", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+    }
+
     /// `command`, `command -p` and `builtin` do not hide `cd`.
     #[test]
     fn follows_a_cd_behind_command_or_builtin() {
