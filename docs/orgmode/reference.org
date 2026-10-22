@@ -25,7 +25,9 @@ action is judged as a script of its own. A shell with no =-c= script
 and no file runs what it reads on stdin: the text of a here-string or
 heredoc is judged as that script, and a pipe, a =-s= shell fed
 neither, or a here-string holding an expansion is refused as
-=shell-stdin-unshown=.
+=shell-stdin-unshown=. A command word that an =alias= earlier on the
+line names is read as the alias's body, since dash and zsh expand
+aliases in a script and the line does not say which shell reads it.
 
 | Token | Cap'n PolicyReason | When |
 |---+---|---|
@@ -81,7 +83,8 @@ judged as written. A =cd= or =pushd= to a path the line does not show
 (=cd "$X"=) leaves it in a directory it does not follow, so a runner
 after it is refused. So does an =eval=, =source= or =.=, whose script
 is not followed, and a command word the line does not show (=$c dir=),
-which may be =cd=, and a =trap= whose action is one of those or a
+which may be =cd=, as may an alias whose body the line does not show,
+and a =trap= whose action is one of those or a
 =cd=, =pushd= or =popd=, since a =DEBUG= trap runs before each
 command; after one =HOME=, =CDPATH= and =PWD= are not followed either.
 Raw newlines and carriage returns split script commands, and =$'...'=

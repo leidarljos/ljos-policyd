@@ -198,6 +198,7 @@ fn runner_commands(
     depth: usize,
     out: &mut Vec<(Vec<String>, std::path::PathBuf, bool)>,
 ) {
+    let argv = &*expand_aliases(argv);
     // Every directory the next command may run in, and every one its
     // `cd -` may enter. A `cd` before `&&` holds for the commands after
     // it, and the directories it left wait in `failed` and `old_failed`
@@ -442,7 +443,7 @@ fn runner_commands(
     if depth >= MAX_DEPTH {
         return;
     }
-    for (i, inner) in inner_commands_at(argv) {
+    for (i, inner) in inner_commands_expanded(argv) {
         if inner.as_slice() != argv {
             let (dirs, old, set) = &ran_in[i];
             for dir in dirs {
@@ -1196,8 +1197,65 @@ fn inner_commands(argv: &[String]) -> Vec<Vec<String>> {
 }
 
 /// [`inner_commands`], each with the index in [`commands`] of the command
-/// it comes from.
+/// it comes from, once the line's aliases are expanded.
 fn inner_commands_at(argv: &[String]) -> Vec<(usize, Vec<String>)> {
+    inner_commands_expanded(&expand_aliases(argv))
+}
+
+/// `argv` with each command word that an `alias` before it on the line
+/// names replaced by the alias's body. dash and zsh expand aliases in a
+/// script, as bash does under `shopt -s expand_aliases`, and the line
+/// does not say which shell reads it, so expansion may always be on. A
+/// body the line does not show (`$`, a backquote) becomes a command word
+/// it does not show.
+fn expand_aliases(argv: &[String]) -> Cow<'_, [String]> {
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    let mut out = Vec::new();
+    let mut changed = false;
+    for (cmd, end) in ended_commands(argv) {
+        let front = (0..cmd.len())
+            .take_while(|&i| is_assignment(cmd[i]) || keyword_at(&cmd, i))
+            .count();
+        let front = front + case_head(&cmd[front..]);
+        let mut rest: Vec<String> = cmd[front..].iter().map(|s| (*s).to_string()).collect();
+        let mut used: Vec<&String> = Vec::new();
+        while let Some((name, body)) = rest
+            .first()
+            .and_then(|w| aliases.iter().rev().find(|(n, _)| n == w))
+            .filter(|(n, _)| !used.contains(&n))
+        {
+            used.push(name);
+            changed = true;
+            if body.contains(['$', '`']) {
+                rest[0] = format!("${{alias {name}}}");
+                break;
+            }
+            let mut words = shell_words(body);
+            words.extend(rest.drain(1..));
+            rest = words;
+        }
+        if let Some((w, defs)) = peel_cd_command_word(&cmd[front..]).split_first() {
+            if base_of(w) == "alias" {
+                aliases.extend(
+                    defs.iter()
+                        .filter_map(|d| d.split_once('='))
+                        .map(|(n, b)| (n.to_string(), b.to_string())),
+                );
+            }
+        }
+        out.extend(cmd[..front].iter().map(|s| (*s).to_string()));
+        out.extend(rest);
+        out.extend((!end.is_empty()).then(|| end.to_string()));
+    }
+    if changed {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(argv)
+    }
+}
+
+/// [`inner_commands_at`] on a line whose aliases are already expanded.
+fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
     let mut out = Vec::new();
     // `g=git; $g push -f`: a bare assignment earlier on the line names what
     // a later `$g` or `${g}` command word runs.
