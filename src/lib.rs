@@ -541,15 +541,64 @@ fn path_from(to: &str, dir: &std::path::Path) -> Option<std::path::PathBuf> {
     (!to.starts_with('~')).then(|| dir.join(to))
 }
 
+/// What the `env` option word `a`, with `next` after it, does: how many
+/// words it takes, and the letter and value of the one it holds that
+/// takes a value (`-u NAME`, `-C DIR`, `-S STRING`, or the long forms).
+/// Short options cluster, and the first that takes a value takes the
+/// rest of the word, or the next word when nothing is left: `-iC DIR`,
+/// `-iCDIR`, `-uVAR`. A long option may be cut to any prefix that names
+/// only it: `--ch DIR`.
+fn env_flag<'a>(a: &'a str, next: Option<&'a str>) -> (usize, Option<(char, &'a str)>) {
+    const LONG: [(&str, Option<char>); 12] = [
+        ("block-signal", None),
+        ("chdir", Some('C')),
+        ("debug", None),
+        ("default-signal", None),
+        ("help", None),
+        ("ignore-environment", None),
+        ("ignore-signal", None),
+        ("list-signal-handling", None),
+        ("null", None),
+        ("split-string", Some('S')),
+        ("unset", Some('u')),
+        ("version", None),
+    ];
+    if let Some(long) = a.strip_prefix("--") {
+        let (name, value) = long
+            .split_once('=')
+            .map_or((long, None), |(n, v)| (n, Some(v)));
+        let named: Vec<_> = LONG.iter().filter(|(n, _)| n.starts_with(name)).collect();
+        let [&(_, Some(key))] = named[..] else {
+            return (1, None);
+        };
+        return match value {
+            Some(v) => (1, Some((key, v))),
+            None => (2, next.map(|v| (key, v))),
+        };
+    }
+    let flags = a.strip_prefix('-').unwrap_or(a);
+    for (i, c) in flags.char_indices() {
+        if matches!(c, 'u' | 'C' | 'S') {
+            let rest = &flags[i + 1..];
+            return if rest.is_empty() {
+                (2, next.map(|v| (c, v)))
+            } else {
+                (1, Some((c, rest)))
+            };
+        }
+    }
+    (1, None)
+}
+
 /// The directory a command runs in from `dir` after the runner words
-/// `wrappers` in front of it: the one `env -C DIR`, `-CDIR`, `--chdir DIR`
-/// or `--chdir=DIR` names, or `dir`. The last of an `env`'s flags wins,
-/// from where that `env` starts.
+/// `wrappers` in front of it: the one an `env` `-C` or `--chdir` names, in
+/// any form [`env_flag`] reads, or `dir`. The last of an `env`'s flags
+/// wins, from where that `env` starts.
 fn env_dir(wrappers: &[String], dir: &std::path::Path) -> std::path::PathBuf {
     let mut at = dir.to_path_buf();
     // Where the `env` whose flags are being read starts.
     let mut from = None;
-    let mut words = wrappers.iter().map(String::as_str);
+    let mut words = wrappers.iter().map(String::as_str).peekable();
     while let Some(w) = words.next() {
         if base_of(w) == "env" {
             from = Some(at.clone());
@@ -558,21 +607,20 @@ fn env_dir(wrappers: &[String], dir: &std::path::Path) -> std::path::PathBuf {
         let Some(start) = &from else {
             continue;
         };
-        let to = if w == "-C" || w == "--chdir" {
-            words.next()
-        } else if let Some(to) = w.strip_prefix("--chdir=") {
-            Some(to)
-        } else if let Some(to) = w.strip_prefix("-C").filter(|t| !t.is_empty()) {
-            Some(to)
-        } else {
-            if matches!(w, "-u" | "--unset" | "-S" | "--split-string") {
-                words.next();
-            } else if !w.starts_with('-') && !is_assignment(w) {
+        if !w.starts_with('-') {
+            if !is_assignment(w) {
                 from = None;
             }
             continue;
-        };
-        if let Some(d) = to.and_then(|t| path_from(t, start)) {
+        }
+        let (taken, value) = env_flag(w, words.peek().copied());
+        if taken == 2 {
+            words.next();
+        }
+        if let Some(d) = value
+            .filter(|(c, _)| *c == 'C')
+            .and_then(|(_, t)| path_from(t, start))
+        {
             at = d;
         }
     }
@@ -971,15 +1019,13 @@ fn unwrap_wrappers(cmd: &[String]) -> (&[String], Option<&str>) {
                 i += 1;
                 break;
             }
-            if *name == "env" {
-                if a == "-S" || a == "--split-string" {
-                    return (&[], cmd.get(i + 1).map(String::as_str));
+            if *name == "env" && a.starts_with('-') {
+                let (taken, value) = env_flag(a, cmd.get(i + 1).map(String::as_str));
+                if let Some(('S', s)) = value {
+                    return (&[], Some(s));
                 }
-                if let Some(v) = a.strip_prefix("--split-string=") {
-                    return (&[], Some(v));
-                }
-            }
-            if *name == "env" && is_assignment(a) {
+                i += taken;
+            } else if *name == "env" && is_assignment(a) {
                 i += 1;
             } else if a.starts_with('-') && a.len() > 1 {
                 i += if valued.contains(&a) { 2 } else { 1 };
@@ -4516,6 +4562,39 @@ mod tests {
         );
     }
 
+    /// `env` reads its short flags as a cluster and a long one by any
+    /// prefix that names only it, so `-iC DIR`, `-uVAR -C DIR` and
+    /// `--ch DIR` move the command it runs too.
+    #[test]
+    fn reads_a_runner_where_clustered_env_flags_move_it() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "env -iC project make clean-all",
+            "env -iCproject make clean-all",
+            "env -uHOME -C project make clean-all",
+            "env -iuHOME -C project make clean-all",
+            "env -vC project make clean-all",
+            "env -u HOME -iC project make clean-all",
+            "env -i --chdir=project make clean-all",
+            "env --ch=project make clean-all",
+            "env --chd project make clean-all",
+        ] {
+            let c = entering("env-cluster", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        for line in [
+            "env -iS 'make clean-all'",
+            "env --sp 'make clean-all'",
+            "env -uC make clean-all",
+        ] {
+            assert_eq!(leaving("env-cluster", line), Decision::Deny, "{line}");
+        }
+        assert_eq!(
+            leaving("env-cluster", "env -iC safe make clean-all"),
+            Decision::Allow
+        );
+    }
+
     /// `pushd -n` stacks a directory without entering it, and `pushd +N`,
     /// `-N` or a bare `pushd` enters the one it brings to the top.
     #[test]
@@ -5199,6 +5278,8 @@ mod tests {
             ],
             &["env", "-S", "git push -f"],
             &["env", "--split-string=git push -f"],
+            &["env", "-iS", "git push -f"],
+            &["env", "--sp=git push -f"],
             &["flock", "/tmp/lock", "-c", "git push -f"],
             &["flock", "-w", "5", "-c", "git push -f", "/tmp/lock"],
             &["watch", "-n", "5", "git push -f"],
