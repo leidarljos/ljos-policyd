@@ -100,6 +100,16 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
     let mut runs = Vec::new();
     runner_commands(argv, cwd, 0, &mut runs);
     for (run, dir) in runs {
+        if is_untracked(&dir) && scripts::runner(&run) {
+            return Checked {
+                decision: Decision::Deny,
+                code: PolicyReason::ShellDangerousRunner,
+                token: Cow::Owned(format!(
+                    "{} may run in an untracked directory",
+                    run.join(" ")
+                )),
+            };
+        }
         for line in scripts::resolved(&run, &dir) {
             let sh = ["sh".to_string(), "-c".to_string(), line.clone()];
             let c = check_shell_in(&sh, &dir, depth + 1);
@@ -116,15 +126,37 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
 }
 
 /// How many directories the commands after a `cd` that may have failed
-/// are read in. Past this, a further `cd` drops the ones it leaves.
+/// are read in. Past this, a further `cd` leaves the ones it drops
+/// untracked.
 const MAX_DIRS: usize = 16;
 
+/// Stands for a directory the line may be in that is not followed. No
+/// real directory holds a NUL byte, and every path joined onto it keeps
+/// it, so nothing is read there; a task runner that may run there is
+/// refused instead.
+const UNTRACKED: &str = "/\0";
+
+fn is_untracked(d: &std::path::Path) -> bool {
+    d.as_os_str().as_encoded_bytes().contains(&0)
+}
+
 /// Add each of `dirs` that `set` lacks, while it holds fewer than
-/// [`MAX_DIRS`].
+/// [`MAX_DIRS`]. One past that is dropped, and [`UNTRACKED`] goes in once
+/// in its place.
 fn add_dirs(set: &mut Vec<std::path::PathBuf>, dirs: impl IntoIterator<Item = std::path::PathBuf>) {
     for d in dirs {
-        if set.len() < MAX_DIRS && !set.contains(&d) {
+        let d = if is_untracked(&d) {
+            UNTRACKED.into()
+        } else {
+            d
+        };
+        if set.contains(&d) {
+            continue;
+        }
+        if set.len() < MAX_DIRS {
             set.push(d);
+        } else if !set.iter().any(|s| is_untracked(s)) {
+            set.push(UNTRACKED.into());
         }
     }
 }
@@ -252,9 +284,13 @@ fn runner_commands(
                 continue;
             }
             // A `cd` that may have failed keeps the directories it left,
-            // and one into a directory that is not there moves nothing.
+            // and one into a directory that is not there, or that lacks
+            // the search bit, moves nothing.
             let mut to = Vec::new();
-            add_dirs(&mut to, named.into_iter().filter(|d| gates || d.is_dir()));
+            add_dirs(
+                &mut to,
+                named.into_iter().filter(|d| gates || d.join(".").is_dir()),
+            );
             if !to.is_empty() {
                 let from = std::mem::replace(&mut here, to);
                 if b == "pushd" {
@@ -3989,6 +4025,61 @@ mod tests {
             check_shell_in(&argv, &root.join("d0"), 0).decision,
             Decision::Allow
         );
+    }
+
+    /// Past sixteen directories the one dropped is not followed, so a
+    /// runner after it is refused. A directory without the search bit is
+    /// not entered, and fills no place.
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_runner_past_sixteen_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("policyd-lib-{}-seventeen", std::process::id()));
+        let mut line = String::new();
+        for i in 0..=MAX_DIRS {
+            let d = root.join(format!("d{i}"));
+            std::fs::create_dir_all(&d).expect("dir");
+            std::fs::write(d.join("Makefile"), "clean-all:\n\techo clean\n").expect("write");
+            if i > 0 {
+                line.push_str(&format!("cd {} ; ", d.display()));
+            }
+        }
+        line.push_str("make clean-all");
+        std::fs::write(root.join("Makefile"), MAKEFILE).expect("write");
+        let argv = shell_words(&line);
+        let c = check_shell_in(&argv, &root, 0);
+        assert_eq!(c.decision, Decision::Deny);
+        assert_eq!(c.token, "make clean-all may run in an untracked directory");
+        let c = check_shell_in(&argv, &root.join("d0"), 0);
+        assert_eq!(c.decision, Decision::Deny);
+
+        let shut: Vec<_> = (0..18).map(|i| root.join(format!("shut{i}"))).collect();
+        for d in &shut {
+            std::fs::create_dir_all(d).expect("dir");
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        }
+        let cds: String = shut
+            .iter()
+            .map(|d| format!("cd {} ; ", d.display()))
+            .collect();
+        let files = [("Makefile", MAKEFILE)];
+        let line = format!("cd project && {cds}make clean-all");
+        assert_eq!(entering("shut-cd", &files, &line).decision, Decision::Deny);
+        // Root may enter a directory with no mode bits, and the shell then
+        // does too.
+        let searchable = shut[0].join(".").is_dir();
+        let line = format!("{cds}make clean-all");
+        let c = check_shell_in(&shell_words(&line), &root.join("d0"), 0);
+        let want = if searchable {
+            Decision::Deny
+        } else {
+            Decision::Allow
+        };
+        assert_eq!(c.decision, want);
+        for d in &shut {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
     }
 
     /// A subshell or substitution runs where the command holding it runs,

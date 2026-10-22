@@ -52,6 +52,12 @@ Nothing is spawned. A missing or unreadable file, or a directory the
 line does not name (a variable, =cd -=), leaves the line judged as
 written.
 
+The line goes on past a =cd= that may fail, so the runner after it is
+read in each directory the line may be in, up to sixteen. A =cd= into a
+directory without the search bit moves nothing. A runner that may run
+in a directory past those sixteen is refused, as
+=make clean-all may run in an untracked directory=.
+
 * Argument limits
 
 A phronesis build hands each word to the pack whole. phronesis 0.2.3
