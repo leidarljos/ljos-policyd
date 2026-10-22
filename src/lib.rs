@@ -5882,9 +5882,59 @@ fn program_writes(run: &[String]) -> Vec<String> {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let args = operands(&args);
     match base_of(head) {
-        "cp" | "mv" | "ln" => out.extend(copy_target(&args, base_of(head) == "ln")),
+        "cp" | "mv" | "ln" | "install" => out.extend(copy_target(&args, base_of(head) == "ln")),
         "sed" if sed_in_place(&args) => out.extend(sed_files(&args)),
+        "perl" if perl_in_place(&args) => out.extend(perl_files(&args)),
+        "dd" => out.extend(
+            args.iter()
+                .filter_map(|a| a.strip_prefix("of="))
+                .filter(|p| saved_name(p).is_some())
+                .map(str::to_string),
+        ),
         _ => {}
+    }
+    out
+}
+
+/// Whether a `perl` with `args` edits its files in place: `-i` alone or
+/// in a cluster (`-pi`, `-i.bak`).
+fn perl_in_place(args: &[&str]) -> bool {
+    args.iter()
+        .take_while(|a| **a != "--")
+        .filter_map(|a| a.strip_prefix('-').filter(|f| !f.starts_with('-')))
+        .any(|f| perl_cluster(f).0)
+}
+
+/// Whether a `perl` switch cluster edits in place, and whether the word
+/// after it is the program `-e` or `-E` takes. A switch with a value
+/// (`-i.bak`, `-Mstrict`, `-I lib`) ends the cluster.
+fn perl_cluster(cluster: &str) -> (bool, bool) {
+    for (k, c) in cluster.char_indices() {
+        match c {
+            'i' => return (true, false),
+            'e' | 'E' => return (false, k + 1 == cluster.len()),
+            'I' | 'M' | 'm' | 'x' | 'C' | 'd' | 'D' | '0' | 'l' => return (false, false),
+            _ => {}
+        }
+    }
+    (false, false)
+}
+
+/// The operands of a `perl`, past the program `-e` or `-E` takes, alone
+/// or at the end of a cluster (`-pe`). With no `-e` the first is the
+/// program file, which is kept: a path no script is run from.
+fn perl_files(args: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut words = args.iter().copied();
+    let mut end = false;
+    while let Some(a) = words.next() {
+        if end || !a.starts_with('-') || a == "-" {
+            out.push(a.to_string());
+        } else if a == "--" {
+            end = true;
+        } else if perl_cluster(&a[1..]).1 {
+            words.next();
+        }
     }
     out
 }
@@ -11983,6 +12033,47 @@ hash -r 2> /dev/null
             "echo x >&2; source ok.sh",
             "echo x 1>&- ; sh ok.sh",
             "echo x >& 2; sh ok.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        assert_everyday_allowed(&root);
+    }
+
+    /// `dd of=ok.sh`, `install evil.sh ok.sh` and `perl -pi -e ... ok.sh`
+    /// before `sh ok.sh` were allowed: only redirections, tee, downloads,
+    /// cp, mv, ln and sed -i were taken for writes.
+    #[test]
+    fn dd_install_and_perl_in_place_write_their_files() {
+        let root = startup_root("ddinstall");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "dd if=evil/force.sh of=ok.sh; sh ok.sh",
+            "dd status=none of=ok.sh < evil/force.sh && source ok.sh",
+            "install evil/force.sh ok.sh; source ok.sh",
+            "install -m 755 evil/force.sh ok.sh && bash ok.sh",
+            "install -t bin evil/force.sh; sh bin/force.sh",
+            "perl -pi -e 's/echo ok/git push -f/' ok.sh; sh ok.sh",
+            "perl -i.bak -pe 's/x/y/' ok.sh; . ok.sh",
+            "perl -i -p -e 's/x/y/' -- ok.sh && bash ok.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(
+                c.token.starts_with("script-written-on-line: "),
+                "{line}: {}",
+                c.token
+            );
+        }
+        for line in [
+            "dd if=ok.sh of=/dev/null; sh ok.sh",
+            "dd if=ok.sh of=copy.img; sh ok.sh",
+            "perl -pe 's/a/b/' ok.sh > out.txt; sh ok.sh",
+            "perl -ne 'print' ok.sh; source ok.sh",
+            "perl -Mstrict -ne 'print' ok.sh; sh ok.sh",
+            "install -d build; sh ok.sh",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
