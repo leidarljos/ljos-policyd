@@ -33,6 +33,29 @@ Token                 Cap'n PolicyReason       When
 
 Anything else is ``allow``. ``python -c`` is allow. Schema: ``schema/policy.capnp``.
 
+Task runners
+============
+
+A line that runs a task runner is also judged on what the target runs.
+The recipe comes from the file the runner reads, in the directory it
+runs in: the working directory, the one a ``cd`` or ``pushd`` earlier on
+the line enters, or the one ``-C``, ``--prefix`` or ``--cwd`` names.
+
+============================================ ==============================================================================================
+Runner                                       File read
+============================================ ==============================================================================================
+``make``, ``gmake``                          ``GNUmakefile``, ``makefile`` or ``Makefile``, or ``-f FILE``, with the target's prerequisites
+``just``                                     ``justfile``, ``Justfile`` or ``.justfile``
+``cargo make``, ``makers``                   ``Makefile.toml``
+``npm run``, ``pnpm``, ``yarn``, ``bun run`` the ``scripts`` of ``package.json``, with ``pre`` and ``post``
+============================================ ==============================================================================================
+
+Each recipe line is judged as a ``sh -c`` script, and a refusal names the
+target and the line: :literal:`make clean-all runs \`rm -rf ~\`: rm-rf-outside-tmp`.
+Nothing is spawned. A missing or unreadable file, or a directory the
+line does not name (a variable, ``cd -``), leaves the line judged as
+written.
+
 Argument limits
 ===============
 
