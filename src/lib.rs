@@ -253,6 +253,8 @@ struct Written {
     loose: bool,
     /// What the write leaves in the file, when the line spells it out.
     text: Option<String>,
+    /// The word naming the file, or for a loose write the command.
+    word: String,
 }
 
 /// How a file is run: by a shell (a script operand, `source`, a startup
@@ -316,7 +318,12 @@ impl LineFiles {
             self.wrote(&w, at, home, false);
         }
         if !walked && !self.data && may_write_anywhere(run, at, home) {
+            let from = self.written.len();
             self.wrote(".", at, home, true);
+            let name = command_word(run).unwrap_or_default();
+            for w in &mut self.written[from..] {
+                w.word = name.to_string();
+            }
         }
         let run = peeled(run);
         let word = command_at(run).map(|i| run[i].as_str());
@@ -362,6 +369,7 @@ impl LineFiles {
                 id: self.cmd.clone(),
                 loose,
                 text: None,
+                word: w.to_string(),
             });
         }
     }
@@ -419,11 +427,30 @@ impl LineFiles {
                     Some(t) if *how == Ran::Shell && r.is_some() && w.path == *r => {
                         texts.push((shown(r), t.clone()))
                     }
-                    _ => return Err(shown(r)),
+                    _ => return Err(written_reason(&shown(r), w)),
                 }
             }
         }
         Ok(texts)
+    }
+}
+
+/// Why the script `script` counts as written by `w`: a path the line
+/// does not show may be it, and a command the guard does not know may
+/// write anything where it runs.
+fn written_reason(script: &str, w: &Written) -> String {
+    match &w.path {
+        None if !w.loose => format!(
+            "{script}: `{}` may name it; write to a literal path",
+            w.word
+        ),
+        Some(dir) if w.loose => format!(
+            "{script}: `{}` may write any file under {}",
+            w.word,
+            dir.display()
+        ),
+        None => format!("{script}: `{}` may write any file where it runs", w.word),
+        Some(_) => script.to_string(),
     }
 }
 
@@ -12622,5 +12649,29 @@ hash -r 2> /dev/null
         ] {
             assert_eq!(at(line).decision, Decision::Deny, "{line}");
         }
+    }
+
+    #[test]
+    fn a_write_to_a_path_not_shown_says_which_word() {
+        let root = startup_root("unshownw");
+        std::fs::write(root.join("configure"), "echo configured\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        let c = at("echo start > \"$LOG\"; sh ./configure");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(
+            c.token
+                .ends_with("configure: `$LOG` may name it; write to a literal path"),
+            "{}",
+            c.token
+        );
+        let c = at("tar xf a.tar; sh ./configure");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(
+            c.token.contains("`tar` may write any file under "),
+            "{}",
+            c.token
+        );
+        let c = at("echo start > build.log; sh ./configure");
+        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
     }
 }
