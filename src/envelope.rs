@@ -156,7 +156,7 @@ fn check_argv_recipients(config: &Config, recipients: &[String], reasons: &mut V
         if let Some(shown) = mixed_script_domain(&addr.domain) {
             reasons.push(reason("mixed-script", format!("argv {shown}")));
         }
-        if address_denied(&addr, &config.deny_addresses, &config.subaddress) {
+        if address_denied(&addr, config) {
             reasons.push(reason("argv-recipient-denied", addr.key()));
         }
         if domain_denied(&addr.domain, &config.deny_domains)
@@ -192,6 +192,7 @@ struct Config {
     /// Characters that split a local part into a mailbox and a tag.
     /// Default `+-=`. An address rule for the mailbox covers the tag.
     subaddress: String,
+    aliases: Vec<AliasFamily>,
 }
 
 fn load_config(path: &Path) -> Result<Config, MailReason> {
@@ -229,9 +230,10 @@ fn load_config(path: &Path) -> Result<Config, MailReason> {
         Some(_) => return Err(reason("config-invalid", "config")),
         None => "+-=".to_string(),
     };
+    let aliases = builtin_families().ok_or_else(|| reason("config-invalid", "config"))?;
     let identity =
         normalize_identity(&identity).ok_or_else(|| reason("identity-invalid", "identity"))?;
-    let (deny_addresses, deny_domains) = load_deny(&resolve(path, &deny_file))?;
+    let (deny_addresses, deny_domains) = load_deny(&resolve(path, &deny_file), &aliases)?;
     let pack_domains = load_pack_law(&resolve(path, &pack_law))?;
     Ok(Config {
         identity,
@@ -239,6 +241,7 @@ fn load_config(path: &Path) -> Result<Config, MailReason> {
         deny_domains,
         pack_domains,
         subaddress,
+        aliases,
     })
 }
 
@@ -278,7 +281,10 @@ fn normalize_identity(value: &str) -> Option<NormAddr> {
     normalize_mailbox(&list[0])
 }
 
-fn load_deny(path: &Path) -> Result<(BTreeSet<String>, BTreeSet<String>), MailReason> {
+fn load_deny(
+    path: &Path,
+    aliases: &[AliasFamily],
+) -> Result<(BTreeSet<String>, BTreeSet<String>), MailReason> {
     let text = read_text(path).map_err(|()| reason("deny-file-unreadable", "deny-file"))?;
     let mut addresses = BTreeSet::new();
     let mut domains = BTreeSet::new();
@@ -297,8 +303,8 @@ fn load_deny(path: &Path) -> Result<(BTreeSet<String>, BTreeSet<String>), MailRe
                 }
                 let addr = normalize_mailbox(&list[0])
                     .ok_or_else(|| reason("deny-file-invalid", "deny-file"))?;
-                for key in rule_keys(&addr) {
-                    addresses.insert(key);
+                for (local, domain) in alias_forms(&addr.local, &addr.domain, aliases) {
+                    addresses.insert(format!("{local}@{domain}"));
                 }
             }
             "domain" => {
@@ -520,7 +526,7 @@ fn check_named(
                     if let Some(shown) = mixed_script_domain(&addr.domain) {
                         hits.push((true, format!("{name} {shown}")));
                     }
-                    if address_denied(&addr, &config.deny_addresses, &config.subaddress)
+                    if address_denied(&addr, config)
                         || domain_denied(&addr.domain, &config.deny_domains)
                         || domain_denied(&addr.domain, &config.pack_domains)
                     {
@@ -579,7 +585,7 @@ fn check_recipients(message: &Message, config: &Config, reasons: &mut Vec<MailRe
                         if let Some(shown) = mixed_script_domain(&addr.domain) {
                             reasons.push(reason("mixed-script", format!("{name} {shown}")));
                         }
-                        if address_denied(&addr, &config.deny_addresses, &config.subaddress) {
+                        if address_denied(&addr, config) {
                             reasons.push(reason(
                                 "recipient-address-denied",
                                 format!("{name} {}", addr.key()),
@@ -654,32 +660,35 @@ fn wire_rewritten(raw: &str) -> bool {
 }
 
 /// An `address` rule names that mailbox and `<local><sep><anything>`.
-/// `seps` comes from the config, or `+-=` when the line is omitted.
+/// The separators are the config's, or `+-=` when the line is omitted,
+/// and those of every alias family naming the domain.
 ///
-/// Two provider shapes are part of the same match, and only here.
-/// `gmail.com` and `googlemail.com` are one domain, and dots in the
-/// local part are ignored. `anything@user.fastmail.com` (one label,
-/// then `fastmail.com`) is `user@fastmail.com`. A domain rule and
-/// `From` do not use either shape.
-fn address_denied(addr: &NormAddr, addresses: &BTreeSet<String>, seps: &str) -> bool {
-    let candidates = candidate_keys(addr);
-    for rule in addresses {
-        let Some((rule_local, rule_domain)) = rule.split_once('@') else {
-            continue;
-        };
-        for key in &candidates {
-            let Some((local, domain)) = key.split_once('@') else {
+/// Alias families fold both the rule and the recipient, and only here.
+/// A domain rule and `From` do not use them.
+fn address_denied(addr: &NormAddr, config: &Config) -> bool {
+    for (local, domain) in alias_forms(&addr.local, &addr.domain, &config.aliases) {
+        let seps = separators(&domain, config);
+        for rule in &config.deny_addresses {
+            let Some((rule_local, rule_domain)) = rule.split_once('@') else {
                 continue;
             };
             if domain != rule_domain {
                 continue;
             }
-            if local == rule_local || is_subaddress(rule_local, local, seps) {
+            if local == rule_local || is_subaddress(rule_local, &local, &seps) {
                 return true;
             }
         }
     }
     false
+}
+
+fn separators(domain: &str, config: &Config) -> String {
+    let mut seps = config.subaddress.clone();
+    for family in families_of(domain, &config.aliases) {
+        seps.push_str(&family.separators);
+    }
+    seps
 }
 
 fn is_subaddress(rule_local: &str, local: &str, seps: &str) -> bool {
@@ -689,51 +698,117 @@ fn is_subaddress(rule_local: &str, local: &str, seps: &str) -> bool {
     rest.chars().next().is_some_and(|c| seps.contains(c))
 }
 
-/// Keys stored for one deny-file address. Gmail dots are already gone,
-/// and both gmail domains are present, so a later lookup can compare
-/// the same shape.
-fn rule_keys(addr: &NormAddr) -> Vec<String> {
-    let mut keys = Vec::new();
-    push_exact(&mut keys, &addr.local, &addr.domain);
-    keys
+/// Provider alias families, one per line in the form of a config `alias`
+/// value: `<domain>[,<domain>...] <separators> [flag...]`. The
+/// separators are added to the `subaddress` line on those domains.
+/// `shared` makes the domains one mailbox, `dots` ignores dots in the
+/// local part, and `subdomain` reads `<anything>@<user>.<domain>` as
+/// `<user>@<domain>`. Every entry only widens what an address rule
+/// covers, so a wrong entry over-blocks and cannot allow a recipient.
+const ALIAS_FAMILIES: &[&str] = &[
+    // Dots do not matter, and gmail.com and googlemail.com are the same:
+    // https://support.google.com/mail/answer/7436150
+    // https://support.google.com/mail/answer/10313
+    "gmail.com,googlemail.com + shared dots",
+    // Plus and subdomain addressing, one subdomain level only:
+    // https://www.fastmail.help/hc/en-us/articles/360060591053-Plus-addressing-and-subdomain-addressing
+    "fastmail.com + subdomain",
+];
+
+struct AliasFamily {
+    domains: Vec<String>,
+    separators: String,
+    shared: bool,
+    dots: bool,
+    subdomain: bool,
 }
 
-/// Forms of `addr` that an address rule might name. The fastmail alias
-/// adds `user@fastmail.com` and does not cut the domain label on a
-/// separator: a hyphen there is part of the user name.
-fn candidate_keys(addr: &NormAddr) -> Vec<String> {
-    let mut keys = Vec::new();
-    push_exact(&mut keys, &addr.local, &addr.domain);
-    if let Some(user) = fastmail_user(&addr.domain) {
-        keys.push(format!("{user}@fastmail.com"));
+fn builtin_families() -> Option<Vec<AliasFamily>> {
+    ALIAS_FAMILIES
+        .iter()
+        .map(|line| alias_family(line))
+        .collect()
+}
+
+/// `None` for a line that names no domain, a separator `subaddress`
+/// would refuse, or an unknown flag.
+fn alias_family(value: &str) -> Option<AliasFamily> {
+    let mut parts = value.split_whitespace();
+    let domains = parts
+        .next()?
+        .split(',')
+        .map(normalize_domain)
+        .collect::<Option<Vec<_>>>()?;
+    let separators = parts.next()?.to_string();
+    if !valid_separators(&separators) {
+        return None;
     }
-    keys
-}
-
-fn push_exact(keys: &mut Vec<String>, local: &str, domain: &str) {
-    if is_gmail(domain) {
-        let bare = strip_dots(local);
-        keys.push(format!("{bare}@gmail.com"));
-        keys.push(format!("{bare}@googlemail.com"));
-    } else {
-        keys.push(format!("{local}@{domain}"));
+    let mut family = AliasFamily {
+        domains,
+        separators,
+        shared: false,
+        dots: false,
+        subdomain: false,
+    };
+    for flag in parts {
+        let slot = match flag {
+            "shared" => &mut family.shared,
+            "dots" => &mut family.dots,
+            "subdomain" => &mut family.subdomain,
+            _ => return None,
+        };
+        *slot = true;
     }
+    Some(family)
 }
 
-fn is_gmail(domain: &str) -> bool {
-    domain == "gmail.com" || domain == "googlemail.com"
+fn families_of<'a>(
+    domain: &'a str,
+    families: &'a [AliasFamily],
+) -> impl Iterator<Item = &'a AliasFamily> {
+    families
+        .iter()
+        .filter(move |f| f.domains.iter().any(|d| d == domain))
 }
 
-fn strip_dots(local: &str) -> String {
-    local.chars().filter(|c| *c != '.').collect()
+/// Every `(local, domain)` the families make of one mailbox, itself
+/// first. Each form is folded again until nothing new appears, so a
+/// domain named by two families gets both. The subdomain label is not
+/// cut on a separator: a hyphen there is part of the user name.
+fn alias_forms(local: &str, domain: &str, families: &[AliasFamily]) -> Vec<(String, String)> {
+    let mut forms = vec![(local.to_string(), domain.to_string())];
+    for family in families.iter().filter(|f| f.subdomain) {
+        for base in &family.domains {
+            let user = domain
+                .strip_suffix(base.as_str())
+                .and_then(|rest| rest.strip_suffix('.'));
+            if let Some(user) = user.filter(|u| !u.is_empty() && !u.contains('.')) {
+                push_form(&mut forms, user.to_string(), base.clone());
+            }
+        }
+    }
+    let mut i = 0;
+    while i < forms.len() {
+        let (local, domain) = forms[i].clone();
+        for family in families_of(&domain, families) {
+            if family.dots {
+                let bare = local.chars().filter(|c| *c != '.').collect();
+                push_form(&mut forms, bare, domain.clone());
+            }
+            if family.shared {
+                for other in &family.domains {
+                    push_form(&mut forms, local.clone(), other.clone());
+                }
+            }
+        }
+        i += 1;
+    }
+    forms
 }
 
-fn fastmail_user(domain: &str) -> Option<&str> {
-    let user = domain.strip_suffix(".fastmail.com")?;
-    if user.is_empty() || user.contains('.') {
-        None
-    } else {
-        Some(user)
+fn push_form(forms: &mut Vec<(String, String)>, local: String, domain: String) {
+    if !forms.iter().any(|(l, d)| *l == local && *d == domain) {
+        forms.push((local, domain));
     }
 }
 
@@ -1611,6 +1686,15 @@ pair left right
             vec!["recipient-address-denied"]
         );
         assert!(codes(&plain("To: badx@gmail.com\r\n"), gmail, "").is_empty());
+        assert_eq!(
+            codes_with(
+                &plain("To: bad+x@gmail.com\r\n"),
+                gmail,
+                "",
+                "subaddress -\n"
+            ),
+            vec!["recipient-address-denied"]
+        );
         let fast = "address user@fastmail.com\n";
         assert_eq!(
             codes(&plain("To: x@user.fastmail.com\r\n"), fast, ""),

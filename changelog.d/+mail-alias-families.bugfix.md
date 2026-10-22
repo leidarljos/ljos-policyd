@@ -1,0 +1,1 @@
+Address rules folded only the gmail pair and one fastmail shape. Provider aliases are now a table of families, each with its domains, its subaddress separators and its local-part folding, and `+` is a separator on gmail and fastmail even when `subaddress` leaves it out.

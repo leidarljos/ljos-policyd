@@ -244,13 +244,15 @@ is that mailbox, not the whole domain. It also covers that local
 part, one ``subaddress`` separator, and anything after the
 separator. The separators are the ``subaddress`` line, or ``+-=``
 when the line is omitted. ``.``, ``@``, ``%`` and ``!`` are not
-separators. On an address rule for ``gmail.com`` or
-``googlemail.com`` the two domains are one domain, and dots in
-the local part are ignored. On an address rule for
-``fastmail.com``, a mailbox at ``<local>@<user>.fastmail.com``
-(one label, then ``fastmail.com``) is ``<user>@fastmail.com``.
-A hyphen in that label is part of the user name. Domain rules
-and ``From`` are not matched this way. A domain literal (an
+separators. A provider alias family folds both the rule and the
+recipient, and adds its separators to the ``subaddress`` line on
+its domains. ``gmail.com`` and ``googlemail.com`` are one
+domain, dots in the local part are ignored, and ``+`` is a
+separator. On ``fastmail.com``, ``+`` is a separator and a
+mailbox at ``<local>@<user>.fastmail.com`` (one label, then
+``fastmail.com``) is ``<user>@fastmail.com``. A hyphen in that
+label is part of the user name. Domain rules and ``From`` are
+not matched this way. A domain literal (an
 address at ``@[ ... ]``) in a watched header is a refusal. An
 all-numeric domain is a refusal, judged after IDNA. That
 includes a dotted quad, a shorter form ``inet_aton`` accepts,
