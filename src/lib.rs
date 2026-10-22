@@ -3518,6 +3518,9 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
         if let Some((Fed::Text(script), _)) = shell_stdin(run) {
             out.extend(script_lines(script, 0).iter().map(|l| (i, shell_words(l))));
         }
+        if let Some(cb) = mapfile_callback(run) {
+            out.extend(script_lines(cb, 0).iter().map(|l| (i, shell_words(l))));
+        }
         if let Some(script) = shell_script(run) {
             out.extend(script_lines(script, 0).iter().map(|l| (i, shell_words(l))));
         } else if base_of(&run[0]) == "eval" {
@@ -3658,12 +3661,20 @@ fn parallel_command_unshown(argv: &[String]) -> bool {
 /// input comes from stdin or an argument list, so the script is unknown.
 /// It lands there through a replace string (`xargs -I{} sh -c '{}'`), or
 /// as the words xargs appends when the command ends where the script
-/// would be (`xargs sh -c`, `xargs bash`, `xargs python3 -c`).
+/// would be (`xargs sh -c`, `xargs bash`, `xargs python3 -c`). A
+/// `mapfile -C` callback takes the lines it reads the same way.
 fn xargs_script_unshown(argv: &[String]) -> bool {
     commands(argv).into_iter().any(|cmd| {
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
         let owned = split_env_strings(&owned).into_owned();
         let run = unwrap_wrappers(&owned).0;
+        // A `mapfile` callback runs with the index and the line it read
+        // added after it.
+        if let Some(cb) = mapfile_callback(run) {
+            if script_takes_input(&shell_words(cb), &|_| false, true) {
+                return true;
+            }
+        }
         let wrappers = &owned[..owned.len() - run.len()];
         let Some(at) = wrappers
             .iter()
@@ -3773,6 +3784,29 @@ fn script_takes_input(run: &[String], fed: &dyn Fn(&str) -> bool, appended: bool
         Some(at) => run.get(at + 1).map_or(appended, |code| fed(code)),
         None => false,
     }
+}
+
+/// The command string a `mapfile` or `readarray` call runs with `-C`,
+/// alone or at the end of a cluster, or glued (`-Ccb`).
+fn mapfile_callback(run: &[String]) -> Option<&str> {
+    if !matches!(base_of(run.first()?), "mapfile" | "readarray") {
+        return None;
+    }
+    let mut words = run[1..].iter().map(String::as_str);
+    while let Some(a) = words.next() {
+        let flags = a.strip_prefix('-').filter(|f| !f.is_empty() && *f != "-")?;
+        for (k, c) in flags.char_indices() {
+            if "dnOsucC".contains(c) {
+                let rest = &flags[k + 1..];
+                let value = if rest.is_empty() { words.next()? } else { rest };
+                if c == 'C' {
+                    return Some(value);
+                }
+                break;
+            }
+        }
+    }
+    None
 }
 
 /// A variable `read`, `mapfile` or `readarray` fills from stdin earlier
@@ -12673,5 +12707,33 @@ hash -r 2> /dev/null
         );
         let c = at("echo start > build.log; sh ./configure");
         assert_eq!(c.decision, Decision::Allow, "{}", c.token);
+    }
+
+    #[test]
+    fn a_mapfile_callback_is_judged() {
+        let root = startup_root("mapfilecb");
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "mapfile -t -C eval -c 1 lines < cmds.txt",
+            "readarray -C 'sh -c' -c1 arr < cmds.txt",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert_eq!(c.token, "xargs-script-unshown", "{line}");
+        }
+        for line in [
+            "mapfile -C 'git push -f origin' -c 1 arr < list.txt",
+            "readarray -C'rm -rf ~' arr < list.txt",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+        }
+        for line in [
+            "mapfile -t lines < list.txt",
+            "mapfile -C 'echo got' -c 1 arr < list.txt",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
     }
 }
