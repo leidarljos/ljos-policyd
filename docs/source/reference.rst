@@ -121,13 +121,17 @@ a runner after the ``cd`` is refused. A word that only names it
 
 ``HOME`` is followed the same way: a bare ``cd`` enters the one set in
 front of it (``HOME=dir cd``) or earlier on the line (``export HOME=dir;
-cd``), and ``~`` expands from the one set before the command. A ``HOME``
+cd``), and ``~`` expands from the one set before the command, as do
+``$HOME`` and ``${HOME}`` at the head of a path. A ``HOME``
 that may hold either of two values, or one the line does not show
 (``HOME=$(mktemp -d) cd``), leaves the runner after the ``cd`` refused.
 ``$PWD`` in either value is the one directory the line is in, when it
 shows that and does not set ``PWD`` (``export HOME="$PWD/.home"``).
 With ``HOME`` unset, ``~`` is the home in the user's passwd entry, as in
 bash, and a bare ``cd`` stays.
+``~login`` expands from the password database and ``~+`` to where the
+line is, while ``~-`` and a stack entry such as ``~1`` name a directory
+that is not followed.
 
 A ``cd`` or ``pushd`` takes ``..`` off the path by name, as the shell's
 logical ``cd`` does, so ``cd lnk/..`` comes back to where it started even

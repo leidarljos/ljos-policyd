@@ -1470,20 +1470,61 @@ fn tilde_home(home: Option<&str>) -> Cow<'_, str> {
     Cow::Owned(dir.to_string_lossy().into_owned())
 }
 
-/// Where the path word `to` lands from `dir`: `~` and `~/path` from
-/// `home`, anything else joined onto `dir`. A variable, a substitution or
-/// `~user` names no directory the line shows.
+/// Where the path word `to` lands from `dir`: `~` at its head as
+/// [`tilde_home`] reads it, `$HOME` and `${HOME}` from `home`, `~login`
+/// from the password database, `~+` at `dir`, anything else joined onto
+/// `dir`. Another variable or a substitution names no directory the line
+/// shows, and `~-` or a stack entry (`~1`) one the line does not follow.
 fn path_from(to: &str, dir: &std::path::Path, home: Option<&str>) -> Option<std::path::PathBuf> {
-    if to.contains(['$', '`']) {
+    let (head, rest) = to.split_once('/').unwrap_or((to, ""));
+    if rest.contains(['$', '`']) {
         return None;
     }
-    if to == "~" {
-        return home_from(Some(&tilde_home(home)), dir);
+    let base = match head {
+        "~" => home_from(Some(&tilde_home(home)), dir)?,
+        "$HOME" | "${HOME}" => home_from(home, dir)?,
+        "~+" => dir.to_path_buf(),
+        _ if head.contains(['$', '`']) => return None,
+        _ => match head.strip_prefix('~') {
+            Some(n) if n.starts_with(['+', '-']) || n.bytes().all(|b| b.is_ascii_digit()) => {
+                UNTRACKED.into()
+            }
+            Some(name) => user_home(name).unwrap_or_else(|| dir.join(head)),
+            None => return Some(dir.join(to)),
+        },
+    };
+    Some(base.join(rest))
+}
+
+/// The home directory of the login `name` in the password database.
+#[cfg(unix)]
+fn user_home(name: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(name).ok()?;
+    let mut buf = vec![0 as libc::c_char; 16384];
+    // SAFETY: an all-zero passwd is valid, and getpwnam_r fills it with
+    // pointers into `buf`, which outlives every read of them below.
+    let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwnam_r(
+            name.as_ptr(),
+            &mut pw,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut found,
+        )
+    };
+    if rc != 0 || found.is_null() || pw.pw_dir.is_null() {
+        return None;
     }
-    if let Some(rest) = to.strip_prefix("~/") {
-        return home_from(Some(&tilde_home(home)), dir).map(|h| h.join(rest));
-    }
-    (!to.starts_with('~')).then(|| dir.join(to))
+    let dir = unsafe { std::ffi::CStr::from_ptr(pw.pw_dir) };
+    Some(std::ffi::OsStr::from_bytes(dir.to_bytes()).into())
+}
+
+#[cfg(not(unix))]
+fn user_home(_: &str) -> Option<std::path::PathBuf> {
+    None
 }
 
 /// What the `env` option word `a`, with `next` after it, does: how many
@@ -6034,6 +6075,8 @@ mod tests {
             "HOME=$(mktemp -d); cd $HOME/x && make clean-all",
         );
         assert_eq!(c.decision, Decision::Deny);
+        let c = entering("home-word", &files, "cd é/x && make clean-all");
+        assert_eq!(c.decision, Decision::Allow);
     }
 
     /// `$PWD` in a value names the one directory the line is in, unless
