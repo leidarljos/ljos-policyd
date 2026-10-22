@@ -5392,6 +5392,22 @@ mod tests {
         );
     }
 
+    /// `>|` is a redirection that overwrites under `noclobber`, not a pipe.
+    #[test]
+    fn reads_a_clobber_redirection_as_one_word() {
+        assert_eq!(
+            shell_words("cd >| x evil 2>|y | z"),
+            ["cd", ">|", "x", "evil", "2>|y", "|", "z"]
+        );
+        for line in [
+            "cd >| /dev/null evil && make clean-all",
+            "cd >|/dev/null evil && make clean-all",
+            "pushd 2>| /dev/null evil && make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("clobber", line), Decision::Deny, "{line}");
+        }
+    }
+
     /// The `&` of a redirection does not send the `cd` before it to the
     /// background.
     #[test]
