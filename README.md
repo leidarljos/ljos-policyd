@@ -149,10 +149,12 @@ pack-law law.txt
 angle brackets, read from the raw header after a folded line is
 joined. An encoded-word in a display name is decoded for display
 only, and an encoded addr-spec is a refusal. A second `From`, a
-`From` that does not parse, or any other address is a refusal. `Reply-To`, `Sender` and `Return-Path` must stay
-clear of an identity in the deny file. `To`, `Cc` and `Bcc` are refused
+`From` that does not parse, or any other address is a refusal.
+`Reply-To`, `Sender` and `Return-Path` must stay clear of an
+identity in the deny file. `To`, `Cc` and `Bcc` are refused
 when that domain, or a parent of it, is named by the deny file or by
-the pack-law file.
+the pack-law file. An address at `@[ ... ]` is a domain literal and
+is a refusal.
 
 A domain is compared after NFKC and IDNA, so a fullwidth spelling and
 the punycode form are the same domain. ASCII case is folded. A

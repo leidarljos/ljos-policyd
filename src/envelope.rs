@@ -465,11 +465,10 @@ fn normalize_domain(raw: &str) -> Option<String> {
     if folded.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return None;
     }
-    if folded.starts_with('[') {
-        if !folded.ends_with(']') || folded.len() < 3 {
-            return None;
-        }
-        return Some(folded.to_ascii_lowercase());
+    // A domain literal is not a name. NFKC cannot turn the brackets into
+    // one, and the address is refused instead of compared.
+    if folded.contains('[') || folded.contains(']') {
+        return None;
     }
     idna::domain_to_ascii(folded).ok().filter(|d| !d.is_empty())
 }
@@ -672,6 +671,43 @@ From: other@example.test\r\n";
         assert_eq!(
             codes(&raw, "domain xn--bcher-kva.test\n", ""),
             vec!["recipient-domain-denied"]
+        );
+    }
+
+    #[test]
+    fn a_domain_literal_is_refused() {
+        let deny = "domain blocked.test\n";
+        assert_eq!(
+            codes(&plain("To: a@[blocked.test]\r\n"), deny, ""),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("Cc: a@[mx.blocked.test]\r\n"), deny, ""),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("Bcc: a@[blocked.test]\r\n"), deny, ""),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("Reply-To: x@[blocked.test]\r\n"), deny, ""),
+            vec!["reply-to-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("Sender: a@[blocked.test]\r\n"), deny, ""),
+            vec!["sender-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("Return-Path: <a@[blocked.test]>\r\n"), deny, ""),
+            vec!["return-path-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("To: a@[192.000.002.001]\r\n"), "", ""),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes("From: mailseat@[example.test]\r\n", "", ""),
+            vec!["from-unparsed"]
         );
     }
 

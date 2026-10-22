@@ -701,7 +701,7 @@ fn route_addr(inner: &str) -> Result<&str, AddressFault> {
     let idx = rest.find(':').ok_or(AddressFault)?;
     for part in rest[..idx].split(',') {
         let part = part.trim().strip_prefix('@').unwrap_or(part.trim());
-        if part.is_empty() || part.contains('@') {
+        if part.is_empty() || part.contains('@') || part.contains('[') || part.contains(']') {
             return Err(AddressFault);
         }
     }
@@ -803,23 +803,10 @@ fn parse_dot_atom(s: &str) -> Result<(String, usize), AddressFault> {
 
 fn parse_domain(s: &str) -> Result<String, AddressFault> {
     let s = s.trim_end();
-    if s.is_empty() {
+    // A domain literal (`@[ ... ]`) is not a name this check can compare.
+    // Accepting the brackets lets the same host through in another shape.
+    if s.is_empty() || s.contains('[') || s.contains(']') {
         return Err(AddressFault);
-    }
-    if let Some(rest) = s.strip_prefix('[') {
-        let end = rest.find(']').ok_or(AddressFault)?;
-        if !rest[end + 1..].trim().is_empty() {
-            return Err(AddressFault);
-        }
-        let lit = &rest[..end];
-        if lit.is_empty()
-            || lit
-                .chars()
-                .any(|c| c.is_whitespace() || c == '[' || c == ']')
-        {
-            return Err(AddressFault);
-        }
-        return Ok(format!("[{lit}]"));
     }
     let bare = s.strip_suffix('.').unwrap_or(s);
     if bare.is_empty() {
@@ -1020,6 +1007,14 @@ From: other@example.test\r\n\
     #[test]
     fn an_empty_return_path_has_no_mailbox() {
         assert!(mailboxes("<>").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_domain_literal_is_not_a_mailbox() {
+        assert!(mailboxes("a@[blocked.test]").is_err());
+        assert!(mailboxes("a@[192.000.002.001]").is_err());
+        assert!(mailboxes("<a@[mx.blocked.test]>").is_err());
+        assert!(mailboxes("<@[192.0.2.1]:a@example.test>").is_err());
     }
 
     #[test]

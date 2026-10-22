@@ -222,7 +222,8 @@ an encoded addr-spec is a refusal. A second ``From`` is a refusal.
 must stay clear of a deny-file identity (``address``, or a mailbox at a
 ``domain``). ``To``, ``Cc`` and ``Bcc`` are refused when the domain or a
 parent of it is named by the deny file or by a ``deny-domain`` line in
-the pack-law file.
+the pack-law file. A domain literal (an address at ``@[ ... ]``) in a
+watched header is a refusal.
 
 A fullwidth spelling and the punycode form compare as the same domain.
 A homoglyph that NFKC and IDNA leave alone does not. ASCII case is
