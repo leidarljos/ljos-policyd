@@ -446,12 +446,17 @@ impl Vars {
     }
 
     /// Take the assignment `w`, which may append. A value the shell
-    /// expands, with `~` in it as well as `$` or `` ` ``, is not shown.
+    /// expands, with `~` in it as well as `$` or `` ` ``, is not shown,
+    /// nor is one set through an array element (`HOME[0]=dir`).
     fn assign(&mut self, w: &str) {
         let Some((name, v)) = w.split_once('=') else {
             return;
         };
         let (name, add) = name.strip_suffix('+').map_or((name, false), |n| (n, true));
+        if name.contains('[') {
+            self.lose_target(name);
+            return;
+        }
         if let Some(slot) = self.slot(name) {
             let was = slot.take().filter(|_| add).unwrap_or_default();
             *slot = Some(was + if v.contains('~') { "$" } else { v });
@@ -1230,10 +1235,16 @@ fn substitutions(script: &str) -> Vec<String> {
     out
 }
 
-/// A `NAME=value` or `NAME+=value` word.
+/// A `NAME=value` or `NAME+=value` word, where NAME may be an array
+/// element, `NAME[i]`.
 fn is_assignment(w: &str) -> bool {
     w.split_once('=').is_some_and(|(k, _)| {
         let k = k.strip_suffix('+').unwrap_or(k);
+        let k = match k.split_once('[') {
+            Some((name, sub)) if sub.ends_with(']') => name,
+            Some(_) => return false,
+            None => k,
+        };
         !k.is_empty()
             && !k.starts_with(|c: char| c.is_ascii_digit())
             && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
