@@ -935,6 +935,7 @@ fn walk(
     let mut loops = Vec::new();
     let mut spans = Vec::new();
     let (heredocs, data) = heredoc_bodies(&ended_commands(&argv));
+    let pattern_skip = case_pattern_skips(&argv);
     for (ci, (cmd, end)) in ended_commands(&argv).into_iter().enumerate() {
         shell.aliases.extend(alias_defs(&cmd));
         if after == "&" {
@@ -990,7 +991,8 @@ fn walk(
         // command and after the one before it.
         seq += 2;
         let id = [base.as_slice(), &[seq]].concat();
-        if !data[ci] && starts_loop(&cmd) {
+        let pat = pattern_skip.get(ci).copied().unwrap_or(false);
+        if !data[ci] && !pat && starts_loop(&cmd) {
             loops.push(seq);
         }
         shell.files.borrow_mut().cmd.clone_from(&id);
@@ -1010,7 +1012,7 @@ fn walk(
                 // A here-document is text. Parentheses in it are not a
                 // subshell. An unquoted body still expands `$(...)` and
                 // backticks, and those run.
-                if data[ci] && !w.contains("$(") && !w.contains('`') {
+                if (data[ci] || pat) && !w.contains("$(") && !w.contains('`') {
                     continue;
                 }
                 for body in substitutions(w) {
@@ -1040,9 +1042,10 @@ fn walk(
             .files
             .borrow_mut()
             .lower(mark.., &[base.as_slice(), &[seq - 1]].concat());
-        // A here-document body is text. Noting it would treat a word
-        // there as a program that writes, runs or moves this shell.
-        if data[ci] {
+        // A here-document body and a case pattern are text. Noting them
+        // would treat a word there as a program that writes, runs or
+        // moves this shell.
+        if data[ci] || pat {
             continue;
         }
         // After the substitutions, which run before the command does.
@@ -1408,7 +1411,7 @@ fn walk(
         return;
     }
     for (i, inner) in inner_commands_expanded(&argv) {
-        if data.get(i).copied().unwrap_or(false) {
+        if data.get(i).copied().unwrap_or(false) || pattern_skip.get(i).copied().unwrap_or(false) {
             continue;
         }
         if inner.as_slice() != argv.as_slice() {
@@ -5039,18 +5042,85 @@ fn shell_stdin(run: &[String]) -> Option<(Fed<'_>, bool)> {
 /// Whether a shell on the line runs a script from stdin that the line
 /// does not show: one after a `|`, or one called with `-s`, that no
 /// here-string or heredoc feeds, or a here-string holding an expansion.
+/// A `|` between `case` patterns is not a pipeline (`| sh | other)`).
 fn unshown_stdin_script(argv: &[String]) -> bool {
     let mut piped = false;
-    ended_commands(argv).into_iter().any(|(cmd, end)| {
-        let after_pipe = std::mem::replace(&mut piped, end == "|");
-        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
-        match shell_stdin(unwrap_wrappers(&owned).0) {
-            Some((Fed::Text(text), _)) => text.contains(['$', '`']),
-            Some((Fed::File(file), _)) => file.starts_with(['<', '>']) || !literal_text(file),
-            Some((Fed::Unshown, dash_s)) => after_pipe || dash_s,
-            _ => false,
+    let mut cmd: Vec<String> = Vec::new();
+    let mut case_depth = 0i32;
+    let mut await_in = false;
+    let mut pattern = false;
+    let words: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let closes =
+        |p: &str| p == ")" || (p.ends_with(')') && p.matches(')').count() > p.matches('(').count());
+    let mut i = 0;
+    while i < words.len() {
+        let a = words[i];
+        if pattern {
+            if a == "|" {
+                i += 1;
+                continue;
+            }
+            if closes(a) {
+                pattern = false;
+            }
+            i += 1;
+            continue;
         }
-    })
+        // `;;` is two `;` words. It ends a case arm and the next word is
+        // a pattern, so `|` there is not a pipeline.
+        if a == ";" && case_depth > 0 && words.get(i + 1) == Some(&";") {
+            if stdin_hit(&cmd, piped) {
+                return true;
+            }
+            cmd.clear();
+            piped = false;
+            pattern = true;
+            i += 2;
+            continue;
+        }
+        if matches!(a, ";" | "&&" | "||" | "|" | "&") {
+            if stdin_hit(&cmd, piped) {
+                return true;
+            }
+            piped = a == "|";
+            cmd.clear();
+            await_in = false;
+            i += 1;
+            continue;
+        }
+        if a == "esac" && case_depth > 0 {
+            case_depth -= 1;
+            await_in = false;
+            pattern = false;
+            i += 1;
+            continue;
+        }
+        if a == "case" && cmd.is_empty() {
+            case_depth += 1;
+            await_in = true;
+        }
+        if a == "in" && await_in {
+            await_in = false;
+            pattern = true;
+            i += 1;
+            continue;
+        }
+        cmd.push(a.to_string());
+        i += 1;
+    }
+    stdin_hit(&cmd, piped)
+}
+
+fn stdin_hit(cmd: &[String], after_pipe: bool) -> bool {
+    if cmd.is_empty() {
+        return false;
+    }
+    match shell_stdin(unwrap_wrappers(cmd).0) {
+        Some((Fed::Text(text), _)) => text.contains(['$', '`']),
+        Some((Fed::File(file), _)) => file.starts_with(['<', '>']) || !literal_text(file),
+        Some((Fed::Unshown, dash_s)) => after_pipe || dash_s,
+        _ => false,
+    }
 }
 
 fn decode_ansi_c_quoted(chars: &[char], i: &mut usize, out: &mut String) {
@@ -6874,6 +6944,104 @@ fn decoded_exec(argv: &[String]) -> bool {
             })
         })
     })
+}
+
+/// Commands that are only a `case` pattern (`./ | .// | /usr/*`). The
+/// `|` there is not a pipeline, and the words are not programs. An arm
+/// body after the `)` is not skipped.
+fn case_pattern_skips(argv: &[String]) -> Vec<bool> {
+    let ended = ended_commands(argv);
+    let mut skip = vec![false; ended.len()];
+    let mut case_depth = 0i32;
+    let mut await_in = false;
+    let mut pattern = false;
+    let closes =
+        |p: &str| p == ")" || (p.ends_with(')') && p.matches(')').count() > p.matches('(').count());
+    let doubles = double_semicolons(argv);
+    for (i, (cmd, end)) in ended.iter().enumerate() {
+        let mut for_cmd = false;
+        let mut body = false;
+        for (wi, w) in cmd.iter().enumerate() {
+            if pattern {
+                if *w == "esac" && case_depth > 0 {
+                    case_depth -= 1;
+                    pattern = false;
+                    await_in = false;
+                    continue;
+                }
+                if closes(w) {
+                    pattern = false;
+                    if wi + 1 < cmd.len() {
+                        body = true;
+                    }
+                }
+                continue;
+            }
+            if *w == "esac" && case_depth > 0 {
+                case_depth -= 1;
+                await_in = false;
+                pattern = false;
+            } else if matches!(*w, "for" | "select") && wi == 0 {
+                for_cmd = true;
+            } else if *w == "case" && wi == 0 {
+                case_depth += 1;
+                await_in = true;
+            } else if *w == "in" && await_in && !for_cmd {
+                await_in = false;
+                pattern = true;
+            }
+        }
+        let pure = pattern && !body;
+        if pure && (*end == "|" || cmd.iter().all(|w| !matches!(*w, "case" | "in" | "esac"))) {
+            skip[i] = true;
+        }
+        if doubles.get(i).copied().unwrap_or(false) && case_depth > 0 {
+            pattern = true;
+        }
+    }
+    skip
+}
+
+/// Whether each command [`ended_commands`] returns is closed by `;;`.
+/// Two `;` with only an empty command between them are one `;;`. A
+/// newline between them is not: that is two commands.
+fn double_semicolons(argv: &[String]) -> Vec<bool> {
+    let mut flags = Vec::new();
+    let mut nonempty = false;
+    let words: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let mut i = 0;
+    while i < words.len() {
+        let a = words[i];
+        if a == ";" && words.get(i + 1) == Some(&";") {
+            if nonempty {
+                flags.push(true);
+                nonempty = false;
+            }
+            i += 2;
+            continue;
+        }
+        if matches!(a, ";" | "&&" | "||" | "|" | "&") {
+            if nonempty {
+                flags.push(false);
+                nonempty = false;
+            }
+            i += 1;
+            continue;
+        }
+        let tok = a.trim_end_matches(';');
+        if !tok.is_empty() {
+            nonempty = true;
+        }
+        if a.ends_with(';') && nonempty {
+            flags.push(false);
+            nonempty = false;
+        }
+        i += 1;
+    }
+    if nonempty {
+        flags.push(false);
+    }
+    flags
 }
 
 /// Split a hooked line into its commands at shell separators. A token
@@ -13884,6 +14052,40 @@ hash -r 2> /dev/null
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+        }
+    }
+
+    /// `|` between `case` patterns is not a pipeline, and the pattern is
+    /// not a command. A `|` in an arm body still is.
+    #[test]
+    fn a_bar_between_case_patterns_is_not_a_pipeline() {
+        let root = startup_root("casebar");
+        std::fs::create_dir_all(root.join("safe")).unwrap();
+        std::fs::write(root.join("safe/Makefile"), "all:\n\techo ok\n").unwrap();
+        std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "case $x in a | sh | b) echo ok;; esac",
+            "case $x in ./ | .// | /usr/*) echo ok;; esac; make -C safe",
+            "case $x in cd) :;; esac; make -C safe",
+            "case $x in /usr/bin/foo*) :;; esac; sh ./ok.sh",
+            "case $1 in a) echo a;; esac; make -C safe",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for (line, token) in [
+            ("case $x in a) echo x | sh;; esac", "shell-stdin-unshown"),
+            ("echo x | sh", "shell-stdin-unshown"),
+            ("case $1 in b|c) git push -f;; esac", "git-force-push"),
+            (
+                "case $1 in\n  a | b) git push -f\n  ;;\nesac",
+                "git-force-push",
+            ),
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert_eq!(c.token, token, "{line}");
         }
     }
 }
