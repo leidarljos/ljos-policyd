@@ -104,7 +104,7 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
         .filter(|p| depth == 0 && !p.is_empty())
         .map_or_else(|| UNTRACKED.into(), |p| cwd.join(p));
     let mut runs = Vec::new();
-    runner_commands(argv, cwd, &[oldpwd], 0, &mut runs);
+    runner_commands(argv, cwd, &[oldpwd], &Vars::from_env(), 0, &mut runs);
     for (run, dir, stdin) in runs {
         if is_untracked(&dir) && scripts::runner(&run) {
             return Checked {
@@ -187,12 +187,14 @@ fn add_dirs(set: &mut Vec<std::path::PathBuf>, dirs: impl IntoIterator<Item = st
 /// with `&`. The line goes on past a `cd` that fails at a `;` or `||`, so
 /// the commands there are read both where it went and where it was. A
 /// script nested in the line starts where the command that runs it does,
-/// and with its `cd -`, which goes to one of `oldpwd` at the start.
+/// and with its `cd -`, which goes to one of `oldpwd` at the start, and
+/// with the [`Vars`] it sees, `vars` at the start.
 /// Each command also says whether `xargs` adds words to it from stdin.
 fn runner_commands(
     argv: &[String],
     cwd: &std::path::Path,
     oldpwd: &[std::path::PathBuf],
+    vars: &Vars,
     depth: usize,
     out: &mut Vec<(Vec<String>, std::path::PathBuf, bool)>,
 ) {
@@ -237,13 +239,18 @@ fn runner_commands(
         // shell, in DIR, and moves nothing after it.
         let wrappers = &owned[..owned.len() - run.len()];
         let at: Vec<_> = here.iter().map(|d| env_dir(wrappers, d)).collect();
-        ran_in.push((at.clone(), old.clone()));
+        // The command's own assignments hold for it and what it runs.
+        let mut set = vars.clone();
+        for w in wrappers.iter().filter(|w| is_assignment(w)) {
+            set.assign(w);
+        }
+        ran_in.push((at.clone(), old.clone(), set.clone()));
         // A subshell or substitution in the command runs where the
         // command does, and a `cd` inside it moves only itself.
         if depth < MAX_DEPTH {
             for body in cmd.iter().flat_map(|w| substitutions(w)) {
                 for dir in &here {
-                    runner_commands(&shell_words(&body), dir, &old, depth + 1, out);
+                    runner_commands(&shell_words(&body), dir, &old, vars, depth + 1, out);
                 }
             }
         }
@@ -300,7 +307,7 @@ fn runner_commands(
             }
             let named: Vec<_> = here
                 .iter()
-                .flat_map(|d| entered(&args, d, pushd, &old))
+                .flat_map(|d| entered(&args, d, pushd, &old, set.cdpath.as_deref()))
                 .collect();
             if pushd && (keep || named.is_empty()) {
                 // A directory the line does not name still takes its place
@@ -362,10 +369,47 @@ fn runner_commands(
     }
     for (i, inner) in inner_commands_at(argv) {
         if inner.as_slice() != argv {
-            let (dirs, old) = &ran_in[i];
+            let (dirs, old, set) = &ran_in[i];
             for dir in dirs {
-                runner_commands(&inner, dir, old, depth + 1, out);
+                runner_commands(&inner, dir, old, set, depth + 1, out);
             }
+        }
+    }
+}
+
+/// The `CDPATH` a command on the line sees: `None` where it is unset, and
+/// a value with `$` in it, which names no directory, where the line does
+/// not show it.
+#[derive(Clone)]
+struct Vars {
+    cdpath: Option<String>,
+}
+
+impl Vars {
+    fn from_env() -> Self {
+        let var = |n| std::env::var_os(n).map(|v| v.to_string_lossy().into_owned());
+        Vars {
+            cdpath: var("CDPATH"),
+        }
+    }
+
+    fn slot(&mut self, name: &str) -> Option<&mut Option<String>> {
+        match name {
+            "CDPATH" => Some(&mut self.cdpath),
+            _ => None,
+        }
+    }
+
+    /// Take the assignment `w`, which may append. A value the shell
+    /// expands, with `~` in it as well as `$` or `` ` ``, is not shown.
+    fn assign(&mut self, w: &str) {
+        let Some((name, v)) = w.split_once('=') else {
+            return;
+        };
+        let (name, add) = name.strip_suffix('+').map_or((name, false), |n| (n, true));
+        if let Some(slot) = self.slot(name) {
+            let was = slot.take().filter(|_| add).unwrap_or_default();
+            *slot = Some(was + if v.contains('~') { "$" } else { v });
         }
     }
 }
@@ -392,7 +436,7 @@ fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
 
 /// The directories `cd` or `pushd` with `args` may enter from `dir`: a
 /// path, `~` or `~/path`, home for a bare `cd`, `old` for `-`, and for a
-/// relative path whose first part is not `.` or `..`, each `CDPATH`
+/// relative path whose first part is not `.` or `..`, each `cdpath`
 /// entry that holds it. A bare `pushd`, a stack index, a variable or a
 /// substitution names no directory the line shows, so the caller keeps
 /// the one it has.
@@ -401,6 +445,7 @@ fn entered(
     dir: &std::path::Path,
     pushd: bool,
     old: &[std::path::PathBuf],
+    cdpath: Option<&str>,
 ) -> Vec<std::path::PathBuf> {
     let Some(&to) = args
         .iter()
@@ -420,10 +465,10 @@ fn entered(
             std::path::Path::new(to).components().next(),
             Some(std::path::Component::Normal(_))
         );
-    if let Some(cdpath) = std::env::var_os("CDPATH").filter(|_| searched) {
+    if let Some(cdpath) = cdpath.filter(|_| searched) {
         // The shell takes the first entry it can enter, or else `dir`; an
         // entry that names no directory the line shows may be any.
-        for entry in cdpath.to_string_lossy().split(':') {
+        for entry in cdpath.split(':') {
             let d = path_from(entry, dir)
                 .unwrap_or_else(|| UNTRACKED.into())
                 .join(to);

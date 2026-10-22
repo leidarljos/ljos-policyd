@@ -68,7 +68,10 @@ ANSI-C quoted words are decoded before the line is judged.
 
 A =cd= or =pushd= to a relative path whose first part is not =.= or
 =..= may enter that path under any =CDPATH= entry, so the runner after
-it is also read in each entry that holds the path.
+it is also read in each entry that holds the path. A =CDPATH= set in
+front of the =cd= (=CDPATH=dir cd x=), or of the shell that runs it, is
+the one searched. An entry with =$=, a backquote or =~= in it names no
+directory the line shows, so a runner after the =cd= is refused.
 
 =pushd= and =popd= follow the directory stack. =pushd -n= stacks its
 directory without entering it, =pushd +N= and =-N= enter the entry they

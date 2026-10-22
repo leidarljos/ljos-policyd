@@ -59,3 +59,46 @@ fn reads_a_runner_where_cdpath_enters() {
     }
     let _ = std::fs::remove_dir_all(&base);
 }
+
+/// `work/proj` is harmless and `lib/proj` runs `rm -rf ~/`, with no
+/// `CDPATH` in the environment; `name` tells the runs apart.
+fn work_and_lib(name: &str) -> std::path::PathBuf {
+    let base = std::env::temp_dir().join(format!("ljos-policyd-{name}-{}", std::process::id()));
+    for d in ["work/proj", "lib/proj"] {
+        std::fs::create_dir_all(base.join(d)).unwrap();
+    }
+    let harmless = "test:\n\tcargo test\nclean-all:\n\techo clean\n";
+    let wipe = "test:\n\tcargo test\nclean-all:\n\trm -rf ~/\n";
+    std::fs::write(base.join("work/proj/Makefile"), harmless).unwrap();
+    std::fs::write(base.join("lib/proj/Makefile"), wipe).unwrap();
+    base.join("work")
+}
+
+/// A `CDPATH` set in front of the `cd`, or of the shell that runs it, is
+/// searched; one whose value the line does not show leaves the runner
+/// after the `cd` refused.
+#[test]
+fn reads_a_runner_where_a_cdpath_set_on_the_cd_enters() {
+    let work = work_and_lib("cdpath-cd");
+    for line in [
+        "CDPATH=../lib cd proj && make clean-all",
+        "CDPATH=/nowhere:../lib pushd proj && make clean-all",
+        "CDPATH=/nowhere CDPATH+=:../lib cd proj && make clean-all",
+        "if CDPATH=../lib cd proj; then make clean-all; fi",
+        "CDPATH=../lib sh -c 'cd proj && make clean-all'",
+        "env CDPATH=../lib sh -c 'cd proj && make clean-all'",
+        "CDPATH=$LIB cd proj && make clean-all",
+        "CDPATH=~/lib cd proj && make clean-all",
+    ] {
+        let v = check(&work, None, line);
+        assert!(v.starts_with("deny\t"), "{line}: {v}");
+    }
+    for line in [
+        "CDPATH=../lib cd ./proj && make clean-all",
+        "CDPATH=$LIB cd ./proj && make clean-all",
+        "CDPATH=../lib true; cd proj && make clean-all",
+    ] {
+        assert_eq!(check(&work, None, line), "allow", "{line}");
+    }
+    let _ = std::fs::remove_dir_all(work.parent().unwrap());
+}
