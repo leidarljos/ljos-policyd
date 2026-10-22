@@ -9,6 +9,8 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use icu_casemap::{CaseMapper, CaseMapperBorrowed};
+use icu_locale_core::LanguageIdentifier;
 use icu_properties::props::{DefaultIgnorableCodePoint, GeneralCategory, NoncharacterCodePoint};
 use icu_properties::{CodePointMapData, CodePointSetData};
 use unicode_normalization::UnicodeNormalization;
@@ -923,13 +925,44 @@ fn spacing_mark_on_ascii(local: &str) -> bool {
 }
 
 /// NFKC, then uppercase, then lowercase, then NFKC again.
+///
+/// Case mapping is ICU's full mapping for the root locale, not
+/// `char::to_lowercase`. The toolchain's tables are an older Unicode
+/// and leave letters such as U+A7DD unchanged.
 fn casefold(local: &str) -> String {
-    let folded: String = local
-        .nfkc()
-        .flat_map(char::to_uppercase)
-        .flat_map(char::to_lowercase)
-        .collect();
+    let nfkc: String = local.nfkc().collect();
+    let folded = icu_lower(&icu_upper(&nfkc));
     folded.nfkc().collect()
+}
+
+fn icu_upper(s: &str) -> String {
+    icu_map(s, |cm, ch| {
+        cm.uppercase_to_string(ch, &LanguageIdentifier::UNKNOWN)
+    })
+}
+
+fn icu_lower(s: &str) -> String {
+    icu_map(s, |cm, ch| {
+        cm.lowercase_to_string(ch, &LanguageIdentifier::UNKNOWN)
+    })
+}
+
+/// One character at a time. The string mapping is context sensitive, so
+/// a final sigma and a medial one become different letters and a rule
+/// for `abσ` misses `abσx`. The per-character mapping is what the
+/// skeleton already compared, and it still folds a letter the
+/// toolchain leaves unchanged.
+fn icu_map(
+    s: &str,
+    map: impl for<'a> Fn(CaseMapperBorrowed<'static>, &'a str) -> std::borrow::Cow<'a, str>,
+) -> String {
+    let cm = CaseMapper::new();
+    let mut out = String::with_capacity(s.len());
+    let mut buf = [0u8; 4];
+    for ch in s.chars() {
+        out.push_str(&map(cm, ch.encode_utf8(&mut buf)));
+    }
+    out
 }
 
 fn same_family(domain: &str, other: &str, families: &[AliasFamily]) -> bool {
@@ -1216,7 +1249,7 @@ fn normalize_local(raw: &str) -> Option<String> {
         .collect();
     if folded
         .chars()
-        .any(|c| local_closed(&sets, c) || c.is_control())
+        .any(|c| local_closed(&sets, c) || mail::unicode_control(c))
     {
         return None;
     }
@@ -1226,7 +1259,7 @@ fn normalize_local(raw: &str) -> Option<String> {
     if spacing_mark_on_ascii(&stripped) || spacing_mark_on_ascii(&folded) {
         return None;
     }
-    let lower: String = folded.chars().flat_map(|c| c.to_lowercase()).collect();
+    let lower = icu_lower(&folded);
     if lower.is_empty() {
         return None;
     }
@@ -1247,7 +1280,7 @@ fn rule_domain(raw: &str) -> Option<String> {
 }
 
 fn forbidden_in_domain(c: char) -> bool {
-    matches!(c, '*' | ':' | '/' | '@') || c.is_whitespace()
+    matches!(c, '*' | ':' | '/' | '@') || mail::unicode_space(c)
 }
 
 /// LDH labels of 1 to 63 characters, no leading or trailing hyphen, and
@@ -1296,7 +1329,7 @@ fn address_rule_can_match(mailbox: &Mailbox, addr: &NormAddr) -> bool {
 /// `@`, `%` and `!` are routes the parser refuses. A control other than
 /// a tab cannot be in a parsed local part either.
 fn recipient_local_char(c: char) -> bool {
-    !matches!(c, '@' | '%' | '!' | '*') && (!c.is_control() || c == '\t')
+    !matches!(c, '@' | '%' | '!' | '*') && (!mail::unicode_control(c) || c == '\t')
 }
 
 /// NFKC, then IDNA, so a fullwidth label and a punycode label of the same
@@ -1323,7 +1356,7 @@ fn normalize_domain(raw: &str) -> Option<String> {
     }
     if folded
         .chars()
-        .any(|c| c.is_control() || c.is_whitespace() || domain_closed(&sets, c))
+        .any(|c| mail::unicode_control(c) || mail::unicode_space(c) || domain_closed(&sets, c))
     {
         return None;
     }
@@ -3359,7 +3392,7 @@ pair left right
                         | '~'
                 );
         }
-        !ch.is_control() && !ch.is_whitespace()
+        !mail::unicode_control(ch) && !mail::unicode_space(ch)
     }
 
     fn surrogate_message(cp: u32) -> Vec<u8> {
@@ -3550,6 +3583,24 @@ pair left right
         let v = check_mail_bytes(&[0xff, 0xfe], &dir.join("mail.conf"));
         assert_eq!(v.reasons[0].code, "message-invalid");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ICU properties, `unicode-normalization` and the case mapping are
+    /// Unicode 18.0.0. The toolchain's `char` tables are not read on
+    /// this path: they leave these letters unchanged.
+    #[test]
+    fn the_deny_path_uses_unicode_18() {
+        assert_eq!(icu_properties_data::unicode_tag!(), "18.0.0");
+        assert_eq!(unicode_normalization::UNICODE_VERSION, (18, 0, 0));
+        for (upper, lower) in [
+            ('\u{A7DD}', "\u{0277}"),
+            ('\u{AB6C}', "\u{AB4B}"),
+            ('\u{1DF40}', "\u{1DF41}"),
+        ] {
+            let cp = u32::from(upper);
+            assert_eq!(icu_lower(&upper.to_string()), lower, "U+{cp:04X}");
+            assert_eq!(casefold(&upper.to_string()), lower, "U+{cp:04X}");
+        }
     }
 
     #[test]
