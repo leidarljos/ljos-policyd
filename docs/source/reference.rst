@@ -93,6 +93,8 @@ front of it (``HOME=dir cd``) or earlier on the line (``export HOME=dir;
 cd``), and ``~`` expands from the one set before the command. A ``HOME``
 that may hold either of two values, or one the line does not show
 (``HOME=$(mktemp -d) cd``), leaves the runner after the ``cd`` refused.
+``$PWD`` in either value is the one directory the line is in, when it
+shows that and does not set ``PWD`` (``export HOME="$PWD/.home"``).
 With ``HOME`` unset, ``~`` is the home in the user's passwd entry, as in
 bash, and a bare ``cd`` stays.
 

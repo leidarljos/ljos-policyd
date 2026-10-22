@@ -216,6 +216,8 @@ fn runner_commands(
     let mut list = (here.clone(), old.clone(), pushed.clone(), vars.clone());
     let mut after = ";";
     let mut ran_in = Vec::new();
+    // `$PWD` follows the line's directory unless the line sets it.
+    let pwd_set = argv.iter().any(|w| may_set(w, "PWD"));
     for (cmd, end) in ended_commands(argv) {
         if after == "&" {
             (here, old, pushed, vars) = list.clone();
@@ -251,10 +253,14 @@ fn runner_commands(
             .iter()
             .map(|d| env_dir(wrappers, d, vars.home.as_deref()))
             .collect();
+        let pwd = match here.as_slice() {
+            [d] if !pwd_set && !is_untracked(d) => Some(d.as_path()),
+            _ => None,
+        };
         // The command's own assignments hold for it and what it runs.
         let mut set = vars.clone();
         for w in wrappers.iter().filter(|w| is_assignment(w)) {
-            set.assign(w);
+            set.assign(&with_pwd(w, pwd));
         }
         ran_in.push((at.clone(), old.clone(), set.clone()));
         // A subshell or substitution in the command runs where the
@@ -268,7 +274,8 @@ fn runner_commands(
         }
         if !piped {
             let was = vars.clone();
-            set_vars(&cmd, &mut vars);
+            let shown: Vec<_> = cmd.iter().map(|w| with_pwd(w, pwd)).collect();
+            set_vars(&shown.iter().map(|w| &**w).collect::<Vec<_>>(), &mut vars);
             match before {
                 "||" => vars.merge(was),
                 "&&" => match &mut vars_failed {
@@ -455,21 +462,10 @@ impl Vars {
     /// other than to read it (`$NAME`, `${NAME}`), or sets by default
     /// (`${NAME:=value}`).
     fn lose(&mut self, w: &str) {
-        let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
-        let sets = |name: &str| {
-            w.match_indices(name).any(|(i, _)| {
-                let (pre, post) = (&w[..i], &w[i + name.len()..]);
-                !pre.ends_with(ident)
-                    && !post.starts_with(ident)
-                    && (!pre.ends_with(['$', '{'])
-                        || post.starts_with('=')
-                        || post.starts_with(":="))
-            })
-        };
-        if sets("CDPATH") {
+        if may_set(w, "CDPATH") {
             self.cdpath = Some("$".into());
         }
-        if sets("HOME") {
+        if may_set(w, "HOME") {
             self.home = Some("$".into());
         }
     }
@@ -504,6 +500,37 @@ impl Vars {
             self.home = Some("$".into());
         }
     }
+}
+
+/// Whether the word `w` names the variable `name` other than to read it
+/// (`$NAME`, `${NAME}`), or sets it by default (`${NAME:=value}`).
+fn may_set(w: &str, name: &str) -> bool {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    w.match_indices(name).any(|(i, _)| {
+        let (pre, post) = (&w[..i], &w[i + name.len()..]);
+        !pre.ends_with(ident)
+            && !post.starts_with(ident)
+            && (!pre.ends_with(['$', '{']) || post.starts_with('=') || post.starts_with(":="))
+    })
+}
+
+/// `w` with each `$PWD` and `${PWD}` in it read as `pwd`, the one
+/// directory the line is in when it shows that.
+fn with_pwd<'a>(w: &'a str, pwd: Option<&std::path::Path>) -> Cow<'a, str> {
+    let Some(p) = pwd.and_then(|p| p.to_str()).filter(|_| w.contains("$")) else {
+        return Cow::Borrowed(w);
+    };
+    let w = w.replace("${PWD}", p);
+    let mut out = String::new();
+    let mut rest = w.as_str();
+    while let Some(i) = rest.find("$PWD") {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + 4..];
+        let longer = rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
+        out.push_str(if longer { "$PWD" } else { p });
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
 }
 
 /// Keywords that open or continue a compound command; the command after
