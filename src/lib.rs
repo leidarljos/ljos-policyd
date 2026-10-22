@@ -5168,6 +5168,30 @@ mod tests {
         }
     }
 
+    /// A word that only names `PWD` leaves it the line's directory; an
+    /// assignment, or a command that writes the name it takes, does not.
+    #[test]
+    fn only_a_write_in_this_shell_sets_pwd() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "echo PWD; export HOME=\"$PWD/project\"; cd ~ && make test",
+            "grep -r PWD .; export PWD; export HOME=\"$PWD/project\"; cd ~ && make test",
+            "env PWD=/x true; export HOME=\"$PWD/project\"; cd ~ && make test",
+        ] {
+            let c = entering("pwd-named", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+        for line in [
+            "read PWD; export HOME=\"$PWD/project\"; cd ~ && make test",
+            "unset PWD; export HOME=\"$PWD/project\"; cd ~ && make test",
+            "eval PWD=/x; export HOME=\"$PWD/project\"; cd ~ && make test",
+            "((PWD=1)); export HOME=\"$PWD/project\"; cd ~ && make test",
+        ] {
+            let c = entering("pwd-named", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+    }
+
     /// `command`, `command -p` and `builtin` do not hide `cd`.
     #[test]
     fn follows_a_cd_behind_command_or_builtin() {
