@@ -317,7 +317,11 @@ subdomains: ``domain example.test`` already covers
 character a parsed recipient cannot carry, is refused the same
 way. ``From`` is
 not matched this way. A domain literal (an
-address at ``@[ ... ]``) in a watched header is a refusal. An
+address at ``@[ ... ]``) in a watched header is a refusal. So is
+a domain that is not a hostname after IDNA, such as one with an
+underscore, a ``!`` or a ``+``, a label that starts or ends with a
+hyphen, a label over 63 characters or a name over 253: no rule
+could name it. An
 all-numeric domain is a refusal, judged after IDNA. That
 includes a dotted quad, a shorter form ``inet_aton`` accepts,
 a hex label (``0x``) and a label with a leading zero. U+3002
@@ -332,8 +336,10 @@ mixes Latin with Cyrillic or Greek after NFKC and IDNA.
 
 A deny-file domain compares a fullwidth spelling and the punycode
 form as the same domain. A homoglyph that NFKC and IDNA leave alone
-does not. ASCII case is folded, and a character a reader skips is
-removed before that comparison. ``From`` is not compared that way. ``handle``, ``term`` and ``pair`` may share the deny file
+does not, and a label wholly in Cyrillic or Greek is not mapped to
+the Latin it looks like. Case is folded as the address skeleton
+folds it, so ß is ss and ı and İ are i, and a character a reader
+skips is removed before that comparison. ``From`` is not compared that way. ``handle``, ``term`` and ``pair`` may share the deny file
 and are ignored here. A pack-law line that would allow a domain refuses
 the file. The detail of ``deny-file-invalid`` and ``pack-law-invalid``
 is the line number, not the value. A message over 1 MiB, a control character in the header
