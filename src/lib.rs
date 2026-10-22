@@ -5245,6 +5245,27 @@ mod tests {
         );
     }
 
+    /// After `command` or `builtin`, `time` is not the keyword: `command
+    /// time cd dir` runs the time program, which runs `cd` in a child.
+    #[test]
+    fn time_after_command_or_builtin_is_a_program() {
+        for line in [
+            "command time cd evil; make clean-all",
+            "builtin time cd evil; make clean-all",
+            "command -p time -p cd evil; make clean-all",
+        ] {
+            assert_eq!(
+                evil_and_safe("command-time", line),
+                Decision::Allow,
+                "{line}"
+            );
+        }
+        assert_eq!(
+            evil_and_safe("command-time", "time command cd evil; make clean-all"),
+            Decision::Deny
+        );
+    }
+
     /// An opening `{` before `cd` does not hide it.
     #[test]
     fn follows_a_cd_behind_a_brace_group() {
