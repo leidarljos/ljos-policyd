@@ -1073,20 +1073,16 @@ fn normalize_local(raw: &str) -> Option<String> {
 }
 
 /// A deny-file or pack-law domain. `None` when a recipient domain could
-/// not be written the same way, or the value is not a hostname after
-/// IDNA. A star, a colon, a slash or a dotted quad would load and then
-/// match no real recipient. A domain rule already covers its
-/// subdomains, so a wildcard is not another way to write it.
+/// not be written the same way. A star, a colon, a slash or a dotted
+/// quad would load and then match no real recipient. A domain rule
+/// already covers its subdomains, so a wildcard is not another way to
+/// write it.
 fn rule_domain(raw: &str) -> Option<String> {
     if raw.chars().any(forbidden_in_domain) {
         return None;
     }
     let bare = mail::parse_domain(raw).ok()?;
-    let ascii = normalize_domain(&bare)?;
-    if ascii.chars().any(forbidden_in_domain) || !is_hostname(&ascii) {
-        return None;
-    }
-    Some(ascii)
+    normalize_domain(&bare)
 }
 
 fn forbidden_in_domain(c: char) -> bool {
@@ -1094,8 +1090,9 @@ fn forbidden_in_domain(c: char) -> bool {
 }
 
 /// LDH labels of 1 to 63 characters, no leading or trailing hyphen, and
-/// the whole name at most 253. That is a hostname after IDNA. A label
-/// outside it does not compare with a recipient domain.
+/// the whole name at most 253. That is a hostname after IDNA. A rule
+/// and a recipient both have to be one, so every recipient domain is a
+/// domain a rule can name.
 fn is_hostname(ascii: &str) -> bool {
     if ascii.is_empty() || ascii.len() > 253 || ascii.starts_with('.') || ascii.ends_with('.') {
         return false;
@@ -1129,7 +1126,6 @@ fn address_rule_can_match(mailbox: &Mailbox, addr: &NormAddr) -> bool {
     }
     if mailbox.domain.chars().any(forbidden_in_domain)
         || addr.domain.chars().any(forbidden_in_domain)
-        || !is_hostname(&addr.domain)
     {
         return false;
     }
@@ -1144,7 +1140,10 @@ fn recipient_local_char(c: char) -> bool {
 
 /// NFKC, then IDNA, so a fullwidth label and a punycode label of the same
 /// domain compare equal. A trailing dot is the same name. A homoglyph that
-/// NFKC leaves alone stays a different domain.
+/// NFKC leaves alone stays a different domain. Rules and recipients are
+/// both read here, and a name that is not a hostname after IDNA is
+/// `None` for both: a recipient at an underscore or edge-hyphen label is
+/// refused, because no rule could name it.
 fn normalize_domain(raw: &str) -> Option<String> {
     if raw.contains('@') {
         return None;
@@ -1162,7 +1161,9 @@ fn normalize_domain(raw: &str) -> Option<String> {
     if folded.contains('[') || folded.contains(']') {
         return None;
     }
-    idna::domain_to_ascii(folded).ok().filter(|d| !d.is_empty())
+    idna::domain_to_ascii(folded)
+        .ok()
+        .filter(|d| is_hostname(d))
 }
 
 /// Latin together with Cyrillic or Greek in one label, after NFKC and
@@ -1528,6 +1529,57 @@ From: other@example.test\r\n";
             codes(&raw, "domain xn--bcher-kva.test\n", ""),
             vec!["recipient-domain-denied"]
         );
+    }
+
+    /// The recipient parser takes any atext in a domain, and IDNA does
+    /// not check hyphens or lengths. A domain no rule can name is
+    /// refused, not allowed.
+    #[test]
+    fn a_recipient_domain_no_rule_can_name_is_refused() {
+        let a61 = "a".repeat(61);
+        let a62 = "a".repeat(62);
+        let a63 = "a".repeat(63);
+        let a64 = "a".repeat(64);
+        let refused = [
+            "foo_bar.test".to_string(),
+            "_under.test".to_string(),
+            "-lead.test".to_string(),
+            "trail-.test".to_string(),
+            "a.-lead.test".to_string(),
+            format!("{a64}.test"),
+            format!("{a63}.{a63}.{a63}.{a62}"),
+            "a!b.test".to_string(),
+            "a*b.test".to_string(),
+            "a+b.test".to_string(),
+            "a%b.test".to_string(),
+            "a$b.test".to_string(),
+        ];
+        for domain in &refused {
+            let to = format!("user@{domain}");
+            assert_eq!(
+                codes(&plain(&format!("To: {to}\r\n")), "", ""),
+                vec!["recipient-unparsed"],
+                "{to}"
+            );
+            assert_eq!(
+                codes_argv(&plain(""), "", "", &[&to]),
+                vec!["argv-recipient-unparsed"],
+                "{to}"
+            );
+        }
+        for domain in [
+            "a-b.test".to_string(),
+            format!("{a63}.test"),
+            format!("{a63}.{a63}.{a63}.{a61}"),
+        ] {
+            let to = plain(&format!("To: user@{domain}\r\n"));
+            assert!(codes(&to, "", "").is_empty(), "{domain}");
+            assert_eq!(
+                codes(&to, &format!("domain {domain}\n"), ""),
+                vec!["recipient-domain-denied"],
+                "{domain}"
+            );
+        }
     }
 
     #[test]
