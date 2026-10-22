@@ -5403,6 +5403,26 @@ mod tests {
         );
     }
 
+    /// A redirection that names its descriptor by a variable, `{fd}>file`,
+    /// is not the `cd` target, and it sets that variable in this shell.
+    #[test]
+    fn reads_a_named_descriptor_redirection() {
+        for line in [
+            "cd {fd}>/dev/null evil && make clean-all",
+            "cd {fd}> /dev/null evil && make clean-all",
+            "pushd {fd}>&- evil && make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("fd-name", line), Decision::Deny, "{line}");
+        }
+        let files = [("Makefile", MAKEFILE)];
+        let c = entering(
+            "fd-name",
+            &files,
+            "HOME={dir}; true {HOME}>/dev/null; cd ~ && make test",
+        );
+        assert_eq!(c.decision, Decision::Deny);
+    }
+
     /// `>|` is a redirection that overwrites under `noclobber`, not a pipe.
     #[test]
     fn reads_a_clobber_redirection_as_one_word() {
