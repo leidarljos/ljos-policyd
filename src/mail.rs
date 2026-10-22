@@ -35,7 +35,13 @@ pub(crate) enum MessageFault {
     /// CRLF and a bare LF in the same header block. One reader splits the
     /// body at the earlier blank line and drops the headers between them.
     LineEnding,
+    /// A header line over 998 octets. A hop that wraps it without
+    /// folding turns the tail into a new header.
+    LineTooLong,
 }
+
+/// RFC 5322 limit, excluding the CRLF.
+const HEADER_LINE_MAX: usize = 998;
 
 #[derive(Debug)]
 pub(crate) struct Message {
@@ -59,6 +65,9 @@ pub(crate) fn parse_message(input: &str) -> Result<Message, MessageFault> {
     let block = header_block(input)?;
     if has_bad_control(block) {
         return Err(MessageFault::Control);
+    }
+    if header_line_too_long(block) {
+        return Err(MessageFault::LineTooLong);
     }
     let fields = split_headers(block)?;
     let mut headers = Vec::with_capacity(fields.len());
@@ -136,6 +145,10 @@ fn has_bare_lf(s: &str) -> bool {
         .iter()
         .enumerate()
         .any(|(i, c)| *c == b'\n' && (i == 0 || bytes[i - 1] != b'\r'))
+}
+
+fn header_line_too_long(block: &str) -> bool {
+    block.lines().any(|line| line.len() > HEADER_LINE_MAX)
 }
 
 fn has_bad_control(block: &str) -> bool {
@@ -1094,6 +1107,23 @@ From: other@example.test\r\n\
     fn a_broken_encoded_word_is_not_read_as_text() {
         let raw = "From: =?utf-8?q?unterminated <mailseat@example.test>\r\n\r\n";
         assert_eq!(froms(raw), vec![Err(HeaderFault::EncodedWord)]);
+    }
+
+    #[test]
+    fn a_header_line_over_998_octets_is_refused() {
+        let mut line = String::from("Subject: ");
+        while line.len() < 998 {
+            line.push('a');
+        }
+        line.push_str("Bcc: a@example.test");
+        let raw = format!("From: mailseat@example.test\r\n{line}\r\n\r\n");
+        assert_eq!(parse_message(&raw).unwrap_err(), MessageFault::LineTooLong);
+        let mut ok = String::from("Subject: ");
+        while ok.len() < 998 {
+            ok.push('b');
+        }
+        let raw = format!("From: mailseat@example.test\r\n{ok}\r\n\r\n");
+        assert!(parse_message(&raw).is_ok());
     }
 
     #[test]

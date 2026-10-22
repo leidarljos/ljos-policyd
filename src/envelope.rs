@@ -109,6 +109,9 @@ pub fn check_mail_bytes(message: &[u8], config_path: &Path) -> MailVerdict {
         Err(MessageFault::LineEnding) => {
             return MailVerdict::refusal("header-line-ending", "header block");
         }
+        Err(MessageFault::LineTooLong) => {
+            return MailVerdict::refusal("header-line-too-long", "header block");
+        }
         Err(MessageFault::Structure) => {
             return MailVerdict::refusal("message-invalid", "header block");
         }
@@ -1199,6 +1202,28 @@ pair left right
         let v = check_mail_bytes(b"From: mailseat@example.test\r\n", &dir.join("mail.conf"));
         assert_eq!(v.reasons[0].code, "deny-file-unreadable");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_header_line_over_998_octets_is_refused() {
+        let deny = "domain blocked.test\n";
+        let mut line = String::from("Subject: ");
+        while line.len() < 998 {
+            line.push('a');
+        }
+        line.push_str("Bcc: a@blocked.test");
+        let raw = format!("From: mailseat@example.test\r\n{line}\r\n\r\n");
+        assert_eq!(codes(&raw, deny, ""), vec!["header-line-too-long"]);
+        let mut ok = String::from("Subject: ");
+        while ok.len() < 998 {
+            ok.push('b');
+        }
+        let raw = format!("From: mailseat@example.test\r\n{ok}\r\n\r\n");
+        assert!(
+            codes(&raw, deny, "").is_empty(),
+            "{:?}",
+            details(&raw, deny, "")
+        );
     }
 
     #[test]
