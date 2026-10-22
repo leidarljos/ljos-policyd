@@ -42,6 +42,8 @@ Leading words that still run =cd= in this shell (=command=,
 =builtin=, =if=, =while=, ={= and the other control keywords)
 are peeled before this check, and a redirection among the words of a
 =cd= or =pushd= names neither the directory nor a =pushd= stack index.
+One that closes a descriptor (=2>&-=, =<&-=) is a whole word, so the
+word after it is the target.
 
 | Runner | File read |
 |---+---|

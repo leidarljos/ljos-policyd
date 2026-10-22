@@ -374,8 +374,10 @@ fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
             out.push(a);
             continue;
         }
+        // The `-` of `2>&-` closes the descriptor and is the whole target;
+        // only the heredoc `<<-` still wants the next word.
         let rest = a.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
-        if rest.chars().all(|c| matches!(c, '>' | '<' | '&' | '-')) {
+        if rest == "<<-" || rest.chars().all(|c| matches!(c, '>' | '<' | '&')) {
             words.next();
         }
     }
@@ -4520,6 +4522,27 @@ mod tests {
             let c = entering("redir-target-cd", &files, line);
             assert_eq!(c.decision, Decision::Deny, "{line}");
         }
+    }
+
+    /// A redirection that closes a descriptor (`2>&-`) is whole, so the
+    /// word after it is the target.
+    #[test]
+    fn reads_a_cd_target_after_a_closing_redirection() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "cd 2>&- project && make clean-all",
+            "cd >&- project && make clean-all",
+            "cd <&- project && make clean-all",
+            "pushd 2>&- project && make clean-all",
+            "cd 2>& - project && make clean-all",
+        ] {
+            let c = entering("close-redir-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        assert_eq!(
+            leaving("close-redir-cd", "cd 2>&- safe && make clean-all"),
+            Decision::Allow
+        );
     }
 
     /// The `&` of a redirection does not send the `cd` before it to the
