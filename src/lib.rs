@@ -5554,6 +5554,27 @@ mod tests {
         );
     }
 
+    /// An `env -S` string holding a `$` whose value the line does not show
+    /// may run anything, so it is refused.
+    #[test]
+    fn env_split_string_with_an_unshown_value_is_refused() {
+        for argv in [
+            &["env", "-S", "${CMD}"][..],
+            &["bash", "-c", "env -S \"$X\""],
+            &["bash", "-c", "ls; env -iS \"git ${SUB:-push} -f\""],
+            &["bash", "-c", "CMD=ls; read CMD; env -S \"$CMD\""],
+            &["bash", "-c", "CMD=ls; false && CMD=git; env -S \"$CMD\""],
+        ] {
+            assert!(v(argv).starts_with("deny\t"), "{argv:?}");
+        }
+        for argv in [
+            &["env", "-S", "ls -l"][..],
+            &["bash", "-c", "CMD=ls; env -S \"$CMD -l\""],
+        ] {
+            assert_eq!(v(argv), "allow", "{argv:?}");
+        }
+    }
+
     /// `pushd -n` stacks a directory without entering it, and `pushd +N`,
     /// `-N` or a bare `pushd` enters the one it brings to the top.
     #[test]
