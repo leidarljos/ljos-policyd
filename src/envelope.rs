@@ -147,6 +147,9 @@ struct Config {
     deny_addresses: BTreeSet<String>,
     deny_domains: BTreeSet<String>,
     pack_domains: BTreeSet<String>,
+    /// Characters that split a local part into a mailbox and a tag.
+    /// Default `+-=`. An address rule for the mailbox covers the tag.
+    subaddress: String,
 }
 
 fn load_config(path: &Path) -> Result<Config, MailReason> {
@@ -154,6 +157,7 @@ fn load_config(path: &Path) -> Result<Config, MailReason> {
     let mut identity = None;
     let mut deny_file = None;
     let mut pack_law = None;
+    let mut subaddress = None;
     for line in text.lines() {
         let Some((key, value)) =
             rule_line(line).map_err(|()| reason("config-invalid", "config"))?
@@ -164,6 +168,7 @@ fn load_config(path: &Path) -> Result<Config, MailReason> {
             "identity" => &mut identity,
             "deny-file" => &mut deny_file,
             "pack-law" => &mut pack_law,
+            "subaddress" => &mut subaddress,
             _ => return Err(reason("config-invalid", "config")),
         };
         if slot.is_some() || value.is_empty() {
@@ -174,6 +179,14 @@ fn load_config(path: &Path) -> Result<Config, MailReason> {
     let (Some(identity), Some(deny_file), Some(pack_law)) = (identity, deny_file, pack_law) else {
         return Err(reason("config-invalid", "config"));
     };
+    // Absent means the default. A present line that is not a list of
+    // separator characters would match nothing, or match the wrong cut,
+    // so the config is refused.
+    let subaddress = match subaddress {
+        Some(value) if valid_separators(&value) => value,
+        Some(_) => return Err(reason("config-invalid", "config")),
+        None => "+-=".to_string(),
+    };
     let identity =
         normalize_identity(&identity).ok_or_else(|| reason("identity-invalid", "identity"))?;
     let (deny_addresses, deny_domains) = load_deny(&resolve(path, &deny_file))?;
@@ -183,7 +196,36 @@ fn load_config(path: &Path) -> Result<Config, MailReason> {
         deny_addresses,
         deny_domains,
         pack_domains,
+        subaddress,
     })
+}
+
+/// Separators are ASCII punctuation that can occur in a local part.
+/// `.` is not one: gmail ignores dots instead of cutting on them. `@`,
+/// `%` and `!` are routes, not tags.
+fn valid_separators(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|c| {
+            matches!(
+                c,
+                '#' | '$'
+                    | '&'
+                    | '\''
+                    | '*'
+                    | '+'
+                    | '-'
+                    | '/'
+                    | '='
+                    | '?'
+                    | '^'
+                    | '_'
+                    | '`'
+                    | '{'
+                    | '|'
+                    | '}'
+                    | '~'
+            )
+        })
 }
 
 fn normalize_identity(value: &str) -> Option<NormAddr> {
@@ -213,7 +255,9 @@ fn load_deny(path: &Path) -> Result<(BTreeSet<String>, BTreeSet<String>), MailRe
                 }
                 let addr = normalize_mailbox(&list[0])
                     .ok_or_else(|| reason("deny-file-invalid", "deny-file"))?;
-                addresses.insert(addr.key());
+                for key in rule_keys(&addr) {
+                    addresses.insert(key);
+                }
             }
             "domain" => {
                 let domain = normalize_domain(value)
@@ -374,15 +418,7 @@ fn check_identity_headers(message: &Message, config: &Config, reasons: &mut Vec<
             "mail-reply-to-denied",
         ),
     ] {
-        check_named(
-            message,
-            name,
-            unparsed,
-            denied,
-            &config.deny_addresses,
-            &config.deny_domains,
-            reasons,
-        );
+        check_named(message, name, unparsed, denied, config, reasons);
     }
 }
 
@@ -391,8 +427,7 @@ fn check_named(
     name: &str,
     unparsed_code: &'static str,
     denied_code: &'static str,
-    addresses: &BTreeSet<String>,
-    domains: &BTreeSet<String>,
+    config: &Config,
     reasons: &mut Vec<MailReason>,
 ) {
     let mut encoded = false;
@@ -407,7 +442,9 @@ fn check_named(
                     if let Some(shown) = mixed_script_domain(&addr.domain) {
                         hits.push((true, format!("{name} {shown}")));
                     }
-                    if address_denied(&addr, addresses) || domain_denied(&addr.domain, domains) {
+                    if address_denied(&addr, &config.deny_addresses, &config.subaddress)
+                        || domain_denied(&addr.domain, &config.deny_domains)
+                    {
                         hits.push((false, addr.key()));
                     }
                 }
@@ -460,7 +497,7 @@ fn check_recipients(message: &Message, config: &Config, reasons: &mut Vec<MailRe
                         if let Some(shown) = mixed_script_domain(&addr.domain) {
                             reasons.push(reason("mixed-script", format!("{name} {shown}")));
                         }
-                        if address_denied(&addr, &config.deny_addresses) {
+                        if address_denied(&addr, &config.deny_addresses, &config.subaddress) {
                             reasons.push(reason(
                                 "recipient-address-denied",
                                 format!("{name} {}", addr.key()),
@@ -528,19 +565,88 @@ fn wire_rewritten(raw: &str) -> bool {
     folded != raw
 }
 
-/// An `address` rule names that mailbox and a `local+tag` subaddress
-/// of it. Providers deliver the tag to the mailbox.
-fn address_denied(addr: &NormAddr, addresses: &BTreeSet<String>) -> bool {
-    if addresses.contains(&addr.key()) {
-        return true;
+/// An `address` rule names that mailbox and `<local><sep><anything>`.
+/// `seps` comes from the config, or `+-=` when the line is omitted.
+///
+/// Two provider shapes are part of the same match, and only here.
+/// `gmail.com` and `googlemail.com` are one domain, and dots in the
+/// local part are ignored. `anything@user.fastmail.com` (one label,
+/// then `fastmail.com`) is `user@fastmail.com`. A domain rule and
+/// `From` do not use either shape.
+fn address_denied(addr: &NormAddr, addresses: &BTreeSet<String>, seps: &str) -> bool {
+    let candidates = candidate_keys(addr);
+    for rule in addresses {
+        let Some((rule_local, rule_domain)) = rule.split_once('@') else {
+            continue;
+        };
+        for key in &candidates {
+            let Some((local, domain)) = key.split_once('@') else {
+                continue;
+            };
+            if domain != rule_domain {
+                continue;
+            }
+            if local == rule_local || is_subaddress(rule_local, local, seps) {
+                return true;
+            }
+        }
     }
-    let Some((base, _)) = addr.local.split_once('+') else {
+    false
+}
+
+fn is_subaddress(rule_local: &str, local: &str, seps: &str) -> bool {
+    let Some(rest) = local.strip_prefix(rule_local) else {
         return false;
     };
-    if base.is_empty() {
-        return false;
+    rest.chars().next().is_some_and(|c| seps.contains(c))
+}
+
+/// Keys stored for one deny-file address. Gmail dots are already gone,
+/// and both gmail domains are present, so a later lookup can compare
+/// the same shape.
+fn rule_keys(addr: &NormAddr) -> Vec<String> {
+    let mut keys = Vec::new();
+    push_exact(&mut keys, &addr.local, &addr.domain);
+    keys
+}
+
+/// Forms of `addr` that an address rule might name. The fastmail alias
+/// adds `user@fastmail.com` and does not cut the domain label on a
+/// separator: a hyphen there is part of the user name.
+fn candidate_keys(addr: &NormAddr) -> Vec<String> {
+    let mut keys = Vec::new();
+    push_exact(&mut keys, &addr.local, &addr.domain);
+    if let Some(user) = fastmail_user(&addr.domain) {
+        keys.push(format!("{user}@fastmail.com"));
     }
-    addresses.contains(&format!("{base}@{}", addr.domain))
+    keys
+}
+
+fn push_exact(keys: &mut Vec<String>, local: &str, domain: &str) {
+    if is_gmail(domain) {
+        let bare = strip_dots(local);
+        keys.push(format!("{bare}@gmail.com"));
+        keys.push(format!("{bare}@googlemail.com"));
+    } else {
+        keys.push(format!("{local}@{domain}"));
+    }
+}
+
+fn is_gmail(domain: &str) -> bool {
+    domain == "gmail.com" || domain == "googlemail.com"
+}
+
+fn strip_dots(local: &str) -> String {
+    local.chars().filter(|c| *c != '.').collect()
+}
+
+fn fastmail_user(domain: &str) -> Option<&str> {
+    let user = domain.strip_suffix(".fastmail.com")?;
+    if user.is_empty() || user.contains('.') {
+        None
+    } else {
+        Some(user)
+    }
 }
 
 fn domain_denied(domain: &str, denied: &BTreeSet<String>) -> bool {
@@ -714,6 +820,10 @@ mod tests {
     }
 
     fn verdict(message: &str, deny: &str, law: &str) -> MailVerdict {
+        verdict_with(message, deny, law, "")
+    }
+
+    fn verdict_with(message: &str, deny: &str, law: &str, extra: &str) -> MailVerdict {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -726,12 +836,20 @@ mod tests {
         std::fs::write(dir.join("law.txt"), law).unwrap();
         std::fs::write(
             dir.join("mail.conf"),
-            format!("identity {IDENTITY}\ndeny-file deny.txt\npack-law law.txt\n"),
+            format!("identity {IDENTITY}\ndeny-file deny.txt\npack-law law.txt\n{extra}"),
         )
         .unwrap();
         let got = check_mail_bytes(message.as_bytes(), &dir.join("mail.conf"));
         let _ = std::fs::remove_dir_all(&dir);
         got
+    }
+
+    fn codes_with(message: &str, deny: &str, law: &str, extra: &str) -> Vec<String> {
+        verdict_with(message, deny, law, extra)
+            .reasons
+            .into_iter()
+            .map(|r| r.code.to_string())
+            .collect()
     }
 
     fn plain(extra: &str) -> String {
@@ -1238,6 +1356,71 @@ pair left right
         );
         assert!(codes(&plain("Reply-To: evilx@example.test\r\n"), deny, "").is_empty());
         assert!(codes(&plain("To: notevil+x@example.test\r\n"), deny, "").is_empty());
+    }
+
+    /// The default separators are `+-=`. Gmail and Googlemail are one
+    /// domain with dots ignored, and `x@user.fastmail.com` is the user
+    /// at fastmail.com. A `subaddress` line replaces the default.
+    #[test]
+    fn address_rules_cover_subaddresses_and_provider_aliases() {
+        let deny = "address evil@example.test\n";
+        assert_eq!(
+            codes(&plain("To: evil-x@example.test\r\n"), deny, ""),
+            vec!["recipient-address-denied"]
+        );
+        assert_eq!(
+            codes(&plain("To: evil=x@example.test\r\n"), deny, ""),
+            vec!["recipient-address-denied"]
+        );
+        assert_eq!(
+            codes(&plain("To: \"evil-x\"@example.test\r\n"), deny, ""),
+            vec!["recipient-address-denied"]
+        );
+        assert!(codes_with(
+            &plain("To: evil-x@example.test\r\n"),
+            deny,
+            "",
+            "subaddress +\n"
+        )
+        .is_empty());
+        assert_eq!(
+            codes_with(
+                &plain("To: evil+x@example.test\r\n"),
+                deny,
+                "",
+                "subaddress +\n"
+            ),
+            vec!["recipient-address-denied"]
+        );
+        assert_eq!(
+            codes_with(&plain(""), "", "", "subaddress .\n"),
+            vec!["config-invalid"]
+        );
+        let gmail = "address bad@gmail.com\n";
+        assert_eq!(
+            codes(&plain("To: b.a.d@gmail.com\r\n"), gmail, ""),
+            vec!["recipient-address-denied"]
+        );
+        assert_eq!(
+            codes(&plain("To: bad@googlemail.com\r\n"), gmail, ""),
+            vec!["recipient-address-denied"]
+        );
+        assert_eq!(
+            codes(&plain("To: b.a.d+x@googlemail.com\r\n"), gmail, ""),
+            vec!["recipient-address-denied"]
+        );
+        assert!(codes(&plain("To: badx@gmail.com\r\n"), gmail, "").is_empty());
+        let fast = "address user@fastmail.com\n";
+        assert_eq!(
+            codes(&plain("To: x@user.fastmail.com\r\n"), fast, ""),
+            vec!["recipient-address-denied"]
+        );
+        assert_eq!(
+            codes(&plain("To: X@User.Fastmail.Com\r\n"), fast, ""),
+            vec!["recipient-address-denied"]
+        );
+        assert!(codes(&plain("To: x@a.user.fastmail.com\r\n"), fast, "").is_empty());
+        assert!(codes(&plain("To: other@fastmail.com\r\n"), fast, "").is_empty());
     }
 
     #[test]

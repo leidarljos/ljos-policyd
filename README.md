@@ -143,7 +143,12 @@ path is read from the directory of the config file.
 identity mailseat@example.test
 deny-file deny.txt
 pack-law law.txt
+subaddress +-=
 ```
+
+`subaddress` is optional. When the line is omitted the separators
+are `+-=`. The value is those characters, and it replaces the
+default. `.`, `@`, `%` and `!` are not separators.
 
 `From` has to be that one address after ASCII case folding only.
 The mailbox is the address in angle brackets, read from the raw
@@ -162,8 +167,15 @@ is a refusal, and so is any `Apparently-To`. `To`, `Cc` and `Bcc`
 are refused when the mailbox is an `address` line in the deny
 file, and when that domain, or a parent of it, is named by the
 deny file or by the pack-law file. An `address` line is that
-mailbox, not the whole domain. It also covers a `local+tag`
-subaddress of that mailbox. An address at `@[ ... ]` is a
+mailbox, not the whole domain. It also covers that local part,
+one `subaddress` separator, and anything after the separator.
+On an address rule for `gmail.com` or `googlemail.com` the two
+domains are one domain, and dots in the local part are ignored.
+On an address rule for `fastmail.com`, a mailbox at
+`<local>@<user>.fastmail.com` (one label, then `fastmail.com`)
+is `<user>@fastmail.com`. A hyphen in that label is part of the
+user name. Domain rules and `From` are not matched this way.
+An address at `@[ ... ]` is a
 domain literal and is a refusal. An all-numeric domain, such as
 a dotted quad, is a refusal. A source route
 (`<@host:mailbox>`) is a refusal. `@`, `%` or `!` in a local

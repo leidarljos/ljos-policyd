@@ -203,7 +203,8 @@ these limits.
 =check-mail= prints one JSON object and only refuses. =allow= means
 this check found nothing to refuse. A send still needs its own grant.
 
-The config is lines of =identity=, =deny-file= and =pack-law=. A
+The config is lines of =identity=, =deny-file= and =pack-law=,
+and an optional =subaddress= line. A
 relative path is read from the config file's directory. =identity= is
 the one address =From= must be, after ASCII case folding only. A
 local part or domain that NFKC or the removal of a skipped
@@ -222,8 +223,17 @@ any =Apparently-To=. =To=, =Cc= and =Bcc= are refused when
 the mailbox is an =address= line in the deny file, and when the
 domain or a parent of it is named by the deny file or by a
 =deny-domain= line in the pack-law file. An =address= line is
-that mailbox, not the whole domain. It also covers a
-=local+tag= subaddress of that mailbox. A domain literal (an address
+that mailbox, not the whole domain. It also covers that local
+part, one =subaddress= separator, and anything after the
+separator. The separators are the =subaddress= line, or =+-=
+when the line is omitted. =.=, =@=, =%= and =!= are not
+separators. On an address rule for =gmail.com= or
+=googlemail.com= the two domains are one domain, and dots in
+the local part are ignored. On an address rule for
+=fastmail.com=, a mailbox at =<local>@<user>.fastmail.com=
+(one label, then =fastmail.com=) is =<user>@fastmail.com=.
+A hyphen in that label is part of the user name. Domain rules
+and =From= are not matched this way. A domain literal (an address
 at =@[ ... ]=) in a watched header is a refusal. An
 all-numeric domain, such as a dotted quad, is a refusal. A source route
 (=<@host:mailbox>=) is a refusal. =@=, =%= or =!= in a local
