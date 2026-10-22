@@ -299,7 +299,7 @@ fn runner_commands(
                 vars.home = Some("$".into());
             }
         }
-        let words = peel_cd_command_word(&cmd);
+        let words = peel_cd_command_word(&shown);
         let b = words.first().map_or("", |w| base_of(w));
         if piped && matches!(b, "cd" | "pushd" | "popd" | "dirs") {
             // A last stage that may run here leaves where the line is,
@@ -394,8 +394,8 @@ fn runner_commands(
             }
             // A `cd` that may have failed keeps the directories it left,
             // and one into a directory that is not there, or that lacks
-            // the search bit, moves nothing. One the line does not name
-            // is read as staying, and a `cd -` after it may come back.
+            // the search bit, moves nothing. A bare one with no `HOME`
+            // stays, and a `cd -` after it may come back.
             let mut to = Vec::new();
             add_dirs(
                 &mut to,
@@ -693,9 +693,10 @@ fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
 /// path, `~` or `~/path` from `home`, the `HOME` of `set` for a bare `cd`,
 /// `old` for `-`, and for a relative path whose first part is not `.` or
 /// `..`, each entry of the `CDPATH` of `set` that holds it. `set` holds
-/// the command's own assignments, which `~` does not see. A bare `pushd`,
-/// a stack index, a variable or a substitution names no directory the
-/// line shows, so the caller keeps the one it has.
+/// the command's own assignments, which `~` does not see. A bare `pushd`
+/// or a stack index names nothing, so the caller keeps the directory it
+/// has; a path the line does not show, through a variable, a substitution
+/// or `~user`, may be any, and is [`UNTRACKED`].
 fn entered(
     args: &[&str],
     dir: &std::path::Path,
@@ -715,7 +716,7 @@ fn entered(
         return old.to_vec();
     }
     let Some(path) = path_from(to, dir, home) else {
-        return Vec::new();
+        return vec![UNTRACKED.into()];
     };
     let mut dirs = Vec::new();
     let searched = !to.starts_with('~')
@@ -4782,7 +4783,6 @@ mod tests {
             "make clean-all",
             "npm run nuke",
             "cd project/missing && make clean-all",
-            "cd \"$PROJECT\" && make clean-all",
             "pushd project && popd && npm run nuke",
             "(cd project) && make clean-all",
         ] {
