@@ -117,6 +117,7 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
         fn_depth: 0,
         left_tree: false,
         files: &files,
+        known: None,
     };
     runner_commands(argv, &inn, 0, &mut runs, &mut denied);
     if let Some(c) = denied {
@@ -206,8 +207,19 @@ const MAX_DIRS: usize = 16;
 /// refused instead.
 const UNTRACKED: &str = "/\0";
 
+/// A `cd` or `pushd` whose target the line does not resolve. It is not a
+/// directory the walk can name, so a runner there is refused as
+/// [`UNTRACKED`] is, but it is not the same loss: a relative `source` is
+/// still read from the last directory the walk knew, when that file is
+/// there at check time.
+const UNKNOWN: &str = "/\0cd";
+
 fn is_untracked(d: &std::path::Path) -> bool {
     d.as_os_str().as_encoded_bytes().contains(&0)
+}
+
+fn is_unknown(d: &std::path::Path) -> bool {
+    d.as_os_str() == std::ffi::OsStr::new(UNKNOWN)
 }
 
 /// Add each of `dirs` that `set` lacks, while it holds fewer than
@@ -215,7 +227,9 @@ fn is_untracked(d: &std::path::Path) -> bool {
 /// in its place.
 fn add_dirs(set: &mut Vec<std::path::PathBuf>, dirs: impl IntoIterator<Item = std::path::PathBuf>) {
     for d in dirs {
-        let d = if is_untracked(&d) {
+        let d = if is_unknown(&d) {
+            UNKNOWN.into()
+        } else if is_untracked(&d) {
             UNTRACKED.into()
         } else {
             d
@@ -517,6 +531,10 @@ struct Shell {
     /// What the line writes and runs. A file stays written when a
     /// subshell or a `&` puts the rest back, so it is not [`Saved`].
     files: Files,
+    /// The last directory the walk could name. A later `cd` whose target
+    /// does not resolve leaves [`here`][Self::here] [`UNKNOWN`], and a
+    /// relative `source` is still read here.
+    known: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone)]
@@ -528,6 +546,7 @@ struct Saved {
     funcs: FnMap,
     pwd_set: bool,
     left_tree: bool,
+    known: Option<std::path::PathBuf>,
 }
 
 impl Shell {
@@ -540,6 +559,7 @@ impl Shell {
             funcs: self.funcs.clone(),
             pwd_set: self.pwd_set,
             left_tree: self.left_tree,
+            known: self.known.clone(),
         }
     }
 
@@ -551,6 +571,7 @@ impl Shell {
         self.funcs = saved.funcs;
         self.pwd_set = saved.pwd_set;
         self.left_tree = saved.left_tree;
+        self.known = saved.known;
     }
 
     /// The directory, the stack and `HOME` / `CDPATH` are no longer known.
@@ -562,6 +583,7 @@ impl Shell {
         self.vars.home = Some("$".into());
         self.pwd_set = true;
         self.left_tree = true;
+        self.known = None;
         // A body recorded before this no longer says what a call runs.
         self.funcs.clear();
     }
@@ -577,6 +599,8 @@ struct ShellIn<'a> {
     fn_depth: usize,
     left_tree: bool,
     files: &'a Files,
+    /// The last directory a caller could name, when `cwd` itself is not.
+    known: Option<std::path::PathBuf>,
 }
 
 /// `words` with each function definition replaced by a marker, in order.
@@ -790,6 +814,7 @@ fn replay_subshell(
             fn_depth: shell.fn_depth,
             left_tree: shell.left_tree,
             files: &shell.files,
+            known: shell.known.clone(),
         };
         runner_commands(body, &inn, depth, out, denied);
         if denied.is_some() {
@@ -842,6 +867,11 @@ fn runner_commands(
         stack: Vec::new(),
         follow_unseen: true,
         files: inn.files.clone(),
+        known: if is_untracked(inn.cwd) {
+            inn.known.clone()
+        } else {
+            Some(inn.cwd.to_path_buf())
+        },
     };
     walk(argv, &mut shell, depth, out, denied);
 }
@@ -917,6 +947,11 @@ fn walk(
         if matches!(after, ";" | "&") {
             list = shell.save();
         }
+        if let [d] = shell.here.as_slice() {
+            if !is_untracked(d) {
+                shell.known = Some(d.clone());
+            }
+        }
         let piped = after == "|" || end == "|";
         // A `cd` before `&&` holds for what runs after it, unless a `||`
         // before it may have skipped it.
@@ -973,6 +1008,7 @@ fn walk(
                         fn_depth,
                         left_tree: left,
                         files: &files,
+                        known: shell.known.clone(),
                     };
                     runner_commands(&words, &inn, depth + 1, out, denied);
                     if denied.is_some() {
@@ -1062,6 +1098,7 @@ fn walk(
             &shell.here,
             shell.vars.home.as_deref(),
             &shell.aliases,
+            shell.known.as_deref(),
         );
         match read {
             Sourced::Read { keeps, words } => {
@@ -1356,6 +1393,7 @@ fn walk(
                     fn_depth: shell.fn_depth,
                     left_tree: shell.left_tree,
                     files: &shell.files,
+                    known: shell.known.clone(),
                 };
                 runner_commands(&inner, &inn, depth + 1, out, denied);
                 shell.files.borrow_mut().data = was;
@@ -1737,13 +1775,31 @@ fn sourced(
     dirs: &[std::path::PathBuf],
     home: Option<&str>,
     aliases: &[(String, String)],
+    known: Option<&std::path::Path>,
 ) -> Sourced {
     let Some(path) = literal_source_path(cmd) else {
         return Sourced::No;
     };
     let mut texts = match script_texts(&path, dirs, home) {
         Ok(t) => t,
-        Err(c) => return Sourced::Unread(c),
+        Err(c) => {
+            // Every directory is one the line did not resolve. The file
+            // is still the one in the last directory the walk could name,
+            // when that file is there to be read.
+            let Some(known) = known.filter(|_| dirs.iter().all(|d| is_unknown(d))) else {
+                return Sourced::Unread(c);
+            };
+            match script_texts(&path, &[known.to_path_buf()], home) {
+                Ok(mut t) if t.len() == 1 => {
+                    let scan = scan_script(&t.remove(0).1, aliases);
+                    return Sourced::Read {
+                        keeps: scan.keeps,
+                        words: scan.words,
+                    };
+                }
+                _ => return Sourced::Unread(c),
+            }
+        }
     };
     let one = dirs.len() == 1 || path.starts_with(['/', '~']);
     if one && texts.len() == 1 {
@@ -2837,7 +2893,8 @@ fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
 /// the command's own assignments, which `~` does not see. A bare `pushd`
 /// or a stack index names nothing, so the caller keeps the directory it
 /// has; a path the line does not show, through a variable, a substitution
-/// or `~user`, may be any, and is [`UNTRACKED`].
+/// or `~user`, may be any. That is [`UNKNOWN`]: not a directory the walk
+/// can name, and not the same as losing the one it had.
 fn entered(
     args: &[&str],
     dir: &std::path::Path,
@@ -2878,7 +2935,7 @@ fn entered(
         return old.to_vec();
     }
     let Some(path) = path_from(to, dir, home) else {
-        return vec![UNTRACKED.into()];
+        return vec![UNKNOWN.into()];
     };
     let mut dirs = Vec::new();
     // The shell searches with the word as it expands it, so `$HOME/x` is
@@ -9811,6 +9868,7 @@ hash -r 2> /dev/null
                 fn_depth: 0,
                 left_tree: false,
                 files: &files,
+                known: None,
             };
             runner_commands(&shell_words(line), &inn, 0, &mut runs, &mut denied);
             let dirs: Vec<_> = runs
@@ -11590,6 +11648,7 @@ hash -r 2> /dev/null
     fn assert_everyday_allowed(dir: &std::path::Path) {
         for line in [
             "source .venv/bin/activate",
+            "cd \"$X\" && source .venv/bin/activate",
             "conda activate",
             "nvm use",
             "direnv allow",
@@ -12870,6 +12929,47 @@ hash -r 2> /dev/null
         }
     }
 
+    /// `cd "$X"` does not name a directory, so the walk cannot follow a
+    /// runner there. A relative `source` is still the file in the last
+    /// directory the walk could name, read when it is there.
+    #[test]
+    fn an_unresolved_cd_still_sources_the_last_known_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = startup_root("cdsrc");
+        std::fs::write(root.join("evil.sh"), "git push -f origin\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "cd \"$X\" && source .venv/bin/activate",
+            "cd \"$X\" && . .venv/bin/activate",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        let c = at("cd \"$X\" && source evil.sh");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(c.token.contains("git-force-push"), "{}", c.token);
+        for line in [
+            "cd \"$X\" && source x.sh",
+            "cd \"$X\" && sh x.sh",
+            "cd \"$X\" && ./hi.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.starts_with("script-unread:"), "{line}: {}", c.token);
+        }
+        let c = at("cd \"$X\" && make test");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(c.token.contains("untracked directory"), "{}", c.token);
+        let hidden = root.join("hidden.sh");
+        std::fs::write(&hidden, "echo hi\n").unwrap();
+        let mut perm = std::fs::metadata(&hidden).unwrap().permissions();
+        perm.set_mode(0o0);
+        std::fs::set_permissions(&hidden, perm).unwrap();
+        let c = at("cd \"$X\" && source hidden.sh");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(c.token.starts_with("script-unread:"), "{}", c.token);
+    }
+
     // The pack a phronesis build loads keeps its own list of build
     // output, so the host table is what this reads.
     #[test]
@@ -12923,6 +13023,7 @@ hash -r 2> /dev/null
             "xargs -I{} echo {}",
             "find . -name '*.pyc' -exec rm -f {} +",
             "source .venv/bin/activate",
+            "cd \"$X\" && source .venv/bin/activate",
             "conda activate",
             "nvm use",
             "direnv allow",
