@@ -6162,6 +6162,15 @@ hash -r 2> /dev/null
                 "bash -c {line}"
             );
         }
+        for (name, body) in [
+            ("trap.sh", "trap 'cd ../evil' DEBUG\n"),
+            ("alias.sh", "alias make='cd ../evil && make'\n"),
+            ("bashopts.sh", "export BASHOPTS=lastpipe\n"),
+        ] {
+            std::fs::write(safe.join(name), body).expect("write");
+            let line = format!("source ./{name} && make clean-all");
+            assert_eq!(check(&line), Decision::Deny, "{line}");
+        }
         for line in [
             "source bad/bin/activate && make clean-all",
             "source missing/activate && make clean-all",
