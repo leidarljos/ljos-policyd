@@ -39,7 +39,8 @@ Task runners
 A line that runs a task runner is also judged on what the target runs.
 The recipe comes from the file the runner reads, in the directory it
 runs in: the working directory, the one a ``cd`` or ``pushd`` earlier on
-the line enters, or the one ``-C``, ``--prefix`` or ``--cwd`` names.
+the line enters, the one ``env -C`` names for the command it runs, or
+the one the runner's own ``-C``, ``--prefix`` or ``--cwd`` names.
 
 ============================================ ==============================================================================================
 Runner                                       File read

@@ -173,7 +173,13 @@ fn runner_commands(
         // before it may have skipped it.
         let gates = end == "&&" && after != "||";
         after = end;
-        ran_in.push(here.clone());
+        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        let run = unwrap_wrappers(&owned).0.to_vec();
+        // `env -C DIR` runs its own command, and any script it hands a
+        // shell, in DIR, and moves nothing after it.
+        let wrappers = &owned[..owned.len() - run.len()];
+        let at: Vec<_> = here.iter().map(|d| env_dir(wrappers, d)).collect();
+        ran_in.push(at.clone());
         // A subshell or substitution in the command runs where the
         // command does, and a `cd` inside it moves only itself.
         if depth < MAX_DEPTH {
@@ -218,12 +224,10 @@ fn runner_commands(
             }
             continue;
         }
-        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
-        let run = unwrap_wrappers(&owned).0.to_vec();
         if run.is_empty() {
             continue;
         }
-        for dir in &here {
+        for dir in &at {
             if !out.iter().any(|(r, d)| *r == run && d == dir) {
                 out.push((run.clone(), dir.clone()));
             }
@@ -246,23 +250,74 @@ fn runner_commands(
 /// stack index, a variable or a substitution names no directory the line
 /// shows, so the caller keeps the one it has.
 fn entered(args: &[&str], dir: &std::path::Path, pushd: bool) -> Option<std::path::PathBuf> {
-    let home = || std::env::var_os("HOME").map(std::path::PathBuf::from);
     let Some(to) = args
         .iter()
         .find(|a| !a.starts_with(['-', '+']) || **a == "-")
     else {
-        return if pushd { None } else { home() };
+        return if pushd { None } else { home_dir() };
     };
-    if *to == "-" || to.contains(['$', '`']) {
+    if *to == "-" {
         return None;
     }
-    if *to == "~" {
-        return home();
+    path_from(to, dir)
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+/// Where the path word `to` lands from `dir`: `~` and `~/path` from home,
+/// anything else joined onto `dir`. A variable, a substitution or `~user`
+/// names no directory the line shows.
+fn path_from(to: &str, dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    if to.contains(['$', '`']) {
+        return None;
+    }
+    if to == "~" {
+        return home_dir();
     }
     if let Some(rest) = to.strip_prefix("~/") {
-        return home().map(|h| h.join(rest));
+        return home_dir().map(|h| h.join(rest));
     }
     (!to.starts_with('~')).then(|| dir.join(to))
+}
+
+/// The directory a command runs in from `dir` after the runner words
+/// `wrappers` in front of it: the one `env -C DIR`, `-CDIR`, `--chdir DIR`
+/// or `--chdir=DIR` names, or `dir`. The last of an `env`'s flags wins,
+/// from where that `env` starts.
+fn env_dir(wrappers: &[String], dir: &std::path::Path) -> std::path::PathBuf {
+    let mut at = dir.to_path_buf();
+    // Where the `env` whose flags are being read starts.
+    let mut from = None;
+    let mut words = wrappers.iter().map(String::as_str);
+    while let Some(w) = words.next() {
+        if base_of(w) == "env" {
+            from = Some(at.clone());
+            continue;
+        }
+        let Some(start) = &from else {
+            continue;
+        };
+        let to = if w == "-C" || w == "--chdir" {
+            words.next()
+        } else if let Some(to) = w.strip_prefix("--chdir=") {
+            Some(to)
+        } else if let Some(to) = w.strip_prefix("-C").filter(|t| !t.is_empty()) {
+            Some(to)
+        } else {
+            if matches!(w, "-u" | "--unset" | "-S" | "--split-string") {
+                words.next();
+            } else if !w.starts_with('-') && !is_assignment(w) {
+                from = None;
+            }
+            continue;
+        };
+        if let Some(d) = to.and_then(|t| path_from(t, start)) {
+            at = d;
+        }
+    }
+    at
 }
 
 fn host_argv_table(argv: &[String]) -> Checked {
@@ -3854,6 +3909,34 @@ mod tests {
         ] {
             assert_eq!(leaving("sub-cd", line), Decision::Allow, "{line}");
         }
+    }
+
+    /// `env -C DIR` runs its own command in DIR, and only that command.
+    #[test]
+    fn reads_a_runner_where_env_chdir_runs_it() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "env -C project make clean-all",
+            "env -Cproject make clean-all",
+            "env --chdir project make clean-all",
+            "env --chdir=project make clean-all",
+            "env -i -u HOME -C {dir} make clean-all",
+            "env -C /tmp -C project make clean-all",
+            "nice env -C project sh -c 'make clean-all'",
+        ] {
+            let c = entering("env-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        let c = entering("env-cd", &files, "env -C project true && make clean-all");
+        assert_eq!(c.decision, Decision::Allow);
+        assert_eq!(
+            leaving("env-cd", "env -C safe true && make clean-all"),
+            Decision::Deny
+        );
+        assert_eq!(
+            leaving("env-cd", "env -C safe make clean-all"),
+            Decision::Allow
+        );
     }
 
     /// The `&` of a redirection does not send the `cd` before it to the
