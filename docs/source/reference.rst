@@ -229,7 +229,8 @@ any ``Apparently-To``. ``To``, ``Cc`` and ``Bcc`` are refused
 when the mailbox is an ``address`` line in the deny file, and
 when the domain or a parent of it is named by the deny file or by
 a ``deny-domain`` line in the pack-law file. An ``address`` line
-is that mailbox, not the whole domain. A domain literal (an
+is that mailbox, not the whole domain. It also covers a
+``local+tag`` subaddress of that mailbox. A domain literal (an
 address at ``@[ ... ]``) in a watched header is a refusal. A
 source route (``<@host:mailbox>``) is a refusal. ``%`` or ``!``
 in an unquoted local part is a refusal. A quoted local part may

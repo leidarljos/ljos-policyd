@@ -161,7 +161,8 @@ is a refusal, and so is any `Apparently-To`. `To`, `Cc` and `Bcc`
 are refused when the mailbox is an `address` line in the deny
 file, and when that domain, or a parent of it, is named by the
 deny file or by the pack-law file. An `address` line is that
-mailbox, not the whole domain. An address at `@[ ... ]` is a
+mailbox, not the whole domain. It also covers a `local+tag`
+subaddress of that mailbox. An address at `@[ ... ]` is a
 domain literal and is a refusal. A source route
 (`<@host:mailbox>`) is a refusal. `%` or `!` in an unquoted local
 part is a refusal. A quoted local part may hold either character.

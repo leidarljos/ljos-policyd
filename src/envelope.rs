@@ -394,7 +394,7 @@ fn check_named(
                     if let Some(shown) = mixed_script_domain(&addr.domain) {
                         hits.push((true, format!("{name} {shown}")));
                     }
-                    if addresses.contains(&addr.key()) || domain_denied(&addr.domain, domains) {
+                    if address_denied(&addr, addresses) || domain_denied(&addr.domain, domains) {
                         hits.push((false, addr.key()));
                     }
                 }
@@ -447,7 +447,7 @@ fn check_recipients(message: &Message, config: &Config, reasons: &mut Vec<MailRe
                         if let Some(shown) = mixed_script_domain(&addr.domain) {
                             reasons.push(reason("mixed-script", format!("{name} {shown}")));
                         }
-                        if config.deny_addresses.contains(&addr.key()) {
+                        if address_denied(&addr, &config.deny_addresses) {
                             reasons.push(reason(
                                 "recipient-address-denied",
                                 format!("{name} {}", addr.key()),
@@ -513,6 +513,21 @@ fn wire_rewritten(raw: &str) -> bool {
     }
     let folded: String = raw.nfkc().collect();
     folded != raw
+}
+
+/// An `address` rule names that mailbox and a `local+tag` subaddress
+/// of it. Providers deliver the tag to the mailbox.
+fn address_denied(addr: &NormAddr, addresses: &BTreeSet<String>) -> bool {
+    if addresses.contains(&addr.key()) {
+        return true;
+    }
+    let Some((base, _)) = addr.local.split_once('+') else {
+        return false;
+    };
+    if base.is_empty() {
+        return false;
+    }
+    addresses.contains(&format!("{base}@{}", addr.domain))
 }
 
 fn domain_denied(domain: &str, denied: &BTreeSet<String>) -> bool {
@@ -1119,6 +1134,25 @@ pair left right
             codes(&plain("Reply-To: Other@Blocked.test\r\n"), deny, ""),
             vec!["reply-to-denied"]
         );
+    }
+
+    /// `local+tag` is delivered to `local` at most providers. The
+    /// address rule covers that subaddress.
+    #[test]
+    fn an_address_rule_covers_a_subaddress() {
+        let deny = "address evil@example.test\n";
+        let raw = "From: mailseat@example.test\r\nReply-To: evil+x@example.test\r\n\r\n";
+        assert_eq!(codes(raw, deny, ""), vec!["reply-to-denied"]);
+        assert_eq!(
+            codes(&plain("To: evil+x@example.test\r\n"), deny, ""),
+            vec!["recipient-address-denied"]
+        );
+        assert_eq!(
+            codes(&plain("Bcc: Evil+Tag@Example.test\r\n"), deny, ""),
+            vec!["recipient-address-denied"]
+        );
+        assert!(codes(&plain("Reply-To: evilx@example.test\r\n"), deny, "").is_empty());
+        assert!(codes(&plain("To: notevil+x@example.test\r\n"), deny, "").is_empty());
     }
 
     #[test]
