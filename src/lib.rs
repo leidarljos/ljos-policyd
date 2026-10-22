@@ -6788,6 +6788,38 @@ mod tests {
         );
     }
 
+    /// `trap` runs its action as a script on each signal it names, in
+    /// this shell.
+    #[test]
+    fn a_trap_action_does_not_hide_a_force_push() {
+        for script in [
+            "trap \"git push -f\" EXIT; :",
+            "trap -- 'git push --force' INT TERM",
+        ] {
+            assert_eq!(
+                v(&["bash", "-c", script]),
+                "deny\tgit-force-push",
+                "{script}"
+            );
+        }
+        for script in ["trap 'rm -f /tmp/x' EXIT", "trap - EXIT", "trap -p"] {
+            assert_eq!(v(&["bash", "-c", script]), "allow", "{script}");
+        }
+        for line in [
+            "trap 'cd evil' DEBUG; make clean-all",
+            "trap \"$X\" DEBUG; make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("trap", line), Decision::Deny, "{line}");
+        }
+        assert_eq!(
+            evil_and_safe(
+                "trap",
+                "cd safe && trap 'rm -f /tmp/x' EXIT && make clean-all"
+            ),
+            Decision::Allow
+        );
+    }
+
     #[test]
     fn a_shell_script_does_not_hide_a_recursive_delete() {
         assert!(v(&["sh", "-c", "rm -rf /home/u/x"]).starts_with("deny"));
