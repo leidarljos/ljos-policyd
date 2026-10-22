@@ -5107,6 +5107,33 @@ mod tests {
         assert_eq!(c.decision, Decision::Allow);
     }
 
+    /// Arithmetic that only reads `HOME` leaves it as the line set it;
+    /// an assignment operator after it, or `++` or `--` next to it, writes
+    /// it.
+    #[test]
+    fn an_arithmetic_read_keeps_home() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "HOME={dir}; echo $((HOME)); cd ~ && make test",
+            "HOME={dir}; (( HOME == 1 )); cd ~ && make test",
+            "HOME={dir}; echo $((HOME > 1 ? 1 : 0)); cd ~ && make test",
+        ] {
+            let c = entering("arith-read", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+        for line in [
+            "HOME={dir}; ((HOME=5)); cd ~ && make test",
+            "HOME={dir}; ((HOME++)); cd ~ && make test",
+            "HOME={dir}; ((--HOME)); cd ~ && make test",
+            "HOME={dir}; ((HOME <<= 1)); cd ~ && make test",
+            "HOME={dir}; ((n = 1, HOME |= 2)); cd ~ && make test",
+            "HOME={dir}; ((HOME[0] = 2)); cd ~ && make test",
+        ] {
+            let c = entering("arith-read", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+    }
+
     /// `$PWD` in a value names the one directory the line is in, unless
     /// the line sets `PWD` itself.
     #[test]
