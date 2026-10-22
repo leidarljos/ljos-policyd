@@ -162,7 +162,8 @@ address is a refusal.
 `Reply-To`, `Sender`, `Return-Path`, `Errors-To`,
 `Disposition-Notification-To`, `Return-Receipt-To`,
 `Delivery-Receipt-To`, `Mail-Followup-To` and `Mail-Reply-To` must
-stay clear of an identity in the deny file. Any `Resent-*` header
+stay clear of an identity in the deny file, and of a domain named
+by the pack-law file. Any `Resent-*` header
 is a refusal, and so is any `Apparently-To`. `To`, `Cc` and `Bcc`
 are refused when the mailbox is an `address` line in the deny
 file, and when that domain, or a parent of it, is named by the

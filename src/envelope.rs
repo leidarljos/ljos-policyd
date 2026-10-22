@@ -444,6 +444,7 @@ fn check_named(
                     }
                     if address_denied(&addr, &config.deny_addresses, &config.subaddress)
                         || domain_denied(&addr.domain, &config.deny_domains)
+                        || domain_denied(&addr.domain, &config.pack_domains)
                     {
                         hits.push((false, addr.key()));
                     }
@@ -1459,14 +1460,43 @@ pair left right
             codes(&raw, "", "deny-domain blocked.test\n"),
             vec!["recipient-domain-denied"]
         );
-        // Pack law is recipient domains. A Reply-To at that domain is not
-        // a recipient, and an empty deny file has no identity for it.
+        // Pack law is every watched header, not only To, Cc and Bcc. A
+        // reply or a receipt to that domain leaves the seat.
         let reply = plain("Reply-To: person@blocked.test\r\nTo: person@ok.test\r\n");
-        assert!(codes(&reply, "", "deny-domain blocked.test\n").is_empty());
+        assert_eq!(
+            codes(&reply, "", "deny-domain blocked.test\n"),
+            vec!["reply-to-denied"]
+        );
         assert_eq!(
             codes(&plain(""), "", "allow-domain blocked.test\n"),
             vec!["pack-law-invalid"]
         );
+    }
+
+    /// A pack-law domain on a reply, receipt or follow-up header is the
+    /// same refusal as on To. The recipient's mailer will use it.
+    #[test]
+    fn pack_law_covers_every_watched_header() {
+        let law = "deny-domain packblocked.test\n";
+        for (header, code) in [
+            ("Reply-To", "reply-to-denied"),
+            ("Sender", "sender-denied"),
+            ("Return-Path", "return-path-denied"),
+            ("Errors-To", "errors-to-denied"),
+            (
+                "Disposition-Notification-To",
+                "disposition-notification-to-denied",
+            ),
+            ("Return-Receipt-To", "return-receipt-to-denied"),
+            ("Delivery-Receipt-To", "delivery-receipt-to-denied"),
+            ("Mail-Followup-To", "mail-followup-to-denied"),
+            ("Mail-Reply-To", "mail-reply-to-denied"),
+        ] {
+            let raw = plain(&format!("{header}: a@packblocked.test\r\n"));
+            assert_eq!(codes(&raw, "", law), vec![code.to_string()], "{header}");
+            let sub = plain(&format!("{header}: a@sub.packblocked.test\r\n"));
+            assert_eq!(codes(&sub, "", law), vec![code.to_string()], "{header} sub");
+        }
     }
 
     #[test]

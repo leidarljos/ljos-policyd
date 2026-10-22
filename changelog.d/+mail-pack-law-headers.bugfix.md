@@ -1,0 +1,1 @@
+Pack-law domains were judged only on To, Cc and Bcc. A reply, a receipt or a follow-up could still name that domain, and the other side's mailer would use it. The same domain is a refusal on every header this check watches.

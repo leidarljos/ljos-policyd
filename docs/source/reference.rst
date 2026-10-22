@@ -227,7 +227,7 @@ still contributes its mailboxes.
 ``Disposition-Notification-To``, ``Return-Receipt-To``,
 ``Delivery-Receipt-To``, ``Mail-Followup-To`` and ``Mail-Reply-To``
 must stay clear of a deny-file identity (``address``, or a mailbox
-at a ``domain``). Any ``Resent-*`` header is a refusal, and so is
+at a ``domain``) and of a domain named by the pack-law file. Any ``Resent-*`` header is a refusal, and so is
 any ``Apparently-To``. ``To``, ``Cc`` and ``Bcc`` are refused
 when the mailbox is an ``address`` line in the deny file, and
 when the domain or a parent of it is named by the deny file or by
