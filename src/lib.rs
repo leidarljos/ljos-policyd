@@ -1710,7 +1710,7 @@ fn shell_words(script: &str) -> Vec<String> {
             }
             c if !single && !double && (c.is_whitespace() || matches!(c, ';' | '|' | '&')) => {
                 if word {
-                    out.push(std::mem::take(&mut cur));
+                    out.push(closed_word(std::mem::take(&mut cur)));
                     word = false;
                 }
                 if matches!(c, '\n' | '\r') {
@@ -1733,9 +1733,20 @@ fn shell_words(script: &str) -> Vec<String> {
         }
     }
     if word {
-        out.push(cur);
+        out.push(closed_word(cur));
     }
     out
+}
+
+/// A word [`shell_words`] closes. A bare separator is a word of its own,
+/// so a word that still reads as one (`';'`, `'a;'`, `\;`) was quoted,
+/// and keeps quotes to stay an argument.
+fn closed_word(w: String) -> String {
+    if matches!(w.as_str(), ";" | "&&" | "||" | "|" | "&") || w.ends_with(';') {
+        format!("'{w}'")
+    } else {
+        w
+    }
 }
 
 fn host_argv_rules(argv: &[String], moved: bool) -> Checked {
