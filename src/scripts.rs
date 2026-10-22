@@ -289,7 +289,7 @@ fn apply_make_words(
                         i += 1;
                         words.get(i).ok_or(MAKE_FLAG_TOKEN)?.clone()
                     };
-                    apply_long(name, &arg, state);
+                    apply_long(name, &arg, state)?;
                 }
                 LongOpt::Optional => {
                     if let Some(value) = inline {
@@ -370,12 +370,26 @@ fn long_option(name: &str) -> Result<LongOpt, &'static str> {
     })
 }
 
-fn apply_long(name: &str, arg: &str, state: &mut MakeCmd) {
+fn apply_long(name: &str, arg: &str, state: &mut MakeCmd) -> Result<(), &'static str> {
     match name {
-        "directory" => state.dir = join_dir(&state.dir, arg),
+        "directory" => {
+            shown_dir(arg)?;
+            state.dir = join_dir(&state.dir, arg);
+        }
         "file" | "makefile" => state.files.push(join_dir(&state.dir, arg)),
         "include-dir" => state.includes.push(join_dir(&state.dir, arg)),
         _ => {}
+    }
+    Ok(())
+}
+
+/// A `make -C` directory the line spells out. A variable, a substitution
+/// or a glob is not that directory, and an empty one is not either.
+fn shown_dir(arg: &str) -> Result<(), &'static str> {
+    if arg.is_empty() || arg.contains(['$', '`', '*', '?', '[', '~']) {
+        Err("make-directory-unshown")
+    } else {
+        Ok(())
     }
 }
 
@@ -401,7 +415,10 @@ fn apply_short(
                     next.ok_or(MAKE_FLAG_TOKEN)?.to_string()
                 };
                 match c {
-                    'C' => state.dir = join_dir(&state.dir, &arg),
+                    'C' => {
+                        shown_dir(&arg)?;
+                        state.dir = join_dir(&state.dir, &arg);
+                    }
                     'f' => state.files.push(join_dir(&state.dir, &arg)),
                     'I' => state.includes.push(join_dir(&state.dir, &arg)),
                     _ => {}

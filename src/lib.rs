@@ -16675,6 +16675,29 @@ hash -r 2> /dev/null
         assert!(c.token.contains("rm-rf-outside-tmp"), "{}", c.token);
     }
 
+    /// `make -C` with a directory the line does not spell out is not
+    /// judged by reading whatever that directory happens to be. A
+    /// variable, a substitution and a glob are refused.
+    #[test]
+    fn make_dash_c_with_an_unshown_directory_is_refused() {
+        let root = startup_root("makecvar");
+        let bld = root.join("bld");
+        std::fs::create_dir_all(&bld).unwrap();
+        std::fs::write(bld.join("Makefile"), "all:\n\tsh ./x.sh\n").unwrap();
+        std::fs::write(bld.join("x.sh"), "git push -f\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "d=bld; make -C \"$d\"",
+            "make -C $(echo bld)",
+            "make -C bl*",
+        ] {
+            assert_eq!(at(line).decision, Decision::Deny, "{line}");
+        }
+        assert_eq!(at("make -C bld").decision, Decision::Deny);
+        assert_eq!(at("make -Cbld").decision, Decision::Deny);
+        assert_eq!(at("make --directory=bld").decision, Decision::Deny);
+    }
+
     /// A `case` pattern is not a command. `*[!_$as_cr_alnum]* )` holds a
     /// variable inside brackets and a `)` of its own, and neither moves
     /// the shell. The arm still runs: a `cd` there leaves the line, and
