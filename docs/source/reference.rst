@@ -55,7 +55,8 @@ that may run any command, so it is refused as
 ``env-split-string-unshown``.
 Leading words that still run ``cd`` in this shell (``command``,
 ``builtin``, ``if``, ``while``, ``{`` and the other control keywords, and
-the ``time`` keyword with its ``-p``)
+the ``time`` keyword with its ``-p``, which is a program after ``command``
+or ``builtin``, where no word is a keyword)
 are peeled before this check, as are assignments among them
 (``if FOO=1 cd dir``), and a redirection among the words of a
 ``cd`` or ``pushd`` names neither the directory nor a ``pushd`` stack index.

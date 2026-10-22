@@ -998,6 +998,9 @@ fn env_dir(wrappers: &[String], dir: &std::path::Path, home: Option<&str>) -> st
 /// assignment among them is set for that command alone: `FOO=1 cd dir`
 /// and `if FOO=1 cd dir` still move the shell.
 fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
+    // After `command` or `builtin` no word is a keyword: `command time`
+    // runs the time program.
+    let mut looked_up = false;
     loop {
         let Some((w, rest)) = words.split_first() else {
             return words;
@@ -1008,6 +1011,7 @@ fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
         }
         match base_of(w) {
             "command" => {
+                looked_up = true;
                 words = rest;
                 while let Some((a, tail)) = words.split_first() {
                     if *a == "--" {
@@ -1022,6 +1026,7 @@ fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
                 }
             }
             "builtin" => {
+                looked_up = true;
                 words = rest;
                 if let Some((a, tail)) = words.split_first() {
                     if *a == "--" {
@@ -1030,8 +1035,8 @@ fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
                 }
             }
             // `/usr/bin/time` is a program, and runs `cd` in a child.
-            "time" if *w != "time" => return words,
-            k if KEYWORDS.contains(&k) => {
+            "time" if *w != "time" || looked_up => return words,
+            k if KEYWORDS.contains(&k) && !looked_up => {
                 words = rest;
                 if k == "time" && words.first() == Some(&"-p") {
                     words = &words[1..];
