@@ -121,7 +121,7 @@ without the library reports `host table`, and the doctor warns about it.
 | `check -- ARGV` | prints `allow`, or `deny`, a tab and the reason | 0 |
 | `exec -- ARGV` | runs ARGV only if the verdict is allow | ARGV's status; 2 on deny |
 | `capnp -- ARGV` | writes a packed Cap'n Proto `PolicyDecision` | 0 |
-| `check-mail --config PATH` | reads one RFC 5322 message on stdin and prints a JSON allow or deny | 0 when nothing was refused; 2 when it refuses |
+| `check-mail --config PATH [--argv [--] RECIPIENT...]` | reads one RFC 5322 message on stdin and prints a JSON allow or deny | 0 when nothing was refused; 2 when it refuses |
 | `version` | the version and the backend | 0 |
 
 ## Outbound mail
@@ -135,6 +135,13 @@ $ ljos-policyd check-mail --config mail.conf < message.eml
 {"verdict":"allow","reasons":[]}
 ```
 
+The message on stdin is the whole input. `sendmail -t recipient`
+adds that recipient to the ones in the headers, and this check
+does not see it. The caller must pass no recipient arguments, or
+pass the same recipients to
+`check-mail --config PATH --argv [--] RECIPIENT...`. An argv
+recipient is judged as a recipient.
+
 The config is one key per line. `identity` is the address `From` must
 be. `deny-file` and `pack-law` name the other two files. A relative
 path is read from the directory of the config file.
@@ -143,7 +150,12 @@ path is read from the directory of the config file.
 identity mailseat@example.test
 deny-file deny.txt
 pack-law law.txt
+subaddress +-=
 ```
+
+`subaddress` is optional. When the line is omitted the separators
+are `+-=`. The value is those characters, and it replaces the
+default. `.`, `@`, `%` and `!` are not separators.
 
 `From` has to be that one address after ASCII case folding only.
 The mailbox is the address in angle brackets, read from the raw
@@ -157,17 +169,33 @@ address is a refusal.
 `Reply-To`, `Sender`, `Return-Path`, `Errors-To`,
 `Disposition-Notification-To`, `Return-Receipt-To`,
 `Delivery-Receipt-To`, `Mail-Followup-To` and `Mail-Reply-To` must
-stay clear of an identity in the deny file. Any `Resent-*` header
+stay clear of an identity in the deny file, and of a domain named
+by the pack-law file. `Sender`, `Errors-To` and `Return-Path`,
+when present, must be the identity under the same rule as `From`.
+An empty `Return-Path` is not that address. Any `Resent-*` header
 is a refusal, and so is any `Apparently-To`. `To`, `Cc` and `Bcc`
 are refused when the mailbox is an `address` line in the deny
 file, and when that domain, or a parent of it, is named by the
 deny file or by the pack-law file. An `address` line is that
-mailbox, not the whole domain. It also covers a `local+tag`
-subaddress of that mailbox. An address at `@[ ... ]` is a
-domain literal and is a refusal. An all-numeric domain, such as
-a dotted quad, is a refusal. A source route
-(`<@host:mailbox>`) is a refusal. `%` or `!` in an unquoted local
-part is a refusal. A quoted local part may hold either character.
+mailbox, not the whole domain. It also covers that local part,
+one `subaddress` separator, and anything after the separator.
+On an address rule for `gmail.com` or `googlemail.com` the two
+domains are one domain, and dots in the local part are ignored.
+On an address rule for `fastmail.com`, a mailbox at
+`<local>@<user>.fastmail.com` (one label, then `fastmail.com`)
+is `<user>@fastmail.com`. A hyphen in that label is part of the
+user name. Domain rules and `From` are not matched this way.
+An address at `@[ ... ]` is a
+domain literal and is a refusal. An all-numeric domain is a
+refusal, judged after IDNA. That includes a dotted quad, a
+shorter form `inet_aton` accepts, a hex label (`0x`) and a
+label with a leading zero. U+3002 or U+FF61 between the
+numbers is still that address. A source route
+(`<@host:mailbox>`) is a refusal. `@`, `%` or `!` in a local
+part is a refusal, quoted or not, including a backslash escape
+inside the quotes. A local part that NFKC changes into ASCII
+punctuation, such as a fullwidth `@`, `%`, `!` or `+`, is a
+refusal.
 A recipient domain, or a domain on a header checked against the
 deny file, is refused when one of its labels mixes Latin with
 Cyrillic or Greek after NFKC and IDNA.

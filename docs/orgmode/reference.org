@@ -6,8 +6,8 @@
 
 =ljos-policyd check|exec|capnp|version -- argv...=
 
-=ljos-policyd check-mail --config PATH= reads one RFC 5322 message on
-stdin. See "Outbound mail" below.
+=ljos-policyd check-mail --config PATH [--argv [--] RECIPIENT...]=
+reads one RFC 5322 message on stdin. See "Outbound mail" below.
 
 | Verb | Meaning |
 |---+---|
@@ -203,7 +203,13 @@ these limits.
 =check-mail= prints one JSON object and only refuses. =allow= means
 this check found nothing to refuse. A send still needs its own grant.
 
-The config is lines of =identity=, =deny-file= and =pack-law=. A
+The message on stdin is the whole input. A caller must pass no
+recipient arguments to =sendmail -t=: those addresses are not in
+the message. Pass the same recipients to =--argv= and this check
+refuses them as recipients. =--config= comes before =--argv=.
+
+The config is lines of =identity=, =deny-file= and =pack-law=,
+and an optional =subaddress= line. A
 relative path is read from the config file's directory. =identity= is
 the one address =From= must be, after ASCII case folding only. A
 local part or domain that NFKC or the removal of a skipped
@@ -217,17 +223,35 @@ still contributes its mailboxes.
 =Disposition-Notification-To=, =Return-Receipt-To=,
 =Delivery-Receipt-To=, =Mail-Followup-To= and =Mail-Reply-To=
 must stay clear of a deny-file identity (=address=, or a mailbox
-at a =domain=). Any =Resent-*= header is a refusal, and so is
+at a =domain=) and of a domain named by the pack-law file.
+=Sender=, =Errors-To= and =Return-Path=, when present, must
+be the identity under the same rule as =From=. An empty
+=Return-Path= is not that address. Any =Resent-*= header is a refusal, and so is
 any =Apparently-To=. =To=, =Cc= and =Bcc= are refused when
 the mailbox is an =address= line in the deny file, and when the
 domain or a parent of it is named by the deny file or by a
 =deny-domain= line in the pack-law file. An =address= line is
-that mailbox, not the whole domain. It also covers a
-=local+tag= subaddress of that mailbox. A domain literal (an address
+that mailbox, not the whole domain. It also covers that local
+part, one =subaddress= separator, and anything after the
+separator. The separators are the =subaddress= line, or =+-=
+when the line is omitted. =.=, =@=, =%= and =!= are not
+separators. On an address rule for =gmail.com= or
+=googlemail.com= the two domains are one domain, and dots in
+the local part are ignored. On an address rule for
+=fastmail.com=, a mailbox at =<local>@<user>.fastmail.com=
+(one label, then =fastmail.com=) is =<user>@fastmail.com=.
+A hyphen in that label is part of the user name. Domain rules
+and =From= are not matched this way. A domain literal (an address
 at =@[ ... ]=) in a watched header is a refusal. An
-all-numeric domain, such as a dotted quad, is a refusal. A source route
-(=<@host:mailbox>=) is a refusal. =%= or =!= in an unquoted local
-part is a refusal. A quoted local part may hold either character.
+all-numeric domain is a refusal, judged after IDNA. That
+includes a dotted quad, a shorter form inet_aton accepts, a
+hex label (=0x=) and a label with a leading zero. U+3002 or
+U+FF61 between the numbers is still that address. A source route
+(=<@host:mailbox>=) is a refusal. =@=, =%= or =!= in a local
+part is a refusal, quoted or not, including a backslash escape
+inside the quotes. A local part that NFKC changes into ASCII
+punctuation, such as a fullwidth =@=, =%=, =!= or =+=, is a
+refusal.
 A recipient domain, or a domain on a header checked against the
 deny file, is refused when one label mixes Latin with Cyrillic or
 Greek after NFKC and IDNA.
@@ -254,10 +278,13 @@ config that cannot be read is a refusal.
 | =reply-to-unparsed= | Reply-To does not parse |
 | =sender-denied= | Sender names a deny-file identity |
 | =sender-unparsed= | Sender does not parse |
+| =sender-not-identity= | Sender is present and is not the identity |
 | =return-path-denied= | Return-Path names a deny-file identity |
 | =return-path-unparsed= | Return-Path does not parse |
+| =return-path-not-identity= | Return-Path is present and is not the identity |
 | =errors-to-denied= | Errors-To names a deny-file identity |
 | =errors-to-unparsed= | Errors-To does not parse |
+| =errors-to-not-identity= | Errors-To is present and is not the identity |
 | =disposition-notification-to-denied= | Disposition-Notification-To names a deny-file identity |
 | =disposition-notification-to-unparsed= | Disposition-Notification-To does not parse |
 | =return-receipt-to-denied= | Return-Receipt-To names a deny-file identity |
@@ -274,6 +301,8 @@ config that cannot be read is a refusal.
 | =recipient-address-denied= | To, Cc or Bcc names a deny-file address |
 | =recipient-domain-denied= | To, Cc or Bcc is at a denied domain |
 | =recipient-unparsed= | To, Cc or Bcc does not parse |
+| =argv-recipient-denied= | an argv recipient is a denied address or domain |
+| =argv-recipient-unparsed= | an argv recipient does not parse |
 | =header-control= | a control, or U+0085, U+2028 or U+2029 |
 | =header-line-ending= | the header block mixes CRLF and a bare LF |
 | =header-line-too-long= | a header line is over 998 octets |

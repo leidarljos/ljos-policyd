@@ -1,0 +1,1 @@
+An address rule covered only a `+` tag, so qmail and Postfix `-` or `=` extensions, a dotted gmail local part, googlemail.com, and a fastmail user subdomain were still delivered. Separators come from `subaddress` (default `+-=`). The gmail pair is one domain with dots ignored, and `local@user.fastmail.com` is that user at fastmail.com.

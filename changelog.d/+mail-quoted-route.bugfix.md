@@ -1,0 +1,1 @@
+Postfix opens a quoted local part and routes on @, % and ! after it strips a local domain, including when a backslash escapes the character. The quoted form was accepted, so that route was never judged. A quoted local part that holds any of the three is a refusal.

@@ -811,6 +811,11 @@ fn parse_quoted(s: &str) -> Result<(String, usize), AddressFault> {
             if c >= 0x80 {
                 return Err(AddressFault);
             }
+            // A quoted-pair is still the character. Postfix opens the
+            // quotes and routes on it, so the escape is not a hiding place.
+            if is_route_byte(c) {
+                return Err(AddressFault);
+            }
             local.push(c as char);
             escape = false;
             i += 1;
@@ -822,12 +827,13 @@ fn parse_quoted(s: &str) -> Result<(String, usize), AddressFault> {
                 i += 1;
             }
             b'"' => {
-                if local.is_empty() {
+                if local.is_empty() || nfkc_to_ascii_punctuation(&local) {
                     return Err(AddressFault);
                 }
                 return Ok((local, i + 1));
             }
             c if c < 0x20 && c != b'\t' => return Err(AddressFault),
+            c if is_route_byte(c) => return Err(AddressFault),
             c if c < 0x80 => {
                 local.push(c as char);
                 i += 1;
@@ -848,7 +854,7 @@ fn parse_dot_atom(s: &str) -> Result<(String, usize), AddressFault> {
     let mut any = false;
     for (i, c) in s.char_indices() {
         if c == '@' {
-            if !any || prev_dot {
+            if !any || prev_dot || nfkc_to_ascii_punctuation(&local) {
                 return Err(AddressFault);
             }
             return Ok((local, i));
@@ -863,8 +869,9 @@ fn parse_dot_atom(s: &str) -> Result<(String, usize), AddressFault> {
         }
         // `%` is the percent hack and `!` is a bang path. Postfix
         // rewrites both when the domain is local and then relays to
-        // the rewritten address. A quoted local part may still hold
-        // either character: that form is not rewritten.
+        // the rewritten address. The quoted form is refused in
+        // `parse_quoted`, including a backslash escape: Postfix opens
+        // the quotes before it routes.
         if c == '%' || c == '!' {
             return Err(AddressFault);
         }
@@ -909,9 +916,9 @@ fn parse_domain(s: &str) -> Result<String, AddressFault> {
     if !any || prev_dot {
         return Err(AddressFault);
     }
-    // A dotted quad, or any domain whose labels are all digits, is an
-    // address a resolver will connect to. Fullwidth digits fold to the
-    // same shape. It is not a name this check can compare.
+    // A dotted quad, or any domain a resolver will connect to, is not a
+    // name this check can compare. The shape is read after IDNA: NFKC
+    // leaves U+3002 and U+FF61 in place, and IDNA turns both into `.`.
     if numeric_domain(bare) {
         return Err(AddressFault);
     }
@@ -921,10 +928,137 @@ fn parse_domain(s: &str) -> Result<String, AddressFault> {
 fn numeric_domain(bare: &str) -> bool {
     let folded: String = bare.nfkc().collect();
     let folded = folded.trim_end_matches('.');
-    !folded.is_empty()
-        && folded
-            .split('.')
-            .all(|label| !label.is_empty() && label.chars().all(|c| c.is_ascii_digit()))
+    if folded.is_empty() {
+        return false;
+    }
+    if is_numeric_or_inet(folded) {
+        return true;
+    }
+    match idna::domain_to_ascii(folded) {
+        Ok(ascii) => {
+            let ascii = ascii.trim_end_matches('.');
+            !ascii.is_empty() && ascii != folded && is_numeric_or_inet(ascii)
+        }
+        Err(_) => false,
+    }
+}
+
+/// All-decimal labels of any count, a hex (`0x`) or leading-zero label,
+/// or a string `inet_aton` accepts. A leading zero is refused even when
+/// a later digit is 8 or 9: it is still an octal-shaped number.
+fn is_numeric_or_inet(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.iter().any(|label| label.is_empty()) {
+        return false;
+    }
+    if labels
+        .iter()
+        .all(|label| !label.is_empty() && label.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return true;
+    }
+    if labels
+        .iter()
+        .any(|label| is_hex_label(label) || is_octal_label(label))
+    {
+        return true;
+    }
+    inet_aton(host)
+}
+
+fn is_hex_label(label: &str) -> bool {
+    let Some(rest) = label
+        .strip_prefix("0x")
+        .or_else(|| label.strip_prefix("0X"))
+    else {
+        return false;
+    };
+    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn is_octal_label(label: &str) -> bool {
+    let bytes = label.as_bytes();
+    bytes.len() >= 2 && bytes[0] == b'0' && bytes[1..].iter().all(|b| b.is_ascii_digit())
+}
+
+fn inet_aton(host: &str) -> bool {
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return false;
+    }
+    let mut values = [0u64; 4];
+    for (i, part) in parts.iter().enumerate() {
+        let Some(value) = c_number(part) else {
+            return false;
+        };
+        values[i] = value;
+    }
+    let n = parts.len();
+    for value in values.iter().take(n - 1) {
+        if *value > 0xff {
+            return false;
+        }
+    }
+    let max = match n {
+        1 => 0xffff_ffff,
+        2 => 0x00ff_ffff,
+        3 => 0x0000_ffff,
+        4 => 0x0000_00ff,
+        _ => return false,
+    };
+    values[n - 1] <= max
+}
+
+/// A C integer: `0x` hex, a leading `0` octal, otherwise decimal.
+fn c_number(part: &str) -> Option<u64> {
+    if part.is_empty() {
+        return None;
+    }
+    let (base, digits) =
+        if let Some(rest) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+            if rest.is_empty() {
+                return None;
+            }
+            (16u64, rest)
+        } else if part.as_bytes()[0] == b'0' && part.len() > 1 {
+            (8u64, part)
+        } else {
+            (10u64, part)
+        };
+    let mut value = 0u64;
+    for c in digits.chars() {
+        let digit = match c {
+            '0'..='9' => u64::from(c as u8 - b'0'),
+            'a'..='f' if base == 16 => u64::from(c as u8 - b'a' + 10),
+            'A'..='F' if base == 16 => u64::from(c as u8 - b'A' + 10),
+            _ => return None,
+        };
+        if digit >= base {
+            return None;
+        }
+        value = value.checked_mul(base)?.checked_add(digit)?;
+    }
+    Some(value)
+}
+
+/// `@` routes inside a quoted local part once the quotes are removed,
+/// the same way `%` and `!` do. Postfix does this with
+/// `resolve_dequoted` on, which is the default.
+fn is_route_byte(c: u8) -> bool {
+    matches!(c, b'@' | b'%' | b'!')
+}
+
+/// NFKC of a fullwidth punctuation mark is the ASCII mark. A local
+/// part that changes into `@`, `%`, `!` or any other ASCII punctuation
+/// is not the mailbox a later comparison would read.
+fn nfkc_to_ascii_punctuation(local: &str) -> bool {
+    local.chars().any(|c| {
+        let folded: String = c.nfkc().collect();
+        folded != c.to_string() && folded.chars().any(|d| d.is_ascii_punctuation())
+    })
 }
 
 fn is_atext(c: char) -> bool {
@@ -1121,6 +1255,16 @@ From: other@example.test\r\n\
         assert!(mailboxes("<a@192.000.002.001>").is_err());
         let full = "\u{FF11}\u{FF19}\u{FF12}.\u{FF10}.\u{FF12}.\u{FF11}";
         assert!(mailboxes(&format!("a@{full}")).is_err());
+        let ideographic = "192\u{3002}0\u{3002}2\u{3002}1";
+        assert!(mailboxes(&format!("a@{ideographic}")).is_err());
+        let halfwidth = "192\u{FF61}0\u{FF61}2\u{FF61}1";
+        assert!(mailboxes(&format!("a@{halfwidth}")).is_err());
+        assert!(mailboxes("a@0x7f.1").is_err());
+        assert!(mailboxes("a@0X7F000001").is_err());
+        assert!(mailboxes("a@0177.0.0.1").is_err());
+        assert!(mailboxes("a@0177.example.test").is_err());
+        assert!(mailboxes("a@0x7f.example.test").is_err());
+        assert!(mailboxes("a@127.1").is_err());
         assert!(mailboxes("a@mx1.example.test").is_ok());
         assert!(mailboxes("a@192.0.2.example.test").is_ok());
     }
@@ -1138,20 +1282,24 @@ From: other@example.test\r\n\
         assert!(mailboxes("a%blocked.test@localhost").is_err());
         assert!(mailboxes("blocked.test!a@localhost").is_err());
         assert!(mailboxes("<a%b@example.test>").is_err());
-        assert_eq!(
-            mailboxes("\"a%b\"@example.test").unwrap(),
-            vec![Mailbox {
-                local: "a%b".into(),
-                domain: "example.test".into(),
-            }]
-        );
-        assert_eq!(
-            mailboxes("\"a!b\"@example.test").unwrap(),
-            vec![Mailbox {
-                local: "a!b".into(),
-                domain: "example.test".into(),
-            }]
-        );
+        assert!(mailboxes("\"a%b\"@example.test").is_err());
+        assert!(mailboxes("\"a!b\"@example.test").is_err());
+        assert!(mailboxes("\"a@b\"@example.test").is_err());
+        assert!(mailboxes("\"a\\@blocked.test\"@example.test").is_err());
+        assert!(mailboxes("\"a\\%blocked.test\"@localhost").is_err());
+        assert!(mailboxes("\"blocked.test\\!a\"@localhost").is_err());
+        assert!(mailboxes("\"Two Three\"@example.test").is_ok());
+    }
+
+    #[test]
+    fn a_local_part_nfkc_folds_to_ascii_punctuation_is_not_a_mailbox() {
+        assert!(mailboxes("a\u{FF05}blocked.test@localhost").is_err());
+        assert!(mailboxes("a\u{FF20}blocked.test@localhost").is_err());
+        assert!(mailboxes("a\u{FF01}b@localhost").is_err());
+        assert!(mailboxes("a\u{FF0B}b@example.test").is_err());
+        assert!(mailboxes("\"a\u{FF05}b\"@example.test").is_err());
+        assert!(mailboxes("a+b@example.test").is_ok());
+        assert!(mailboxes("\u{FF41}@example.test").is_ok());
     }
 
     #[test]
