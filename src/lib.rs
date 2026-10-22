@@ -6938,6 +6938,8 @@ struct FeedSplit {
     replace: Option<String>,
     /// `-a FILE` reads a file the line does not show.
     argfile: bool,
+    /// `parallel --arg-sep SEP`. The inputs start at the next `SEP`.
+    argsep: Option<String>,
 }
 
 /// The text a literal `printf` writes, reusing its format while arguments
@@ -7054,6 +7056,7 @@ fn parse_feed_flags(flags: &[String]) -> Option<FeedSplit> {
         group: None,
         replace: None,
         argfile: false,
+        argsep: None,
     };
     let mut i = 0;
     while i < flags.len() {
@@ -7090,6 +7093,10 @@ fn parse_feed_flags(flags: &[String]) -> Option<FeedSplit> {
                         i += 1;
                     }
                 }
+                "env" | "results" | "tmpdir" => {
+                    take(inline)?;
+                }
+                "arg-sep" | "argsep" => spec.argsep = Some(take(inline)?),
                 "max-procs" | "eof" | "no-run-if-empty" | "exit" | "verbose" | "interactive"
                 | "show-limits" | "process-slot-var" | "help" | "version" | "jobs" => {
                     if matches!(name, "max-procs" | "eof" | "process-slot-var" | "jobs")
@@ -7125,7 +7132,10 @@ fn parse_feed_flags(flags: &[String]) -> Option<FeedSplit> {
                     let v = need(rest)?;
                     spec.delim = Some(v.chars().next().filter(|_| v.chars().count() == 1)?);
                 }
-                'I' => spec.replace = Some(need(rest)?),
+                'I' | 'J' => spec.replace = Some(need(rest)?),
+                'R' | 'S' => {
+                    need(rest)?;
+                }
                 'i' => {
                     spec.replace = Some(if rest.is_empty() {
                         "{}".into()
@@ -7263,8 +7273,16 @@ fn splice_feed(
     out
 }
 
-fn parallel_inputs(run: &[String]) -> Option<Result<Vec<String>, ()>> {
-    let at = run.iter().position(|w| w == ":::" || w == "::::")?;
+fn feed_end(run: &[String], sep: Option<&str>) -> usize {
+    run.iter()
+        .position(|w| w == ":::" || w == "::::" || sep.is_some_and(|s| !s.is_empty() && w == s))
+        .unwrap_or(run.len())
+}
+
+fn parallel_inputs(run: &[String], sep: Option<&str>) -> Option<Result<Vec<String>, ()>> {
+    let at = run
+        .iter()
+        .position(|w| w == ":::" || w == "::::" || sep.is_some_and(|s| !s.is_empty() && w == s))?;
     if run[at] == "::::" || run[at..].iter().any(|w| w == "::::") {
         return Some(Err(()));
     }
@@ -7309,10 +7327,8 @@ fn xargs_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Op
         let flags = &wrappers[at + 1..];
         let parsed = parse_feed_flags(flags);
         let opaque = parsed.is_none();
-        let end = run_all
-            .iter()
-            .position(|w| w == ":::" || w == "::::")
-            .unwrap_or(run_all.len());
+        let argsep = parsed.as_ref().and_then(|s| s.argsep.clone());
+        let end = feed_end(run_all, argsep.as_deref());
         let template = run_all[..end].to_vec();
         if template.is_empty() || !fed_sensitive(&template) {
             continue;
@@ -7324,6 +7340,7 @@ fn xargs_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Op
             group: None,
             replace: None,
             argfile: false,
+            argsep: None,
         });
         if parallel {
             spec.group = spec.group.or(Some(1));
@@ -7338,7 +7355,7 @@ fn xargs_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Op
         if let Some(c) = benign_denial(&template, &marks, moved, bound) {
             return Some(c);
         }
-        let colon = parallel_inputs(run_all);
+        let colon = parallel_inputs(run_all, argsep.as_deref());
         let producer = i.checked_sub(1).filter(|&p| ended[p].1 == "|");
         let from_colon = colon.is_some();
         let shown = if spec.argfile {
@@ -7433,10 +7450,8 @@ fn temp_fed_marks(argv: &[String]) -> Vec<String> {
         let parallel = base_of(&wrappers[at]) == "parallel";
         let parsed = parse_feed_flags(&wrappers[at + 1..]);
         let opaque = parsed.is_none();
-        let end = run_all
-            .iter()
-            .position(|w| w == ":::" || w == "::::")
-            .unwrap_or(run_all.len());
+        let argsep = parsed.as_ref().and_then(|s| s.argsep.clone());
+        let end = feed_end(run_all, argsep.as_deref());
         let template = &run_all[..end];
         let mut spec = parsed.unwrap_or(FeedSplit {
             nul: false,
@@ -7445,6 +7460,7 @@ fn temp_fed_marks(argv: &[String]) -> Vec<String> {
             group: None,
             replace: None,
             argfile: false,
+            argsep: None,
         });
         if parallel {
             spec.group = spec.group.or(Some(1));
@@ -7461,7 +7477,7 @@ fn temp_fed_marks(argv: &[String]) -> Vec<String> {
         if mark.is_empty() || spec.argfile {
             continue;
         }
-        let colon = parallel_inputs(run_all);
+        let colon = parallel_inputs(run_all, argsep.as_deref());
         let producer = i.checked_sub(1).filter(|&p| ended[p].1 == "|");
         let inputs = if let Some(found) = colon {
             found.ok()
@@ -8046,8 +8062,8 @@ fn replace_strings(call: &[String]) -> Vec<String> {
         for (k, c) in short.char_indices() {
             let rest = &short[k + 1..];
             match c {
-                'I' if rest.is_empty() => out.extend(words.next().map(str::to_string)),
-                'I' => out.push(rest.to_string()),
+                'I' | 'J' if rest.is_empty() => out.extend(words.next().map(str::to_string)),
+                'I' | 'J' => out.push(rest.to_string()),
                 'i' => out.push(if rest.is_empty() { "{}" } else { rest }.into()),
                 c if valued.contains(&format!("-{c}").as_str()) => {
                     if rest.is_empty() {
@@ -8638,6 +8654,9 @@ const RUNNERS: &[(&str, &[&str])] = &[
             "-E",
             "-a",
             "-s",
+            "-J",
+            "-R",
+            "-S",
             "--delimiter",
             "--max-args",
             "--max-procs",
@@ -8655,6 +8674,10 @@ const RUNNERS: &[(&str, &[&str])] = &[
             "-a",
             "--arg-file",
             "--argsep",
+            "--arg-sep",
+            "--env",
+            "--results",
+            "--tmpdir",
             "-d",
             "--delimiter",
             "--colsep",
@@ -18044,6 +18067,25 @@ hash -r 2> /dev/null
             v("printf '/tmp/a \\n' | while read x y; do rm -rf \"$x\"; done"),
             "allow"
         );
+    }
+
+    /// A valued flag of `xargs` or `parallel` is not the command. The
+    /// command after the value is, and so is an input after `--arg-sep`.
+    #[test]
+    fn a_valued_runner_flag_is_not_the_command() {
+        let v = |s: &str| verdict(&shell_words(s));
+        for line in [
+            "parallel --env X rm -rf ::: /",
+            "parallel --results out rm -rf ::: /",
+            "parallel --tmpdir /tmp rm -rf ::: /",
+            "parallel --arg-sep ,, rm -rf ,, /",
+            "parallel --argsep ,, rm -rf ,, /",
+            "printf '/\\n' | xargs -J % rm -rf %",
+            "printf '/\\n' | xargs -R 1 -I % rm -rf %",
+            "printf '/\\n' | xargs -S 1024 -I % rm -rf %",
+        ] {
+            assert_eq!(v(line), "deny\trm-rf-outside-tmp", "{line}");
+        }
     }
 
     /// Words `xargs`, `parallel`, `find -exec` or `read` add are part of
