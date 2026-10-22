@@ -746,8 +746,9 @@ fn is_subaddress(rule_local: &str, local: &str, seps: &str) -> bool {
 /// `yahoo.*` covers `yahoo.com.br` and any other country suffix. It
 /// also covers `yahoo.example.test`, which can only over-block.
 /// `shared` makes the domains one mailbox, `dots` ignores dots in the
-/// local part, and `subdomain` reads `<anything>@<user>.<domain>` as
-/// `<user>@<domain>`. `cut` also cuts the rule's own local part at the
+/// local part, and `subdomain` reads `<local>@<user>.<domain>` as
+/// `<user><sep><local>@<domain>`, `<sep>` being the first of the
+/// family's separators. `cut` also cuts the rule's own local part at the
 /// first separator, so a rule naming one disposable address covers
 /// every address with that base. Every entry only widens what an address rule
 /// covers, so a wrong entry over-blocks and cannot allow a recipient.
@@ -872,20 +873,15 @@ fn families_of<'a>(
 
 /// Every `(local, domain)` the families make of one mailbox, itself
 /// first. Each form is folded again until nothing new appears, so a
-/// domain named by two families gets both. The subdomain label is not
-/// cut on a separator: a hyphen there is part of the user name.
+/// domain named by two families gets both, and a subdomain of a `shared`
+/// domain is also that subdomain of every other domain in the family.
+/// `subdomain` reads `<local>@<user>.<domain>` as
+/// `<user><sep><local>@<domain>`, with the family's first separator,
+/// and the result is folded again, so `dots` also reaches the user.
+/// The user is every label in front of the domain, and is not cut on a
+/// separator: a hyphen there is part of the user name.
 fn alias_forms(local: &str, domain: &str, families: &[AliasFamily]) -> Vec<(String, String)> {
     let mut forms = vec![(local.to_string(), domain.to_string())];
-    for family in families.iter().filter(|f| f.subdomain) {
-        for base in family.literal_domains() {
-            let user = domain
-                .strip_suffix(base.as_str())
-                .and_then(|rest| rest.strip_suffix('.'));
-            if let Some(user) = user.filter(|u| !u.is_empty() && !u.contains('.')) {
-                push_form(&mut forms, user.to_string(), base.clone());
-            }
-        }
-    }
     let mut i = 0;
     while i < forms.len() {
         let (local, domain) = forms[i].clone();
@@ -897,6 +893,30 @@ fn alias_forms(local: &str, domain: &str, families: &[AliasFamily]) -> Vec<(Stri
             if family.shared {
                 for other in family.literal_domains() {
                     push_form(&mut forms, local.clone(), other.clone());
+                }
+            }
+        }
+        for family in families.iter().filter(|f| f.shared || f.subdomain) {
+            for base in family.literal_domains() {
+                let Some(user) = domain
+                    .strip_suffix(base.as_str())
+                    .and_then(|rest| rest.strip_suffix('.'))
+                    .filter(|u| !u.is_empty())
+                else {
+                    continue;
+                };
+                if family.shared {
+                    for other in family.literal_domains() {
+                        push_form(&mut forms, local.clone(), format!("{user}.{other}"));
+                    }
+                }
+                if let Some(sep) = family
+                    .separators
+                    .chars()
+                    .next()
+                    .filter(|_| family.subdomain)
+                {
+                    push_form(&mut forms, format!("{user}{sep}{local}"), base.clone());
                 }
             }
         }
@@ -1935,6 +1955,48 @@ pair left right
         let fast = "address user@fastmail.com\n";
         assert!(denied("user+x@fastmail.com", fast));
         assert!(denied("x@user.fastmail.com", fast));
+    }
+
+    /// Fastmail delivers `shop@user.fastmail.com` to `user+shop`, so the
+    /// two spellings are one rule and other tags stay outside it.
+    #[test]
+    fn a_fastmail_subdomain_is_the_plus_form() {
+        let denied = |to: &str, deny: &str, extra: &str| {
+            codes_with(&plain(&format!("To: {to}\r\n")), deny, "", extra)
+                == vec!["recipient-address-denied"]
+        };
+        let plus = "address user+shop@fastmail.com\n";
+        for to in [
+            "shop@user.fastmail.com",
+            "\"shop\"@user.fastmail.com",
+            "Shop@User.FastMail.com",
+            "user+shop@fastmail.com",
+        ] {
+            assert!(denied(to, plus, ""), "{to}");
+        }
+        let sub = "address shop@user.fastmail.com\n";
+        for to in ["user+shop@fastmail.com", "shop@user.fastmail.com"] {
+            assert!(denied(to, sub, ""), "{to}");
+        }
+        for to in [
+            "user@fastmail.com",
+            "user+other@fastmail.com",
+            "other@user.fastmail.com",
+        ] {
+            assert!(!denied(to, sub, ""), "{to}");
+            assert!(!denied(to, plus, ""), "{to}");
+        }
+        let fm = "alias fastmail.com,fastmail.fm + shared\n";
+        assert!(denied("shop@user.fastmail.fm", plus, fm));
+        assert!(denied("user+shop@fastmail.fm", sub, fm));
+        let dotted = "alias example.test + dots subdomain\n";
+        for deny in [
+            "address jdoe@example.test\n",
+            "address tag@jdoe.example.test\n",
+        ] {
+            assert!(denied("tag@j.doe.example.test", deny, dotted), "{deny}");
+            assert!(!denied("tag@j.doe.example.test", deny, ""), "{deny}");
+        }
     }
 
     /// `yahoo.*` and the Microsoft patterns name every country suffix,
