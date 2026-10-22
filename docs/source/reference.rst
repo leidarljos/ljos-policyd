@@ -19,7 +19,8 @@ Built-in denials
 
 First match wins. The head is the last path component of argv[0].
 Leading assignments, ``NAME=value`` or ``NAME+=value``, and runner words
-such as ``env``, ``nice`` and ``timeout`` come off first.
+such as ``env``, ``nice`` and ``timeout`` come off first, as does the head
+of a ``case`` arm (``case $x in a)``, or ``b)`` after ``;;``).
 
 ===================== ======================== ============================
 Token                 Cap'n PolicyReason       When
@@ -54,7 +55,8 @@ other way, is read as that value. A string that still holds a ``$`` after
 that may run any command, so it is refused as
 ``env-split-string-unshown``.
 Leading words that still run ``cd`` in this shell (``command``,
-``builtin``, ``if``, ``while``, ``{`` and the other control keywords, and
+``builtin``, ``if``, ``while``, ``{`` and the other control keywords, a
+``case`` arm's head, and
 the ``time`` keyword with its ``-p``, which is a program after ``command``
 or ``builtin``, where no word is a keyword)
 are peeled before this check, as are assignments among them

@@ -1081,6 +1081,11 @@ fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
         let Some((w, rest)) = words.split_first() else {
             return words;
         };
+        let head = case_head(words);
+        if head > 0 && !looked_up {
+            words = &words[head..];
+            continue;
+        }
         if is_assignment(w) {
             words = rest;
             continue;
@@ -1572,6 +1577,11 @@ fn wrapper_walk(cmd: &[String]) -> Walk<'_> {
             i += 1;
             continue;
         }
+        let head = case_head(&cmd[i..]);
+        if head > 0 {
+            i += head;
+            continue;
+        }
         if let Some(head) = function_head(&cmd[i..]) {
             // `f() { git push -f; }`: the body is what runs when `f` is
             // called, so it is judged as written.
@@ -1708,6 +1718,24 @@ fn env_split_words(s: &str) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+/// How many words at the front of `words` open a `case` arm: `case WORD
+/// in` with the first arm's pattern (`a)`, `(a)`), or the pattern alone
+/// that opens each later arm after `;;`. The command after them is the
+/// one the arm runs. A pattern is a word with a `)` no `(` in it opens.
+fn case_head<S: AsRef<str>>(words: &[S]) -> usize {
+    let word = |i: usize| words.get(i).map(AsRef::as_ref);
+    let pattern = |p: &str| p.ends_with(')') && p.matches(')').count() > p.matches('(').count();
+    let n = if word(0) == Some("case") && word(2) == Some("in") {
+        3
+    } else {
+        0
+    };
+    match word(n) {
+        Some(p) if pattern(p) || (n == 3 && p.starts_with('(') && p.ends_with(')')) => n + 1,
+        _ => n,
+    }
 }
 
 /// How many words a function definition's head takes at the front of
