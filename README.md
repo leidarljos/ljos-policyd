@@ -199,7 +199,11 @@ numbers is still that address. A source route
 part is a refusal, quoted or not, including a backslash escape
 inside the quotes. A local part that NFKC changes into ASCII
 punctuation, such as a fullwidth `@`, `%`, `!` or `+`, is a
-refusal.
+refusal. A local part that contains a default ignorable code point,
+a noncharacter, an unassigned or private-use code point, a format
+or control character, or a space separator is a refusal. A
+zero-width space or a braille blank is still removed before the
+address is compared.
 A recipient domain, or a domain on a header checked against the
 deny file, is refused when one of its labels mixes Latin with
 Cyrillic or Greek after NFKC and IDNA.
