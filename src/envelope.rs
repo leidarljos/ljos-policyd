@@ -1244,6 +1244,19 @@ pair left right
     }
 
     #[test]
+    fn unicode_line_separators_in_the_header_are_refused() {
+        let deny = "domain blocked.test\n";
+        let raw = "From: mailseat@example.test\r\nSubject: x\u{0085}Bcc: a@blocked.test\r\n\r\n";
+        assert_eq!(codes(raw, deny, ""), vec!["header-control"]);
+        let raw = "From: mailseat@example.test\r\nSubject: x\u{2028}Bcc: a@blocked.test\r\n\r\n";
+        assert_eq!(codes(raw, deny, ""), vec!["header-control"]);
+        let raw = "From: mailseat@example.test\r\nSubject: x\u{2029}Bcc: a@blocked.test\r\n\r\n";
+        assert_eq!(codes(raw, deny, ""), vec!["header-control"]);
+        let raw = "From: mailseat@example.test\r\n\r\nx\u{0085}y\r\n";
+        assert!(codes(raw, "", "").is_empty(), "{:?}", details(raw, "", ""));
+    }
+
+    #[test]
     fn a_control_or_an_overlong_message_is_refused() {
         let raw = "From: mailseat@example.test\r\nSubject: a\u{0001}b\r\n";
         assert_eq!(codes(raw, "", ""), vec!["header-control"]);

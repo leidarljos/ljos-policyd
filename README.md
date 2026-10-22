@@ -184,9 +184,11 @@ share the file and are ignored here. The pack-law file's lines are
 `deny-domain`. A line that would allow a domain is not a rule, and
 the file is refused.
 
-A message over 1 MiB, a control character in the header block, a
-header line over 998 octets, a header block that mixes CRLF and a
-bare LF, or a config that cannot be read is a refusal. The body is not part of this check.
+A message over 1 MiB, a control character in the header block,
+U+0085, U+2028 or U+2029 in that block, a header line over 998
+octets, a header block that mixes CRLF and a bare LF, or a config
+that cannot be read is a refusal. The body is not part of this
+check.
 
 ## How ljos uses it
 

@@ -1,0 +1,1 @@
+U+0085, U+2028 and U+2029 passed the header control check, which looks at bytes. A reader that splits lines on them, as Python's str.splitlines does, would see a new header. Those characters in the header block are a refusal.

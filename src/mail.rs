@@ -152,6 +152,15 @@ fn header_line_too_long(block: &str) -> bool {
 }
 
 fn has_bad_control(block: &str) -> bool {
+    // U+0085, U+2028 and U+2029 are not C0 controls. A reader that
+    // splits lines on them, as Python's str.splitlines does, sees a
+    // new header. The bytes below never match those characters.
+    if block
+        .chars()
+        .any(|c| matches!(c, '\u{0085}' | '\u{2028}' | '\u{2029}'))
+    {
+        return true;
+    }
     let bytes = block.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -1132,6 +1141,18 @@ From: other@example.test\r\n\
         assert_eq!(parse_message(raw).unwrap_err(), MessageFault::LineEnding);
         let raw = "From: mailseat@example.test\r\nTo: a@example.test\n";
         assert_eq!(parse_message(raw).unwrap_err(), MessageFault::LineEnding);
+    }
+
+    #[test]
+    fn a_unicode_line_separator_in_the_header_is_refused() {
+        for sep in ['\u{0085}', '\u{2028}', '\u{2029}'] {
+            let raw = format!(
+                "From: mailseat@example.test\r\nSubject: x{sep}Bcc: a@example.test\r\n\r\n"
+            );
+            assert_eq!(parse_message(&raw).unwrap_err(), MessageFault::Control);
+        }
+        let raw = "From: mailseat@example.test\r\n\r\nx\u{0085}y\r\n";
+        assert!(parse_message(raw).is_ok());
     }
 
     #[test]

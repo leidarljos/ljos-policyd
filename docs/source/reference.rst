@@ -244,8 +244,9 @@ does not. ASCII case is folded, and a character a reader skips is
 removed before that comparison. ``From`` is not compared that way. ``handle``, ``term`` and ``pair`` may share the deny file
 and are ignored here. A pack-law line that would allow a domain refuses
 the file. A message over 1 MiB, a control character in the header
-block, a header line over 998 octets, a header block that mixes
-CRLF and a bare LF, or a config that cannot be read is a refusal.
+block, U+0085, U+2028 or U+2029 in that block, a header line over
+998 octets, a header block that mixes CRLF and a bare LF, or a
+config that cannot be read is a refusal.
 
 ======================================== ======================================================
 Code                                     When
@@ -279,7 +280,7 @@ Code                                     When
 ``recipient-address-denied``             To, Cc or Bcc names a deny-file address
 ``recipient-domain-denied``              To, Cc or Bcc is at a denied domain
 ``recipient-unparsed``                   To, Cc or Bcc does not parse
-``header-control``                       a control character in the header block
+``header-control``                       a control, or U+0085, U+2028 or U+2029
 ``header-line-ending``                   the header block mixes CRLF and a bare LF
 ``header-line-too-long``                 a header line is over 998 octets
 ``message-too-large``                    the message is over 1 MiB
