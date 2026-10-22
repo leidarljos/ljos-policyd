@@ -177,6 +177,7 @@ fn runner_commands(
         // An assignment in front of a builtin is set for that command
         // alone: `FOO=1 cd dir` still moves the shell.
         let words = &cmd[cmd.iter().take_while(|w| is_assignment(w)).count()..];
+        let words = peel_cd_command_word(words);
         let b = words.first().map_or("", |w| base_of(w));
         if piped && matches!(b, "cd" | "pushd" | "popd") {
             continue;
@@ -254,6 +255,40 @@ fn entered(args: &[&str], dir: &std::path::Path, pushd: bool) -> Option<std::pat
         return home().map(|h| h.join(rest));
     }
     (!to.starts_with('~')).then(|| dir.join(to))
+}
+
+/// Words that keep `cd` in this shell when they run before it.
+fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
+    loop {
+        let Some((w, rest)) = words.split_first() else {
+            return words;
+        };
+        match base_of(w) {
+            "command" => {
+                words = rest;
+                while let Some((a, tail)) = words.split_first() {
+                    if *a == "--" {
+                        words = tail;
+                        break;
+                    }
+                    if *a == "-p" {
+                        words = tail;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            "builtin" => {
+                words = rest;
+                if let Some((a, tail)) = words.split_first() {
+                    if *a == "--" {
+                        words = tail;
+                    }
+                }
+            }
+            _ => return words,
+        }
+    }
 }
 
 fn host_argv_table(argv: &[String]) -> Checked {
@@ -3726,6 +3761,20 @@ mod tests {
             "pushd project && FOO=1 popd && make clean-all",
         );
         assert_eq!(c.decision, Decision::Allow);
+    }
+
+    /// `command`, `command -p` and `builtin` do not hide `cd`.
+    #[test]
+    fn follows_a_cd_behind_command_or_builtin() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "command cd project && make clean-all",
+            "command -p cd project && make clean-all",
+            "builtin cd project && make clean-all",
+        ] {
+            let c = entering("command-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
     }
 
     /// A script the line hands a shell, `eval` or a named command word runs
