@@ -834,6 +834,10 @@ fn walk(
         if denied.is_some() {
             return;
         }
+        judge_direct_exec(&shown, shell, depth, out, denied);
+        if denied.is_some() {
+            return;
+        }
         let words = peel_cd_command_word(&shown);
         let b = words.first().map_or("", |w| base_of(w));
         // A pipeline stage runs in a subshell, so it cannot move this
@@ -843,7 +847,12 @@ fn walk(
         // the same walk that tracks the directory, whether or not the
         // file can move this shell. A pipeline stage's source moves only
         // its own subshell.
-        let read = sourced(&cmd, &shell.here, &shell.aliases);
+        let read = sourced(
+            &cmd,
+            &shell.here,
+            shell.vars.home.as_deref(),
+            &shell.aliases,
+        );
         match read {
             Sourced::Read { keeps, words } => {
                 if let Some(c) = judge_body(&words, shell) {
@@ -1404,15 +1413,20 @@ enum Sourced {
 /// followed; several directories or a missing file lose the line, and a
 /// file the guard cannot read, or a relative path in a directory the
 /// walk does not follow, is refused.
-fn sourced(cmd: &[&str], dirs: &[std::path::PathBuf], aliases: &[(String, String)]) -> Sourced {
+fn sourced(
+    cmd: &[&str],
+    dirs: &[std::path::PathBuf],
+    home: Option<&str>,
+    aliases: &[(String, String)],
+) -> Sourced {
     let Some(path) = literal_source_path(cmd) else {
         return Sourced::No;
     };
-    let mut texts = match script_texts(&path, dirs) {
+    let mut texts = match script_texts(&path, dirs, home) {
         Ok(t) => t,
         Err(c) => return Sourced::Unread(c),
     };
-    let one = std::path::Path::new(&path).is_absolute() || dirs.len() == 1;
+    let one = dirs.len() == 1 || path.starts_with(['/', '~']);
     if one && texts.len() == 1 {
         let scan = scan_script(&texts.remove(0).1, aliases);
         return Sourced::Read {
@@ -1689,7 +1703,7 @@ fn judge_script_file(
         .iter()
         .map(|d| env_dir(wrappers, d, shell.vars.home.as_deref()))
         .collect();
-    let texts = match script_texts(op, &dirs) {
+    let texts = match script_texts(op, &dirs, shell.vars.home.as_deref()) {
         Ok(t) => t,
         Err(c) => {
             *denied = Some(c);
@@ -1762,6 +1776,110 @@ fn judge_procsub(
     replay_subshell(&words, shell, depth, out, denied);
 }
 
+/// Judge a file the command runs by its path (`./build.sh`, `exec sub/x`,
+/// `env ./x`). The kernel runs a compiled program, which is not read. A
+/// file with a shell's `#!` line, or none, which a shell then runs, is
+/// judged as a shell's script file is, and one for an interpreter in
+/// [`INTERPRETERS`] as that interpreter's inline program. Any other
+/// interpreter's text is not judged and is refused.
+fn judge_direct_exec(
+    cmd: &[&str],
+    shell: &Shell,
+    depth: usize,
+    out: &mut Vec<(Vec<String>, std::path::PathBuf, bool)>,
+    denied: &mut Option<Checked>,
+) {
+    if denied.is_some() {
+        return;
+    }
+    let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+    let owned = split_env_strings(&owned).into_owned();
+    let (run, _) = unwrap_wrappers(&owned);
+    let Some(word) = run.first().map(String::as_str) else {
+        return;
+    };
+    let plain = |c: char| !c.is_whitespace() && !"$`*?[(){}<>'\"|;&".contains(c);
+    if !word.contains('/') || !word.chars().all(plain) {
+        return;
+    }
+    let wrappers = &owned[..owned.len() - run.len()];
+    let dirs: Vec<_> = shell
+        .here
+        .iter()
+        .map(|d| env_dir(wrappers, d, shell.vars.home.as_deref()))
+        .collect();
+    let texts = match script_texts(word, &dirs, shell.vars.home.as_deref()) {
+        Ok(t) => t,
+        Err(c) => {
+            *denied = Some(c);
+            return;
+        }
+    };
+    for (_, text) in texts {
+        let program = shebang_program(&text);
+        let interp = program.and_then(|p| interpreter_flag(p).map(|f| (p, f)));
+        let words = match (program, interp) {
+            (Some(_), Some((p, flag))) => vec![p.to_string(), flag.to_string(), text.clone()],
+            (Some(p), None) if !SHELLS.contains(&p) => {
+                *denied = Some(script_unread(word));
+                return;
+            }
+            _ if depth >= MAX_DEPTH => {
+                *denied = Some(Checked {
+                    decision: Decision::Deny,
+                    code: PolicyReason::ShellDangerousRunner,
+                    token: Cow::Borrowed("script-file-unshown"),
+                });
+                return;
+            }
+            _ => {
+                let mut aliases = shell.aliases.clone();
+                expand_aliases_with(&shell_words(&text), &mut aliases).into_owned()
+            }
+        };
+        if let Some(c) = judge_body(&words, shell) {
+            *denied = Some(c);
+            return;
+        }
+        if interp.is_none() {
+            replay_subshell(&words, shell, depth + 1, out, denied);
+            if denied.is_some() {
+                return;
+            }
+        }
+    }
+}
+
+/// The program a `#!` line names, by base name: past `env` and its
+/// options, so `#!/usr/bin/env -S python3 -u` is `python3`. `None` with
+/// no `#!` line.
+fn shebang_program(text: &str) -> Option<&str> {
+    let line = text.strip_prefix("#!")?.lines().next().unwrap_or("");
+    let mut words = line.split_whitespace();
+    let first = base_of(words.next().unwrap_or(""));
+    if first != "env" {
+        return Some(first);
+    }
+    Some(
+        words
+            .find(|w| !w.starts_with('-') && !w.contains('='))
+            .map_or("", base_of),
+    )
+}
+
+/// The inline-program flag of the interpreter `name`, version and any
+/// suffix after it taken off (`python3.12`, `perl5.38-x86_64-linux-gnu`).
+fn interpreter_flag(name: &str) -> Option<&'static str> {
+    let b = name
+        .split(|c: char| c.is_ascii_digit())
+        .next()
+        .unwrap_or(name);
+    INTERPRETERS
+        .iter()
+        .find(|(n, _)| n.trim_end_matches(|c: char| c.is_ascii_digit()) == b)
+        .map(|(_, f)| *f)
+}
+
 /// The text of a literal path, read from the one directory the shell is
 /// in. `None` when the path is relative and that directory is not known,
 /// or the file cannot be read.
@@ -1827,7 +1945,20 @@ enum ScriptText {
     /// A file the guard cannot judge: past [`SCRIPT_MAX`], not a regular
     /// file, a loop of links, or unreadable.
     Unread,
+    /// A compiled program, by its magic number. The kernel runs it and a
+    /// shell will not read it as a script.
+    Binary,
 }
+
+/// The first bytes of an ELF or Mach-O program, thin or universal.
+const BINARY_MAGIC: &[[u8; 4]] = &[
+    *b"\x7fELF",
+    [0xfe, 0xed, 0xfa, 0xce],
+    [0xfe, 0xed, 0xfa, 0xcf],
+    [0xce, 0xfa, 0xed, 0xfe],
+    [0xcf, 0xfa, 0xed, 0xfe],
+    [0xca, 0xfe, 0xba, 0xbe],
+];
 
 /// The text of the regular file at `path`, opened through any symlink as
 /// the shell opens it, and with `O_NONBLOCK` so a fifo cannot stall the
@@ -1852,11 +1983,20 @@ fn read_script(path: &std::path::Path) -> ScriptText {
     if meta.is_dir() {
         return ScriptText::Missing;
     }
-    if !meta.file_type().is_file() || meta.len() > SCRIPT_MAX {
+    if !meta.file_type().is_file() {
         return ScriptText::Unread;
     }
     let mut buf = Vec::new();
-    if file.take(SCRIPT_MAX + 1).read_to_end(&mut buf).is_err() || buf.len() as u64 > SCRIPT_MAX {
+    if (&file).take(4).read_to_end(&mut buf).is_err() {
+        return ScriptText::Unread;
+    }
+    if BINARY_MAGIC.iter().any(|m| buf == m) {
+        return ScriptText::Binary;
+    }
+    if meta.len() > SCRIPT_MAX
+        || (&file).take(SCRIPT_MAX).read_to_end(&mut buf).is_err()
+        || buf.len() as u64 > SCRIPT_MAX
+    {
         return ScriptText::Unread;
     }
     // bash runs the bytes it parses whatever the encoding, so a refused
@@ -1884,25 +2024,30 @@ fn script_unread(word: &str) -> Checked {
 }
 
 /// The text of the script `word` as a shell in each of `dirs` would open
-/// it, one entry per file found. A relative path in a directory the walk
+/// it, with `~` read from `home`, one entry per file found. A relative path in a directory the walk
 /// does not follow, or a file the guard cannot read, is refused. A
-/// missing file runs nothing and has no entry.
+/// missing file runs nothing, and a compiled program is no script, so
+/// neither has an entry.
 fn script_texts(
     word: &str,
     dirs: &[std::path::PathBuf],
+    home: Option<&str>,
 ) -> Result<Vec<(std::path::PathBuf, String)>, Checked> {
-    let path = std::path::Path::new(word);
-    let fulls: Vec<std::path::PathBuf> = if path.is_absolute() {
-        vec![path.to_path_buf()]
-    } else if dirs.iter().any(|d| is_untracked(d)) {
-        return Err(script_unread(word));
-    } else {
-        dirs.iter().map(|d| d.join(path)).collect()
-    };
+    let mut fulls = Vec::new();
+    for d in dirs {
+        match path_from(word, d, home) {
+            Some(p) if !is_untracked(&p) => {
+                if !fulls.contains(&p) {
+                    fulls.push(p);
+                }
+            }
+            _ => return Err(script_unread(word)),
+        }
+    }
     let mut out = Vec::new();
     for full in fulls {
         match read_script(&full) {
-            ScriptText::Missing => {}
+            ScriptText::Missing | ScriptText::Binary => {}
             ScriptText::Text(t) => out.push((full, t)),
             ScriptText::Unread => return Err(script_unread(word)),
         }
@@ -6330,12 +6475,7 @@ fn inline_program(run: &[String]) -> Option<&str> {
 
 /// Where an interpreter call's inline-program flag (`-c`, `-e`) is.
 fn inline_flag_at(run: &[String]) -> Option<usize> {
-    let b = base_of(run.first()?);
-    let b = b.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
-    let flag = INTERPRETERS
-        .iter()
-        .find(|(n, _)| n.trim_end_matches(|c: char| c.is_ascii_digit()) == b)?
-        .1;
+    let flag = interpreter_flag(base_of(run.first()?))?;
     run.iter().position(|a| {
         a == flag
             || (a.starts_with('-')
@@ -11719,6 +11859,91 @@ hash -r 2> /dev/null
             "cat < evil/force.sh",
             "bash 3< evil/force.sh -c 'echo ok'",
             "sh -c 'echo ok' < evil/force.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        assert_everyday_allowed(&root);
+    }
+
+    /// `./direct.sh`, `exec ./direct.sh` and `env ./direct.sh` were
+    /// allowed whatever the file held: only a script handed to a shell
+    /// was read. A path run as a program is read unless it is a compiled
+    /// binary: a shell's shebang, or none, is judged as a shell script,
+    /// and a known interpreter's as its inline program.
+    #[test]
+    fn a_script_run_by_its_path_is_judged() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = startup_root("direct");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        let files: [(&str, &[u8]); 9] = [
+            ("direct.sh", b"#!/bin/sh\ngit push -f origin\n"),
+            (
+                "tool.pl",
+                b"#!/usr/bin/perl5.38-x86_64-linux-gnu\nsystem(\"git push -f\");\n",
+            ),
+            ("envsh", b"#!/usr/bin/env bash\ngit push --force\n"),
+            (
+                "tool.py",
+                b"#!/usr/bin/env python3\nimport os\nos.system(\"git push -f\")\n",
+            ),
+            ("odd.tcl", b"#!/usr/bin/tclsh\nputs hi\n"),
+            ("hi.sh", b"#!/bin/sh\necho hi\n"),
+            ("ok.py", b"#!/usr/bin/python3\nprint('ok')\n"),
+            ("macho", b"\xcf\xfa\xed\xfe\x07\x00\x00\x01git push -f\n"),
+            ("sub/run", b"git push -f origin\n"),
+        ];
+        for (name, body) in files {
+            std::fs::write(root.join(name), body).unwrap();
+            std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        std::fs::copy("/bin/true", root.join("app")).unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "./direct.sh",
+            "exec ./direct.sh",
+            "env ./direct.sh",
+            "nohup ./envsh",
+            "./tool.py",
+            "sub/run",
+            "./sub/../direct.sh",
+            "cd sub && ./run",
+            "cargo build && ./direct.sh",
+            "./tool.pl",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
+        }
+        for line in [
+            format!("HOME={}; cd \"$X\"; ~/direct.sh", root.display()),
+            format!("HOME={}; cd \"$X\"; source ~/evil/force.sh", root.display()),
+        ] {
+            let line = line.as_str();
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
+        }
+        for line in ["./odd.tcl", "cd \"$X\" && ./hi.sh"] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(
+                c.token.starts_with("script-unread: "),
+                "{line}: {}",
+                c.token
+            );
+        }
+        for line in [
+            "./app",
+            "./app --version",
+            "./macho",
+            "./hi.sh",
+            "./ok.py",
+            "./missing.sh",
+            "exec ./app",
+            "cd \"$X\" && /bin/true",
+            "( : <>/dev/null ) && echo ok",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
