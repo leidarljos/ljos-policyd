@@ -5583,7 +5583,8 @@ fn tee_paths(cmd: &[String]) -> Vec<&str> {
 }
 
 /// The words that name the files a command writes as a program: what
-/// `tee`, `curl` and `wget` save, and the target of `cp`, `mv` and `ln`.
+/// `tee`, `curl` and `wget` save, the target of `cp`, `mv` and `ln`,
+/// and each file of a `sed -i`.
 fn program_writes(run: &[String]) -> Vec<String> {
     let mut out = fetched_paths(run);
     out.extend(tee_paths(run).into_iter().map(str::to_string));
@@ -5594,6 +5595,7 @@ fn program_writes(run: &[String]) -> Vec<String> {
     let args = operands(&args);
     match base_of(head) {
         "cp" | "mv" | "ln" => out.extend(copy_target(&args, base_of(head) == "ln")),
+        "sed" if sed_in_place(&args) => out.extend(sed_files(&args)),
         _ => {}
     }
     out
@@ -5632,6 +5634,39 @@ fn copy_target(args: &[&str], ln: bool) -> Option<String> {
         (None, [_, .., last]) => Some((*last).to_string()),
         _ => None,
     }
+}
+
+/// Whether a `sed` with `args` edits its files in place.
+fn sed_in_place(args: &[&str]) -> bool {
+    args.iter().any(|a| {
+        a.starts_with("--in-place")
+            || a.strip_prefix('-')
+                .filter(|f| !f.starts_with('-'))
+                .is_some_and(|f| f.split(['e', 'f', 'l']).next().unwrap_or("").contains('i'))
+    })
+}
+
+/// The operands of a `sed`, past the script and option values. With no
+/// `-e` or `-f` the first is the script, which is kept: a path it might
+/// name is still no file the line runs.
+fn sed_files(args: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut words = args.iter().copied();
+    while let Some(a) = words.next() {
+        if matches!(a, "--expression" | "--file" | "--line-length") {
+            words.next();
+        } else if let Some(f) = a
+            .strip_prefix('-')
+            .filter(|f| !f.starts_with('-') && !f.is_empty())
+        {
+            if f.find(['e', 'f', 'l']).is_some_and(|k| k + 1 == f.len()) {
+                words.next();
+            }
+        } else if !a.starts_with("--") {
+            out.push(a.to_string());
+        }
+    }
+    out
 }
 
 /// A file a fetch on the line writes, then a later command on the line
@@ -11047,6 +11082,38 @@ hash -r 2> /dev/null
             "cp ok.sh backup.sh; source ok.sh",
             "mv ok.sh sub/; echo moved",
             "ln -s ok.sh link.sh; cat link.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        assert_everyday_allowed(&root);
+    }
+
+    /// `sed -i 's/echo ok/git push -f/' ok.sh; . ok.sh` was allowed:
+    /// ok.sh was judged as it stood before sed edited it in place.
+    #[test]
+    fn a_script_edited_in_place_earlier_is_refused() {
+        let root = startup_root("sedi");
+        std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "sed -i 's/echo ok/git push -f/' ok.sh; . ok.sh",
+            "sed -e 's/echo ok/git push -f/' -i.bak ok.sh; bash ok.sh",
+            "sed --in-place -e 's/x/y/' ok.sh && source ok.sh",
+            "sed -Ei 's/x/y/' ok.sh; ./ok.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(
+                c.token.starts_with("script-written-on-line: "),
+                "{line}: {}",
+                c.token
+            );
+        }
+        for line in [
+            "sed 's/a/b/' ok.sh > out.txt; bash ok.sh",
+            "sed -n 1p ok.sh; source ok.sh",
+            "sed -i 's/a/b/' notes.txt; source ok.sh",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);

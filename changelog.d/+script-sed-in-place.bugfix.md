@@ -1,0 +1,1 @@
+Each file a `sed -i` (or `--in-place`) edits counts as a file the line writes, so `sed -i 's/echo ok/git push -f/' ok.sh; . ok.sh` is refused as `script-written-on-line` rather than judged by the text ok.sh held before the edit. A `sed` that only prints stays a reader.
