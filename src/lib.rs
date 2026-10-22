@@ -268,13 +268,10 @@ fn runner_commands(
         }
         if b == "cd" || b == "pushd" {
             let pushd = b == "pushd";
+            let args = operands(&words[1..]);
             // `pushd -n` changes the stack and leaves the directory.
-            let args: Vec<&str> = words[1..]
-                .iter()
-                .copied()
-                .filter(|a| !pushd || *a != "-n")
-                .collect();
-            let keep = args.len() + 1 < words.len();
+            let keep = pushd && args.contains(&"-n");
+            let args: Vec<&str> = args.into_iter().filter(|a| !keep || *a != "-n").collect();
             if pushd && args.first().is_none_or(|a| stack_index(a)) {
                 let stack: Vec<_> = std::iter::once((here.clone(), true))
                     .chain(pushed.iter().rev().cloned())
@@ -367,6 +364,24 @@ fn runner_commands(
     }
 }
 
+/// The words after `cd` or `pushd` that are not redirections, nor the file
+/// a redirection names in the word after it.
+fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut words = args.iter();
+    while let Some(&a) = words.next() {
+        if !is_redirection(a) {
+            out.push(a);
+            continue;
+        }
+        let rest = a.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+        if rest.chars().all(|c| matches!(c, '>' | '<' | '&' | '-')) {
+            words.next();
+        }
+    }
+    out
+}
+
 /// The directories `cd` or `pushd` with `args` may enter from `dir`: a
 /// path, `~` or `~/path`, home for a bare `cd`, `old` for `-`, and for a
 /// relative path whose first part is not `.` or `..`, each `CDPATH`
@@ -379,25 +394,10 @@ fn entered(
     pushd: bool,
     old: &[std::path::PathBuf],
 ) -> Vec<std::path::PathBuf> {
-    let mut to = None;
-    let mut i = 0;
-    while i < args.len() {
-        let a = args[i];
-        if is_redirection(a) {
-            i += 1;
-            let rest = a.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
-            if rest.chars().all(|c| matches!(c, '>' | '<' | '&' | '-')) && i < args.len() {
-                i += 1;
-            }
-            continue;
-        }
-        if !a.starts_with(['-', '+']) || a == "-" {
-            to = Some(a);
-            break;
-        }
-        i += 1;
-    }
-    let Some(to) = to else {
+    let Some(&to) = args
+        .iter()
+        .find(|a| !a.starts_with(['-', '+']) || **a == "-")
+    else {
         return if pushd { None } else { home_dir() }.into_iter().collect();
     };
     if to == "-" {
@@ -4478,6 +4478,9 @@ mod tests {
             "pushd safe && pushd && make clean-all",
             "pushd safe && pushd \"$PWD\" && pushd +2 && make clean-all",
             "pushd safe ; pushd +1 && make clean-all",
+            "pushd safe >/dev/null && pushd >/dev/null && make clean-all",
+            "pushd safe && pushd 2>/dev/null +1 && make clean-all",
+            "pushd safe && pushd > /dev/null -0 && make clean-all",
         ] {
             assert_eq!(leaving("pushd-stack", line), Decision::Deny, "{line}");
         }
@@ -4486,6 +4489,7 @@ mod tests {
             "cd safe && pushd -n .. && make clean-all",
             "pushd safe && pushd +0 && make clean-all",
             "pushd safe && pushd -1 && make clean-all",
+            "pushd safe >/dev/null && pushd >/dev/null +0 && make clean-all",
         ] {
             assert_eq!(leaving("pushd-stack", line), Decision::Allow, "{line}");
         }

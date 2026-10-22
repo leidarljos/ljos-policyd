@@ -43,8 +43,8 @@ the line enters, the one ``env -C`` names for the command it runs, or
 the one the runner's own ``-C``, ``--prefix`` or ``--cwd`` names.
 Leading words that still run ``cd`` in this shell (``command``,
 ``builtin``, ``if``, ``while``, ``{`` and the other control keywords)
-are peeled before this check, and redirections before a ``cd`` target do
-not name the directory.
+are peeled before this check, and a redirection among the words of a
+``cd`` or ``pushd`` names neither the directory nor a ``pushd`` stack index.
 
 ============================================ ==============================================================================================
 Runner                                       File read
