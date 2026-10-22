@@ -2614,6 +2614,13 @@ fn host_argv_table_at(argv: &[String], depth: usize, moved: bool) -> Checked {
             token: Cow::Borrowed("xargs-script-unshown"),
         };
     }
+    if stdin_variable_script(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: Cow::Borrowed("stdin-variable-script"),
+        };
+    }
     for inner in inner_commands(argv)
         .into_iter()
         .filter(|_| depth < MAX_DEPTH)
@@ -3073,6 +3080,58 @@ fn script_takes_input(run: &[String], fed: &dyn Fn(&str) -> bool, appended: bool
         Some(at) => run.get(at + 1).map_or(appended, |code| fed(code)),
         None => false,
     }
+}
+
+/// A variable `read`, `mapfile` or `readarray` fills from stdin earlier
+/// on the line, expanded where a later command reads a script or names
+/// the command it runs: `read x; sh -c "$x"`, `read -r c; eval "$c"`,
+/// `read c; $c`. Its value is whatever stdin holds.
+fn stdin_variable_script(argv: &[String]) -> bool {
+    let mut names: Vec<String> = Vec::new();
+    for cmd in commands(argv) {
+        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        let owned = split_env_strings(&owned).into_owned();
+        let run = unwrap_wrappers(&owned).0;
+        let fed = |w: &str| names.iter().any(|n| expands(w, n));
+        if run.first().is_some_and(|w| fed(w)) || script_takes_input(run, &fed, false) {
+            return true;
+        }
+        names.extend(read_names(run));
+    }
+    false
+}
+
+/// The variables a `read`, `mapfile` or `readarray` call fills: its
+/// name operands, or `REPLY` and `MAPFILE` when it names none.
+fn read_names(run: &[String]) -> Vec<String> {
+    let Some((head, args)) = run.split_first() else {
+        return Vec::new();
+    };
+    let (default, valued): (_, &[&str]) = match base_of(head) {
+        "read" => ("REPLY", &["-d", "-n", "-N", "-p", "-t", "-u", "-i"]),
+        "mapfile" | "readarray" => ("MAPFILE", &["-d", "-n", "-O", "-s", "-u", "-C", "-c"]),
+        _ => return Vec::new(),
+    };
+    let mut out = vec![default.to_string()];
+    let mut words = args.iter();
+    while let Some(a) = words.next() {
+        if valued.contains(&a.as_str()) {
+            words.next();
+        } else if is_name(a) {
+            out.push(a.clone());
+        }
+    }
+    out
+}
+
+/// Whether the word `w` expands the variable `name`: `$name` or
+/// `${name...}` with no more of a name after it.
+fn expands(w: &str, name: &str) -> bool {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    ["$", "${", "${!"].iter().any(|open| {
+        w.match_indices(&format!("{open}{name}"))
+            .any(|(i, m)| !w[i + m.len()..].starts_with(ident))
+    })
 }
 
 /// A script written out in the line: no parameter, glob or `~`.
@@ -10643,6 +10702,44 @@ hash -r 2> /dev/null
             "parallel echo {} ::: a b",
             "parallel -j 4 echo hi ::: a b",
             "parallel gzip ::: a b",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        assert_everyday_allowed(&root);
+    }
+
+    /// `read x; sh -c "$x"` was allowed: the script was `$x`, a command
+    /// word the line does not show, and the table let it by. `x` holds
+    /// what stdin holds, so the script is unknown.
+    #[test]
+    fn a_variable_read_from_stdin_is_not_a_script() {
+        let root = startup_root("readvar");
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "read x; sh -c \"$x\"",
+            "read -r x; eval \"$x\"",
+            "IFS= read -r cmd; bash -c \"$cmd\"",
+            "read; eval \"$REPLY\"",
+            "read -p 'cmd? ' c && $c",
+            "read -a words; \"${words[@]}\"",
+            "mapfile -t lines; eval \"${lines[0]}\"",
+            "read f; source \"$f\"",
+            "read f; bash \"$f\"",
+            "read code; python3 -c \"$code\"",
+            "printf 'git push -f' | while read -r l; do sh -c \"$l\"; done",
+            "bash -c 'read x; sh -c \"$x\"'",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+        }
+        assert_eq!(at("read x; sh -c \"$x\"").token, "stdin-variable-script");
+        for line in [
+            "read x; echo \"$x\"",
+            "read -r x; sh -c 'echo \"$1\"' _ \"$x\"",
+            "read name; git checkout \"$name\"",
+            "read xy; sh -c \"$x\"",
+            "sh -c \"$x\"; read x",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
