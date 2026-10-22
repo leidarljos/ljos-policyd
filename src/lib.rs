@@ -5717,21 +5717,48 @@ fn env_split_words(s: &str) -> Vec<String> {
 }
 
 /// How many words at the front of `words` open a `case` arm: `case WORD
-/// in` with the first arm's pattern (`a)`, `(a)`), or the pattern alone
-/// that opens each later arm after `;;`. The command after them is the
-/// one the arm runs. A pattern is a word with a `)` no `(` in it opens.
+/// in` with the first arm's pattern (`a)`, `(a)`, `pat )`), or the
+/// pattern alone that opens each later arm after `;;`. The command after
+/// them is the one the arm runs. A pattern is a word with a `)` no `(`
+/// in it opens, or pattern words closed by a `)` of their own.
 fn case_head<S: AsRef<str>>(words: &[S]) -> usize {
     let word = |i: usize| words.get(i).map(AsRef::as_ref);
-    let pattern = |p: &str| p.ends_with(')') && p.matches(')').count() > p.matches('(').count();
+    let closes =
+        |p: &str| p == ")" || (p.ends_with(')') && p.matches(')').count() > p.matches('(').count());
     let n = if word(0) == Some("case") && word(2) == Some("in") {
         3
     } else {
         0
     };
-    match word(n) {
-        Some(p) if pattern(p) || (n == 3 && p.starts_with('(') && p.ends_with(')')) => n + 1,
-        _ => n,
+    if let Some(p) = word(n) {
+        if closes(p) || (n == 3 && p.starts_with('(') && p.ends_with(')')) {
+            return n + 1;
+        }
     }
+    // `*[!_$as_cr_alnum]* )` keeps the `)` as its own word. That pattern
+    // is not a command, so the `$` in it does not drop the directory.
+    // `echo )` and `find \( -name x \)` are commands: their first word
+    // is not a pattern.
+    if let Some(k) = (n..words.len()).find(|&i| word(i).is_some_and(closes)) {
+        let arm = n == 3 || (n < k && (n..k).all(|i| word(i).is_some_and(is_case_pattern)));
+        if arm && k > n {
+            return k + 1;
+        }
+    }
+    n
+}
+
+/// Whether `p` can be a `case` pattern word rather than a command: a
+/// glob, an option (`-V`, `--help`), an empty `''`, or `(pattern`. `[`
+/// and `[[` are the test builtin.
+fn is_case_pattern(p: &str) -> bool {
+    if p.is_empty() || (p.starts_with('(') && !p.starts_with("((")) {
+        return true;
+    }
+    if p == "[" || p == "[[" {
+        return false;
+    }
+    p.contains(['*', '?', '[']) || p.starts_with('-')
 }
 
 /// How many words a function definition's head takes at the front of
@@ -15349,6 +15376,42 @@ hash -r 2> /dev/null
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
             assert_eq!(c.token, token, "{line}");
         }
+    }
+
+    /// A `case` pattern is not a command. `*[!_$as_cr_alnum]* )` holds a
+    /// variable inside brackets and a `)` of its own, and neither moves
+    /// the shell. The arm still runs: a `cd` there leaves the line, and
+    /// `git push -f` there is still refused.
+    #[test]
+    fn a_case_pattern_holding_a_variable_is_not_a_command() {
+        let line = "\
+case $ac_envvar in
+  '' | [0-9]* | *[!_$as_cr_alnum]* )
+  as_fn_error $? \"invalid variable name: $ac_envvar\" ;;
+esac
+make -C safe test
+";
+        assert_eq!(evil_and_safe("casepat", line), Decision::Allow);
+        assert_eq!(
+            evil_and_safe(
+                "casepat",
+                "case $x in *[!_$as_cr_alnum]* ) cd evil;; esac; make clean-all"
+            ),
+            Decision::Deny
+        );
+        let pushed = evil_and_safe(
+            "casepat",
+            "case $x in *[!_$as_cr_alnum]* ) git push -f;; esac",
+        );
+        assert_eq!(pushed, Decision::Deny);
+        assert_eq!(
+            evil_and_safe("casepat", "echo ')'; make -C safe test"),
+            Decision::Allow
+        );
+        assert_eq!(
+            evil_and_safe("casepat", "case $x in a) $cmd;; esac; make -C safe test"),
+            Decision::Deny
+        );
     }
 
     /// An EXIT trap runs as the shell exits. It does not move the
