@@ -50,7 +50,9 @@ does. ``-S STRING`` (or ``-iS STRING``) splits STRING into words that take
 its place, so options in it (``env -S '-C dir' make``) and the words
 after it are read too. The shell expands STRING first, so a ``$NAME`` or
 ``${NAME}`` in it that the line assigned one value earlier, and sets no
-other way, is read as that value.
+other way, is read as that value. A string that still holds a ``$`` after
+that may run any command, so it is refused as
+``env-split-string-unshown``.
 Leading words that still run ``cd`` in this shell (``command``,
 ``builtin``, ``if``, ``while``, ``{`` and the other control keywords, and
 the ``time`` keyword with its ``-p``)

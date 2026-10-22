@@ -1,0 +1,1 @@
+An `env -S` string that still holds a `$` once the values the line shows are read in (`env -S "$X"`, `env -S "git ${SUB:-push} -f"`) is refused as `env-split-string-unshown`, since what it runs may be any command. A more specific refusal from inside the string still names itself.

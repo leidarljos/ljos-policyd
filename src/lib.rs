@@ -1056,10 +1056,13 @@ const MAX_DEPTH: usize = 4;
 /// working tree, so a relative path no longer says where a delete lands.
 fn host_argv_table_at(argv: &[String], depth: usize, moved: bool) -> Checked {
     let own = host_argv_rules(argv, moved);
-    if own.decision != Decision::Allow || depth >= MAX_DEPTH {
+    if own.decision != Decision::Allow {
         return own;
     }
-    for inner in inner_commands(argv) {
+    for inner in inner_commands(argv)
+        .into_iter()
+        .filter(|_| depth < MAX_DEPTH)
+    {
         if inner.as_slice() == argv {
             continue;
         }
@@ -1067,6 +1070,15 @@ fn host_argv_table_at(argv: &[String], depth: usize, moved: bool) -> Checked {
         if c.decision != Decision::Allow {
             return c;
         }
+    }
+    // What an `env -S` string runs, with a value in it the line does not
+    // show, may be any command.
+    if matches!(wrapper_walk(argv), Walk::Split(_, _, s) if s.contains('$')) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: Cow::Borrowed("env-split-string-unshown"),
+        };
     }
     own
 }
@@ -1126,6 +1138,7 @@ fn inner_commands_at(argv: &[String]) -> Vec<(usize, Vec<String>)> {
             for w in &mut owned[at..at + taken] {
                 *w = with_names(w, &names, argv);
             }
+            out.push((i, owned.clone()));
         }
         // GNU env runs no `$(...)` in a `-S` string, but one is still read
         // as a script, so a substitution in it is judged as before.
