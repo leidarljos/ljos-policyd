@@ -7690,6 +7690,33 @@ hash -r 2> /dev/null
         assert_eq!(v(&["bash", "-c", "alias ll='ls -la'; ll"]), "allow");
     }
 
+    /// An alias the line defines runs its body when a file the line
+    /// sources calls it, so the file is read with it expanded.
+    #[test]
+    fn an_alias_reaches_a_sourced_file() {
+        let root =
+            std::env::temp_dir().join(format!("policyd-lib-{}-alias-src", std::process::id()));
+        std::fs::create_dir_all(&root).expect("dir");
+        std::fs::write(root.join("go.sh"), "go\n").expect("write");
+        std::fs::write(root.join("arm.sh"), "case x in *) go;; esac\n").expect("write");
+        std::fs::write(root.join("ll.sh"), "ll\n").expect("write");
+        for line in [
+            "alias go='cd evil'; source ./go.sh && make clean-all",
+            "alias go='cd evil'\n. ./go.sh && make clean-all",
+            "alias go='cd evil'; source ./arm.sh && make clean-all",
+            "alias go=\"$X\"; source ./go.sh && make clean-all",
+            "alias go='builtin cd evil'; source ./go.sh && make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("alias-src", line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "alias ll='ls -la'; source ./ll.sh && cd safe && make clean-all",
+            "alias go='cd evil'; source ./ll.sh && cd safe && make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("alias-src", line), Decision::Allow, "{line}");
+        }
+    }
+
     #[test]
     fn a_shell_script_does_not_hide_a_recursive_delete() {
         assert!(v(&["sh", "-c", "rm -rf /home/u/x"]).starts_with("deny"));
