@@ -146,9 +146,10 @@ pack-law law.txt
 ```
 
 `From` has to be that one address. The mailbox is the address in
-angle brackets, after a folded line is joined and an encoded-word is
-decoded. A second `From`, a `From` that does not parse, or any other
-address is a refusal. `Reply-To`, `Sender` and `Return-Path` must stay
+angle brackets, read from the raw header after a folded line is
+joined. An encoded-word in a display name is decoded for display
+only, and an encoded addr-spec is a refusal. A second `From`, a
+`From` that does not parse, or any other address is a refusal. `Reply-To`, `Sender` and `Return-Path` must stay
 clear of an identity in the deny file. `To`, `Cc` and `Bcc` are refused
 when that domain, or a parent of it, is named by the deny file or by
 the pack-law file.

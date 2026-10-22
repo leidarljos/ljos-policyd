@@ -205,9 +205,11 @@ this check found nothing to refuse. A send still needs its own grant.
 
 The config is lines of =identity=, =deny-file= and =pack-law=. A
 relative path is read from the config file's directory. =identity= is
-the one address =From= must be, after folding, encoded-word decoding,
-NFKC and IDNA. A second =From= is a refusal. The mailbox is the
-address in angle brackets. =Reply-To=, =Sender= and =Return-Path= must
+the one address =From= must be, after folding, NFKC and IDNA. The
+mailbox is the address in angle brackets, read from the raw unfolded
+value. A display-name encoded-word is decoded for display only, and
+an encoded addr-spec is a refusal. A second =From= is a refusal.
+=Reply-To=, =Sender= and =Return-Path= must
 stay clear of a deny-file identity (=address=, or a mailbox at a
 =domain=). =To=, =Cc= and =Bcc= are refused when the domain or a parent
 of it is named by the deny file or by a =deny-domain= line in the

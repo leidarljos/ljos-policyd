@@ -1,7 +1,9 @@
 //! RFC 5322 header block for an outbound envelope.
 //!
-//! The fold is part of the header it continues, an encoded-word is the
-//! text it names, and a second `From` stays a second header. The envelope
+//! The fold is part of the header it continues, and a second `From` stays
+//! a second header. An encoded-word in a display name is the text it
+//! names, for display only. The mailbox is read from the raw unfolded
+//! value, so a decoded parenthesis cannot become a comment. The envelope
 //! check refuses from what this read; it does not decide the address by
 //! which copy of `From` a later reader might keep.
 
@@ -9,7 +11,10 @@
 #[derive(Debug)]
 pub(crate) struct Header {
     pub name: String,
-    /// Decoded text, or why the value cannot be trusted.
+    /// Unfolded field body. Mailbox extraction reads this and not `value`.
+    pub raw: String,
+    /// Display-name encoded-words decoded, for display only, or why an
+    /// encoded-word cannot be trusted.
     pub value: Result<String, HeaderFault>,
 }
 
@@ -52,21 +57,23 @@ pub(crate) fn parse_message(input: &str) -> Result<Message, MessageFault> {
     if has_bad_control(block) {
         return Err(MessageFault::Control);
     }
-    let raw = split_headers(block)?;
-    let mut headers = Vec::with_capacity(raw.len());
-    for (name, value) in raw {
-        let value = decode_encoded_words(&value).map_err(|()| HeaderFault::EncodedWord);
-        headers.push(Header { name, value });
+    let fields = split_headers(block)?;
+    let mut headers = Vec::with_capacity(fields.len());
+    for (name, raw) in fields {
+        let value = display_value(&raw).map_err(|()| HeaderFault::EncodedWord);
+        headers.push(Header { name, raw, value });
     }
     Ok(Message { headers })
 }
 
-/// Mailboxes in one decoded header value.
+/// Mailboxes in one raw unfolded header value.
 ///
-/// `<>` is the empty return path and contributes no mailbox. A group such
-/// as `Friends: a@example.test;` contributes the mailboxes and not the
-/// group name. The address in angle brackets is the mailbox; a phrase that
-/// looks like an address is not.
+/// Encoded-words are not decoded. A parenthesis that exists only as an
+/// encoded-word is not a comment, and an encoded addr-spec is not a
+/// mailbox. `<>` is the empty return path and contributes no mailbox. A
+/// group such as `Friends: a@example.test;` contributes the mailboxes and
+/// not the group name. The address in angle brackets is the mailbox; a
+/// phrase that looks like an address is not.
 pub(crate) fn mailboxes(value: &str) -> Result<Vec<Mailbox>, AddressFault> {
     let text = strip_comments(value)?;
     let mut out = Vec::new();
@@ -167,6 +174,150 @@ fn decode_encoded_words(input: &str) -> Result<String, ()> {
         i += ch.len_utf8();
     }
     Ok(out)
+}
+
+/// Display text. Encoded-words in a display name become the text they
+/// name. An addr-spec is left encoded, and so is a word whose text would
+/// be address syntax, so this string is not a second parse of the mailbox.
+fn display_value(raw: &str) -> Result<String, ()> {
+    if !encoded_words_well_formed(raw) {
+        return Err(());
+    }
+    let Ok(segments) = split_list(raw) else {
+        return Ok(raw.to_string());
+    };
+    let mut out = String::new();
+    for (i, segment) in segments.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&decode_segment_display(segment));
+    }
+    Ok(out)
+}
+
+fn encoded_words_well_formed(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'=' && bytes.get(i + 1) == Some(&b'?') {
+            let Ok((_, n)) = take_encoded_word(&input[i..]) else {
+                return false;
+            };
+            if n == 0 {
+                return false;
+            }
+            i += n;
+            continue;
+        }
+        let Some(ch) = input[i..].chars().next() else {
+            return false;
+        };
+        i += ch.len_utf8();
+    }
+    true
+}
+
+fn decode_segment_display(segment: &str) -> String {
+    let Some(idx) = display_name_end(segment) else {
+        return segment.to_string();
+    };
+    let phrase = &segment[..idx];
+    let rest = &segment[idx..];
+    let decoded = match decode_span_for_display(phrase) {
+        Ok(text) => text,
+        Err(()) => phrase.to_string(),
+    };
+    let mut out = decoded;
+    out.push_str(rest);
+    out
+}
+
+/// Byte index of the `<` that opens a name-addr, when this segment has one.
+fn display_name_end(segment: &str) -> Option<usize> {
+    let mut quote = false;
+    let mut escape = false;
+    let mut comment = 0i32;
+    for (i, c) in segment.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if quote {
+            match c {
+                '\\' => escape = true,
+                '"' => quote = false,
+                _ => {}
+            }
+            continue;
+        }
+        if comment > 0 {
+            match c {
+                '\\' => escape = true,
+                '(' => comment += 1,
+                ')' => comment -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '\\' => escape = true,
+            '"' => quote = true,
+            '(' => comment = 1,
+            '<' => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn decode_span_for_display(span: &str) -> Result<String, ()> {
+    if !encoded_words_are_display_safe(span)? {
+        return Ok(span.to_string());
+    }
+    decode_encoded_words(span)
+}
+
+/// A word that decodes to address syntax stays encoded. Decoding it into
+/// the display string would make a later parse see a different mailbox.
+fn encoded_words_are_display_safe(span: &str) -> Result<bool, ()> {
+    let bytes = span.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'=' && bytes.get(i + 1) == Some(&b'?') {
+            let (word, n) = take_encoded_word(&span[i..])?;
+            if word.chars().any(|c| is_addr_special(c) || c.is_control()) {
+                return Ok(false);
+            }
+            i += n;
+            continue;
+        }
+        let Some(ch) = span[i..].chars().next() else {
+            return Err(());
+        };
+        i += ch.len_utf8();
+    }
+    Ok(true)
+}
+
+fn is_addr_special(c: char) -> bool {
+    matches!(
+        c,
+        '(' | ')' | '<' | '>' | '[' | ']' | ':' | ';' | '@' | '\\' | ',' | '"'
+    )
+}
+
+fn contains_encoded_word(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'=' && bytes.get(i + 1) == Some(&b'?') && take_encoded_word(&s[i..]).is_ok()
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 fn whitespace_before_encoded_word(s: &str) -> Option<usize> {
@@ -414,8 +565,20 @@ fn mailbox_segment(segment: &str) -> Result<Option<Mailbox>, AddressFault> {
     }
     let spec = match angle_contents(segment)? {
         Some("") => return Ok(None),
-        Some(inner) => route_addr(inner)?,
-        None => segment,
+        Some(inner) => {
+            // An encoded-word is not an addr-spec. Decoding it would name
+            // a mailbox the raw text does not.
+            if contains_encoded_word(inner) {
+                return Err(AddressFault);
+            }
+            route_addr(inner)?
+        }
+        None => {
+            if contains_encoded_word(segment) {
+                return Err(AddressFault);
+            }
+            segment
+        }
     };
     parse_addr_spec(spec).map(Some)
 }
@@ -783,20 +946,13 @@ mod tests {
         assert_eq!(value, "Mail Seat <mailseat@example.test>");
     }
 
-    /// Whitespace between adjacent encoded-words is removed, including the
-    /// space a fold leaves behind.
+    /// An encoded addr-spec is not a mailbox. Decoding it first would
+    /// accept the address the words spell.
     #[test]
-    fn adjacent_encoded_words_join_across_a_fold() {
+    fn an_encoded_addr_spec_is_not_a_mailbox() {
         let raw = "From: =?utf-8?q?mailseat?=\r\n =?utf-8?q?=40example=2etest?=\r\n\r\n";
         let value = froms(raw)[0].as_ref().unwrap().clone();
-        assert_eq!(value, "mailseat@example.test");
-        assert_eq!(
-            mailboxes(&value).unwrap(),
-            vec![Mailbox {
-                local: "mailseat".into(),
-                domain: "example.test".into(),
-            }]
-        );
+        assert!(mailboxes(&value).is_err());
     }
 
     #[test]

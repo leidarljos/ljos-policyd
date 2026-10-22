@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use unicode_normalization::UnicodeNormalization;
 
-use crate::mail::{self, Header, HeaderFault, Mailbox, Message, MessageFault};
+use crate::mail::{self, Header, Mailbox, Message, MessageFault};
 
 /// A message longer than this is refused before it is parsed.
 pub const MAIL_MESSAGE_MAX: usize = 1024 * 1024;
@@ -402,21 +402,23 @@ enum Parsed {
 }
 
 fn read_mailboxes(header: &Header) -> Parsed {
-    match &header.value {
-        Err(HeaderFault::EncodedWord) => Parsed::EncodedWord,
-        Ok(text) => match mail::mailboxes(text) {
-            Err(_) => Parsed::Unparsed,
-            Ok(list) => {
-                let mut out = Vec::with_capacity(list.len());
-                for mailbox in list {
-                    match normalize_mailbox(&mailbox) {
-                        Some(addr) => out.push(addr),
-                        None => return Parsed::Unparsed,
-                    }
+    // `raw` is the address. `value` has decoded display names and is not
+    // parsed: a decoded parenthesis would hide the mailbox in a comment.
+    if header.value.is_err() {
+        return Parsed::EncodedWord;
+    }
+    match mail::mailboxes(&header.raw) {
+        Err(_) => Parsed::Unparsed,
+        Ok(list) => {
+            let mut out = Vec::with_capacity(list.len());
+            for mailbox in list {
+                match normalize_mailbox(&mailbox) {
+                    Some(addr) => out.push(addr),
+                    None => return Parsed::Unparsed,
                 }
-                Parsed::Mailboxes(out)
             }
-        },
+            Parsed::Mailboxes(out)
+        }
     }
 }
 
@@ -573,7 +575,38 @@ mod tests {
         let raw = "From: =?utf-8?b?TWFpbCBTZWF0?= <mailseat@example.test>\r\n";
         assert!(codes(raw, "", "").is_empty());
         let raw = "From: =?utf-8?q?mailseat?=\r\n =?utf-8?q?=40example=2etest?=\r\n";
-        assert!(codes(raw, "", "").is_empty());
+        assert_eq!(codes(raw, "", ""), vec!["from-unparsed"]);
+    }
+
+    /// A decoded parenthesis is comment syntax. The mailbox has to be read
+    /// from the raw value, or the address inside the constructed comment
+    /// is never compared.
+    #[test]
+    fn an_encoded_parenthesis_does_not_hide_a_mailbox() {
+        let deny = "domain blocked.test\naddress evil@example.test\n";
+        let law = "deny-domain packblocked.test\n";
+        let to = "\
+From: mailseat@example.test\r\n\
+To: =?utf-8?q?=28?= <a@blocked.test> (=?utf-8?q?=29?=)\r\n";
+        assert_eq!(codes(to, deny, law), vec!["recipient-domain-denied"]);
+        assert_eq!(details(to, deny, law), vec!["to blocked.test"]);
+        let to_b = "\
+From: mailseat@example.test\r\n\
+To: =?utf-8?b?KA==?= <a@blocked.test> (=?utf-8?b?KQ==?=)\r\n";
+        assert_eq!(codes(to_b, deny, law), vec!["recipient-domain-denied"]);
+        assert_eq!(details(to_b, deny, law), vec!["to blocked.test"]);
+        let bcc = "\
+From: mailseat@example.test\r\n\
+Bcc: =?utf-8?b?KA==?= <a@packblocked.test> (=?utf-8?b?KQ==?=)\r\n";
+        assert_eq!(codes(bcc, deny, law), vec!["recipient-domain-denied"]);
+        assert_eq!(details(bcc, deny, law), vec!["bcc packblocked.test"]);
+        let reply = "\
+From: mailseat@example.test\r\n\
+Reply-To: =?utf-8?q?=28?= <evil@example.test> (=?utf-8?q?=29?=)\r\n";
+        assert_eq!(codes(reply, deny, law), vec!["reply-to-denied"]);
+        let from = "\
+From: =?utf-8?q?=28?= <other@evil.test> (=?utf-8?q?=29?= =?utf-8?q?=29?= mailseat@example.test =?utf-8?q?=28?=)\r\n";
+        assert_eq!(codes(from, deny, law), vec!["from-not-identity"]);
     }
 
     #[test]
