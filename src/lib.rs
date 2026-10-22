@@ -115,35 +115,65 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
     table
 }
 
-/// Every simple command the line runs, wrappers off, with the directory it
-/// runs in: the line split on its separators, then each `-c` script,
+/// How many directories the commands after a `cd` that may have failed
+/// are read in. Past this, a further `cd` drops the ones it leaves.
+const MAX_DIRS: usize = 16;
+
+/// Add each of `dirs` that `set` lacks, while it holds fewer than
+/// [`MAX_DIRS`].
+fn add_dirs(set: &mut Vec<std::path::PathBuf>, dirs: impl IntoIterator<Item = std::path::PathBuf>) {
+    for d in dirs {
+        if set.len() < MAX_DIRS && !set.contains(&d) {
+            set.push(d);
+        }
+    }
+}
+
+/// Every simple command the line runs, wrappers off, with each directory
+/// it may run in: the line split on its separators, then each `-c` script,
 /// `eval` and wrapper inside it, down to [`MAX_DEPTH`]. A `cd`, `pushd`
 /// or `popd` moves the commands after it on the same line, unless it runs
 /// in a subshell: a stage of a pipeline, or a list sent to the background
-/// with `&`. A script nested in the line starts where the command that
-/// runs it does.
+/// with `&`. The line goes on past a `cd` that fails at a `;` or `||`, so
+/// the commands there are read both where it went and where it was. A
+/// script nested in the line starts where the command that runs it does.
 fn runner_commands(
     argv: &[String],
     cwd: &std::path::Path,
     depth: usize,
     out: &mut Vec<(Vec<String>, std::path::PathBuf)>,
 ) {
-    let mut dir = cwd.to_path_buf();
-    let mut pushed = Vec::new();
+    // Every directory the next command may run in. A `cd` before `&&`
+    // holds for the commands after it, and the directories it left wait
+    // in `failed` for the next `;` or `||`.
+    let mut here = vec![cwd.to_path_buf()];
+    let mut failed = Vec::new();
+    // Each `pushd`'s directories, and whether it surely ran.
+    let mut pushed: Vec<(Vec<std::path::PathBuf>, bool)> = Vec::new();
     // Where the list now running started, for a `&` to put back.
-    let mut list = (dir.clone(), pushed.clone());
+    let mut list = (here.clone(), pushed.clone());
     let mut after = ";";
     let mut ran_in = Vec::new();
     for (cmd, end) in ended_commands(argv) {
         if after == "&" {
-            (dir, pushed) = list.clone();
+            (here, pushed) = list.clone();
+            failed.clear();
+        }
+        if matches!(after, ";" | "||") {
+            add_dirs(&mut here, failed.drain(..));
+            for p in &mut pushed {
+                p.1 = false;
+            }
         }
         if matches!(after, ";" | "&") {
-            list = (dir.clone(), pushed.clone());
+            list = (here.clone(), pushed.clone());
         }
         let piped = after == "|" || end == "|";
+        // A `cd` before `&&` holds for what runs after it, unless a `||`
+        // before it may have skipped it.
+        let gates = end == "&&" && after != "||";
         after = end;
-        ran_in.push(dir.clone());
+        ran_in.push(here.clone());
         // An assignment in front of a builtin is set for that command
         // alone: `FOO=1 cd dir` still moves the shell.
         let words = &cmd[cmd.iter().take_while(|w| is_assignment(w)).count()..];
@@ -152,15 +182,30 @@ fn runner_commands(
             continue;
         }
         if b == "popd" {
-            dir = pushed.pop().unwrap_or(dir);
+            if let Some((back, sure)) = pushed.pop() {
+                let now = std::mem::replace(&mut here, back);
+                if !sure {
+                    add_dirs(&mut here, now);
+                }
+            }
             continue;
         }
         if b == "cd" || b == "pushd" {
-            if let Some(to) = entered(&words[1..], &dir, b == "pushd") {
-                let from = std::mem::replace(&mut dir, to);
+            // A `cd` that may have failed keeps the directories it left,
+            // and one into a directory that is not there moves nothing.
+            let mut to = Vec::new();
+            add_dirs(
+                &mut to,
+                here.iter()
+                    .filter_map(|d| entered(&words[1..], d, b == "pushd"))
+                    .filter(|d| gates || d.is_dir()),
+            );
+            if !to.is_empty() {
+                let from = std::mem::replace(&mut here, to);
                 if b == "pushd" {
-                    pushed.push(from);
+                    pushed.push((from.clone(), gates));
                 }
+                add_dirs(if gates { &mut failed } else { &mut here }, from);
             }
             continue;
         }
@@ -169,8 +214,10 @@ fn runner_commands(
         if run.is_empty() {
             continue;
         }
-        if !out.iter().any(|(r, d)| *r == run && *d == dir) {
-            out.push((run, dir.clone()));
+        for dir in &here {
+            if !out.iter().any(|(r, d)| *r == run && d == dir) {
+                out.push((run.clone(), dir.clone()));
+            }
         }
     }
     if depth >= MAX_DEPTH {
@@ -178,7 +225,9 @@ fn runner_commands(
     }
     for (i, inner) in inner_commands_at(argv) {
         if inner.as_slice() != argv {
-            runner_commands(&inner, &ran_in[i], depth + 1, out);
+            for dir in &ran_in[i] {
+                runner_commands(&inner, dir, depth + 1, out);
+            }
         }
     }
 }
@@ -3690,6 +3739,33 @@ mod tests {
             "bash -lc 'make clean-all' && cd project",
         );
         assert_eq!(c.decision, Decision::Allow);
+    }
+
+    /// The line goes on past a `cd` that fails at a `;` or `||`, so the
+    /// runner after it is read where the `cd` went and where it was.
+    #[test]
+    fn reads_both_directories_past_a_cd_that_may_fail() {
+        for line in [
+            "cd missing ; make clean-all",
+            "cd missing; make clean-all",
+            "cd missing || make clean-all",
+            "cd safe ; make clean-all",
+            "cd safe && true ; make clean-all",
+            "true || cd safe && make clean-all",
+            "pushd safe && pushd missing ; popd ; make clean-all",
+            "cd missing ; bash -c 'make clean-all'",
+            "cd m1; cd m2; cd m3; cd m4; cd m5; cd m6; cd safe; make clean-all",
+        ] {
+            assert_eq!(leaving("fail-cd", line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "cd safe && make clean-all",
+            "cd missing && make clean-all",
+            "cd safe && true && make clean-all",
+            "cd safe && pushd .. && popd && make clean-all",
+        ] {
+            assert_eq!(leaving("fail-cd", line), Decision::Allow, "{line}");
+        }
     }
 
     #[test]
