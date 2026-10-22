@@ -990,7 +990,7 @@ fn walk(
         // command and after the one before it.
         seq += 2;
         let id = [base.as_slice(), &[seq]].concat();
-        if starts_loop(&cmd) {
+        if !data[ci] && starts_loop(&cmd) {
             loops.push(seq);
         }
         shell.files.borrow_mut().cmd.clone_from(&id);
@@ -1006,22 +1006,30 @@ fn walk(
             let fn_depth = shell.fn_depth;
             let left = shell.left_tree;
             let files = shell.files.clone();
-            for body in cmd.iter().flat_map(|w| substitutions(w)) {
-                let words = shell_words(&body);
-                for dir in &dirs {
-                    let inn = ShellIn {
-                        cwd: dir,
-                        oldpwd: &oldpwd,
-                        vars: &vars_now,
-                        funcs: &funcs,
-                        fn_depth,
-                        left_tree: left,
-                        files: &files,
-                        known: shell.known.clone(),
-                    };
-                    runner_commands(&words, &inn, depth + 1, out, denied);
-                    if denied.is_some() {
-                        return;
+            for w in &cmd {
+                // A here-document is text. Parentheses in it are not a
+                // subshell. An unquoted body still expands `$(...)` and
+                // backticks, and those run.
+                if data[ci] && !w.contains("$(") && !w.contains('`') {
+                    continue;
+                }
+                for body in substitutions(w) {
+                    let words = shell_words(&body);
+                    for dir in &dirs {
+                        let inn = ShellIn {
+                            cwd: dir,
+                            oldpwd: &oldpwd,
+                            vars: &vars_now,
+                            funcs: &funcs,
+                            fn_depth,
+                            left_tree: left,
+                            files: &files,
+                            known: shell.known.clone(),
+                        };
+                        runner_commands(&words, &inn, depth + 1, out, denied);
+                        if denied.is_some() {
+                            return;
+                        }
                     }
                 }
             }
@@ -1032,6 +1040,11 @@ fn walk(
             .files
             .borrow_mut()
             .lower(mark.., &[base.as_slice(), &[seq - 1]].concat());
+        // A here-document body is text. Noting it would treat a word
+        // there as a program that writes, runs or moves this shell.
+        if data[ci] {
+            continue;
+        }
         // After the substitutions, which run before the command does.
         let walked = data[ci] || called_fn(&cmd, &shell.funcs).is_some();
         shell.files.borrow_mut().note(
@@ -1395,6 +1408,9 @@ fn walk(
         return;
     }
     for (i, inner) in inner_commands_expanded(&argv) {
+        if data.get(i).copied().unwrap_or(false) {
+            continue;
+        }
         if inner.as_slice() != argv.as_slice() {
             let Some((dirs, oldpwd, set, id)) = ran_in.get(i) else {
                 continue;
@@ -13821,6 +13837,46 @@ hash -r 2> /dev/null
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for line in [
+            "bash <<EOF\ngit push -f\nEOF",
+            "bash <<EOF\nrm -rf /etc\nEOF",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+        }
+    }
+
+    /// Lines of a here-document fed to something other than a shell are
+    /// text. A `cd` or another program written there does not move this
+    /// shell or write a script. A shell that takes the document as its
+    /// script still runs it.
+    #[test]
+    fn a_heredoc_body_is_not_a_command() {
+        let root = startup_root("heredocbody");
+        std::fs::create_dir_all(root.join("safe")).unwrap();
+        std::fs::write(root.join("safe/Makefile"), "all:\n\techo ok\n").unwrap();
+        std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
+        std::fs::create_dir_all(root.join("evil")).unwrap();
+        std::fs::write(root.join("evil/Makefile"), MAKEFILE).unwrap();
+        std::fs::write(root.join("Makefile"), "clean-all:\n\techo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "cat <<EOF\ncd evil\nEOF\nmake clean-all\n",
+            "cat <<EOF\n(cd evil && make clean-all)\nEOF\nmake clean-all\n",
+            "cat <<EOF\ncd /\nEOF\nmake -C safe\n",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for line in [
+            "cd evil && make clean-all",
+            "bash <<EOF\ncd evil\nmake clean-all\nEOF",
+            "bash <<EOF\ngit push -f\nEOF",
+            "bash <<EOF\nrm -rf /etc\nEOF",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
         }
         for line in [
             "bash <<EOF\ngit push -f\nEOF",
