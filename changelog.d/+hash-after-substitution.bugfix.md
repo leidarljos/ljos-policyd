@@ -1,0 +1,1 @@
+`#` after any `)` was a comment. In `a$(true)#` that `)` closes the substitution and the word continues, so the rest of the line, including a later command, was skipped. `#` starts a comment there only when the `)` closes a subshell or a case pattern.
