@@ -1312,19 +1312,32 @@ fn substitutions(script: &str) -> Vec<String> {
 }
 
 /// A `NAME=value` or `NAME+=value` word, where NAME may be an array
-/// element, `NAME[i]`.
+/// element, `NAME[i]`. The subscript ends at its matching `]` and may
+/// hold `=` (`a[b=c]=1`).
 fn is_assignment(w: &str) -> bool {
-    w.split_once('=').is_some_and(|(k, _)| {
-        let k = k.strip_suffix('+').unwrap_or(k);
-        let k = match k.split_once('[') {
-            Some((name, sub)) if sub.ends_with(']') => name,
-            Some(_) => return false,
-            None => k,
+    let end = w
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(w.len());
+    if end == 0 || w.starts_with(|c: char| c.is_ascii_digit()) {
+        return false;
+    }
+    let mut rest = &w[end..];
+    if rest.starts_with('[') {
+        let mut depth = 0;
+        let close = rest.char_indices().find(|&(_, c)| {
+            match c {
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                _ => {}
+            }
+            depth == 0
+        });
+        let Some((i, _)) = close else {
+            return false;
         };
-        !k.is_empty()
-            && !k.starts_with(|c: char| c.is_ascii_digit())
-            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-    })
+        rest = &rest[i + 1..];
+    }
+    rest.starts_with('=') || rest.starts_with("+=")
 }
 
 /// Words that run the command after them, with the flags of each that take

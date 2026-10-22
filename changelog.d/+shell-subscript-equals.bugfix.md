@@ -1,0 +1,1 @@
+An array element assignment whose subscript holds `=` (`a[b=c]=1`) is split at the `=` after the matching `]`, as bash splits it, so `a[b=c]=1 git push --force origin main` is refused and `a[b=c]=1 cd evil && make clean-all` follows the `cd`.
