@@ -315,7 +315,11 @@ fn runner_commands(
         }
         if b == "dirs" {
             let args = operands(&words[1..]);
-            if args.iter().any(|a| a.starts_with('-') && a.contains('c')) {
+            if args
+                .iter()
+                .take_while(|a| **a != "--")
+                .any(|a| a.starts_with('-') && a.contains('c'))
+            {
                 pushed.clear();
             }
             continue;
