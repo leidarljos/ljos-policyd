@@ -713,7 +713,8 @@ fn shell_script(run: &[String]) -> Option<&str> {
 
 /// A script split into words the way a shell would: quotes group, a
 /// backslash escapes the next character outside single quotes, and `;`,
-/// `&&`, `||` and `|` stand as words of their own.
+/// `&&`, `||`, `|` and `&` stand as words of their own. The `&` of a
+/// redirection (`2>&1`, `<&3`, `&>log`) stays in its word.
 fn shell_words(script: &str) -> Vec<String> {
     let chars: Vec<char> = script.chars().collect();
     let mut out = Vec::new();
@@ -746,6 +747,14 @@ fn shell_words(script: &str) -> Vec<String> {
             }
             '"' if !single => {
                 double = !double;
+                word = true;
+            }
+            '&' if !single
+                && !double
+                && ((word && cur.ends_with(['>', '<']))
+                    || (!word && chars.get(i) == Some(&'>'))) =>
+            {
+                cur.push('&');
                 word = true;
             }
             c if !single && !double && (c.is_whitespace() || matches!(c, ';' | '|' | '&')) => {
@@ -3765,6 +3774,24 @@ mod tests {
             "cd safe && pushd .. && popd && make clean-all",
         ] {
             assert_eq!(leaving("fail-cd", line), Decision::Allow, "{line}");
+        }
+    }
+
+    /// The `&` of a redirection does not send the `cd` before it to the
+    /// background.
+    #[test]
+    fn keeps_a_redirection_ampersand_in_its_word() {
+        assert_eq!(
+            shell_words("make 2>&1 >&2 <&3 &>log x & y |& z"),
+            ["make", "2>&1", ">&2", "<&3", "&>log", "x", "&", "y", "|", "&", "z"]
+        );
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "sh -c 'pushd project >/dev/null 2>&1 && make clean-all'",
+            "sh -c 'cd project &>/dev/null && make clean-all'",
+        ] {
+            let c = entering("redir-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
         }
     }
 
