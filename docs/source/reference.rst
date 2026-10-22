@@ -63,6 +63,9 @@ directory without the search bit moves nothing. A runner that may run
 in a directory past those sixteen is refused, as
 ``make clean-all may run in an untracked directory``.
 
+The words ``xargs`` adds from stdin can name any target, so a runner that
+``xargs`` runs is refused, as ``xargs make may take a target from stdin``.
+
 Argument limits
 ===============
 

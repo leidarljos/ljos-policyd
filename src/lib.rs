@@ -99,13 +99,25 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
     }
     let mut runs = Vec::new();
     runner_commands(argv, cwd, 0, &mut runs);
-    for (run, dir) in runs {
+    for (run, dir, stdin) in runs {
         if is_untracked(&dir) && scripts::runner(&run) {
             return Checked {
                 decision: Decision::Deny,
                 code: PolicyReason::ShellDangerousRunner,
                 token: Cow::Owned(format!(
                     "{} may run in an untracked directory",
+                    run.join(" ")
+                )),
+            };
+        }
+        // The words `xargs` adds can name any target, so the ones the line
+        // shows say nothing of what runs.
+        if stdin && scripts::runner(&run) {
+            return Checked {
+                decision: Decision::Deny,
+                code: PolicyReason::ShellDangerousRunner,
+                token: Cow::Owned(format!(
+                    "xargs {} may take a target from stdin",
                     run.join(" ")
                 )),
             };
@@ -169,11 +181,12 @@ fn add_dirs(set: &mut Vec<std::path::PathBuf>, dirs: impl IntoIterator<Item = st
 /// with `&`. The line goes on past a `cd` that fails at a `;` or `||`, so
 /// the commands there are read both where it went and where it was. A
 /// script nested in the line starts where the command that runs it does.
+/// Each command also says whether `xargs` adds words to it from stdin.
 fn runner_commands(
     argv: &[String],
     cwd: &std::path::Path,
     depth: usize,
-    out: &mut Vec<(Vec<String>, std::path::PathBuf)>,
+    out: &mut Vec<(Vec<String>, std::path::PathBuf, bool)>,
 ) {
     // Every directory the next command may run in. A `cd` before `&&`
     // holds for the commands after it, and the directories it left wait
@@ -303,9 +316,13 @@ fn runner_commands(
         if run.is_empty() {
             continue;
         }
+        let stdin = wrappers.iter().any(|w| base_of(w) == "xargs");
         for dir in &at {
-            if !out.iter().any(|(r, d)| *r == run && d == dir) {
-                out.push((run.clone(), dir.clone()));
+            if !out
+                .iter()
+                .any(|(r, d, s)| *r == run && d == dir && *s == stdin)
+            {
+                out.push((run.clone(), dir.clone(), stdin));
             }
         }
     }
@@ -4079,6 +4096,32 @@ mod tests {
         assert_eq!(c.decision, want);
         for d in &shut {
             std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+    }
+
+    /// `xargs` adds words from stdin to the runner it runs, and they can
+    /// name any target, so the runner is refused.
+    #[test]
+    fn refuses_a_runner_xargs_feeds() {
+        let files = [("Makefile", MAKEFILE), ("package.json", PACKAGE)];
+        for line in [
+            "cd project && printf '%s\\n' clean-all | xargs make",
+            "cd project && echo clean-all | xargs make test",
+            "cd project && echo clean-all | xargs -n 1 nice make",
+            "cd project && echo nuke | xargs npm run",
+            "echo clean-all | xargs make -C project",
+        ] {
+            let c = entering("xargs-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        let c = entering("xargs-cd", &files, "cd project && echo x | xargs make");
+        assert_eq!(c.token, "xargs make may take a target from stdin");
+        for line in [
+            "cd project && ls | xargs wc -l",
+            "cd project && make test && echo x | xargs echo",
+        ] {
+            let c = entering("xargs-cd", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
         }
     }
 
