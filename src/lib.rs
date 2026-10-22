@@ -286,6 +286,9 @@ fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
                     }
                 }
             }
+            "!" | "if" | "then" | "else" | "elif" | "while" | "until" | "do" => {
+                words = rest;
+            }
             _ => return words,
         }
     }
@@ -3773,6 +3776,21 @@ mod tests {
             "builtin cd project && make clean-all",
         ] {
             let c = entering("command-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+    }
+
+    /// A control keyword before `cd` does not hide it.
+    #[test]
+    fn follows_a_cd_behind_control_keywords() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "if cd project; then make clean-all; fi",
+            "while cd project; do make clean-all; done",
+            "until cd project; do make clean-all; done",
+            "! cd project; make clean-all",
+        ] {
+            let c = entering("control-cd", &files, line);
             assert_eq!(c.decision, Decision::Deny, "{line}");
         }
     }
