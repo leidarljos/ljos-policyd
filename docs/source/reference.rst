@@ -245,19 +245,25 @@ part, one ``subaddress`` separator, and anything after the
 separator. The separators are the ``subaddress`` line, or ``+-=``
 when the line is omitted. ``.``, ``@``, ``%`` and ``!`` are not
 separators. An ``address`` rule is also compared by skeleton:
-NFKC, case folded twice, with a combining dot above and every
-``.``, ``_``, ``-``, ``+`` and ``=`` removed and nothing cut.
-The second fold turns capital sharp s into ss, and dropping the
-dot makes İ and i one skeleton. A recipient whose skeleton starts with
+NFD, combining marks removed, case folded twice, combining marks
+removed again, then NFC, with every ``.``, ``_``, ``-``, ``+`` and ``=``
+removed and nothing cut. The second fold turns capital sharp s
+into ss. The second removal drops the dot that case folding İ
+produces, so İ and i are one skeleton, and a mark cannot compose
+with the letter before it and escape the prefix. ``abc`` followed
+by U+0301 and ``x`` is denied by ``abc``, and Lithuanian i + U+0307 +
+U+0300 is the same skeleton as ì. A recipient whose skeleton starts with
 the rule's skeleton, at the rule's domain or one in the same
 alias family, is refused, and so is one the folding below
 refuses. This over-blocks on purpose: a rule for ``john`` also
 refuses ``johnny`` and ``jo.hn-x``, so a provider that ignores a
 character no family lists cannot deliver a denied mailbox.
-An address rule whose skeleton is empty or shorter than three
-characters refuses the deny file. The error names the line and
-not the address. A deny file that does not load refuses every
-send.
+An address rule whose skeleton is empty refuses the deny file.
+The error names the line and not the address. A deny file that
+does not load refuses every send. A skeleton shorter than three
+characters still matches that mailbox, its subaddresses and its
+alias family, and does not use the prefix, so ``jo`` denies ``jo``
+and ``jo+tag`` and not ``john``.
 A provider alias family folds both the rule and the
 recipient, and adds its separators to the ``subaddress`` line on
 its domains. ``gmail.com`` and ``googlemail.com`` are one
@@ -273,7 +279,12 @@ local part, so ``x@xn--bcher-kva.fastmail.com`` is
 domain, and so are ``icloud.com``, ``me.com`` and ``mac.com``,
 each with ``+``. ``outlook.*``, ``hotmail.*``, ``live.*`` and
 ``msn.*`` (every domain with that first label, whatever the
-country suffix) are separate domains, each with ``+``. On
+country suffix) are separate domains, each with ``+``. Exact and
+subaddress matching stay on the domain the rule names. The
+skeleton prefix still crosses that family, so a rule for
+``john@outlook.com`` also denies ``john@hotmail.com``,
+``john@live.com``, ``john@msn.com`` and ``john@outlook.de``. That
+over-block is the prefix, not a shared mailbox. On
 ``yahoo.*``, ``ymail.*`` and ``rocketmail.com``, ``-`` is a
 separator, and an address rule
 is also cut at its first separator, so a rule for one disposable
@@ -294,7 +305,17 @@ twice, refuses the config. A
 domain of that family and their subdomains, so ``domain gmail.com``
 also refuses ``googlemail.com``, ``domain pm.me`` the other Proton
 domains, and ``domain icloud.com`` ``me.com`` and ``mac.com``.
-``deny-domain`` in the pack-law file does the same. ``From`` is
+``deny-domain`` in the pack-law file does the same. A ``domain``
+or ``deny-domain`` value has to be a hostname after IDNA. A star,
+a colon, a slash, an at-sign, whitespace, or anything else that
+is not a hostname refuses the file. So does a domain a
+recipient cannot have, such as an all-numeric one, in a
+``domain``, ``deny-domain`` or ``address`` value. The detail is
+the line number and not the value. A wildcard is not how to name
+subdomains: ``domain example.test`` already covers
+``a.example.test``. An ``address`` value with a star, or with a
+character a parsed recipient cannot carry, is refused the same
+way. ``From`` is
 not matched this way. A domain literal (an
 address at ``@[ ... ]``) in a watched header is a refusal. An
 all-numeric domain is a refusal, judged after IDNA. That
@@ -314,7 +335,8 @@ form as the same domain. A homoglyph that NFKC and IDNA leave alone
 does not. ASCII case is folded, and a character a reader skips is
 removed before that comparison. ``From`` is not compared that way. ``handle``, ``term`` and ``pair`` may share the deny file
 and are ignored here. A pack-law line that would allow a domain refuses
-the file. A message over 1 MiB, a control character in the header
+the file. The detail of ``deny-file-invalid`` and ``pack-law-invalid``
+is the line number, not the value. A message over 1 MiB, a control character in the header
 block, U+0085, U+2028 or U+2029 in that block, a header line over
 998 octets, a header block that mixes CRLF and a bare LF, or a
 config that cannot be read is a refusal.
@@ -366,9 +388,9 @@ Code                                     When
 ``config-invalid``                       the config is missing a key or names an unknown one
 ``identity-invalid``                     the configured identity is not one mailbox
 ``deny-file-unreadable``                 the deny file cannot be read
-``deny-file-invalid``                    a deny-file line is not a known kind, or an address skeleton is shorter than three characters
+``deny-file-invalid``                    a deny-file line is not a known kind, a domain is not a hostname, or an address skeleton is empty. The detail is the line number
 ``pack-law-unreadable``                  the pack-law file cannot be read
-``pack-law-invalid``                     the pack-law file has a line other than deny-domain
+``pack-law-invalid``                     a pack-law line is not deny-domain, or the domain is not a hostname. The detail is the line number
 ======================================== ======================================================
 
 Environment the seat reads

@@ -885,7 +885,10 @@ fn parse_dot_atom(s: &str) -> Result<(String, usize), AddressFault> {
     Err(AddressFault)
 }
 
-fn parse_domain(s: &str) -> Result<String, AddressFault> {
+/// The domain of a parsed mailbox. A deny-file or pack-law domain rule
+/// is read with this too: a rule for a domain this refuses could never
+/// match a recipient.
+pub(crate) fn parse_domain(s: &str) -> Result<String, AddressFault> {
     let s = s.trim_end();
     // A domain literal (`@[ ... ]`) is not a name this check can compare.
     // Accepting the brackets lets the same host through in another shape.
