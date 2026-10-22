@@ -827,7 +827,7 @@ fn parse_quoted(s: &str) -> Result<(String, usize), AddressFault> {
                 i += 1;
             }
             b'"' => {
-                if local.is_empty() {
+                if local.is_empty() || nfkc_to_ascii_punctuation(&local) {
                     return Err(AddressFault);
                 }
                 return Ok((local, i + 1));
@@ -854,7 +854,7 @@ fn parse_dot_atom(s: &str) -> Result<(String, usize), AddressFault> {
     let mut any = false;
     for (i, c) in s.char_indices() {
         if c == '@' {
-            if !any || prev_dot {
+            if !any || prev_dot || nfkc_to_ascii_punctuation(&local) {
                 return Err(AddressFault);
             }
             return Ok((local, i));
@@ -1049,6 +1049,16 @@ fn c_number(part: &str) -> Option<u64> {
 /// `resolve_dequoted` on, which is the default.
 fn is_route_byte(c: u8) -> bool {
     matches!(c, b'@' | b'%' | b'!')
+}
+
+/// NFKC of a fullwidth punctuation mark is the ASCII mark. A local
+/// part that changes into `@`, `%`, `!` or any other ASCII punctuation
+/// is not the mailbox a later comparison would read.
+fn nfkc_to_ascii_punctuation(local: &str) -> bool {
+    local.chars().any(|c| {
+        let folded: String = c.nfkc().collect();
+        folded != c.to_string() && folded.chars().any(|d| d.is_ascii_punctuation())
+    })
 }
 
 fn is_atext(c: char) -> bool {
@@ -1279,6 +1289,17 @@ From: other@example.test\r\n\
         assert!(mailboxes("\"a\\%blocked.test\"@localhost").is_err());
         assert!(mailboxes("\"blocked.test\\!a\"@localhost").is_err());
         assert!(mailboxes("\"Two Three\"@example.test").is_ok());
+    }
+
+    #[test]
+    fn a_local_part_nfkc_folds_to_ascii_punctuation_is_not_a_mailbox() {
+        assert!(mailboxes("a\u{FF05}blocked.test@localhost").is_err());
+        assert!(mailboxes("a\u{FF20}blocked.test@localhost").is_err());
+        assert!(mailboxes("a\u{FF01}b@localhost").is_err());
+        assert!(mailboxes("a\u{FF0B}b@example.test").is_err());
+        assert!(mailboxes("\"a\u{FF05}b\"@example.test").is_err());
+        assert!(mailboxes("a+b@example.test").is_ok());
+        assert!(mailboxes("\u{FF41}@example.test").is_ok());
     }
 
     #[test]

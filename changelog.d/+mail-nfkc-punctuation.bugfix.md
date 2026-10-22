@@ -1,0 +1,1 @@
+A fullwidth percent or at-sign in a local part passed the route check, because NFKC folds it only later. A local part that NFKC changes into ASCII punctuation, including fullwidth `@`, `%`, `!` and the other fullwidth marks, is a refusal.

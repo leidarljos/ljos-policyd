@@ -253,7 +253,9 @@ a hex label (``0x``) and a label with a leading zero. U+3002
 or U+FF61 between the numbers is still that address. A
 source route (``<@host:mailbox>``) is a refusal. ``@``, ``%`` or
 ``!`` in a local part is a refusal, quoted or not, including a
-backslash escape inside the quotes. A recipient domain, or a domain on a
+backslash escape inside the quotes. A local part that NFKC
+changes into ASCII punctuation, such as a fullwidth ``@``,
+``%``, ``!`` or ``+``, is a refusal. A recipient domain, or a domain on a
 header checked against the deny file, is refused when one label
 mixes Latin with Cyrillic or Greek after NFKC and IDNA.
 

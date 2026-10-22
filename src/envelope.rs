@@ -1143,6 +1143,30 @@ From: other@example.test\r\n";
         );
     }
 
+    /// Fullwidth punctuation NFKC-folds to ASCII. The local part is a
+    /// refusal before that fold can be read as `@`, `%`, `!` or another
+    /// mark.
+    #[test]
+    fn a_fullwidth_route_character_in_the_local_part_is_refused() {
+        assert_eq!(
+            codes(&plain("To: a\u{FF05}blocked.test@localhost\r\n"), "", ""),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("To: a\u{FF20}blocked.test@localhost\r\n"), "", ""),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("To: a\u{FF01}b@localhost\r\n"), "", ""),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("Cc: a\u{FF0B}b@example.test\r\n"), "", ""),
+            vec!["recipient-unparsed"]
+        );
+        assert!(codes(&plain("To: a+b@example.test\r\n"), "", "").is_empty());
+    }
+
     #[test]
     fn a_source_route_is_refused() {
         let deny = "address evil@example.test\ndomain blocked.test\n";
