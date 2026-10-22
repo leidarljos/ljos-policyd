@@ -245,10 +245,14 @@ part, one ``subaddress`` separator, and anything after the
 separator. The separators are the ``subaddress`` line, or ``+-=``
 when the line is omitted. ``.``, ``@``, ``%`` and ``!`` are not
 separators. An ``address`` rule is also compared by skeleton:
-NFKC, case folded twice, with a combining dot above and every
-``.``, ``_``, ``-``, ``+`` and ``=`` removed and nothing cut.
-The second fold turns capital sharp s into ss, and dropping the
-dot makes İ and i one skeleton. A recipient whose skeleton starts with
+NFD, combining marks removed, case folded twice, combining marks
+removed again, then NFC, with every ``.``, ``_``, ``-``, ``+`` and ``=``
+removed and nothing cut. The second fold turns capital sharp s
+into ss. The second removal drops the dot that case folding İ
+produces, so İ and i are one skeleton, and a mark cannot compose
+with the letter before it and escape the prefix. ``abc`` followed
+by U+0301 and ``x`` is denied by ``abc``, and Lithuanian i + U+0307 +
+U+0300 is the same skeleton as ì. A recipient whose skeleton starts with
 the rule's skeleton, at the rule's domain or one in the same
 alias family, is refused, and so is one the folding below
 refuses. This over-blocks on purpose: a rule for ``john`` also

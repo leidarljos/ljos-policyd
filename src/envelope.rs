@@ -9,6 +9,8 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use icu_properties::props::GeneralCategory;
+use icu_properties::CodePointMapData;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::mail::{self, Header, Mailbox, Message, MessageFault};
@@ -750,21 +752,33 @@ const TRANSPARENT: &[char] = &['.', '_', '-', '+', '='];
 /// An empty skeleton is refused at load: `starts_with("")` is true.
 const MIN_SKELETON: usize = 3;
 
-/// NFKC, case folded twice, with U+0307 and every `TRANSPARENT`
-/// character removed and nothing cut. One upper-then-lower leaves
-/// capital sharp s as ß, so the fold runs again and ß becomes ss.
-/// İ lowercases to i plus a combining dot; leaving the dot makes the
-/// rule skeleton longer than i, and the prefix check misses a
-/// recipient written with i. A recipient whose skeleton starts with
-/// a rule's skeleton, at that domain or one in the same family, is
-/// denied. This over-blocks on purpose: `john` also denies `johnny`
-/// and `jo.hn-x`, so a provider that ignores a character no family
-/// lists cannot deliver a denied mailbox.
+/// NFD, combining marks (general category Mn) removed, case folded
+/// twice, marks removed again, then NFC, with every `TRANSPARENT`
+/// character removed and nothing cut. `normalize_local` has already
+/// composed, so the decomposition runs here on the rule and the
+/// recipient: `abc` + U+0301 + `x` is `abćx` by then, and the mark
+/// has to come off or the prefix never sees `abc`. Case folding İ
+/// produces i and U+0307, so the second strip is what makes that one
+/// skeleton with i. One upper-then-lower leaves capital sharp s as
+/// ß, so the fold runs again and ß becomes ss. A recipient whose
+/// skeleton starts with a rule's skeleton, at that domain or one in
+/// the same family, is denied. This over-blocks on purpose: `john`
+/// also denies `johnny` and `jo.hn-x`, so a provider that ignores a
+/// character no family lists cannot deliver a denied mailbox.
 fn skeleton(local: &str) -> String {
-    let folded = casefold(&casefold(local));
-    folded
+    let folded = casefold(&casefold(&strip_marks(local)));
+    let composed: String = strip_marks(&folded).nfc().collect();
+    composed
         .chars()
-        .filter(|c| *c != '\u{0307}' && !TRANSPARENT.contains(c))
+        .filter(|c| !TRANSPARENT.contains(c))
+        .collect()
+}
+
+fn strip_marks(local: &str) -> String {
+    let category = CodePointMapData::<GeneralCategory>::new();
+    local
+        .nfd()
+        .filter(|c| category.get(*c) != GeneralCategory::NonspacingMark)
         .collect()
 }
 
@@ -2325,6 +2339,38 @@ pair left right
         }
     }
 
+    /// A mark that composes with the letter before it used to leave the
+    /// skeleton as a different letter. NFD takes the mark off again, on
+    /// the rule and the recipient.
+    #[test]
+    fn a_combining_mark_does_not_escape_the_skeleton() {
+        let denied = |to: &str, deny: &str| {
+            codes(&plain(&format!("To: {to}\r\n")), deny, "") == vec!["recipient-address-denied"]
+        };
+        let abc = "address abc@example.test\n";
+        assert!(denied("abc\u{0301}x@example.test", abc));
+        assert!(denied("ab\u{0107}x@example.test", abc));
+        assert!(denied("ab\u{0307}c@example.test", abc));
+        assert!(denied(
+            "abc@example.test",
+            "address ab\u{0107}@example.test\n"
+        ));
+        let grave = "i\u{0307}\u{0300}";
+        assert!(denied(
+            &format!("{grave}@example.test"),
+            "address \u{00EC}@example.test\n"
+        ));
+        assert!(denied(
+            "\u{00EC}@example.test",
+            &format!("address {grave}@example.test\n")
+        ));
+        assert!(denied(
+            &format!("{grave}x@example.test"),
+            "address \u{00EC}x@example.test\n"
+        ));
+        assert!(!denied("abd@example.test", abc));
+    }
+
     /// The default separators are `+-=`. Gmail and Googlemail are one
     /// domain with dots ignored, and `x@user.fastmail.com` is the user
     /// at fastmail.com. A `subaddress` line replaces the default.
@@ -2485,7 +2531,8 @@ pair left right
         assert!(!denied("xy@b\u{FC}cher.fastmail.com", label, ""));
         assert!(!denied("b\u{FC}cher+xy@fastmail.com", label, ""));
         assert!(!denied("b\u{FC}cher+xshop@fastmail.com", label, ""));
-        assert!(!denied("bucher+x@fastmail.com", label, ""));
+        // ü is u plus a combining diaeresis, so the skeletons are equal.
+        assert!(denied("bucher+x@fastmail.com", label, ""));
         let dotted = "alias example.test + dots subdomain\n";
         for deny in [
             "address jdoe@example.test\n",

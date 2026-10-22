@@ -22,6 +22,7 @@ path = "src/main.rs"
 
 [dependencies]
 capnp = "0.27"
+icu_properties = "2.4.0"
 idna = "1"
 libc = "0.2"
 unicode-normalization = "0.1"
