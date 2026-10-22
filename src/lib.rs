@@ -301,6 +301,15 @@ fn runner_commands(
         let words = peel_cd_command_word(&cmd);
         let b = words.first().map_or("", |w| base_of(w));
         if piped && matches!(b, "cd" | "pushd" | "popd" | "dirs") {
+            // A last stage that may run here leaves where the line is,
+            // and the stack under it, not followed.
+            if lastpipe && end != "|" {
+                if b != "dirs" {
+                    here = vec![UNTRACKED.into()];
+                    old = vec![UNTRACKED.into()];
+                }
+                pushed.clear();
+            }
             continue;
         }
         if b == "dirs" {
