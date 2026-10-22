@@ -7781,11 +7781,6 @@ fn nest_bump(kind: Nest, open: bool, depth: &mut [i32; 5]) {
 /// runs. The `|` after it separates patterns (`case z in a | b)`), so it
 /// is not the pipeline a `{ printf | read` opener starts.
 fn pure_case_pattern(cmd: &[String]) -> bool {
-    let closes = |p: &str| {
-        p == ")"
-            || (p.ends_with(')') && p.matches(')').count() > p.matches('(').count())
-            || (p.starts_with('(') && !p.starts_with("((") && p.ends_with(')'))
-    };
     let mut saw_case = false;
     let mut await_in = false;
     let mut pattern = false;
@@ -7804,9 +7799,12 @@ fn pure_case_pattern(cmd: &[String]) -> bool {
             continue;
         }
         if pattern {
-            if closes(w) {
+            if closes_pat(w) {
                 pattern = false;
-                if wi + 1 < cmd.len() {
+                // `z)printf` glues the command onto the pattern. That
+                // command is the arm, so the `|` after it is a pipeline.
+                let glued = pattern_close_at(w).is_some_and(|at| at + 1 < w.len());
+                if glued || wi + 1 < cmd.len() {
                     body = true;
                 }
             }
@@ -8575,19 +8573,43 @@ fn case_subject(cmd: &[String]) -> Option<String> {
     (literal_text(w) && !w.is_empty()).then(|| w.clone())
 }
 
+/// Where `w` closes a `case` pattern. `z)` and `(z)` close at the end.
+/// `z)printf` closes on the `)` and the rest is the command. `((` is
+/// arithmetic, not a pattern.
+fn pattern_close_at(w: &str) -> Option<usize> {
+    if w.is_empty() || w.starts_with("((") {
+        return None;
+    }
+    let b = w.as_bytes();
+    let mut depth = 0i32;
+    for (i, &c) in b.iter().enumerate() {
+        match c {
+            b'(' => depth += 1,
+            b')' => {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn closes_pat(p: &str) -> bool {
-    p == ")"
-        || (p.ends_with(')') && p.matches(')').count() > p.matches('(').count())
-        || (p.starts_with('(') && !p.starts_with("((") && p.ends_with(')'))
+    pattern_close_at(p).is_some()
 }
 
 fn pattern_text(w: &str) -> String {
-    let bare = if w.starts_with('(') && !w.starts_with("((") && w.ends_with(')') && w.len() >= 2 {
-        &w[1..w.len() - 1]
-    } else {
-        w
+    let head = match pattern_close_at(w) {
+        Some(i) => &w[..i],
+        None => w,
     };
-    bare.strip_suffix(')').unwrap_or(bare).to_string()
+    head.strip_prefix('(').unwrap_or(head).to_string()
 }
 
 fn pat_words(words: &[String], pats: &mut Vec<String>) -> bool {
@@ -8782,21 +8804,79 @@ fn read_command(cmd: &[String]) -> Option<Vec<String>> {
     let owned = split_env_strings(cmd).into_owned();
     let run = unwrap_wrappers(&owned).0;
     let refs: Vec<&str> = run.iter().map(String::as_str).collect();
-    let tail: Vec<String> = command_after_keywords(&refs)
+    let mut tail: Vec<String> = command_after_keywords(&refs)
         .iter()
         .map(|s| (*s).to_string())
         .collect();
+    // `z) read` keeps the pattern on the command. `z)read` glues it.
+    if let Some(first) = tail.first().cloned() {
+        if let Some(at) = pattern_close_at(&first) {
+            if at + 1 == first.len() {
+                tail.remove(0);
+            } else if at + 1 < first.len() {
+                tail[0] = first[at + 1..].to_string();
+            }
+        }
+    }
     tail.first()
         .is_some_and(|w| matches!(base_of(w), "read" | "mapfile" | "readarray"))
         .then_some(tail)
 }
 
 fn read_text(ended: &[(Vec<String>, String)], i: usize, cmd: &[String]) -> Option<String> {
-    if let Some(p) = i.checked_sub(1).filter(|&p| ended[p].1 == "|") {
-        producer_text(&ended[p].0)
+    // A `|` between `case` patterns is not the producer. `a|z)` still
+    // has the here-string. A `)` glued to the command (`z)printf`) is a
+    // real pipeline, and that command is what `read` is fed.
+    let pipe = i
+        .checked_sub(1)
+        .filter(|&p| ended[p].1 == "|" && !pure_case_pattern(&ended[p].0));
+    if let Some(p) = pipe {
+        let prev = &ended[p].0;
+        if let Some(glued) = case_glued_producer(prev) {
+            producer_text(&glued)
+        } else {
+            producer_text(prev)
+        }
     } else {
         here_string(cmd)
     }
+}
+
+/// The command glued onto a `case` pattern (`z)printf '/tmp/a\n'`).
+/// The words before the `)` are the pattern, not the program.
+fn case_glued_producer(cmd: &[String]) -> Option<Vec<String>> {
+    let mut saw_case = false;
+    let mut await_in = false;
+    let mut pattern = false;
+    for (wi, w) in cmd.iter().enumerate() {
+        if !saw_case {
+            if is_assignment(w) {
+                continue;
+            }
+            if w != "case" {
+                return None;
+            }
+            saw_case = true;
+            await_in = true;
+            continue;
+        }
+        if pattern {
+            let Some(at) = pattern_close_at(w) else {
+                continue;
+            };
+            if at + 1 < w.len() {
+                let mut out = vec![w[at + 1..].to_string()];
+                out.extend(cmd[wi + 1..].iter().cloned());
+                return Some(out);
+            }
+            return (wi + 1 < cmd.len()).then(|| cmd[wi + 1..].to_vec());
+        }
+        if w == "in" && await_in {
+            await_in = false;
+            pattern = true;
+        }
+    }
+    None
 }
 
 fn read_lines(text: &str) -> Vec<String> {
@@ -12632,8 +12712,6 @@ fn case_pattern_skips(argv: &[String]) -> Vec<bool> {
     let mut case_depth = 0i32;
     let mut await_in = false;
     let mut pattern = false;
-    let closes =
-        |p: &str| p == ")" || (p.ends_with(')') && p.matches(')').count() > p.matches('(').count());
     let doubles = double_semicolons(argv);
     for (i, (cmd, end)) in ended.iter().enumerate() {
         let mut for_cmd = false;
@@ -12646,9 +12724,10 @@ fn case_pattern_skips(argv: &[String]) -> Vec<bool> {
                     await_in = false;
                     continue;
                 }
-                if closes(w) {
+                if closes_pat(w) {
                     pattern = false;
-                    if wi + 1 < cmd.len() {
+                    let glued = pattern_close_at(w).is_some_and(|at| at + 1 < w.len());
+                    if glued || wi + 1 < cmd.len() {
                         body = true;
                     }
                 }
@@ -19643,9 +19722,40 @@ hash -r 2> /dev/null
             "x=/; for n in a; do printf '/tmp/a\\n' | read x; done; rm -rf \"$x\"",
             "x=/tmp/a; { read x <<< /; }; rm -rf \"$x\"",
             "x=/; case z in a | b) read x <<< /tmp/a ;; esac; rm -rf \"$x\"",
+            // `z)printf` is a real pipeline. Without lastpipe the read
+            // is another shell, so `/` stays.
+            "x=/; case z in z)printf '/tmp/a\\n' | read x;; esac; rm -rf \"$x\"",
         ] {
             assert_eq!(v(line), "deny\trm-rf-outside-tmp", "{line}");
         }
+    }
+
+    /// `z)printf` closes the pattern and runs `printf`. That `|` is a
+    /// pipeline, so `lastpipe` lets the `read` assign. `a|z)` is still
+    /// only a pattern list, and the here-string is what `read` takes.
+    #[test]
+    fn a_glued_case_close_is_the_arm_command() {
+        let both = |s: &str, want: &str| {
+            assert_eq!(verdict(&shell_words(s)), want, "{s}");
+            let bash = vec!["bash".into(), "-c".into(), s.to_string()];
+            assert_eq!(verdict(&bash), want, "bash -c {s}");
+        };
+        both(
+            "x=/; case z in z)printf '/tmp/a\\n' | read x;; esac; rm -rf \"$x\"",
+            "deny\trm-rf-outside-tmp",
+        );
+        both(
+            "shopt -s lastpipe; x=/; case z in z)printf '/tmp/a\\n' | read x;; esac; rm -rf \"$x\"",
+            "allow",
+        );
+        both(
+            "x=/; case z in a|z) read x <<< /tmp/a;; esac; rm -rf \"$x\"",
+            "allow",
+        );
+        both(
+            "x=/; case z in a|b) read x <<< /tmp/a;; esac; rm -rf \"$x\"",
+            "deny\trm-rf-outside-tmp",
+        );
     }
 
     /// Each name takes one field. The last keeps the rest of the line.
