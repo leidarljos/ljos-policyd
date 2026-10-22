@@ -577,16 +577,26 @@ fn may_set(w: &str, name: &str) -> bool {
 
 /// Whether the command `cmd` runs, in the shell that runs it, what the
 /// walk does not follow: `eval`, `source` or `.`, or a command word the
-/// line does not show (`$c dir`), which may be `cd`. After one nothing is
-/// known of where the line is or what `CDPATH`, `HOME` and `PWD` hold.
+/// line does not show (`$c dir`), which may be `cd`, or a `trap` whose
+/// action is one of those or moves the shell, since a DEBUG trap runs
+/// before each command. After one nothing is known of where the line is
+/// or what `CDPATH`, `HOME` and `PWD` hold.
 fn unseen(cmd: &[&str]) -> bool {
     let words = operands(cmd);
     let front = (0..words.len())
         .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
         .count();
-    peel_cd_command_word(&words[front..])
+    let words = peel_cd_command_word(&words[front..]);
+    let moves = |c: &Vec<&str>| {
+        unseen(c)
+            || peel_cd_command_word(c)
+                .first()
+                .is_some_and(|w| matches!(base_of(w), "cd" | "pushd" | "popd"))
+    };
+    words
         .first()
         .is_some_and(|w| matches!(base_of(w), "eval" | "source" | ".") || w.contains(['$', '`']))
+        || trap_action(words).is_some_and(|a| commands(&shell_words(a)).iter().any(moves))
 }
 
 /// Whether the command `cmd` may turn on `lastpipe`: `shopt -s` or `set
@@ -1267,10 +1277,25 @@ fn inner_commands_at(argv: &[String]) -> Vec<(usize, Vec<String>)> {
                     .map(|l| (i, shell_words(l))),
             );
         } else {
+            if let Some(action) = trap_action(run) {
+                out.extend(script_lines(action, 0).iter().map(|l| (i, shell_words(l))));
+            }
             out.push((i, run.to_vec()));
         }
     }
     out
+}
+
+/// The script `trap` runs on each signal it names: its first operand,
+/// past `-l`, `-p` and `--`.
+fn trap_action<S: AsRef<str>>(run: &[S]) -> Option<&str> {
+    let (first, args) = run.split_first()?;
+    if base_of(first.as_ref()) != "trap" {
+        return None;
+    }
+    args.iter()
+        .map(AsRef::as_ref)
+        .find(|a| !(a.starts_with('-') && a.len() > 1))
 }
 
 /// `w` with each `$NAME` and `${NAME}` whose value the line shows read as

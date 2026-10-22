@@ -20,7 +20,8 @@ Built-in denials
 First match wins. The head is the last path component of argv[0].
 Leading assignments, ``NAME=value`` or ``NAME+=value``, and runner words
 such as ``env``, ``nice`` and ``timeout`` come off first, as does the head
-of a ``case`` arm (``case $x in a)``, or ``b)`` after ``;;``).
+of a ``case`` arm (``case $x in a)``, or ``b)`` after ``;;``). A ``trap``
+action is judged as a script of its own.
 
 ===================== ======================== ============================
 Token                 Cap'n PolicyReason       When
@@ -81,8 +82,9 @@ judged as written. A ``cd`` or ``pushd`` to a path the line does not show
 (``cd "$X"``) leaves it in a directory it does not follow, so a runner
 after it is refused. So does an ``eval``, ``source`` or ``.``, whose script
 is not followed, and a command word the line does not show (``$c dir``),
-which may be ``cd``; after one ``HOME``, ``CDPATH`` and ``PWD`` are not
-followed either.
+which may be ``cd``, and a ``trap`` whose action is one of those or a
+``cd``, ``pushd`` or ``popd``, since a ``DEBUG`` trap runs before each
+command; after one ``HOME``, ``CDPATH`` and ``PWD`` are not followed either.
 Raw newlines and carriage returns split script commands, and ``$'...'``
 ANSI-C quoted words are decoded before the line is judged.
 
