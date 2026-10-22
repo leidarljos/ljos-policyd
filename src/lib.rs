@@ -4854,6 +4854,18 @@ mod tests {
         }
     }
 
+    /// The `time` keyword, with or without `-p`, runs `cd` in this shell.
+    #[test]
+    fn follows_a_cd_behind_time() {
+        for line in [
+            "time cd evil && make clean-all",
+            "time -p cd evil && make clean-all",
+            "time FOO=1 cd evil && make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("time-cd", line), Decision::Deny, "{line}");
+        }
+    }
+
     /// An opening `{` before `cd` does not hide it.
     #[test]
     fn follows_a_cd_behind_a_brace_group() {
