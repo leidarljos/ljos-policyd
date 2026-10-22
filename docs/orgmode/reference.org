@@ -285,7 +285,15 @@ twice, refuses the config. A
 domain of that family and their subdomains, so =domain gmail.com=
 also refuses =googlemail.com=, =domain pm.me= the other Proton
 domains, and =domain icloud.com= =me.com= and =mac.com=.
-=deny-domain= in the pack-law file does the same. =From= is
+=deny-domain= in the pack-law file does the same. A =domain=
+or =deny-domain= value has to be a hostname after IDNA. A star,
+a colon, a slash, an at-sign, whitespace, or anything else that
+is not a hostname refuses the file. The detail is the line
+number and not the value. A wildcard is not how to name
+subdomains: =domain example.test= already covers
+=a.example.test=. An =address= value with a star, or with a
+character a parsed recipient cannot carry, is refused the same
+way. =From= is
 not matched this way. A domain literal (an address
 at =@[ ... ]=) in a watched header is a refusal. An
 all-numeric domain is a refusal, judged after IDNA. That
@@ -357,7 +365,7 @@ config that cannot be read is a refusal.
 | =config-invalid= | the config is missing a key or names an unknown one |
 | =identity-invalid= | the configured identity is not one mailbox |
 | =deny-file-unreadable= | the deny file cannot be read |
-| =deny-file-invalid= | a deny-file line is not a known kind, or an address skeleton is shorter than three characters |
+| =deny-file-invalid= | a deny-file line is not a known kind, a domain is not a hostname, or an address skeleton is shorter than three characters |
 | =pack-law-unreadable= | the pack-law file cannot be read |
 | =pack-law-invalid= | the pack-law file has a line other than deny-domain |
 

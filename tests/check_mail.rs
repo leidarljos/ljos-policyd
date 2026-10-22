@@ -93,6 +93,31 @@ fn a_missing_config_flag_is_usage() {
 }
 
 #[test]
+fn a_dead_domain_rule_exits_2_and_names_the_line() {
+    let conf = config(
+        "#\ndomain *.example.test\n",
+        "deny-domain example.test:25\n",
+    );
+    let out = run(
+        &["check-mail", "--config", conf.to_str().unwrap()],
+        b"From: mailseat@example.test\r\nTo: john@example.test\r\n",
+    );
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains(r#""verdict":"deny""#), "{stdout}");
+    assert!(stdout.contains("deny-file-invalid"), "{stdout}");
+    assert!(stdout.contains("line 2"), "{stdout}");
+    assert!(!stdout.contains("*.example.test"), "{stdout}");
+    assert!(!stdout.contains('*'), "{stdout}");
+    assert!(
+        out.stderr.is_empty(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(conf.parent().unwrap());
+}
+
+#[test]
 fn bytes_that_are_not_utf8_are_refused() {
     let conf = config("", "");
     let out = run(

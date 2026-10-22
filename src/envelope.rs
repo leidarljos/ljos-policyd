@@ -303,13 +303,19 @@ fn load_deny(
         };
         match key {
             "address" => {
-                let list =
-                    mail::mailboxes(value).map_err(|_| reason("deny-file-invalid", "deny-file"))?;
+                let list = mail::mailboxes(value)
+                    .map_err(|_| reason("deny-file-invalid", format!("line {line_no}")))?;
                 if list.len() != 1 {
-                    return Err(reason("deny-file-invalid", "deny-file"));
+                    return Err(reason("deny-file-invalid", format!("line {line_no}")));
                 }
+                // A star, or a character a parsed recipient cannot carry,
+                // loads and then matches nothing. So does a domain that
+                // is not a hostname. The line is refused. The detail
+                // names it and not the value, and the failed load denies
+                // every send.
                 let addr = normalize_mailbox(&list[0])
-                    .ok_or_else(|| reason("deny-file-invalid", "deny-file"))?;
+                    .filter(|addr| address_rule_can_match(&list[0], addr))
+                    .ok_or_else(|| reason("deny-file-invalid", format!("line {line_no}")))?;
                 // An empty skeleton matches every local part, because
                 // `starts_with("")` is true, and one or two characters
                 // match most of a domain. A typo there would deny the
@@ -324,8 +330,8 @@ fn load_deny(
                 }
             }
             "domain" => {
-                let domain = normalize_domain(value)
-                    .ok_or_else(|| reason("deny-file-invalid", "deny-file"))?;
+                let domain = rule_domain(value)
+                    .ok_or_else(|| reason("deny-file-invalid", format!("line {line_no}")))?;
                 domains.insert(domain);
             }
             "handle" | "term" => {
@@ -348,7 +354,8 @@ fn load_deny(
 fn load_pack_law(path: &Path) -> Result<BTreeSet<String>, MailReason> {
     let text = read_text(path).map_err(|()| reason("pack-law-unreadable", "pack-law"))?;
     let mut domains = BTreeSet::new();
-    for line in text.lines() {
+    for (idx, line) in text.lines().enumerate() {
+        let line_no = idx + 1;
         let Some((key, value)) =
             rule_line(line).map_err(|()| reason("pack-law-invalid", "pack-law"))?
         else {
@@ -359,8 +366,8 @@ fn load_pack_law(path: &Path) -> Result<BTreeSet<String>, MailReason> {
         if key != "deny-domain" || value.is_empty() {
             return Err(reason("pack-law-invalid", "pack-law"));
         }
-        let domain =
-            normalize_domain(value).ok_or_else(|| reason("pack-law-invalid", "pack-law"))?;
+        let domain = rule_domain(value)
+            .ok_or_else(|| reason("pack-law-invalid", format!("line {line_no}")))?;
         domains.insert(domain);
     }
     Ok(domains)
@@ -1022,6 +1029,75 @@ fn normalize_local(raw: &str) -> Option<String> {
     Some(lower)
 }
 
+/// A deny-file or pack-law domain. `None` when the value is not a
+/// hostname after IDNA. A star, a colon or a slash is not a hostname,
+/// so the line would load and then match no real recipient. A domain
+/// rule already covers its subdomains, so a wildcard is not another
+/// way to write it.
+fn rule_domain(raw: &str) -> Option<String> {
+    if raw.chars().any(forbidden_in_domain) {
+        return None;
+    }
+    let ascii = normalize_domain(raw)?;
+    if ascii.chars().any(forbidden_in_domain) || !is_hostname(&ascii) {
+        return None;
+    }
+    Some(ascii)
+}
+
+fn forbidden_in_domain(c: char) -> bool {
+    matches!(c, '*' | ':' | '/' | '@') || c.is_whitespace()
+}
+
+/// LDH labels of 1 to 63 characters, no leading or trailing hyphen, and
+/// the whole name at most 253. That is a hostname after IDNA. A label
+/// outside it does not compare with a recipient domain.
+fn is_hostname(ascii: &str) -> bool {
+    if ascii.is_empty() || ascii.len() > 253 || ascii.starts_with('.') || ascii.ends_with('.') {
+        return false;
+    }
+    ascii.split('.').all(is_hostname_label)
+}
+
+fn is_hostname_label(label: &str) -> bool {
+    let bytes = label.as_bytes();
+    let (Some(&first), Some(&last)) = (bytes.first(), bytes.last()) else {
+        return false;
+    };
+    if bytes.len() > 63 || first == b'-' || last == b'-' {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+}
+
+/// An address rule has to be a mailbox a parsed recipient can be.
+/// A star is a wildcard a reader might write, and it matches only a
+/// mailbox that itself contains a star.
+fn address_rule_can_match(mailbox: &Mailbox, addr: &NormAddr) -> bool {
+    if mailbox.local.contains('*')
+        || mailbox.domain.contains('*')
+        || addr.local.contains('*')
+        || addr.domain.contains('*')
+    {
+        return false;
+    }
+    if mailbox.domain.chars().any(forbidden_in_domain)
+        || addr.domain.chars().any(forbidden_in_domain)
+        || !is_hostname(&addr.domain)
+    {
+        return false;
+    }
+    mailbox.local.chars().all(recipient_local_char) && addr.local.chars().all(recipient_local_char)
+}
+
+/// `@`, `%` and `!` are routes the parser refuses. A control other than
+/// a tab cannot be in a parsed local part either.
+fn recipient_local_char(c: char) -> bool {
+    !matches!(c, '@' | '%' | '!' | '*') && (!c.is_control() || c == '\t')
+}
+
 /// NFKC, then IDNA, so a fullwidth label and a punycode label of the same
 /// domain compare equal. A trailing dot is the same name. A homoglyph that
 /// NFKC leaves alone stays a different domain.
@@ -1607,6 +1683,87 @@ From: other@example.test\r\n";
         );
         assert!(codes(&plain("To: a@notblocked.test\r\n"), deny, "").is_empty());
         assert!(codes(&plain("To: a@blocked.test.example.test\r\n"), deny, "").is_empty());
+    }
+
+    /// A star, a URL, a port or any other non-hostname loads and then
+    /// matches no recipient. The file is refused, and the detail is the
+    /// line, not the value. `domain example.test` already covers
+    /// subdomains, which is what a wildcard would have been for.
+    #[test]
+    fn a_domain_rule_that_matches_nothing_refuses_the_file() {
+        let clean = "From: mailseat@example.test\r\nTo: john@example.test\r\n";
+        let cases: &[(&str, &str, usize, &str)] = &[
+            ("domain *.example.test\n", "", 1, "*.example.test"),
+            ("domain *\n", "", 1, "*"),
+            ("domain http://example.test\n", "", 1, "http://"),
+            ("domain example.test:25\n", "", 1, ":25"),
+            ("domain example.test/path\n", "", 1, "/path"),
+            ("domain user@example.test\n", "", 1, "user@"),
+            ("domain exam ple.test\n", "", 1, "exam ple"),
+            ("domain _under.test\n", "", 1, "_under"),
+            ("domain -bad.test\n", "", 1, "-bad"),
+            ("domain bad-.test\n", "", 1, "bad-"),
+            ("# note\n\ndomain *.example.test\n", "", 3, "*.example.test"),
+            (
+                "domain \u{FF0A}.example.test\n",
+                "",
+                1,
+                "\u{FF0A}.example.test",
+            ),
+            ("", "deny-domain *.example.test\n", 1, "*.example.test"),
+            ("", "deny-domain http://example.test\n", 1, "http://"),
+            ("", "deny-domain example.test:25\n", 1, ":25"),
+            ("", "deny-domain example.test/path\n", 1, "/path"),
+            ("", "#\n\ndeny-domain *\n", 3, "*"),
+            ("address *john@example.test\n", "", 1, "*john"),
+            ("address john@*.example.test\n", "", 1, "*."),
+            ("address \"*john\"@example.test\n", "", 1, "*john"),
+            ("address john@ex/ample.test\n", "", 1, "ex/ample"),
+            ("address john@example.test:25\n", "", 1, ":25"),
+            ("address john@http://example.test\n", "", 1, "http://"),
+        ];
+        for (deny, law, line, value) in cases {
+            let v = verdict(clean, deny, law);
+            let code = if law.is_empty() {
+                "deny-file-invalid"
+            } else {
+                "pack-law-invalid"
+            };
+            assert_eq!(v.reasons.len(), 1, "{deny:?} {law:?}");
+            assert_eq!(v.reasons[0].code, code, "{deny:?} {law:?}");
+            assert_eq!(
+                v.reasons[0].detail,
+                format!("line {line}"),
+                "{deny:?} {law:?}"
+            );
+            assert!(!v.reasons[0].detail.contains(value), "{deny:?} {law:?}");
+            assert!(!v.json().contains(value), "{deny:?} {law:?}");
+            assert!(v.is_refused());
+        }
+        assert_eq!(
+            codes(
+                &plain("To: a@b.example.test\r\n"),
+                "domain example.test\n",
+                ""
+            ),
+            vec!["recipient-domain-denied"]
+        );
+        assert_eq!(
+            codes(
+                &plain("To: a@example.test\r\n"),
+                "domain example.test.\n",
+                ""
+            ),
+            vec!["recipient-domain-denied"]
+        );
+        assert_eq!(
+            codes(
+                &plain("To: a@sub.blocked.test\r\n"),
+                "",
+                "deny-domain blocked.test\n"
+            ),
+            vec!["recipient-domain-denied"]
+        );
     }
 
     /// A domain rule on one domain of a shared family is the whole
