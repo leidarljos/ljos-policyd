@@ -7915,8 +7915,845 @@ fn walk_shells(
 /// A `read` at `set_at` is the value a later command sees. It has to
 /// run in that command's shell, and before it. The last stage of a
 /// pipeline is a subshell until `lastpipe` is on, so it does not.
+/// A read the walk could not prove runs is not in the hit list: the
+/// name keeps the value this shell already holds.
 fn read_reaches(shells: &[u32], set_at: usize, use_at: usize) -> bool {
     set_at < use_at && shells.get(set_at) == shells.get(use_at)
+}
+
+/// Exit status a list proves. Anything else stays unknown, so a later
+/// `&&` or `||` is not taken as running.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Exit {
+    Success,
+    Failure,
+    Unknown,
+}
+
+/// How [`walk_list`] reads the command it is inside. `case_at` is the
+/// `case` whose arm patterns are not commands. `strip` is the keyword
+/// that opens this list (`if`, `then`, `do`, `{`).
+#[derive(Clone, Copy)]
+struct Reach {
+    case_at: Option<usize>,
+    strip: &'static [&'static str],
+}
+
+const STRIP_NONE: &[&str] = &[];
+const STRIP_IF: &[&str] = &["if", "elif"];
+const STRIP_THEN: &[&str] = &["then"];
+const STRIP_ELSE: &[&str] = &["else"];
+const STRIP_WHILE: &[&str] = &["while"];
+const STRIP_UNTIL: &[&str] = &["until"];
+const STRIP_DO: &[&str] = &["do"];
+const STRIP_BRACE: &[&str] = &["{"];
+const STRIP_PAREN: &[&str] = &["("];
+
+fn reach_strip(mode: Reach, strip: &'static [&'static str]) -> Reach {
+    Reach {
+        case_at: mode.case_at,
+        strip,
+    }
+}
+
+struct ReachIn<'a> {
+    ended: &'a [(Vec<String>, String)],
+    /// A `""` word [`ended_commands`] dropped, one flag per command.
+    empties: Vec<bool>,
+    /// Command closed by `;;`, aligned with `ended`.
+    dsemi: Vec<bool>,
+}
+
+/// Commands whose `read` runs in this shell's control flow. A branch
+/// that is skipped or not proven is false: the read does not assign.
+fn commands_reached(argv: &[String], ended: &[(Vec<String>, String)]) -> Vec<bool> {
+    let mut counts = vec![false; ended.len()];
+    if ended.is_empty() {
+        return counts;
+    }
+    let inn = ReachIn {
+        ended,
+        empties: command_empty_word(argv),
+        dsemi: double_semicolons(argv),
+    };
+    let mode = Reach {
+        case_at: None,
+        strip: STRIP_NONE,
+    };
+    walk_list(&inn, &mut counts, 0, ended.len(), true, mode);
+    counts
+}
+
+/// An empty word kept out of [`ended_commands`], in that command's slot.
+/// `for n in ""` iterates once; `for n in;` does not.
+fn command_empty_word(argv: &[String]) -> Vec<bool> {
+    let mut flags = Vec::new();
+    let mut words = 0usize;
+    let mut empty = false;
+    let flush = |flags: &mut Vec<bool>, words: &mut usize, empty: &mut bool| {
+        if *words > 0 {
+            flags.push(*empty);
+        }
+        *words = 0;
+        *empty = false;
+    };
+    for a in argv.iter().map(String::as_str) {
+        if matches!(a, ";" | "&&" | "||" | "|" | "&") {
+            flush(&mut flags, &mut words, &mut empty);
+            continue;
+        }
+        let closes = a.ends_with(';');
+        let tok = a.trim_end_matches(';');
+        if tok.is_empty() {
+            if a.is_empty() {
+                empty = true;
+            }
+        } else {
+            words += 1;
+        }
+        if closes {
+            flush(&mut flags, &mut words, &mut empty);
+        }
+    }
+    flush(&mut flags, &mut words, &mut empty);
+    flags
+}
+
+fn flow_head(cmd: &[String]) -> &str {
+    cmd.iter()
+        .find(|w| !is_assignment(w))
+        .map(String::as_str)
+        .unwrap_or("")
+}
+
+fn words_after_bang(view: &[String]) -> &[String] {
+    let mut i = 0;
+    while i < view.len() {
+        let w = view[i].as_str();
+        if is_assignment(w) || w == "!" || w == "time" {
+            i += 1;
+            if w == "time" && view.get(i).map(String::as_str) == Some("-p") {
+                i += 1;
+            }
+            continue;
+        }
+        break;
+    }
+    &view[i..]
+}
+
+fn leading_neg(view: &[String]) -> bool {
+    let mut n = 0;
+    for w in view {
+        let w = w.as_str();
+        if is_assignment(w) {
+            continue;
+        }
+        if w == "!" {
+            n += 1;
+            continue;
+        }
+        break;
+    }
+    n % 2 == 1
+}
+
+fn flip_exit(st: Exit, neg: bool) -> Exit {
+    if !neg {
+        return st;
+    }
+    match st {
+        Exit::Success => Exit::Failure,
+        Exit::Failure => Exit::Success,
+        Exit::Unknown => Exit::Unknown,
+    }
+}
+
+fn after_case_head(cmd: &[String]) -> Vec<String> {
+    let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    let n = case_head(&refs);
+    cmd[n..].to_vec()
+}
+
+fn case_head_strips(cmd: &[String]) -> bool {
+    let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    case_head(&refs) > 0
+}
+
+/// The command `item_end` nests on. Arm patterns are not commands.
+/// The list's opener keyword stays, so `if` still finds its `fi`.
+fn nest_view(inn: &ReachIn<'_>, idx: usize, mode: Reach) -> Vec<String> {
+    let cmd = &inn.ended[idx].0;
+    if let Some(case_i) = mode.case_at {
+        let bare_paren = cmd.len() == 1 && cmd[0] == ")";
+        let nested = cmd.first().is_some_and(|s| s == "case") && idx != case_i;
+        if !bare_paren && !nested && (idx == case_i || case_head_strips(cmd)) {
+            return after_case_head(cmd);
+        }
+    }
+    cmd.clone()
+}
+
+fn reached_view(inn: &ReachIn<'_>, idx: usize, list_lo: usize, mode: Reach) -> Vec<String> {
+    let mut w = nest_view(inn, idx, mode);
+    if idx == list_lo && !mode.strip.is_empty() {
+        while !w.is_empty() {
+            let s = w[0].as_str();
+            if is_assignment(s) || s == "!" || s == "time" {
+                let time = s == "time";
+                w.remove(0);
+                if time && w.first().is_some_and(|p| p == "-p") {
+                    w.remove(0);
+                }
+                continue;
+            }
+            break;
+        }
+        if w.first().is_some_and(|s| mode.strip.contains(&s.as_str())) {
+            w.remove(0);
+        }
+    }
+    w
+}
+
+fn item_end(inn: &ReachIn<'_>, i: usize, hi: usize, mode: Reach) -> usize {
+    let view = nest_view(inn, i, mode);
+    let Some((true, kind)) = nest_event(words_after_bang(&view)) else {
+        return i;
+    };
+    let mut depth = [0; 5];
+    nest_bump(kind, true, &mut depth);
+    for j in (i + 1)..hi {
+        let v = nest_view(inn, j, mode);
+        if let Some((open, k)) = nest_event(words_after_bang(&v)) {
+            nest_bump(k, open, &mut depth);
+        }
+        if depth.iter().all(|d| *d == 0) {
+            return j;
+        }
+    }
+    // The closer is outside this list. The opener keyword is stripped
+    // and the command is the condition or the body, not a new compound.
+    i
+}
+
+fn exit_of(words: &[String]) -> Exit {
+    let mut i = 0;
+    let mut neg = false;
+    while i < words.len() {
+        let w = words[i].as_str();
+        if is_assignment(w) {
+            i += 1;
+            continue;
+        }
+        if w == "!" {
+            neg = !neg;
+            i += 1;
+            continue;
+        }
+        if matches!(
+            w,
+            "time" | "do" | "then" | "else" | "{" | "}" | "(" | ")" | "elif"
+        ) {
+            i += 1;
+            continue;
+        }
+        if w == "-p" && i > 0 && words[i - 1] == "time" {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    let st = match words.get(i).map(|s| base_of(s)) {
+        Some("true" | ":") => Exit::Success,
+        Some("false") => Exit::Failure,
+        _ => Exit::Unknown,
+    };
+    flip_exit(st, neg)
+}
+
+fn gate(sep: &str, st: Exit) -> bool {
+    match sep {
+        ";" | "&" | "" => true,
+        "&&" => st == Exit::Success,
+        "||" => st == Exit::Failure,
+        _ => false,
+    }
+}
+
+/// The list `[lo, hi)`. `&&` and `||` are left-associative, so
+/// `true || false && read` runs `read`. A `|` joins stages; without
+/// `pipefail` the status is the last stage. `&` runs the next command
+/// and leaves status 0.
+fn walk_list(
+    inn: &ReachIn<'_>,
+    counts: &mut [bool],
+    lo: usize,
+    hi: usize,
+    entered: bool,
+    mode: Reach,
+) -> Exit {
+    if !entered || lo >= hi {
+        return if entered {
+            Exit::Success
+        } else {
+            Exit::Unknown
+        };
+    }
+    let mut i = lo;
+    let mut status = Exit::Success;
+    let mut prev = ";";
+    while i < hi {
+        let runs = gate(prev, status);
+        let before = i;
+        let (next, sep, st) = walk_pipe(inn, counts, i, hi, runs, mode);
+        if runs {
+            status = if sep == "&" { Exit::Success } else { st };
+        }
+        prev = if sep.is_empty() { ";" } else { sep };
+        i = next;
+        if i <= before {
+            break;
+        }
+    }
+    status
+}
+
+fn walk_pipe<'a>(
+    inn: &'a ReachIn<'a>,
+    counts: &mut [bool],
+    mut at: usize,
+    hi: usize,
+    runs: bool,
+    mode: Reach,
+) -> (usize, &'a str, Exit) {
+    let mut last = Exit::Unknown;
+    let mut sep;
+    if at >= hi {
+        return (at, "", Exit::Success);
+    }
+    loop {
+        let end = item_end(inn, at, hi, mode);
+        if runs {
+            last = eval_one(inn, counts, at, end, at, mode);
+        }
+        sep = inn.ended[end].1.as_str();
+        let next = end + 1;
+        let pipe = sep == "|" && next < hi;
+        at = next;
+        if !pipe {
+            break;
+        }
+    }
+    (at, sep, last)
+}
+
+fn eval_one(
+    inn: &ReachIn<'_>,
+    counts: &mut [bool],
+    at: usize,
+    end: usize,
+    list_lo: usize,
+    mode: Reach,
+) -> Exit {
+    let view = reached_view(inn, at, list_lo, mode);
+    let neg = leading_neg(&view);
+    let open = words_after_bang(&view);
+    let kind = nest_event(open).and_then(|(is_open, k)| is_open.then_some(k));
+    if end == at || kind.is_none() {
+        if at < counts.len() {
+            counts[at] = true;
+        }
+        return exit_of(&view);
+    }
+    let st = match kind {
+        Some(Nest::If) => prove_if(inn, counts, at, end, mode),
+        Some(Nest::Loop) => match open.first().map(String::as_str) {
+            Some("for") => prove_for(inn, counts, at, end, mode),
+            Some("select") => Exit::Unknown,
+            Some("until") => prove_while(inn, counts, at, end, mode, true),
+            _ => prove_while(inn, counts, at, end, mode, false),
+        },
+        Some(Nest::Brace) => walk_list(inn, counts, at, end, true, reach_strip(mode, STRIP_BRACE)),
+        Some(Nest::Paren) => walk_list(inn, counts, at, end, true, reach_strip(mode, STRIP_PAREN)),
+        Some(Nest::Case) => prove_case(inn, counts, at, end, mode),
+        None => Exit::Unknown,
+    };
+    flip_exit(st, neg)
+}
+
+fn prove_if(inn: &ReachIn<'_>, counts: &mut [bool], i: usize, end: usize, mode: Reach) -> Exit {
+    let mut idx = i;
+    let mut open = true;
+    let mut took: Option<Exit> = None;
+    while idx < end {
+        let word = flow_head(&inn.ended[idx].0);
+        if word == "else" {
+            if open {
+                took = Some(walk_list(
+                    inn,
+                    counts,
+                    idx,
+                    end,
+                    true,
+                    reach_strip(mode, STRIP_ELSE),
+                ));
+            }
+            break;
+        }
+        if word == "fi" {
+            break;
+        }
+        let mut cond_hi = idx + 1;
+        while cond_hi < end && flow_head(&inn.ended[cond_hi].0) != "then" {
+            cond_hi += 1;
+        }
+        let cond = if open {
+            walk_list(inn, counts, idx, cond_hi, true, reach_strip(mode, STRIP_IF))
+        } else {
+            Exit::Unknown
+        };
+        let body_lo = cond_hi;
+        let mut body_hi = body_lo;
+        if body_lo < end && flow_head(&inn.ended[body_lo].0) == "then" {
+            body_hi = body_lo + 1;
+            while body_hi < end {
+                let w = flow_head(&inn.ended[body_hi].0);
+                if matches!(w, "elif" | "else" | "fi") {
+                    break;
+                }
+                body_hi += 1;
+            }
+        }
+        if open && cond == Exit::Success && body_hi > body_lo {
+            took = Some(walk_list(
+                inn,
+                counts,
+                body_lo,
+                body_hi,
+                true,
+                reach_strip(mode, STRIP_THEN),
+            ));
+            open = false;
+        } else if open && cond != Exit::Failure {
+            open = false;
+        }
+        if body_hi <= idx {
+            break;
+        }
+        idx = body_hi;
+    }
+    match took {
+        Some(st) => st,
+        None if open => Exit::Success,
+        None => Exit::Unknown,
+    }
+}
+
+fn prove_while(
+    inn: &ReachIn<'_>,
+    counts: &mut [bool],
+    i: usize,
+    end: usize,
+    mode: Reach,
+    until: bool,
+) -> Exit {
+    let mut cond_hi = i + 1;
+    while cond_hi < end && flow_head(&inn.ended[cond_hi].0) != "do" {
+        cond_hi += 1;
+    }
+    let strip = if until { STRIP_UNTIL } else { STRIP_WHILE };
+    let cond = walk_list(inn, counts, i, cond_hi, true, reach_strip(mode, strip));
+    let enters = if until {
+        cond == Exit::Failure
+    } else {
+        cond == Exit::Success
+    };
+    if enters && cond_hi < end {
+        walk_list(inn, counts, cond_hi, end, true, reach_strip(mode, STRIP_DO));
+        // `while true` need not finish, so a command after `&&` is not proven.
+        return Exit::Unknown;
+    }
+    if (until && cond == Exit::Success) || (!until && cond == Exit::Failure) {
+        return Exit::Success;
+    }
+    Exit::Unknown
+}
+
+fn prove_for(inn: &ReachIn<'_>, counts: &mut [bool], i: usize, end: usize, mode: Reach) -> Exit {
+    let empty = inn.empties.get(i).copied().unwrap_or(false);
+    let enters = for_enters(&inn.ended[i].0, empty);
+    let mut body = i + 1;
+    while body < end && flow_head(&inn.ended[body].0) != "do" {
+        body += 1;
+    }
+    match enters {
+        Some(false) => Exit::Success,
+        Some(true) if body < end => {
+            let st = walk_list(inn, counts, body, end, true, reach_strip(mode, STRIP_DO));
+            if for_finishes(&inn.ended[i].0) {
+                st
+            } else {
+                Exit::Unknown
+            }
+        }
+        Some(true) => Exit::Success,
+        None => Exit::Unknown,
+    }
+}
+
+fn for_enters(cmd: &[String], empty: bool) -> Option<bool> {
+    if let Some(w) = cmd
+        .iter()
+        .find(|w| w.starts_with("((") && w.ends_with("))"))
+    {
+        return arith_enters(w);
+    }
+    let in_at = cmd.iter().position(|w| w == "in")?;
+    let items = &cmd[in_at + 1..];
+    if items.is_empty() {
+        return Some(empty);
+    }
+    if items.iter().any(|w| w.is_empty() || literal_text(w)) {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+fn for_finishes(cmd: &[String]) -> bool {
+    match cmd
+        .iter()
+        .find(|w| w.starts_with("((") && w.ends_with("))"))
+    {
+        Some(w) => arith_finishes(w),
+        None => cmd.iter().any(|w| w == "in"),
+    }
+}
+
+fn arith_parts(word: &str) -> Option<Vec<String>> {
+    let inner = word.strip_prefix("((")?.strip_suffix("))")?;
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    for c in inner.chars() {
+        if c == ';' {
+            parts.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    parts.push(cur);
+    Some(parts)
+}
+
+fn arith_ident(n: &str) -> bool {
+    let mut cs = n.chars();
+    match cs.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn arith_num(s: &str, env: &[(String, i64)]) -> Option<i64> {
+    if let Ok(v) = s.parse::<i64>() {
+        return Some(v);
+    }
+    env.iter().find(|(n, _)| n == s).map(|(_, v)| *v)
+}
+
+fn arith_rel(cond: &str, env: &[(String, i64)]) -> Option<bool> {
+    for op in ["<=", ">=", "==", "!=", "<", ">"] {
+        let Some(at) = cond.find(op) else {
+            continue;
+        };
+        let l = arith_num(cond[..at].trim(), env)?;
+        let r = arith_num(cond[at + op.len()..].trim(), env)?;
+        return Some(match op {
+            "<=" => l <= r,
+            ">=" => l >= r,
+            "==" => l == r,
+            "!=" => l != r,
+            "<" => l < r,
+            _ => l > r,
+        });
+    }
+    None
+}
+
+fn arith_enters(word: &str) -> Option<bool> {
+    let parts = arith_parts(word)?;
+    let init = parts.first().map(String::as_str).unwrap_or("");
+    let mut env = Vec::new();
+    if !init.trim().is_empty() {
+        for piece in init.split(',') {
+            let piece = piece.trim();
+            if piece.is_empty() {
+                continue;
+            }
+            let (n, v) = piece.split_once('=')?;
+            let n = n.trim();
+            if !arith_ident(n) {
+                return None;
+            }
+            env.push((n.to_string(), v.trim().parse::<i64>().ok()?));
+        }
+    }
+    let cond = parts.get(1).map(|s| s.trim()).unwrap_or("");
+    if cond.is_empty() {
+        return Some(true);
+    }
+    arith_rel(cond, &env)
+}
+
+fn arith_finishes(word: &str) -> bool {
+    let Some(parts) = arith_parts(word) else {
+        return false;
+    };
+    let cond = parts.get(1).map(|s| s.trim()).unwrap_or("");
+    let step = parts.get(2).map(|s| s.trim()).unwrap_or("");
+    if cond.is_empty() {
+        return false;
+    }
+    let steps =
+        step.contains("++") || step.contains("+=") || step.contains("--") || step.contains("-=");
+    let bounds = cond.contains('<') || cond.contains('>');
+    steps && bounds
+}
+
+fn prove_case(inn: &ReachIn<'_>, counts: &mut [bool], i: usize, esac: usize, mode: Reach) -> Exit {
+    let subject = case_subject(&inn.ended[i].0);
+    let arms = case_arms(inn.ended, i, esac, &inn.dsemi);
+    let mut open = true;
+    let mut took: Option<Exit> = None;
+    for (pats, lo, hi) in arms {
+        if !open {
+            continue;
+        }
+        match pats_match(&pats, &subject) {
+            Some(true) => {
+                let arm = Reach {
+                    case_at: Some(i),
+                    strip: STRIP_NONE,
+                };
+                took = Some(walk_list(inn, counts, lo, hi, true, arm));
+                // `;;` ends the arm. `;&` has no `;;`, so the next
+                // command stayed in this arm and already ran.
+                open = false;
+            }
+            Some(false) => {}
+            None => open = false,
+        }
+    }
+    let _ = mode;
+    match took {
+        Some(st) => st,
+        None if open => Exit::Success,
+        None => Exit::Unknown,
+    }
+}
+
+fn case_subject(cmd: &[String]) -> Option<String> {
+    if cmd.first().map(String::as_str) != Some("case") {
+        return None;
+    }
+    let w = cmd.get(1)?;
+    (literal_text(w) && !w.is_empty()).then(|| w.clone())
+}
+
+fn closes_pat(p: &str) -> bool {
+    p == ")"
+        || (p.ends_with(')') && p.matches(')').count() > p.matches('(').count())
+        || (p.starts_with('(') && !p.starts_with("((") && p.ends_with(')'))
+}
+
+fn pattern_text(w: &str) -> String {
+    let bare = if w.starts_with('(') && !w.starts_with("((") && w.ends_with(')') && w.len() >= 2 {
+        &w[1..w.len() - 1]
+    } else {
+        w
+    };
+    bare.strip_suffix(')').unwrap_or(bare).to_string()
+}
+
+fn pat_words(words: &[String], pats: &mut Vec<String>) -> bool {
+    let mut closed = false;
+    for w in words {
+        if closed {
+            break;
+        }
+        if w == "|" {
+            continue;
+        }
+        if closes_pat(w) {
+            let pat = pattern_text(w);
+            if !pat.is_empty() {
+                pats.push(pat);
+            }
+            closed = true;
+        } else {
+            pats.push(w.clone());
+        }
+    }
+    closed
+}
+
+fn arm_hi(lo: usize, esac: usize, dsemi: &[bool]) -> usize {
+    let mut hi = lo + 1;
+    while hi < esac && !dsemi.get(hi - 1).copied().unwrap_or(false) {
+        hi += 1;
+    }
+    hi.min(esac)
+}
+
+fn case_arms(
+    ended: &[(Vec<String>, String)],
+    i: usize,
+    esac: usize,
+    dsemi: &[bool],
+) -> Vec<(Vec<String>, usize, usize)> {
+    let mut arms = Vec::new();
+    let mut pats = Vec::new();
+    let mut idx = i;
+    let mut in_pats = false;
+    while idx < esac {
+        let cmd = &ended[idx].0;
+        let start = if !in_pats {
+            match cmd.iter().position(|w| w == "in") {
+                Some(p) => {
+                    in_pats = true;
+                    p + 1
+                }
+                None => {
+                    idx += 1;
+                    continue;
+                }
+            }
+        } else {
+            0
+        };
+        if pat_words(&cmd[start..], &mut pats) {
+            let hi = arm_hi(idx, esac, dsemi);
+            arms.push((std::mem::take(&mut pats), idx, hi));
+            idx = hi;
+        } else {
+            idx += 1;
+        }
+    }
+    arms
+}
+
+fn pats_match(pats: &[String], subject: &Option<String>) -> Option<bool> {
+    if pats.is_empty() {
+        return Some(false);
+    }
+    let mut unknown = false;
+    for p in pats {
+        if p.chars().all(|c| c == '*') && p.contains('*') {
+            return Some(true);
+        }
+        match subject {
+            Some(s) if glob_eq(p, s) => return Some(true),
+            Some(_) => {}
+            None => unknown = true,
+        }
+    }
+    if unknown {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+fn glob_eq(pat: &str, text: &str) -> bool {
+    glob_bytes(pat.as_bytes(), text.as_bytes())
+}
+
+fn class_len(p: &[u8]) -> Option<usize> {
+    if p.first() != Some(&b'[') {
+        return None;
+    }
+    let mut i = 1;
+    if p.get(i) == Some(&b'!') || p.get(i) == Some(&b'^') {
+        i += 1;
+    }
+    if p.get(i) == Some(&b']') {
+        i += 1;
+    }
+    while i < p.len() && p[i] != b']' {
+        i += 1;
+    }
+    (i < p.len()).then_some(i + 1)
+}
+
+fn class_has(spec: &[u8], ch: u8) -> bool {
+    let Some(n) = class_len(spec) else {
+        return false;
+    };
+    let mut inner = &spec[1..n - 1];
+    let neg = matches!(inner.first(), Some(b'!') | Some(b'^'));
+    if neg {
+        inner = &inner[1..];
+    }
+    let mut ok = false;
+    let mut i = 0;
+    while i < inner.len() {
+        if i + 2 < inner.len() && inner[i + 1] == b'-' {
+            if ch >= inner[i] && ch <= inner[i + 2] {
+                ok = true;
+                break;
+            }
+            i += 3;
+        } else {
+            if inner[i] == ch {
+                ok = true;
+                break;
+            }
+            i += 1;
+        }
+    }
+    if neg {
+        !ok
+    } else {
+        ok
+    }
+}
+
+fn glob_bytes(p: &[u8], t: &[u8]) -> bool {
+    let (mut pi, mut ti) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            star = Some((pi + 1, ti));
+            pi += 1;
+            continue;
+        }
+        if pi < p.len() && p[pi] == b'[' {
+            if let Some(n) = class_len(&p[pi..]) {
+                if class_has(&p[pi..pi + n], t[ti]) {
+                    pi += n;
+                    ti += 1;
+                    continue;
+                }
+            }
+        } else if pi < p.len() && (p[pi] == b'?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+            continue;
+        }
+        if let Some((sp, st)) = star {
+            let st = st + 1;
+            star = Some((sp, st));
+            pi = sp;
+            ti = st;
+            continue;
+        }
+        return false;
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 struct ReadHit {
@@ -8065,10 +8902,16 @@ fn read_fields(line: &str, nvars: usize, ifs: &str) -> Vec<String> {
     fields
 }
 
-fn read_hits(ended: &[(Vec<String>, String)]) -> Vec<ReadHit> {
+fn read_hits(argv: &[String], ended: &[(Vec<String>, String)]) -> Vec<ReadHit> {
     let shells = command_shells(ended);
+    let runs = commands_reached(argv, ended);
     let mut out = Vec::new();
     for (i, (cmd, _)) in ended.iter().enumerate() {
+        // A branch that never runs, or that this walk cannot prove,
+        // does not assign. The name keeps the earlier value.
+        if runs.get(i) != Some(&true) {
+            continue;
+        }
         let Some(tail) = read_command(cmd) else {
             continue;
         };
@@ -8107,7 +8950,7 @@ fn read_hits(ended: &[(Vec<String>, String)]) -> Vec<ReadHit> {
 fn shown_temp_reads(argv: &[String]) -> (Vec<String>, Vec<String>) {
     let ended = ended_owned(argv);
     let shells = command_shells(&ended);
-    let hits = read_hits(&ended);
+    let hits = read_hits(argv, &ended);
     let mut good = Vec::new();
     let mut bad = Vec::new();
     let mut uncovered = false;
@@ -8236,7 +9079,7 @@ fn split_unquoted(value: &str, ifs: &str) -> Vec<String> {
 fn read_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Option<Checked> {
     let ended = ended_owned(argv);
     let shells = command_shells(&ended);
-    let fed = read_hits(&ended);
+    let fed = read_hits(argv, &ended);
     if fed.is_empty() {
         return None;
     }
@@ -12656,12 +13499,24 @@ struct Scratch {
 
 impl Scratch {
     fn observe(&mut self, argv: &[String]) {
-        for cmd in commands(argv) {
+        let ended = ended_owned(argv);
+        let runs = commands_reached(argv, &ended);
+        for (i, cmd) in commands(argv).into_iter().enumerate() {
             for w in &cmd {
                 self.observe_word(w);
             }
             if command_sets_ifs(&cmd) {
                 self.ifs_assigned = true;
+            }
+            // A `read` poisons the name because stdin is not an assignment.
+            // One that does not run leaves the value already stored.
+            let dead = runs.get(i) == Some(&false);
+            let read = matches!(
+                command_parts(&cmd).1.as_str(),
+                "read" | "mapfile" | "readarray"
+            );
+            if dead && read {
+                continue;
             }
             for name in opaque_bound(&cmd) {
                 self.poison(&name);
@@ -18555,7 +19410,7 @@ hash -r 2> /dev/null
         );
         assert_eq!(
             v("x=/; case z in a) read x <<< /tmp/a ;; esac; rm -rf \"$x\""),
-            "allow"
+            "deny\trm-rf-outside-tmp"
         );
         assert_eq!(
             v("x=/; ( printf '/tmp/a\\n' | read x ); rm -rf \"$x\""),
@@ -21173,6 +22028,62 @@ make -C safe test
             "eval enable_$x=no \\; cd evil; make clean-all",
         ] {
             assert_eq!(evil_and_safe("evalbuilt", line), Decision::Deny, "{line}");
+        }
+    }
+
+    /// A `read` on a branch that does not run, or that is not proven to,
+    /// leaves the value this shell already holds. A matching arm, a true
+    /// `if`, and a loop that enters still assign.
+    #[test]
+    fn a_read_on_an_unproven_branch_keeps_the_earlier_value() {
+        let v = |s: &str| verdict(&shell_words(s));
+        let both = |line: &str, want: &str| {
+            assert_eq!(v(line), want, "{line}");
+            let bash = vec!["bash".into(), "-c".into(), line.to_string()];
+            assert_eq!(verdict(&bash), want, "bash -c {line}");
+        };
+        for line in [
+            "x=/; case z in a) read x <<< /tmp/a ;; esac; rm -rf \"$x\"",
+            "x=/; if false; then read x <<< /tmp/a; fi; rm -rf \"$x\"",
+            "x=/; false && read x <<< /tmp/a; rm -rf \"$x\"",
+            "x=/; true || read x <<< /tmp/a; rm -rf \"$x\"",
+            "x=/; while false; do read x <<< /tmp/a; done; rm -rf \"$x\"",
+            "x=/; until true; do read x <<< /tmp/a; done; rm -rf \"$x\"",
+            "x=/; for ((i=0;i<0;i++)); do read x <<< /tmp/a; done; rm -rf \"$x\"",
+            "x=/; for n in; do read x <<< /tmp/a; done; rm -rf \"$x\"",
+            "x=/; select n in a; do read x <<< /tmp/a; done </dev/null; rm -rf \"$x\"",
+            "x=/; if maybe; then read x <<< /tmp/a; fi; rm -rf \"$x\"",
+            "x=/; ! true && read x <<< /tmp/a; rm -rf \"$x\"",
+            "x=/; case z in z) false && read x <<< /tmp/a ;; esac; rm -rf \"$x\"",
+        ] {
+            both(line, "deny\trm-rf-outside-tmp");
+        }
+        for line in [
+            "x=/; case z in z) read x <<< /tmp/a ;; esac; rm -rf \"$x\"",
+            "x=/; case z in a) read x <<< / ;; z) read x <<< /tmp/a ;; esac; rm -rf \"$x\"",
+            "x=/; case z in *) read x <<< /tmp/a ;; esac; rm -rf \"$x\"",
+            "x=/; if true; then read x <<< /tmp/a; fi; rm -rf \"$x\"",
+            "x=/; if false; then read x <<< /; else read x <<< /tmp/a; fi; rm -rf \"$x\"",
+            "x=/; if true; then read x <<< /tmp/a; else read x <<< /; fi; rm -rf \"$x\"",
+            "x=/; if false; then :; elif true; then read x <<< /tmp/a; fi; rm -rf \"$x\"",
+            "x=/; true && read x <<< /tmp/a; rm -rf \"$x\"",
+            "x=/; false || read x <<< /tmp/a; rm -rf \"$x\"",
+            "x=/; true || false && read x <<< /tmp/a; rm -rf \"$x\"",
+            "x=/; ! false && read x <<< /tmp/a; rm -rf \"$x\"",
+            "x=/; while true; do read x <<< /tmp/a; break; done; rm -rf \"$x\"",
+            "x=/; until false; do read x <<< /tmp/a; break; done; rm -rf \"$x\"",
+            "x=/; for n in a; do read x <<< /tmp/a; done; rm -rf \"$x\"",
+            "x=/; for n in \"\"; do read x <<< /tmp/a; done; rm -rf \"$x\"",
+            "x=/; for ((i=0;i<1;i++)); do read x <<< /tmp/a; done; rm -rf \"$x\"",
+            "x=/tmp/a; if false; then read x <<< /; fi; rm -rf \"$x\"",
+            "x=/tmp/a; if maybe; then read x <<< /; fi; rm -rf \"$x\"",
+            "x=/tmp/a; if true; then :; else read x <<< /; fi; rm -rf \"$x\"",
+            "x=/tmp/a; while false; do read x <<< /; done; rm -rf \"$x\"",
+            "x=/tmp/a; for n in; do read x <<< /; done; rm -rf \"$x\"",
+            "x=/tmp/a; for ((i=0;i<0;i++)); do read x <<< /; done; rm -rf \"$x\"",
+            "x=/tmp/a; select n in a; do read x <<< /; done </dev/null; rm -rf \"$x\"",
+        ] {
+            both(line, "allow");
         }
     }
 }
