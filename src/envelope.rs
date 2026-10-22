@@ -1060,8 +1060,15 @@ fn normalize_mailbox(mailbox: &Mailbox) -> Option<NormAddr> {
     })
 }
 
+/// Ignorables come off before NFKC as well, which turns U+2000 to
+/// U+200A into a plain space.
 fn normalize_local(raw: &str) -> Option<String> {
-    let folded: String = raw.nfkc().filter(|c| !is_ignorable(*c)).collect();
+    let folded: String = raw
+        .chars()
+        .filter(|c| !is_ignorable(*c))
+        .nfkc()
+        .filter(|c| !is_ignorable(*c))
+        .collect();
     if folded.chars().any(|c| c.is_control()) {
         return None;
     }
@@ -1245,7 +1252,8 @@ fn is_cyrillic_letter(c: char) -> bool {
         )
 }
 
-/// Characters a reader skips. A deny-file comparison removes them so
+/// Characters a reader skips: default ignorables, fillers, the braille
+/// blank and the typographic spaces. A deny-file comparison removes them so
 /// they cannot hide an address. `From` does not: a mailbox these
 /// change is a different address on the wire and is refused.
 fn is_ignorable(c: char) -> bool {
@@ -1260,11 +1268,13 @@ fn is_ignorable(c: char) -> bool {
             | '\u{17B4}'
             | '\u{17B5}'
             | '\u{180B}'..='\u{180D}'
-            | '\u{200B}'..='\u{200F}'
+            | '\u{2000}'..='\u{200F}'
             | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206F}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{2800}'
+            | '\u{3164}'
             | '\u{FEFF}'
+            | '\u{FFA0}'
             | '\u{FFF9}'..='\u{FFFB}'
             | '\u{1BCA0}'..='\u{1BCA3}'
             | '\u{1D173}'..='\u{1D17A}'
@@ -2966,6 +2976,40 @@ pair left right
         let deny = "address other@example.test\n";
         let raw = plain("Reply-To: oth\u{200B}er@example.test\r\n");
         assert_eq!(codes(&raw, deny, ""), vec!["reply-to-denied"]);
+    }
+
+    /// Blank and default-ignorable code points, including the spaces
+    /// NFKC turns into U+0020 inside a quoted local part.
+    #[test]
+    fn a_blank_character_does_not_hide_a_denied_address() {
+        let deny = "address other@example.test\n";
+        for blank in [
+            '\u{2800}',
+            '\u{115F}',
+            '\u{1160}',
+            '\u{3164}',
+            '\u{FFA0}',
+            '\u{2000}',
+            '\u{2003}',
+            '\u{200A}',
+            '\u{2065}',
+            '\u{FEFF}',
+            '\u{E0001}',
+            '\u{E0FFF}',
+        ] {
+            let to = if blank.is_whitespace() {
+                format!("\"oth{blank}er\"@example.test")
+            } else {
+                format!("oth{blank}er@example.test")
+            };
+            let raw = plain(&format!("To: {to}\r\n"));
+            assert_eq!(
+                codes(&raw, deny, ""),
+                vec!["recipient-address-denied"],
+                "U+{:04X}",
+                u32::from(blank)
+            );
+        }
     }
 
     #[test]
