@@ -86,14 +86,15 @@ target and the line: :literal:`make clean-all runs \`rm -rf ~\`: rm-rf-outside-t
 Nothing is spawned. A missing or unreadable file leaves the line
 judged as written. A ``cd`` or ``pushd`` to a path the line does not show
 (``cd "$X"``) leaves it in a directory it does not follow, so a runner
-after it is refused. So does an ``eval``, ``source`` or ``.``, whose script
-is not followed, unless it sources a file named with a ``/`` that the
-line can read in each directory it may be in and that moves nothing
-the line follows (a virtualenv's ``activate``), and a command word the line does not show (``$c dir``),
-which may be ``cd``, as may an alias whose body the line does not show,
-and a ``trap`` whose action is one of those or a
-``cd``, ``pushd`` or ``popd``, since a ``DEBUG`` trap runs before each
-command; after one ``HOME``, ``CDPATH`` and ``PWD`` are not followed either.
+after it is refused. So does an ``eval``, a ``source`` or ``.`` whose file
+the guard cannot read or whose text may move the shell or set one of
+those, a command word the line does not show (``$c dir``), which may be
+``cd``, as may an alias whose body the line does not show, and a ``trap``
+whose action is one of those or a ``cd``, ``pushd`` or ``popd``, since a
+``DEBUG`` trap runs before each command; after one ``HOME``, ``CDPATH`` and
+``PWD`` are not followed either. A ``source`` or ``.`` of a literal path to
+a regular file the guard can read, whose text does none of that, leaves
+the line where it was.
 Raw newlines and carriage returns split script commands, and ``$'...'``
 ANSI-C quoted words are decoded before the line is judged.
 

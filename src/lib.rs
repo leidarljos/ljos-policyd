@@ -218,11 +218,15 @@ fn runner_commands(
     let mut after = ";";
     let mut ran_in = Vec::new();
     // `$PWD` follows the line's directory unless the line sets it.
-    let pwd_set = writes_pwd(argv);
+    let pwd_set = writes_pwd(argv, cwd);
     // With `shopt -s lastpipe` anywhere on the line, or a `BASHOPTS` the
     // shell running it started with, the last stage of a pipeline may
     // run in this shell.
     let lastpipe = vars.lastpipe || commands(argv).iter().any(|c| may_set_lastpipe(c));
+    // Functions a sourced file defined whose bodies may move this shell.
+    // A later call of one leaves the line untracked; a definition the
+    // line never calls does not.
+    let mut risky: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (cmd, end) in ended_commands(argv) {
         if after == "&" {
             (here, old, pushed, vars) = list.clone();
@@ -302,12 +306,29 @@ fn runner_commands(
         }
         let words = peel_cd_command_word(&shown);
         let b = words.first().map_or("", |w| base_of(w));
-        if unseen(&cmd) && !sources_inert(&shown, &at) && (!piped || lastpipe && end != "|") {
-            here = vec![UNTRACKED.into()];
-            old = vec![UNTRACKED.into()];
-            pushed.clear();
-            vars.cdpath = Some("$".into());
-            vars.home = Some("$".into());
+        // A pipeline stage runs in a subshell, so it cannot move this
+        // shell. The last stage can, once `lastpipe` is on.
+        let in_shell = !piped || (lastpipe && end != "|");
+        if in_shell {
+            let dir = match here.as_slice() {
+                [d] if !is_untracked(d) => Some(d.as_path()),
+                _ => None,
+            };
+            let loses = match sourced(&cmd, dir) {
+                Sourced::Keeps(names) => {
+                    risky.extend(names);
+                    false
+                }
+                Sourced::Loses => true,
+                Sourced::No => bare_unseen(&cmd) || calls_risky(&cmd, &risky),
+            };
+            if loses {
+                here = vec![UNTRACKED.into()];
+                old = vec![UNTRACKED.into()];
+                pushed.clear();
+                vars.cdpath = Some("$".into());
+                vars.home = Some("$".into());
+            }
         }
         if piped && matches!(b, "cd" | "pushd" | "popd" | "dirs") {
             // A last stage that may run here leaves where the line is,
@@ -559,21 +580,52 @@ impl Vars {
 }
 
 /// Whether a command on the line may write `PWD` in the shell that runs
-/// it, by the rules [`set_vars`] follows for `HOME`.
-fn writes_pwd(argv: &[String]) -> bool {
-    commands(argv).iter().any(|cmd| {
-        if unseen(cmd) {
+/// it, by the rules [`set_vars`] follows for `HOME`. A `source` or `.`
+/// of a literal path writes it when the file cannot be read from `cwd`,
+/// or when a `cd` before a relative path may have put that file
+/// somewhere else: the text this does not read may set `PWD`.
+fn writes_pwd(argv: &[String], cwd: &std::path::Path) -> bool {
+    let mut moved = false;
+    for cmd in commands(argv) {
+        if let Some(path) = literal_source_path(&cmd) {
+            if !sourced_keeps(&path, cwd, moved) {
+                return true;
+            }
+        } else if bare_unseen(&cmd) {
             return true;
+        } else {
+            let mut probe = Vars {
+                cdpath: None,
+                home: None,
+                pwd: Some(UNTRACKED.into()),
+                lastpipe: false,
+            };
+            set_vars(&cmd, &mut probe);
+            if probe.pwd.as_deref() != Some(UNTRACKED) {
+                return true;
+            }
         }
-        let mut probe = Vars {
-            cdpath: None,
-            home: None,
-            pwd: Some(UNTRACKED.into()),
-            lastpipe: false,
-        };
-        set_vars(cmd, &mut probe);
-        probe.pwd.as_deref() != Some(UNTRACKED)
-    })
+        if head_word(&cmd).is_some_and(|w| matches!(base_of(&w), "cd" | "pushd" | "popd")) {
+            moved = true;
+        }
+    }
+    false
+}
+
+/// Whether `source` or `.` of the literal `path` leaves `PWD` as it was.
+/// A relative path after a command that may have moved the shell names a
+/// file this check cannot place, so it may set `PWD`.
+fn sourced_keeps(path: &str, cwd: &std::path::Path, moved: bool) -> bool {
+    let rel = std::path::Path::new(path);
+    if moved && !rel.is_absolute() {
+        return false;
+    }
+    let full = if rel.is_absolute() {
+        rel.to_path_buf()
+    } else {
+        cwd.join(rel)
+    };
+    read_regular_nofollow(&full).is_some_and(|t| scan_script(&t).keeps)
 }
 
 /// Whether the word `w` names the variable `name` other than to read it
@@ -591,65 +643,385 @@ fn may_set(w: &str, name: &str) -> bool {
 /// Whether the command `cmd` runs, in the shell that runs it, what the
 /// walk does not follow: `eval`, `source` or `.`, or a command word the
 /// line does not show (`$c dir`), which may be `cd`, or a `trap` whose
-/// action is one of those or moves the shell, since a DEBUG trap runs
-/// before each command. After one nothing is known of where the line is
+/// action [`trap_moves`]. After one nothing is known of where the line is
 /// or what `CDPATH`, `HOME` and `PWD` hold.
-fn unseen(cmd: &[&str]) -> bool {
-    let words = operands(cmd);
-    let front = (0..words.len())
-        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
-        .count();
-    let words = peel_cd_command_word(&words[front..]);
-    let moves = |c: &Vec<&str>| {
-        unseen(c)
-            || peel_cd_command_word(c)
-                .first()
-                .is_some_and(|w| matches!(base_of(w), "cd" | "pushd" | "popd"))
-    };
-    words
-        .first()
-        .is_some_and(|w| matches!(base_of(w), "eval" | "source" | ".") || w.contains(['$', '`']))
-        || trap_action(words).is_some_and(|a| commands(&shell_words(a)).iter().any(moves))
+/// A `source` or `.` of a literal path is not this: [`sourced`] reads the
+/// file and keeps the line when the text cannot move the shell.
+fn bare_unseen(cmd: &[&str]) -> bool {
+    head_word(cmd)
+        .is_some_and(|w| matches!(base_of(&w), "eval" | "source" | ".") || w.contains(['$', '`']))
+        || trap_moves(cmd)
 }
 
-/// Whether `cmd` sources (`source FILE`, `. FILE`) a script that, read
-/// from each of `dirs`, leaves alone what the walk follows: no command
-/// in it is [`unseen`], moves the shell, defines an alias, may turn on
-/// `lastpipe`, or writes `HOME`, `CDPATH` or `PWD`. A virtualenv's
-/// `activate` is one. FILE must hold a `/`, since bash looks a bare name
-/// up on `PATH` first.
-fn sources_inert(cmd: &[&str], dirs: &[std::path::PathBuf]) -> bool {
+/// Whether `cmd` is a `trap` whose action moves the shell or is
+/// [`bare_unseen`]. A DEBUG trap runs its action before each command.
+fn trap_moves(cmd: &[&str]) -> bool {
     let words = operands(cmd);
     let front = (0..words.len())
         .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
         .count();
-    let [w, file, ..] = peel_cd_command_word(&words[front..]) else {
-        return false;
+    trap_action(peel_cd_command_word(&words[front..])).is_some_and(|a| {
+        commands(&shell_words(a))
+            .iter()
+            .any(|c| bare_unseen(c) || moves_shell(c))
+    })
+}
+
+/// What [`sourced`] found for a `source` or `.`.
+enum Sourced {
+    /// The command is not a `source` or `.` of a literal path.
+    No,
+    /// The file can be read and its text leaves the shell where it was.
+    /// The set is the functions it defines whose bodies may not.
+    Keeps(std::collections::HashSet<String>),
+    /// The file cannot be read, or its text may move the shell or set
+    /// `HOME`, `CDPATH` or `PWD`.
+    Loses,
+}
+
+/// `source FILE` or `. FILE` when `FILE` is a literal path. The file is
+/// read from the one directory the line is in. Several directories, a
+/// path the line does not show, or a file that is not a regular file the
+/// guard can open, lose the line.
+fn sourced(cmd: &[&str], cwd: Option<&std::path::Path>) -> Sourced {
+    let Some(path) = literal_source_path(cmd) else {
+        return Sourced::No;
     };
-    if !matches!(base_of(w), "source" | ".") || !file.contains('/') || file.contains(['$', '`']) {
+    let Some(cwd) = cwd.filter(|d| !is_untracked(d)) else {
+        return Sourced::Loses;
+    };
+    let Some(text) = read_regular_nofollow(&cwd.join(path)) else {
+        return Sourced::Loses;
+    };
+    let scan = scan_script(&text);
+    if scan.keeps {
+        Sourced::Keeps(scan.risky)
+    } else {
+        Sourced::Loses
+    }
+}
+
+/// Whether `cmd` calls a function in `risky`. `command` and `builtin`
+/// skip a function and run the program.
+fn calls_risky(cmd: &[&str], risky: &std::collections::HashSet<String>) -> bool {
+    if risky.is_empty() {
         return false;
     }
-    let inert = |c: &Vec<&str>| {
-        let mut probe = Vars {
-            cdpath: Some(UNTRACKED.into()),
-            home: Some(UNTRACKED.into()),
-            pwd: Some(UNTRACKED.into()),
-            lastpipe: false,
-        };
-        set_vars(c, &mut probe);
-        let first = peel_cd_command_word(c).first().map(|w| base_of(w));
-        !unseen(c)
-            && !(matches!(first, Some("shopt" | "set" | "eval")) && may_set_lastpipe(c))
-            && !matches!(first, Some("cd" | "pushd" | "popd" | "alias"))
-            && [probe.cdpath, probe.home, probe.pwd]
-                .iter()
-                .all(|v| v.as_deref() == Some(UNTRACKED))
-            && !probe.lastpipe
+    let words = operands(cmd);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    let rest = &words[front..];
+    if rest
+        .first()
+        .is_some_and(|w| matches!(base_of(w), "command" | "builtin"))
+    {
+        return false;
+    }
+    peel_cd_command_word(rest)
+        .first()
+        .is_some_and(|w| risky.contains(base_of(w)))
+}
+
+/// The command word of `cmd`, past assignments, redirections and the
+/// keywords that run the command in this shell.
+fn head_word(cmd: &[&str]) -> Option<String> {
+    let words = operands(cmd);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    peel_cd_command_word(&words[front..])
+        .first()
+        .map(|w| (*w).to_string())
+}
+
+/// The operand of `source` or `.` when it is a literal path: no `$`,
+/// glob or backquote. `None` when the command is not one, or the path is
+/// not shown (`source $X`, `source *.sh`).
+fn literal_source_path(cmd: &[&str]) -> Option<String> {
+    let words = operands(cmd);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    let rest = peel_cd_command_word(&words[front..]);
+    let (w, args) = rest.split_first()?;
+    if !matches!(base_of(w), "source" | ".") {
+        return None;
+    }
+    let file = *args.first()?;
+    (!file.is_empty() && !file.contains(['$', '`', '*', '?', '['])).then(|| file.to_string())
+}
+
+/// How large a sourced file is read. Past this the line is untracked.
+const SOURCE_MAX: u64 = 64 * 1024;
+
+/// The text of the regular file at `path`, opened with `O_NOFOLLOW` so a
+/// symlink is not the file, and `O_NONBLOCK` so a fifo cannot stall the
+/// check. `None` when it cannot be read, is not a regular file, is larger
+/// than [`SOURCE_MAX`], or is not UTF-8.
+fn read_regular_nofollow(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.file_type().is_file() || meta.len() > SOURCE_MAX {
+        return None;
+    }
+    let mut buf = Vec::new();
+    file.take(SOURCE_MAX + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > SOURCE_MAX {
+        return None;
+    }
+    String::from_utf8(buf).ok()
+}
+
+/// Whether the script `text` leaves the shell where it was, and which of
+/// its functions may not, when called.
+struct ScriptScan {
+    keeps: bool,
+    risky: std::collections::HashSet<String>,
+}
+
+fn scan_script(text: &str) -> ScriptScan {
+    let words = shell_words(text);
+    let mut funcs = std::collections::HashMap::new();
+    let top = split_functions(&words, &mut funcs);
+    let mut memo = std::collections::HashMap::new();
+    let mut stack = std::collections::HashSet::new();
+    let keeps = body_keeps(&top, &funcs, &mut memo, &mut stack);
+    stack.clear();
+    let risky = funcs
+        .keys()
+        .filter(|name| function_risks(name, &funcs, &mut memo, &mut stack))
+        .cloned()
+        .collect();
+    ScriptScan { keeps, risky }
+}
+
+/// Words of `words` with function bodies taken out into `funcs`. A body
+/// in parentheses runs in a subshell, so it is stored empty.
+fn split_functions(
+    words: &[String],
+    funcs: &mut std::collections::HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    let mut top = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        if let Some((name, body, next)) = function_at(words, i) {
+            let body = split_functions(&body, funcs);
+            funcs.insert(name, body);
+            i = next;
+            continue;
+        }
+        top.push(words[i].clone());
+        i += 1;
+    }
+    top
+}
+
+fn is_name(w: &str) -> bool {
+    let mut chars = w.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// A function at `words[i]`: `(name, body, index after the definition)`.
+/// `name () { ... }`, `name() { ... }` and `function name { ... }`.
+fn function_at(words: &[String], i: usize) -> Option<(String, Vec<String>, usize)> {
+    let w0 = words.get(i)?.as_str();
+    let (raw, mut k, keyword) = if w0 == "function" {
+        (words.get(i + 1)?.as_str(), i + 2, true)
+    } else {
+        (w0, i + 1, false)
     };
-    dirs.iter().all(|d| {
-        !is_untracked(d)
-            && std::fs::read_to_string(d.join(file))
-                .is_ok_and(|body| commands(&shell_words(&body)).iter().all(inert))
+    let mut opened = false;
+    let name = if let Some(name) = raw.strip_suffix("(){") {
+        opened = true;
+        name
+    } else {
+        raw.strip_suffix("()").unwrap_or(raw)
+    };
+    if !is_name(name) {
+        return None;
+    }
+    let mut paren = raw.ends_with("()") || raw.ends_with("(){");
+    if words.get(k).is_some_and(|w| w == "()") {
+        paren = true;
+        k += 1;
+    }
+    if !keyword && !paren {
+        return None;
+    }
+    if !opened {
+        let opener = words.get(k)?.as_str();
+        if opener.starts_with('(') && !opener.starts_with("((") {
+            return Some((name.to_string(), Vec::new(), k + 1));
+        }
+        if opener != "{" {
+            return None;
+        }
+        k += 1;
+    }
+    let mut depth = 1usize;
+    for (n, w) in words.iter().enumerate().skip(k) {
+        if w == "{" {
+            depth += 1;
+        } else if w == "}" {
+            depth -= 1;
+            if depth == 0 {
+                return Some((name.to_string(), words[k..n].to_vec(), n + 1));
+            }
+        }
+    }
+    None
+}
+
+fn function_risks(
+    name: &str,
+    funcs: &std::collections::HashMap<String, Vec<String>>,
+    memo: &mut std::collections::HashMap<String, bool>,
+    stack: &mut std::collections::HashSet<String>,
+) -> bool {
+    if let Some(v) = memo.get(name) {
+        return *v;
+    }
+    if !stack.insert(name.to_string()) {
+        return false;
+    }
+    let risk = funcs
+        .get(name)
+        .is_some_and(|body| !body_keeps(body, funcs, memo, stack));
+    stack.remove(name);
+    memo.insert(name.to_string(), risk);
+    risk
+}
+
+fn body_keeps(
+    words: &[String],
+    funcs: &std::collections::HashMap<String, Vec<String>>,
+    memo: &mut std::collections::HashMap<String, bool>,
+    stack: &mut std::collections::HashSet<String>,
+) -> bool {
+    ended_commands(words)
+        .iter()
+        .all(|(cmd, _)| command_keeps(cmd, funcs, memo, stack))
+}
+
+/// Whether `cmd`, run in this shell, leaves the directory, the stack,
+/// `HOME`, `CDPATH`, `PWD` and `lastpipe` as they were. A subshell does,
+/// and so does a command substitution whose stdout is redirected, because
+/// it injects no command (`$(command -v cygpath &> /dev/null)`).
+fn command_keeps(
+    cmd: &[&str],
+    funcs: &std::collections::HashMap<String, Vec<String>>,
+    memo: &mut std::collections::HashMap<String, bool>,
+    stack: &mut std::collections::HashSet<String>,
+) -> bool {
+    if writes_tracked(cmd) || moves_shell(cmd) || trap_moves(cmd) {
+        return false;
+    }
+    let Some(owned) = head_word(cmd) else {
+        return true;
+    };
+    let w = owned.as_str();
+    if is_plain_subshell(w) || injects_no_command(w) {
+        return true;
+    }
+    // `[` is the test builtin. Its name is the glob character
+    // [`may_set_lastpipe`] treats as a word the line does not show. An
+    // alias it defines may run anything as a later command word.
+    if (w != "[" && w != "[[" && may_set_lastpipe(cmd))
+        || matches!(base_of(w), "eval" | "source" | ".")
+        || w.contains(['$', '`'])
+        || (base_of(w) == "alias" && cmd.iter().any(|a| a.contains('=')))
+    {
+        return false;
+    }
+    let name = base_of(w);
+    !funcs.contains_key(name) || !function_risks(name, funcs, memo, stack)
+}
+
+fn moves_shell(cmd: &[&str]) -> bool {
+    head_word(cmd).is_some_and(|w| matches!(base_of(&w), "cd" | "pushd" | "popd" | "dirs"))
+}
+
+/// Whether `cmd` writes `HOME`, `CDPATH` or `PWD` in this shell, or a
+/// `BASHOPTS` that may turn on `lastpipe` in a shell it starts.
+fn writes_tracked(cmd: &[&str]) -> bool {
+    let mark = "\0";
+    let mut vars = Vars {
+        cdpath: Some(mark.into()),
+        home: Some(mark.into()),
+        pwd: Some(mark.into()),
+        lastpipe: false,
+    };
+    set_vars(cmd, &mut vars);
+    vars.cdpath.as_deref() != Some(mark)
+        || vars.home.as_deref() != Some(mark)
+        || vars.pwd.as_deref() != Some(mark)
+        || vars.lastpipe
+}
+
+fn is_plain_subshell(w: &str) -> bool {
+    w.starts_with('(') && w.ends_with(')') && !w.starts_with("((")
+}
+
+/// Whether `w` is a command substitution or backticks whose stdout is
+/// discarded, so the word it would run in this shell is empty.
+fn injects_no_command(w: &str) -> bool {
+    let body = if let Some(body) = w.strip_prefix("$(").and_then(|s| s.strip_suffix(')')) {
+        if w.starts_with("$((") {
+            return false;
+        }
+        body
+    } else if let Some(body) = w.strip_prefix('`').and_then(|s| s.strip_suffix('`')) {
+        body
+    } else {
+        return false;
+    };
+    let words = shell_words(body);
+    ended_commands(&words)
+        .iter()
+        .all(|(cmd, _)| discards_stdout(cmd))
+}
+
+/// Whether `cmd` redirects its own stdout, so a substitution around it
+/// captures nothing.
+fn discards_stdout(cmd: &[&str]) -> bool {
+    cmd.iter().any(|w| {
+        if !is_redirection(w) {
+            return false;
+        }
+        let fd_len = w.chars().take_while(|c| c.is_ascii_digit()).count();
+        let fd = if fd_len == 0 {
+            None
+        } else {
+            w[..fd_len].parse::<u32>().ok()
+        };
+        let op = &w[fd_len..];
+        if op.starts_with("&>") {
+            return true;
+        }
+        if fd.is_none() {
+            if let Some(target) = op.strip_prefix(">&") {
+                return !target.is_empty() && target != "1";
+            }
+        }
+        if fd.unwrap_or(1) != 1 || !op.starts_with('>') {
+            return false;
+        }
+        match op.strip_prefix(">&") {
+            Some("" | "1") => false,
+            Some(_) => true,
+            None => true,
+        }
     })
 }
 
@@ -5623,6 +5995,97 @@ mod tests {
             let c = entering("unseen", &files, line);
             assert_eq!(c.decision, Decision::Deny, "{line}");
         }
+    }
+
+    /// `source` and `.` of a regular file the guard can read keep the
+    /// directory when the file does not move the shell or set `HOME`,
+    /// `CDPATH` or `PWD`. A function the line does not call is not that
+    /// file's text. `eval`, a symlink, a missing path and a word the line
+    /// does not show still lose the directory.
+    #[test]
+    fn a_sourced_file_keeps_the_line_when_its_text_does() {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-srcread", std::process::id()));
+        std::fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        std::fs::create_dir_all(root.join("virtualenv/bin")).unwrap();
+        std::fs::create_dir_all(root.join("evil")).unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("Makefile"), MAKEFILE).unwrap();
+        std::fs::write(root.join("evil/Makefile"), MAKEFILE).unwrap();
+        std::fs::write(
+            root.join(".venv/bin/activate"),
+            include_str!("../tests/fixtures/pyvenv-activate.sh"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("virtualenv/bin/activate"),
+            include_str!("../tests/fixtures/virtualenv-activate.sh"),
+        )
+        .unwrap();
+        std::fs::write(root.join("env.sh"), "export PATH=\"$PATH\"\n").unwrap();
+        std::fs::write(
+            root.join("conda.sh"),
+            "cd \"$CONDA_PREFIX\"\nexport PATH=\"$CONDA_PREFIX/bin:$PATH\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("home.sh"), "HOME=/not/the/home\n").unwrap();
+        std::fs::write(root.join("shopt.sh"), "shopt -s lastpipe\n").unwrap();
+        std::fs::write(root.join("hidden.sh"), "$c true\n").unwrap();
+        std::fs::write(root.join("evals.sh"), "eval true\n").unwrap();
+        std::fs::write(root.join("funcs.sh"), "evil () {\n    cd \"$GONE\"\n}\n").unwrap();
+        std::fs::write(
+            root.join("calls.sh"),
+            "evil () {\n    cd \"$GONE\"\n}\nevil\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("env.sh", root.join("link.sh")).unwrap();
+        let check = |dir: &std::path::Path, line: &str| check_shell_in(&shell_words(line), dir, 0);
+        for line in [
+            "source .venv/bin/activate && make test",
+            ". .venv/bin/activate && make test",
+            "builtin source .venv/bin/activate && make test",
+            "source virtualenv/bin/activate && make test",
+            ". ./virtualenv/bin/activate && make test",
+            ". ./env.sh && make test",
+            ". ./env.sh && cargo test",
+            "source funcs.sh && make test",
+        ] {
+            let c = check(&root, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        let c = check(&root, "source .venv/bin/activate && make clean-all");
+        assert_eq!(c.decision, Decision::Deny);
+        assert!(
+            c.token.starts_with("make clean-all runs `rm -rf "),
+            "{}",
+            c.token
+        );
+        assert!(c.token.ends_with(": rm-rf-outside-tmp"), "{}", c.token);
+        for line in [
+            "source conda.sh && make test",
+            "source home.sh && make test",
+            "source shopt.sh && make test",
+            "source hidden.sh && make test",
+            "source evals.sh && make test",
+            "source link.sh && make test",
+            "source missing.sh && make test",
+            "source $X && make test",
+            "source \"$X\" && make test",
+            "source *.sh && make test",
+            ". ./missing.sh && make test",
+            "source funcs.sh && evil && make test",
+            "source calls.sh && make test",
+        ] {
+            let c = check(&root, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+            assert_eq!(
+                c.token, "make test may run in an untracked directory",
+                "{line}: {}",
+                c.token
+            );
+        }
+        let c = check(&root.join("sub"), "eval cd ../evil; make clean-all");
+        assert_eq!(c.decision, Decision::Deny);
+        assert_eq!(c.token, "make clean-all may run in an untracked directory");
     }
 
     /// The lines an agent runs every day stay allowed beside the rules for
