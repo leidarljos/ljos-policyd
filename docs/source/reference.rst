@@ -141,8 +141,10 @@ when ``lnk`` is a symbolic link. Where that names no directory, the
 line may instead be through the link, as bash then tries the path as
 written (``cd lnk/../x`` with ``x`` only beside the link's target).
 ``cd -P``, the last of ``-L`` and ``-P`` winning, resolves the link
-first, and after a ``set -P`` or ``set -o physical`` on the line either may
-hold. ``env -C`` resolves it, as ``chdir`` does.
+first, and after a ``set -P`` or ``set -o physical`` on the line, or a
+``SHELLOPTS`` that may name ``physical`` for a bash the line starts, either
+may hold. A ``source`` or ``.`` whose file runs ``set -P`` leaves the line in
+a directory it does not follow. ``env -C`` resolves it, as ``chdir`` does.
 
 ``pushd`` and ``popd`` follow the directory stack. ``pushd -n`` stacks its
 directory without entering it, ``pushd +N`` and ``-N`` enter the entry they

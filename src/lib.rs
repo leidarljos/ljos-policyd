@@ -483,7 +483,8 @@ fn runner_commands(
 /// line does not show it. `pwd` is read only by [`writes_pwd`], to see
 /// whether a command writes `PWD`. `lastpipe` is set once a `BASHOPTS` or
 /// `SHELLOPTS` that may name `lastpipe` is set, which a bash the line
-/// starts reads at startup. `physical` says a `set -P` may have run.
+/// starts reads at startup. `physical` says a `set -P` may have run, or
+/// a `SHELLOPTS` that may name `physical` may have been set.
 #[derive(Clone)]
 struct Vars {
     cdpath: Option<String>,
@@ -529,6 +530,10 @@ impl Vars {
             && (v.contains("lastpipe") || v.contains(['$', '`', '*', '?', '[']))
         {
             self.lastpipe = true;
+        }
+        if name == "SHELLOPTS" && (v.contains("physical") || v.contains(['$', '`', '*', '?', '[']))
+        {
+            self.physical = true;
         }
         if name.contains('[') {
             self.lose_target(name);
@@ -970,8 +975,9 @@ fn moves_shell(cmd: &[&str]) -> bool {
     head_word(cmd).is_some_and(|w| matches!(base_of(&w), "cd" | "pushd" | "popd" | "dirs"))
 }
 
-/// Whether `cmd` writes `HOME`, `CDPATH` or `PWD` in this shell, or a
-/// `BASHOPTS` that may turn on `lastpipe` in a shell it starts.
+/// Whether `cmd` writes `HOME`, `CDPATH` or `PWD` in this shell, may turn
+/// on `set -P`, or sets a `BASHOPTS` that may turn on `lastpipe` in a
+/// shell it starts.
 fn writes_tracked(cmd: &[&str]) -> bool {
     let mark = "\0";
     let mut vars = Vars {
@@ -986,6 +992,7 @@ fn writes_tracked(cmd: &[&str]) -> bool {
         || vars.home.as_deref() != Some(mark)
         || vars.pwd.as_deref() != Some(mark)
         || vars.lastpipe
+        || vars.physical
 }
 
 fn is_plain_subshell(w: &str) -> bool {
