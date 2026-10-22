@@ -13,8 +13,11 @@ pub mod util_capnp;
 #[path = "schema/policy_capnp.rs"]
 pub mod policy_capnp;
 
+mod envelope;
 mod mail;
 mod scripts;
+
+pub use envelope::{check_mail_bytes, MailReason, MailVerdict, MAIL_MESSAGE_MAX};
 
 use std::borrow::Cow;
 

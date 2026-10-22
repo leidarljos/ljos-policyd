@@ -5,10 +5,6 @@
 //! check refuses from what this read; it does not decide the address by
 //! which copy of `From` a later reader might keep.
 
-// The envelope check is the caller. A test-only module is unused in the
-// library build until that call exists.
-#![allow(dead_code)]
-
 /// A header whose value is unfolded. The name is lower case.
 #[derive(Debug)]
 pub(crate) struct Header {

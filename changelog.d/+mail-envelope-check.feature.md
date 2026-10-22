@@ -1,0 +1,1 @@
+An outbound envelope is refused when From is not the configured identity, when Reply-To, Sender or Return-Path names a deny-file identity, or when a recipient domain is named by the deny file or the pack-law file. Domains are compared after NFKC and IDNA, so a fullwidth or punycode form of a denied domain is that domain. An empty result is not a grant to send.

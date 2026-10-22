@@ -1,0 +1,777 @@
+//! Outbound envelope check.
+//!
+//! The check only refuses. An empty reason list means `From` is the
+//! configured identity and neither the deny file nor the pack-law file
+//! named a header this check watches. It is not a grant to send.
+
+use std::collections::BTreeSet;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+
+use unicode_normalization::UnicodeNormalization;
+
+use crate::mail::{self, Header, HeaderFault, Mailbox, Message, MessageFault};
+
+/// A message longer than this is refused before it is parsed.
+pub const MAIL_MESSAGE_MAX: usize = 1024 * 1024;
+
+pub struct MailReason {
+    pub code: &'static str,
+    pub detail: String,
+}
+
+pub struct MailVerdict {
+    pub reasons: Vec<MailReason>,
+}
+
+impl MailVerdict {
+    pub fn refusal(code: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            reasons: vec![MailReason {
+                code,
+                detail: detail.into(),
+            }],
+        }
+    }
+
+    pub fn is_refused(&self) -> bool {
+        !self.reasons.is_empty()
+    }
+
+    /// One JSON object. `allow` means this check found nothing to refuse.
+    pub fn json(&self) -> String {
+        let verdict = if self.is_refused() { "deny" } else { "allow" };
+        let mut out = format!("{{\"verdict\":\"{verdict}\",\"reasons\":[");
+        for (i, reason) in self.reasons.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"code\":");
+            push_json_str(&mut out, reason.code);
+            out.push_str(",\"detail\":");
+            push_json_str(&mut out, &reason.detail);
+            out.push('}');
+        }
+        out.push_str("]}");
+        out
+    }
+}
+
+fn push_json_str(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+fn reason(code: &'static str, detail: impl Into<String>) -> MailReason {
+    MailReason {
+        code,
+        detail: detail.into(),
+    }
+}
+
+/// `message` is the RFC 5322 bytes. `config_path` names the identity, the
+/// deny file and the pack-law file.
+pub fn check_mail_bytes(message: &[u8], config_path: &Path) -> MailVerdict {
+    if message.len() > MAIL_MESSAGE_MAX {
+        return MailVerdict::refusal(
+            "message-too-large",
+            format!("message exceeds {MAIL_MESSAGE_MAX} bytes"),
+        );
+    }
+    let Ok(text) = std::str::from_utf8(message) else {
+        return MailVerdict::refusal("message-invalid", "message is not utf-8");
+    };
+    let config = match load_config(config_path) {
+        Ok(config) => config,
+        Err(reason) => {
+            return MailVerdict {
+                reasons: vec![reason],
+            }
+        }
+    };
+    let message = match mail::parse_message(text) {
+        Ok(message) => message,
+        Err(MessageFault::Control) => {
+            return MailVerdict::refusal("header-control", "header block");
+        }
+        Err(MessageFault::Structure) => {
+            return MailVerdict::refusal("message-invalid", "header block");
+        }
+    };
+    let mut reasons = Vec::new();
+    check_from(&message, &config.identity, &mut reasons);
+    check_identity_headers(&message, &config, &mut reasons);
+    check_recipients(&message, &config, &mut reasons);
+    MailVerdict { reasons }
+}
+
+struct NormAddr {
+    local: String,
+    domain: String,
+}
+
+impl NormAddr {
+    fn key(&self) -> String {
+        format!("{}@{}", self.local, self.domain)
+    }
+}
+
+struct Config {
+    identity: NormAddr,
+    deny_addresses: BTreeSet<String>,
+    deny_domains: BTreeSet<String>,
+    pack_domains: BTreeSet<String>,
+}
+
+fn load_config(path: &Path) -> Result<Config, MailReason> {
+    let text = read_text(path).map_err(|()| reason("config-unreadable", "config"))?;
+    let mut identity = None;
+    let mut deny_file = None;
+    let mut pack_law = None;
+    for line in text.lines() {
+        let Some((key, value)) =
+            rule_line(line).map_err(|()| reason("config-invalid", "config"))?
+        else {
+            continue;
+        };
+        let slot = match key {
+            "identity" => &mut identity,
+            "deny-file" => &mut deny_file,
+            "pack-law" => &mut pack_law,
+            _ => return Err(reason("config-invalid", "config")),
+        };
+        if slot.is_some() || value.is_empty() {
+            return Err(reason("config-invalid", "config"));
+        }
+        *slot = Some(value.to_string());
+    }
+    let (Some(identity), Some(deny_file), Some(pack_law)) = (identity, deny_file, pack_law) else {
+        return Err(reason("config-invalid", "config"));
+    };
+    let identity =
+        normalize_identity(&identity).ok_or_else(|| reason("identity-invalid", "identity"))?;
+    let (deny_addresses, deny_domains) = load_deny(&resolve(path, &deny_file))?;
+    let pack_domains = load_pack_law(&resolve(path, &pack_law))?;
+    Ok(Config {
+        identity,
+        deny_addresses,
+        deny_domains,
+        pack_domains,
+    })
+}
+
+fn normalize_identity(value: &str) -> Option<NormAddr> {
+    let list = mail::mailboxes(value).ok()?;
+    if list.len() != 1 {
+        return None;
+    }
+    normalize_mailbox(&list[0])
+}
+
+fn load_deny(path: &Path) -> Result<(BTreeSet<String>, BTreeSet<String>), MailReason> {
+    let text = read_text(path).map_err(|()| reason("deny-file-unreadable", "deny-file"))?;
+    let mut addresses = BTreeSet::new();
+    let mut domains = BTreeSet::new();
+    for line in text.lines() {
+        let Some((key, value)) =
+            rule_line(line).map_err(|()| reason("deny-file-invalid", "deny-file"))?
+        else {
+            continue;
+        };
+        match key {
+            "address" => {
+                let list =
+                    mail::mailboxes(value).map_err(|_| reason("deny-file-invalid", "deny-file"))?;
+                if list.len() != 1 {
+                    return Err(reason("deny-file-invalid", "deny-file"));
+                }
+                let addr = normalize_mailbox(&list[0])
+                    .ok_or_else(|| reason("deny-file-invalid", "deny-file"))?;
+                addresses.insert(addr.key());
+            }
+            "domain" => {
+                let domain = normalize_domain(value)
+                    .ok_or_else(|| reason("deny-file-invalid", "deny-file"))?;
+                domains.insert(domain);
+            }
+            "handle" | "term" => {
+                if value.is_empty() {
+                    return Err(reason("deny-file-invalid", "deny-file"));
+                }
+            }
+            "pair" => {
+                let mut parts = value.split_whitespace();
+                if parts.next().is_none() || parts.next().is_none() {
+                    return Err(reason("deny-file-invalid", "deny-file"));
+                }
+            }
+            _ => return Err(reason("deny-file-invalid", "deny-file")),
+        }
+    }
+    Ok((addresses, domains))
+}
+
+fn load_pack_law(path: &Path) -> Result<BTreeSet<String>, MailReason> {
+    let text = read_text(path).map_err(|()| reason("pack-law-unreadable", "pack-law"))?;
+    let mut domains = BTreeSet::new();
+    for line in text.lines() {
+        let Some((key, value)) =
+            rule_line(line).map_err(|()| reason("pack-law-invalid", "pack-law"))?
+        else {
+            continue;
+        };
+        // A line that would allow a domain is not a rule this check can
+        // apply. The file is refused so an allow cannot override a deny.
+        if key != "deny-domain" || value.is_empty() {
+            return Err(reason("pack-law-invalid", "pack-law"));
+        }
+        let domain =
+            normalize_domain(value).ok_or_else(|| reason("pack-law-invalid", "pack-law"))?;
+        domains.insert(domain);
+    }
+    Ok(domains)
+}
+
+/// `None` is a blank line or a comment. A line with no value is an error.
+fn rule_line(line: &str) -> Result<Option<(&str, &str)>, ()> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return Ok(None);
+    }
+    let mut parts = line.splitn(2, char::is_whitespace);
+    let key = parts.next().ok_or(())?;
+    let value = parts.next().unwrap_or("").trim();
+    if value.is_empty() {
+        return Err(());
+    }
+    Ok(Some((key, value)))
+}
+
+fn resolve(config: &Path, value: &str) -> PathBuf {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        config.parent().unwrap_or(Path::new(".")).join(path)
+    }
+}
+
+fn read_text(path: &Path) -> Result<String, ()> {
+    let file = File::open(path).map_err(|_| ())?;
+    let mut buf = Vec::new();
+    file.take(MAIL_MESSAGE_MAX as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|_| ())?;
+    if buf.len() > MAIL_MESSAGE_MAX || buf.contains(&0) {
+        return Err(());
+    }
+    String::from_utf8(buf).map_err(|_| ())
+}
+
+fn check_from(message: &Message, identity: &NormAddr, reasons: &mut Vec<MailReason>) {
+    let froms: Vec<&Header> = message
+        .headers
+        .iter()
+        .filter(|h| h.name == "from")
+        .collect();
+    if froms.is_empty() {
+        reasons.push(reason("from-missing", "From"));
+        return;
+    }
+    if froms.len() > 1 {
+        reasons.push(reason("duplicate-from", "From"));
+    }
+    let mut encoded = false;
+    let mut unparsed = false;
+    let mut not_identity = false;
+    for header in froms {
+        match read_mailboxes(header) {
+            Parsed::EncodedWord => encoded = true,
+            Parsed::Unparsed => unparsed = true,
+            Parsed::Mailboxes(list) => {
+                if list.len() != 1 || !same(&list[0], identity) {
+                    not_identity = true;
+                }
+            }
+        }
+    }
+    if encoded {
+        reasons.push(reason("encoded-word", "From"));
+    }
+    if unparsed {
+        reasons.push(reason("from-unparsed", "From"));
+    }
+    if not_identity {
+        reasons.push(reason("from-not-identity", "From"));
+    }
+}
+
+fn check_identity_headers(message: &Message, config: &Config, reasons: &mut Vec<MailReason>) {
+    for (name, unparsed, denied) in [
+        ("reply-to", "reply-to-unparsed", "reply-to-denied"),
+        ("sender", "sender-unparsed", "sender-denied"),
+        ("return-path", "return-path-unparsed", "return-path-denied"),
+    ] {
+        check_named(
+            message,
+            name,
+            unparsed,
+            denied,
+            &config.deny_addresses,
+            &config.deny_domains,
+            reasons,
+        );
+    }
+}
+
+fn check_named(
+    message: &Message,
+    name: &str,
+    unparsed_code: &'static str,
+    denied_code: &'static str,
+    addresses: &BTreeSet<String>,
+    domains: &BTreeSet<String>,
+    reasons: &mut Vec<MailReason>,
+) {
+    let mut encoded = false;
+    let mut unparsed = false;
+    let mut hits = Vec::new();
+    for header in message.headers.iter().filter(|h| h.name == name) {
+        match read_mailboxes(header) {
+            Parsed::EncodedWord => encoded = true,
+            Parsed::Unparsed => unparsed = true,
+            Parsed::Mailboxes(list) => {
+                for addr in list {
+                    if addresses.contains(&addr.key()) || domain_denied(&addr.domain, domains) {
+                        hits.push(addr.key());
+                    }
+                }
+            }
+        }
+    }
+    if encoded {
+        reasons.push(reason("encoded-word", name));
+    }
+    if unparsed {
+        reasons.push(reason(unparsed_code, name));
+    }
+    for hit in hits {
+        reasons.push(reason(denied_code, hit));
+    }
+}
+
+fn check_recipients(message: &Message, config: &Config, reasons: &mut Vec<MailReason>) {
+    for name in ["to", "cc", "bcc"] {
+        for header in message.headers.iter().filter(|h| h.name == name) {
+            match read_mailboxes(header) {
+                Parsed::EncodedWord => reasons.push(reason("encoded-word", name)),
+                Parsed::Unparsed => reasons.push(reason("recipient-unparsed", name)),
+                Parsed::Mailboxes(list) => {
+                    for addr in list {
+                        if domain_denied(&addr.domain, &config.deny_domains)
+                            || domain_denied(&addr.domain, &config.pack_domains)
+                        {
+                            reasons.push(reason(
+                                "recipient-domain-denied",
+                                format!("{name} {}", addr.domain),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+enum Parsed {
+    EncodedWord,
+    Unparsed,
+    Mailboxes(Vec<NormAddr>),
+}
+
+fn read_mailboxes(header: &Header) -> Parsed {
+    match &header.value {
+        Err(HeaderFault::EncodedWord) => Parsed::EncodedWord,
+        Ok(text) => match mail::mailboxes(text) {
+            Err(_) => Parsed::Unparsed,
+            Ok(list) => {
+                let mut out = Vec::with_capacity(list.len());
+                for mailbox in list {
+                    match normalize_mailbox(&mailbox) {
+                        Some(addr) => out.push(addr),
+                        None => return Parsed::Unparsed,
+                    }
+                }
+                Parsed::Mailboxes(out)
+            }
+        },
+    }
+}
+
+fn same(addr: &NormAddr, identity: &NormAddr) -> bool {
+    addr.local == identity.local && addr.domain == identity.domain
+}
+
+fn domain_denied(domain: &str, denied: &BTreeSet<String>) -> bool {
+    denied
+        .iter()
+        .any(|rule| domain == rule || domain.ends_with(&format!(".{rule}")))
+}
+
+fn normalize_mailbox(mailbox: &Mailbox) -> Option<NormAddr> {
+    let local = normalize_local(&mailbox.local)?;
+    let domain = normalize_domain(&mailbox.domain)?;
+    Some(NormAddr { local, domain })
+}
+
+fn normalize_local(raw: &str) -> Option<String> {
+    let folded: String = raw.nfkc().filter(|c| !is_ignorable(*c)).collect();
+    if folded.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let lower: String = folded.chars().flat_map(|c| c.to_lowercase()).collect();
+    if lower.is_empty() {
+        return None;
+    }
+    Some(lower)
+}
+
+/// NFKC, then IDNA, so a fullwidth label and a punycode label of the same
+/// domain compare equal. A trailing dot is the same name. A homoglyph that
+/// NFKC leaves alone stays a different domain.
+fn normalize_domain(raw: &str) -> Option<String> {
+    if raw.contains('@') {
+        return None;
+    }
+    let folded: String = raw.nfkc().filter(|c| !is_ignorable(*c)).collect();
+    let folded = folded.trim().trim_end_matches('.');
+    if folded.is_empty() || folded.starts_with('.') || folded.contains("..") {
+        return None;
+    }
+    if folded.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    if folded.starts_with('[') {
+        if !folded.ends_with(']') || folded.len() < 3 {
+            return None;
+        }
+        return Some(folded.to_ascii_lowercase());
+    }
+    idna::domain_to_ascii(folded).ok().filter(|d| !d.is_empty())
+}
+
+/// Characters a reader skips and a comparison must not treat as part of a
+/// different address. IDNA already rejects these in a domain; the local
+/// part has no such pass of its own.
+fn is_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{180E}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'
+            | '\u{1160}'
+            | '\u{17B4}'
+            | '\u{17B5}'
+            | '\u{180B}'..='\u{180D}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const IDENTITY: &str = "mailseat@example.test";
+
+    fn codes(message: &str, deny: &str, law: &str) -> Vec<String> {
+        verdict(message, deny, law)
+            .reasons
+            .into_iter()
+            .map(|r| r.code.to_string())
+            .collect()
+    }
+
+    fn details(message: &str, deny: &str, law: &str) -> Vec<String> {
+        verdict(message, deny, law)
+            .reasons
+            .into_iter()
+            .map(|r| r.detail)
+            .collect()
+    }
+
+    fn verdict(message: &str, deny: &str, law: &str) -> MailVerdict {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "policyd-env-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("deny.txt"), deny).unwrap();
+        std::fs::write(dir.join("law.txt"), law).unwrap();
+        std::fs::write(
+            dir.join("mail.conf"),
+            format!("identity {IDENTITY}\ndeny-file deny.txt\npack-law law.txt\n"),
+        )
+        .unwrap();
+        let got = check_mail_bytes(message.as_bytes(), &dir.join("mail.conf"));
+        let _ = std::fs::remove_dir_all(&dir);
+        got
+    }
+
+    fn plain(extra: &str) -> String {
+        format!("From: {IDENTITY}\r\n{extra}")
+    }
+
+    #[test]
+    fn a_matching_from_is_not_refused() {
+        let v = verdict(&plain(""), "", "");
+        assert!(!v.is_refused());
+        assert_eq!(v.json(), r#"{"verdict":"allow","reasons":[]}"#);
+        assert!(!v.json().contains("approv"));
+    }
+
+    #[test]
+    fn a_folded_from_matches_the_identity() {
+        let raw = "From: Mail Seat\r\n <mailseat@example.test>\r\n";
+        assert!(codes(raw, "", "").is_empty());
+    }
+
+    #[test]
+    fn a_fold_inside_the_address_is_not_the_identity() {
+        let raw = "From: mailseat\r\n @example.test\r\n";
+        assert_eq!(codes(raw, "", ""), vec!["from-unparsed"]);
+    }
+
+    #[test]
+    fn an_encoded_word_from_matches_the_identity() {
+        let raw = "From: =?utf-8?q?Mail_Seat?= <mailseat@example.test>\r\n";
+        assert!(codes(raw, "", "").is_empty());
+        let raw = "From: =?utf-8?b?TWFpbCBTZWF0?= <mailseat@example.test>\r\n";
+        assert!(codes(raw, "", "").is_empty());
+        let raw = "From: =?utf-8?q?mailseat?=\r\n =?utf-8?q?=40example=2etest?=\r\n";
+        assert!(codes(raw, "", "").is_empty());
+    }
+
+    #[test]
+    fn the_angle_address_is_what_from_must_equal() {
+        let spoof = "From: other@example.test <mailseat@example.test>\r\n";
+        assert!(codes(spoof, "", "").is_empty());
+        let hidden = "From: =?utf-8?q?mailseat=40example=2etest?= <other@example.test>\r\n";
+        assert_eq!(codes(hidden, "", ""), vec!["from-not-identity"]);
+    }
+
+    #[test]
+    fn a_second_from_is_refused() {
+        let same = "\
+From: mailseat@example.test\r\n\
+From: mailseat@example.test\r\n";
+        assert_eq!(codes(same, "", ""), vec!["duplicate-from"]);
+        let other = "\
+From: mailseat@example.test\r\n\
+From: other@example.test\r\n";
+        assert_eq!(
+            codes(other, "", ""),
+            vec!["duplicate-from", "from-not-identity"]
+        );
+    }
+
+    #[test]
+    fn from_case_and_fullwidth_local_still_match() {
+        let raw = "From: MailSeat@Example.Test\r\n";
+        assert!(codes(raw, "", "").is_empty());
+        let raw = "From: \u{FF4D}\u{FF41}\u{FF49}\u{FF4C}\u{FF53}\u{FF45}\u{FF41}\u{FF54}@example.test\r\n";
+        assert!(codes(raw, "", "").is_empty(), "{:?}", details(raw, "", ""));
+    }
+
+    #[test]
+    fn a_cyrillic_lookalike_domain_is_not_the_identity() {
+        // U+0430 is Cyrillic a. NFKC leaves it, and IDNA punycode is not
+        // example.test, so the From is a different address.
+        let raw = "From: mailseat@ex\u{0430}mple.test\r\n";
+        assert_eq!(codes(raw, "", ""), vec!["from-not-identity"]);
+    }
+
+    #[test]
+    fn a_fullwidth_recipient_domain_hits_the_deny_file() {
+        let deny = "domain blocked.test\n";
+        let full = "\u{FF42}\u{FF4C}\u{FF4F}\u{FF43}\u{FF4B}\u{FF45}\u{FF44}.test";
+        let raw = plain(&format!("To: person@{full}\r\n"));
+        assert_eq!(codes(&raw, deny, ""), vec!["recipient-domain-denied"]);
+        assert_eq!(details(&raw, deny, ""), vec!["to blocked.test"]);
+    }
+
+    #[test]
+    fn punycode_and_unicode_are_the_same_denied_domain() {
+        let raw = plain("To: person@xn--bcher-kva.test\r\n");
+        assert_eq!(
+            codes(&raw, "domain bücher.test\n", ""),
+            vec!["recipient-domain-denied"]
+        );
+        assert_eq!(
+            details(&raw, "domain bücher.test\n", ""),
+            vec!["to xn--bcher-kva.test"]
+        );
+        let raw = plain("To: person@bücher.test\r\n");
+        assert_eq!(
+            codes(&raw, "domain xn--bcher-kva.test\n", ""),
+            vec!["recipient-domain-denied"]
+        );
+    }
+
+    #[test]
+    fn a_denied_domain_covers_subdomains_only() {
+        let deny = "domain blocked.test\n";
+        assert_eq!(
+            codes(&plain("To: a@sub.blocked.test\r\n"), deny, ""),
+            vec!["recipient-domain-denied"]
+        );
+        assert!(codes(&plain("To: a@notblocked.test\r\n"), deny, "").is_empty());
+        assert!(codes(&plain("To: a@blocked.test.example.test\r\n"), deny, "").is_empty());
+    }
+
+    #[test]
+    fn reply_to_sender_and_return_path_stay_clear_of_deny_identities() {
+        let deny = "\
+address other@example.test
+domain blocked.test
+handle someone
+term a term
+pair left right
+";
+        assert_eq!(
+            codes(&plain("Reply-To: other@example.test\r\n"), deny, ""),
+            vec!["reply-to-denied"]
+        );
+        assert_eq!(
+            codes(&plain("Sender: person@blocked.test\r\n"), deny, ""),
+            vec!["sender-denied"]
+        );
+        assert_eq!(
+            codes(&plain("Return-Path: <other@example.test>\r\n"), deny, ""),
+            vec!["return-path-denied"]
+        );
+        assert!(codes(&plain("Reply-To: mailseat@example.test\r\n"), deny, "").is_empty());
+        assert!(codes(&plain("Return-Path: <>\r\n"), deny, "").is_empty());
+    }
+
+    /// An address entry is that mailbox. It does not deny every recipient
+    /// at the same domain.
+    #[test]
+    fn an_address_rule_is_not_a_recipient_domain_rule() {
+        let deny = "address other@blocked.test\n";
+        assert!(codes(&plain("To: person@blocked.test\r\n"), deny, "").is_empty());
+        assert_eq!(
+            codes(&plain("Reply-To: Other@Blocked.test\r\n"), deny, ""),
+            vec!["reply-to-denied"]
+        );
+    }
+
+    #[test]
+    fn a_zero_width_character_does_not_hide_a_denied_address() {
+        let deny = "address other@example.test\n";
+        let raw = plain("Reply-To: oth\u{200B}er@example.test\r\n");
+        assert_eq!(codes(&raw, deny, ""), vec!["reply-to-denied"]);
+    }
+
+    #[test]
+    fn pack_law_refuses_a_recipient_domain_and_cannot_allow_one() {
+        let raw = plain("To: person@blocked.test\r\n");
+        assert_eq!(
+            codes(&raw, "", "deny-domain blocked.test\n"),
+            vec!["recipient-domain-denied"]
+        );
+        // Pack law is recipient domains. A Reply-To at that domain is not
+        // a recipient, and an empty deny file has no identity for it.
+        let reply = plain("Reply-To: person@blocked.test\r\nTo: person@ok.test\r\n");
+        assert!(codes(&reply, "", "deny-domain blocked.test\n").is_empty());
+        assert_eq!(
+            codes(&plain(""), "", "allow-domain blocked.test\n"),
+            vec!["pack-law-invalid"]
+        );
+    }
+
+    #[test]
+    fn a_missing_or_broken_config_refuses() {
+        let dir = std::env::temp_dir().join(format!("policyd-env-miss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("no.conf");
+        let v = check_mail_bytes(b"From: mailseat@example.test\r\n", &missing);
+        assert_eq!(v.reasons[0].code, "config-unreadable");
+        std::fs::write(dir.join("mail.conf"), "identity mailseat@example.test\n").unwrap();
+        let v = check_mail_bytes(b"From: mailseat@example.test\r\n", &dir.join("mail.conf"));
+        assert_eq!(v.reasons[0].code, "config-invalid");
+        std::fs::write(
+            dir.join("mail.conf"),
+            "identity mailseat@example.test\ndeny-file missing.txt\npack-law law.txt\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("law.txt"), "").unwrap();
+        let v = check_mail_bytes(b"From: mailseat@example.test\r\n", &dir.join("mail.conf"));
+        assert_eq!(v.reasons[0].code, "deny-file-unreadable");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_control_or_an_overlong_message_is_refused() {
+        let raw = "From: mailseat@example.test\r\nSubject: a\u{0001}b\r\n";
+        assert_eq!(codes(raw, "", ""), vec!["header-control"]);
+        let mut big = b"From: mailseat@example.test\r\n".to_vec();
+        big.extend(std::iter::repeat_n(b'a', MAIL_MESSAGE_MAX));
+        let dir = std::env::temp_dir().join(format!("policyd-env-big-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("deny.txt"), "").unwrap();
+        std::fs::write(dir.join("law.txt"), "").unwrap();
+        std::fs::write(
+            dir.join("mail.conf"),
+            "identity mailseat@example.test\ndeny-file deny.txt\npack-law law.txt\n",
+        )
+        .unwrap();
+        let v = check_mail_bytes(&big, &dir.join("mail.conf"));
+        assert_eq!(v.reasons[0].code, "message-too-large");
+        let v = check_mail_bytes(&[0xff, 0xfe], &dir.join("mail.conf"));
+        assert_eq!(v.reasons[0].code, "message-invalid");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn several_refusals_are_all_reported() {
+        let raw = "\
+From: other@example.test\r\n\
+Reply-To: other@example.test\r\n\
+To: person@blocked.test\r\n";
+        assert_eq!(
+            codes(raw, "address other@example.test\ndomain blocked.test\n", ""),
+            vec![
+                "from-not-identity",
+                "reply-to-denied",
+                "recipient-domain-denied"
+            ]
+        );
+    }
+}
