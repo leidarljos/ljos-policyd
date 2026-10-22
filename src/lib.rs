@@ -1481,7 +1481,8 @@ fn tilde_home(home: Option<&str>) -> Cow<'_, str> {
 }
 
 /// Where the path word `to` lands from `dir`: `~` at its head as
-/// [`tilde_home`] reads it, `$HOME` and `${HOME}` from `home`, `~login`
+/// [`tilde_home`] reads it, `$HOME` and `${HOME}` from `home`, either
+/// from `/` when it is unset or empty and a path follows, `~login`
 /// from the password database, `~+` at `dir`, anything else joined onto
 /// `dir`. Another variable or a substitution names no directory the line
 /// shows, and `~-` or a stack entry (`~1`) one the line does not follow.
@@ -1491,8 +1492,20 @@ fn path_from(to: &str, dir: &std::path::Path, home: Option<&str>) -> Option<std:
         return None;
     }
     let base = match head {
-        "~" => home_from(Some(&tilde_home(home)), dir)?,
-        "$HOME" | "${HOME}" => home_from(home, dir)?,
+        "~" | "$HOME" | "${HOME}" => {
+            let h = if head == "~" {
+                Some(tilde_home(home))
+            } else {
+                home.map(Cow::Borrowed)
+            };
+            match home_from(h.as_deref(), dir) {
+                Some(h) => h,
+                // Unset or empty, it leaves the rest of the word, and a
+                // word of it alone leaves the line where it is.
+                None if to.contains('/') => "/".into(),
+                None => dir.to_path_buf(),
+            }
+        }
         "~+" => dir.to_path_buf(),
         _ if head.contains(['$', '`']) => return None,
         _ => match head.strip_prefix('~') {

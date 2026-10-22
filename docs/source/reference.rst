@@ -128,7 +128,9 @@ that may hold either of two values, or one the line does not show
 ``$PWD`` in either value is the one directory the line is in, when it
 shows that and does not set ``PWD`` (``export HOME="$PWD/.home"``).
 With ``HOME`` unset, ``~`` is the home in the user's passwd entry, as in
-bash, and a bare ``cd`` stays.
+bash, and a bare ``cd`` stays. With it unset or empty, ``$HOME/path`` is
+the path from ``/``, as is ``~/path`` with it empty, while
+``cd $HOME``, or ``cd ~`` with it empty, stays.
 ``~login`` expands from the password database and ``~+`` to where the
 line is, while ``~-`` and a stack entry such as ``~1`` name a directory
 that is not followed.
