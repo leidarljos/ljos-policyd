@@ -1121,6 +1121,12 @@ fn inner_commands_at(argv: &[String]) -> Vec<(usize, Vec<String>)> {
                 }
             }
         }
+        // The shell expands a `-S` string before env splits it.
+        if let Walk::Split(at, taken, _) = wrapper_walk(&owned) {
+            for w in &mut owned[at..at + taken] {
+                *w = with_names(w, &names, argv);
+            }
+        }
         // GNU env runs no `$(...)` in a `-S` string, but one is still read
         // as a script, so a substitution in it is judged as before.
         if let Walk::Split(_, _, s) = wrapper_walk(&owned) {
@@ -1165,6 +1171,45 @@ fn inner_commands_at(argv: &[String]) -> Vec<(usize, Vec<String>)> {
             out.push((i, run.to_vec()));
         }
     }
+    out
+}
+
+/// `w` with each `$NAME` and `${NAME}` whose value the line shows read as
+/// that value: `names` holds one value for it, and no other command on
+/// `argv` may set it. Any other is left as written.
+fn with_names(w: &str, names: &[(String, String)], argv: &[String]) -> String {
+    let known = |name: &str| {
+        let mut vals = names.iter().filter(|(k, _)| k == name).map(|(_, v)| v);
+        let v = vals.next()?;
+        let elsewhere = commands(argv)
+            .iter()
+            .filter(|c| !c.iter().all(|w| is_assignment(w)))
+            .any(|c| c.iter().any(|w| may_set(w, name)));
+        (vals.all(|o| o == v) && !elsewhere).then_some(v)
+    };
+    let mut out = String::new();
+    let mut rest = w;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + 1..];
+        let (name, len) = match rest.strip_prefix('{') {
+            Some(b) => b.find('}').map_or(("", 0), |j| (&b[..j], j + 2)),
+            None => {
+                let n = rest
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .unwrap_or(rest.len());
+                (&rest[..n], n)
+            }
+        };
+        match known(name).filter(|_| !name.is_empty()) {
+            Some(v) => {
+                out.push_str(v);
+                rest = &rest[len..];
+            }
+            None => out.push('$'),
+        }
+    }
+    out.push_str(rest);
     out
 }
 
