@@ -4878,6 +4878,28 @@ mod tests {
         }
     }
 
+    /// Under `shopt -s lastpipe` the last stage of a pipeline runs in this
+    /// shell, so a variable it writes is not followed.
+    #[test]
+    fn a_lastpipe_stage_loses_what_it_writes() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "shopt -s lastpipe; HOME={dir}; echo /x | read HOME; cd ~ && make test",
+            "shopt -s lastpipe; unset CDPATH; echo x | read CDPATH; cd project && make test",
+            "shopt -s lastpipe; HOME={dir}; true | HOME=/x; cd ~ && make test",
+        ] {
+            let c = entering("lastpipe", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        for line in [
+            "HOME={dir}; echo /x | read HOME; cd ~ && make test",
+            "shopt -s lastpipe; HOME={dir}; read HOME | true; cd ~ && make test",
+        ] {
+            let c = entering("lastpipe", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+    }
+
     /// Arithmetic runs in this shell, so `((HOME=5))` or `$((HOME=5))`
     /// leaves `HOME` untracked.
     #[test]
