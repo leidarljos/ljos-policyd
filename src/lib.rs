@@ -7068,6 +7068,26 @@ hash -r 2> /dev/null
         );
     }
 
+    /// A backslash before a new line joins the two lines, as the shell
+    /// joins them before it splits words, inside double quotes too.
+    #[test]
+    fn a_backslash_newline_joins_a_script_line() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "cd project && \\\nmake clean-all",
+            "cd project && make \\\nclean-all",
+            "cd pro\\\nject && make clean-all",
+            "cd \"pro\\\nject\" && make clean-all",
+        ] {
+            let c = entering("continued", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line:?}");
+        }
+        assert_eq!(
+            v(&["bash", "-c", "true && \\\nrm -rf ~"]),
+            "deny\trm-rf-outside-tmp"
+        );
+    }
+
     #[test]
     fn allows_cargo() {
         assert_eq!(v(&["cargo", "test"]), "allow");
