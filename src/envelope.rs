@@ -1815,6 +1815,75 @@ From: other@example.test\r\n";
         );
     }
 
+    /// A rule loads exactly when a recipient at its own domain is
+    /// refused by it. A rule that loads and matches nothing is a deny
+    /// that is not there; a refused rule that could match is a parser
+    /// that has drifted from the recipient's.
+    #[test]
+    fn a_rule_loads_only_when_a_recipient_at_its_domain_matches() {
+        let domains = [
+            "192.0.2.1",
+            "192.0.2",
+            "127.1",
+            "10.0.0.1.2",
+            "\u{FF11}\u{FF19}\u{FF12}.\u{FF10}.\u{FF12}.\u{FF11}",
+            "192\u{3002}0\u{3002}2\u{3002}1",
+            "0x7f.example.test",
+            "0177.example.test",
+            "example.123",
+            "192.0.2.example.test",
+            "mx1.example.test",
+            "b\u{FC}cher.example",
+            "xn--bcher-kva.example",
+            "\u{FF42}locked.test",
+            "blocked.test.",
+            "[blocked.test]",
+            "[192.0.2.1]",
+        ];
+        let mut loaded = 0;
+        for domain in domains {
+            let to = plain(&format!("To: user@{domain}\r\n"));
+            let rules = [
+                (
+                    format!("domain {domain}\n"),
+                    String::new(),
+                    "deny-file-invalid",
+                    "recipient-domain-denied",
+                ),
+                (
+                    String::new(),
+                    format!("deny-domain {domain}\n"),
+                    "pack-law-invalid",
+                    "recipient-domain-denied",
+                ),
+                (
+                    format!("address user@{domain}\n"),
+                    String::new(),
+                    "deny-file-invalid",
+                    "recipient-address-denied",
+                ),
+            ];
+            for (deny, law, invalid, denied) in rules {
+                let load = codes(&plain(""), &deny, &law);
+                let matched = codes(&to, &deny, &law).iter().any(|c| c == denied);
+                if load.is_empty() {
+                    loaded += 1;
+                    assert!(matched, "{deny:?} {law:?} loads and matches nothing");
+                } else {
+                    assert_eq!(load, vec![invalid], "{deny:?} {law:?}");
+                    assert!(!matched, "{deny:?} {law:?}");
+                    if let Ok(list) = mail::mailboxes(&format!("user@{domain}")) {
+                        assert!(
+                            normalize_mailbox(&list[0]).is_none(),
+                            "{deny:?} {law:?} refused but a recipient parses"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(loaded > 0 && loaded < domains.len() * 3);
+    }
+
     /// The detail is the line, for a bad key as well as a bad value, and
     /// it does not repeat the value.
     #[test]
