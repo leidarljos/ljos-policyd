@@ -533,11 +533,16 @@ fn with_pwd<'a>(w: &'a str, pwd: Option<&std::path::Path>) -> Cow<'a, str> {
     Cow::Owned(out)
 }
 
-/// Keywords that open or continue a compound command; the command after
-/// them runs in this shell.
-const KEYWORDS: [&str; 9] = [
-    "!", "{", "if", "then", "else", "elif", "while", "until", "do",
+/// Keywords that open or continue a compound command, or time one; the
+/// command after them runs in this shell. `time` takes a `-p` after it.
+const KEYWORDS: [&str; 10] = [
+    "!", "{", "if", "then", "else", "elif", "while", "until", "do", "time",
 ];
+
+/// Whether `words[i]` is a keyword, or the `-p` of a `time` before it.
+fn keyword_at(words: &[&str], i: usize) -> bool {
+    KEYWORDS.contains(&words[i]) || (words[i] == "-p" && i > 0 && words[i - 1] == "time")
+}
 
 /// Apply to `vars` what the command `cmd` leaves set in the shell that
 /// runs it: assignments alone set themselves, `export`, `declare` and the
@@ -548,9 +553,8 @@ const KEYWORDS: [&str; 9] = [
 /// that only names one (`grep HOME`, `env HOME=dir cmd`) sets nothing.
 fn set_vars(cmd: &[&str], vars: &mut Vars) {
     let words = operands(cmd);
-    let front = words
-        .iter()
-        .take_while(|w| is_assignment(w) || KEYWORDS.contains(w))
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
         .count();
     let rest = peel_cd_command_word(&words[front..]);
     let name = rest.first().map_or("", |w| base_of(w));
@@ -953,8 +957,13 @@ fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
                     }
                 }
             }
+            // `/usr/bin/time` is a program, and runs `cd` in a child.
+            "time" if *w != "time" => return words,
             k if KEYWORDS.contains(&k) => {
                 words = rest;
+                if k == "time" && words.first() == Some(&"-p") {
+                    words = &words[1..];
+                }
             }
             _ => return words,
         }
@@ -4864,6 +4873,10 @@ mod tests {
         ] {
             assert_eq!(evil_and_safe("time-cd", line), Decision::Deny, "{line}");
         }
+        assert_eq!(
+            leaving("time-cd", "/usr/bin/time cd safe && make clean-all"),
+            Decision::Deny
+        );
     }
 
     /// An opening `{` before `cd` does not hide it.
