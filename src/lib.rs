@@ -6209,6 +6209,94 @@ hash -r 2> /dev/null
         }
     }
 
+    /// A sourced file runs in the line's shell, so a `case` arm, a `trap`,
+    /// a script it feeds a `source` on stdin, an alias or a `BASHOPTS` or
+    /// `SHELLOPTS` with `lastpipe` in its text loses the line as on the
+    /// line itself, and a `source` the line reaches through any of those
+    /// is read. A shell the file feeds on stdin is a child and moves
+    /// nothing.
+    #[test]
+    fn a_sourced_file_is_read_through_every_shape() {
+        evil_and_safe("src-shapes", "true");
+        let root =
+            std::env::temp_dir().join(format!("policyd-lib-{}-src-shapes", std::process::id()));
+        let safe = root.join("safe");
+        std::fs::create_dir_all(safe.join(".venv/bin")).expect("dir");
+        std::fs::write(
+            safe.join(".venv/bin/activate"),
+            "deactivate () {\n    unset VIRTUAL_ENV\n}\n\
+             case \"$(uname)\" in\n    CYGWIN*|MSYS*|MINGW*) VIRTUAL_ENV=$(cygpath /p) ;;\n\
+             \x20   *) VIRTUAL_ENV=/p ;;\nesac\nexport VIRTUAL_ENV\nhash -r 2> /dev/null\n",
+        )
+        .expect("write");
+        for (name, body) in [
+            ("case.sh", "case x in *) cd evil;; esac\n"),
+            ("arm.sh", "case x in a) echo a;; b) cd evil;; esac\n"),
+            (
+                "alt.sh",
+                "case \"$(uname)\" in\n    CYGWIN*|MSYS*) cd evil ;;\nesac\n",
+            ),
+            ("trap.sh", "trap 'cd evil' DEBUG\n"),
+            ("stdin.sh", "source /dev/stdin <<< 'cd evil'\n"),
+            ("heredoc.sh", ". /dev/stdin <<EOF\ncd evil\nEOF\n"),
+            ("alias.sh", "alias make='cd evil && make'\n"),
+            ("bashopts.sh", "export BASHOPTS=lastpipe\n"),
+            ("shellopts.sh", "SHELLOPTS=lastpipe; export SHELLOPTS\n"),
+            ("shopt.sh", "shopt -s lastpipe\n"),
+            ("move.sh", "cd evil\n"),
+            ("pipe.sh", "true | cd evil\n"),
+            (
+                "child.sh",
+                "bash -s <<< 'cd evil'\ncase x in a) echo a;; esac\ntrap 'rm -f /tmp/x' EXIT\n",
+            ),
+        ] {
+            std::fs::write(root.join(name), body).expect("write");
+        }
+        let check =
+            |line: &str, at: &std::path::Path| check_shell_in(&shell_words(line), at, 0).decision;
+        for name in [
+            "case.sh",
+            "arm.sh",
+            "alt.sh",
+            "trap.sh",
+            "stdin.sh",
+            "heredoc.sh",
+            "alias.sh",
+            "bashopts.sh",
+            "shellopts.sh",
+            "shopt.sh",
+        ] {
+            let line = format!("source ./{name} && cd safe && make clean-all");
+            assert_eq!(check(&line, &root), Decision::Deny, "{line}");
+        }
+        for line in [
+            "case x in *) source ./move.sh && cd safe && make clean-all;; esac",
+            "trap 'source ./move.sh' DEBUG; cd safe && make clean-all",
+            "alias act='source ./move.sh'; act && cd safe && make clean-all",
+            "bash <<< 'source ./move.sh && cd safe && make clean-all'",
+            "bash -s <<< 'source ./move.sh && cd safe && make clean-all'",
+            "BASHOPTS=lastpipe bash -c 'source ./pipe.sh && cd safe && make clean-all'",
+        ] {
+            assert_eq!(check(line, &root), Decision::Deny, "{line}");
+        }
+        assert_eq!(
+            check("source ./child.sh && cd safe && make clean-all", &root),
+            Decision::Allow
+        );
+        for line in [
+            "source .venv/bin/activate && make test",
+            "case x in *) source .venv/bin/activate && make clean-all;; esac",
+            "trap 'rm -f /tmp/x' EXIT; source .venv/bin/activate && make clean-all",
+            "alias act='source .venv/bin/activate'; act && make clean-all",
+            "alias ll='ls -la'; source .venv/bin/activate && make clean-all",
+            "bash <<< 'source .venv/bin/activate && make clean-all'",
+            "bash -s <<< 'source .venv/bin/activate && make clean-all'",
+            "BASHOPTS=lastpipe bash -c 'source .venv/bin/activate && make clean-all'",
+        ] {
+            assert_eq!(check(line, &safe), Decision::Allow, "{line}");
+        }
+    }
+
     /// `command`, `command -p` and `builtin` do not hide `cd`.
     #[test]
     fn follows_a_cd_behind_command_or_builtin() {
