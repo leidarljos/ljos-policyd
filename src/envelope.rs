@@ -159,8 +159,8 @@ fn check_argv_recipients(config: &Config, recipients: &[String], reasons: &mut V
         if address_denied(&addr, config) {
             reasons.push(reason("argv-recipient-denied", addr.key()));
         }
-        if domain_denied(&addr.domain, &config.deny_domains)
-            || domain_denied(&addr.domain, &config.pack_domains)
+        if domain_denied(&addr.domain, &config.deny_domains, &config.aliases)
+            || domain_denied(&addr.domain, &config.pack_domains, &config.aliases)
         {
             reasons.push(reason("argv-recipient-denied", addr.domain));
         }
@@ -533,8 +533,8 @@ fn check_named(
                         hits.push((true, format!("{name} {shown}")));
                     }
                     if address_denied(&addr, config)
-                        || domain_denied(&addr.domain, &config.deny_domains)
-                        || domain_denied(&addr.domain, &config.pack_domains)
+                        || domain_denied(&addr.domain, &config.deny_domains, &config.aliases)
+                        || domain_denied(&addr.domain, &config.pack_domains, &config.aliases)
                     {
                         hits.push((false, addr.key()));
                     }
@@ -597,8 +597,8 @@ fn check_recipients(message: &Message, config: &Config, reasons: &mut Vec<MailRe
                                 format!("{name} {}", addr.key()),
                             ));
                         }
-                        if domain_denied(&addr.domain, &config.deny_domains)
-                            || domain_denied(&addr.domain, &config.pack_domains)
+                        if domain_denied(&addr.domain, &config.deny_domains, &config.aliases)
+                            || domain_denied(&addr.domain, &config.pack_domains, &config.aliases)
                         {
                             reasons.push(reason(
                                 "recipient-domain-denied",
@@ -669,8 +669,8 @@ fn wire_rewritten(raw: &str) -> bool {
 /// The separators are the config's, or `+-=` when the line is omitted,
 /// and those of every alias family naming the domain.
 ///
-/// Alias families fold both the rule and the recipient, and only here.
-/// A domain rule and `From` do not use them.
+/// Alias families fold both the rule and the recipient. A domain rule
+/// only follows `shared` families, and `From` does not use them.
 ///
 /// The skeleton match is checked beside that, and either one denies.
 fn address_denied(addr: &NormAddr, config: &Config) -> bool {
@@ -911,10 +911,22 @@ fn push_form(forms: &mut Vec<(String, String)>, local: String, domain: String) {
     }
 }
 
-fn domain_denied(domain: &str, denied: &BTreeSet<String>) -> bool {
-    denied
-        .iter()
-        .any(|rule| domain == rule || domain.ends_with(&format!(".{rule}")))
+/// A domain rule covers that domain and its subdomains, and so does a
+/// rule on any other domain of a `shared` family it is in.
+fn domain_denied(domain: &str, denied: &BTreeSet<String>, families: &[AliasFamily]) -> bool {
+    let mut suffix = Some(domain);
+    while let Some(name) = suffix {
+        if denied.iter().any(|rule| {
+            name == rule
+                || families
+                    .iter()
+                    .any(|f| f.shared && f.has(name) && f.has(rule))
+        }) {
+            return true;
+        }
+        suffix = name.split_once('.').map(|(_, parent)| parent);
+    }
+    false
 }
 
 fn normalize_mailbox(mailbox: &Mailbox) -> Option<NormAddr> {
@@ -1525,6 +1537,54 @@ From: other@example.test\r\n";
         );
         assert!(codes(&plain("To: a@notblocked.test\r\n"), deny, "").is_empty());
         assert!(codes(&plain("To: a@blocked.test.example.test\r\n"), deny, "").is_empty());
+    }
+
+    /// A domain rule on one domain of a shared family is the whole
+    /// family. Microsoft domains are not shared, so they stay apart.
+    #[test]
+    fn a_domain_rule_covers_its_shared_family() {
+        let refused = |to: &str, deny: &str, law: &str| {
+            codes(&plain(&format!("To: {to}\r\n")), deny, law) == vec!["recipient-domain-denied"]
+        };
+        for (rule, to) in [
+            ("gmail.com", "a@googlemail.com"),
+            ("googlemail.com", "a@gmail.com"),
+            ("pm.me", "a@proton.me"),
+            ("pm.me", "a@protonmail.com"),
+            ("protonmail.ch", "a@pm.me"),
+            ("icloud.com", "a@me.com"),
+            ("icloud.com", "a@mac.com"),
+            ("mac.com", "a@icloud.com"),
+            ("gmail.com", "a@sub.googlemail.com"),
+            ("gmail.com", "a@GoogleMail\u{FF0E}COM"),
+        ] {
+            assert!(refused(to, &format!("domain {rule}\n"), ""), "{rule} {to}");
+            assert!(
+                refused(to, "", &format!("deny-domain {rule}\n")),
+                "{rule} {to}"
+            );
+        }
+        assert_eq!(
+            codes_argv(&plain(""), "domain pm.me\n", "", &["a@proton.me"]),
+            vec!["argv-recipient-denied"]
+        );
+        assert!(!refused("a@hotmail.com", "domain outlook.com\n", ""));
+        assert!(!refused("a@gmail.com", "domain pm.me\n", ""));
+        assert!(!refused(
+            "a@googlemail.com.example.test",
+            "domain gmail.com\n",
+            ""
+        ));
+        let extra = "alias mail.test,post.test + shared\n";
+        assert_eq!(
+            codes_with(
+                &plain("To: a@post.test\r\n"),
+                "domain mail.test\n",
+                "",
+                extra
+            ),
+            vec!["recipient-domain-denied"]
+        );
     }
 
     #[test]

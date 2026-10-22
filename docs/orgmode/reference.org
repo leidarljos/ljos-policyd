@@ -268,8 +268,13 @@ are =shared= (the domains are one mailbox), =dots= (dots in
 the local part are ignored), =subdomain= (=<local>@<user>.<domain>=
 is =<user>@<domain>=) and =cut= (the rule is also cut at its
 first separator). An =alias= line cannot remove a built-in
-family, and one that does not parse refuses the config. Domain
-rules and =From= are not matched this way. A domain literal (an address
+family, and one that does not parse refuses the config. A
+=domain= rule on a domain of a =shared= family covers every
+domain of that family and their subdomains, so =domain gmail.com=
+also refuses =googlemail.com=, =domain pm.me= the other Proton
+domains, and =domain icloud.com= =me.com= and =mac.com=.
+=deny-domain= in the pack-law file does the same. =From= is
+not matched this way. A domain literal (an address
 at =@[ ... ]=) in a watched header is a refusal. An
 all-numeric domain is a refusal, judged after IDNA. That
 includes a dotted quad, a shorter form inet_aton accepts, a
