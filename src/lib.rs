@@ -6379,9 +6379,6 @@ fn expanded_command(cmd: &[&str]) -> Result<Option<Vec<String>>, ()> {
         if parts.len() != 1 || parts.first().map(String::as_str) != Some(*w) {
             changed = true;
         }
-        if out.len() + parts.len() > BRACE_CAP {
-            return Err(());
-        }
         out.extend(parts);
     }
     Ok(changed.then_some(out))
@@ -14700,6 +14697,17 @@ hash -r 2> /dev/null
             let cut = &arg[..n - 1];
             assert_eq!(v(&["echo", cut]), "allow", "{n} cut");
         }
+    }
+
+    /// A few hundred paths, and a few thousand, are an ordinary command.
+    /// The brace cap is how wide one expansion may grow, not how many
+    /// words the line already has.
+    #[test]
+    fn a_long_line_is_not_a_brace_expansion() {
+        let mut argv = Vec::with_capacity(300);
+        argv.push("echo".to_string());
+        argv.resize(300, "f".to_string());
+        assert_eq!(verdict(&argv), "allow");
     }
 
     /// A few hundred paths, and a few thousand, are an ordinary command.
