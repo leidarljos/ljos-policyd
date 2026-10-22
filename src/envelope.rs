@@ -160,6 +160,9 @@ fn check_argv_recipients(config: &Config, recipients: &[String], reasons: &mut V
         if let Some(shown) = mixed_script_domain(&addr.domain) {
             reasons.push(reason("mixed-script", format!("argv {shown}")));
         }
+        if local_mixes_latin(&addr.local) {
+            reasons.push(reason("mixed-script", format!("argv {}", addr.key())));
+        }
         if address_denied(&addr, config) {
             reasons.push(reason("argv-recipient-denied", addr.key()));
         }
@@ -174,8 +177,8 @@ fn check_argv_recipients(config: &Config, recipients: &[String], reasons: &mut V
 #[derive(Clone)]
 struct NormAddr {
     /// Deny-file form: NFKC, a zero-width space or braille blank removed,
-    /// local part lowercased, domain in IDNA ASCII. A closed code point
-    /// is not a form.
+    /// local part lowercased, a decimal digit mapped to ASCII, domain
+    /// in IDNA ASCII. A closed code point is not a form.
     local: String,
     domain: String,
     /// The mailbox as written, before that folding. `From` is compared
@@ -681,6 +684,9 @@ fn check_named(
                     if let Some(shown) = mixed_script_domain(&addr.domain) {
                         hits.push((true, format!("{name} {shown}")));
                     }
+                    if local_mixes_latin(&addr.local) {
+                        hits.push((true, format!("{name} {}", addr.key())));
+                    }
                     if address_denied(&addr, config)
                         || domain_denied(&addr.domain, &config.deny_domains, &config.aliases)
                         || domain_denied(&addr.domain, &config.pack_domains, &config.aliases)
@@ -739,6 +745,9 @@ fn check_recipients(message: &Message, config: &Config, reasons: &mut Vec<MailRe
                     for addr in list {
                         if let Some(shown) = mixed_script_domain(&addr.domain) {
                             reasons.push(reason("mixed-script", format!("{name} {shown}")));
+                        }
+                        if local_mixes_latin(&addr.local) {
+                            reasons.push(reason("mixed-script", format!("{name} {}", addr.key())));
                         }
                         if address_denied(&addr, config) {
                             reasons.push(reason(
@@ -1236,7 +1245,9 @@ fn normalize_mailbox(mailbox: &Mailbox) -> Option<NormAddr> {
 /// the ones the reference names. Every other closed code point refuses
 /// the local part, before NFKC and after it: U+2000 to U+200A become a
 /// plain space, and a space the parser let through a quoted local part
-/// is still closed.
+/// is still closed. A decimal digit then becomes the ASCII digit of the
+/// same value, so a rule for `user1` meets `user` plus U+0661. ASCII `0`
+/// stays `0`.
 fn normalize_local(raw: &str) -> Option<String> {
     let sets = unicode_sets();
     let stripped: String = raw.chars().filter(|c| !is_documented_fold(*c)).collect();
@@ -1259,11 +1270,42 @@ fn normalize_local(raw: &str) -> Option<String> {
     if spacing_mark_on_ascii(&stripped) || spacing_mark_on_ascii(&folded) {
         return None;
     }
-    let lower = icu_lower(&folded);
+    let lower = map_decimal_digits(&icu_lower(&folded));
     if lower.is_empty() {
         return None;
     }
     Some(lower)
+}
+
+/// First code point of each Unicode 18 decimal-digit block. The next
+/// nine are the digits 1 to 9. Every `Nd` scalar is in one of these
+/// blocks, and the blocks are contiguous.
+const DECIMAL_ZERO: &[u32] = &[
+    0x30, 0x660, 0x6F0, 0x7C0, 0x966, 0x9E6, 0xA66, 0xAE6, 0xB66, 0xBE6, 0xC66, 0xCE6, 0xD66,
+    0xDE6, 0xE50, 0xED0, 0xF20, 0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80, 0x1A90,
+    0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0, 0xAA50, 0xABF0, 0xFF10,
+    0x104A0, 0x10D30, 0x10D40, 0x11066, 0x110F0, 0x11136, 0x111D0, 0x112F0, 0x11450, 0x114D0,
+    0x11650, 0x116C0, 0x116D0, 0x116DA, 0x11730, 0x118E0, 0x11950, 0x11BF0, 0x11C50, 0x11D50,
+    0x11DA0, 0x11DE0, 0x11F50, 0x16130, 0x16A60, 0x16AC0, 0x16B50, 0x16D70, 0x1CCF0, 0x1D7CE,
+    0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1E140, 0x1E2F0, 0x1E4F0, 0x1E5F1, 0x1E950, 0x1FBF0,
+];
+
+fn decimal_digit(c: char) -> char {
+    let cp = u32::from(c);
+    let found = DECIMAL_ZERO.partition_point(|zero| *zero <= cp);
+    if found == 0 {
+        return c;
+    }
+    let value = cp - DECIMAL_ZERO[found - 1];
+    if value < 10 {
+        char::from(b'0' + value as u8)
+    } else {
+        c
+    }
+}
+
+fn map_decimal_digits(local: &str) -> String {
+    local.chars().map(decimal_digit).collect()
 }
 
 /// A deny-file or pack-law domain. `None` when a recipient domain could
@@ -1392,6 +1434,14 @@ fn mixed_script_domain(domain: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Latin together with Cyrillic or Greek in a normalized local part.
+/// The whole local part is one label: a dot does not open a second
+/// one. A local part wholly in Cyrillic or Greek is a different
+/// mailbox, and it is not folded onto the Latin it looks like.
+fn local_mixes_latin(local: &str) -> bool {
+    label_mixes_latin(local)
 }
 
 fn label_mixes_latin(label: &str) -> bool {
@@ -1751,6 +1801,91 @@ From: other@example.test\r\n";
             "{:?}",
             details(&raw, "", "")
         );
+    }
+
+    /// The same script rule as a domain label. The lookalike is refused
+    /// rather than folded, so it does not become the Latin mailbox.
+    #[test]
+    fn a_local_part_that_mixes_latin_with_cyrillic_or_greek_is_refused() {
+        let deny = "address other@example.test\n";
+        let cyr = plain("To: oth\u{0435}r@example.test\r\n");
+        assert_eq!(codes(&cyr, deny, ""), vec!["mixed-script"]);
+        assert_eq!(
+            details(&cyr, deny, ""),
+            vec!["to oth\u{0435}r@example.test"]
+        );
+        let greek = plain("To: oth\u{03BF}r@example.test\r\n");
+        assert_eq!(codes(&greek, "", ""), vec!["mixed-script"]);
+        let reply = plain("Reply-To: us\u{03BF}r@example.test\r\n");
+        assert_eq!(codes(&reply, "", ""), vec!["mixed-script"]);
+        assert_eq!(
+            codes_argv(&plain(""), "", "", &["us\u{043E}r@example.test"]),
+            vec!["mixed-script"]
+        );
+        let whole = plain("To: \u{043F}\u{0440}\u{0438}\u{043C}\u{0435}\u{0440}@example.test\r\n");
+        assert!(
+            codes(&whole, "", "").is_empty(),
+            "{:?}",
+            details(&whole, "", "")
+        );
+        let greek_whole = plain("To: \u{03B1}\u{03B2}\u{03B3}@example.test\r\n");
+        assert!(
+            codes(&greek_whole, "", "").is_empty(),
+            "{:?}",
+            details(&greek_whole, "", "")
+        );
+    }
+
+    /// U+0661 and U+0967 are digit 1. ASCII 0 is not letter o.
+    #[test]
+    fn a_decimal_digit_folds_to_its_ascii_value() {
+        let deny = "address user1@example.test\n";
+        let arabic = plain("To: user\u{0661}@example.test\r\n");
+        assert_eq!(codes(&arabic, deny, ""), vec!["recipient-address-denied"]);
+        let devanagari = plain("To: user\u{0967}@example.test\r\n");
+        assert_eq!(
+            codes(&devanagari, deny, ""),
+            vec!["recipient-address-denied"]
+        );
+        let rule = "address user\u{0661}@example.test\n";
+        let ascii = plain("To: user1@example.test\r\n");
+        assert_eq!(codes(&ascii, rule, ""), vec!["recipient-address-denied"]);
+        let zero = plain("To: 0ther@example.test\r\n");
+        assert!(
+            codes(&zero, "address other@example.test\n", "").is_empty(),
+            "{:?}",
+            details(&zero, "address other@example.test\n", "")
+        );
+        let letter = plain("To: other@example.test\r\n");
+        assert!(
+            codes(&letter, "address 0ther@example.test\n", "").is_empty(),
+            "{:?}",
+            details(&letter, "address 0ther@example.test\n", "")
+        );
+    }
+
+    #[test]
+    fn decimal_digit_blocks_are_every_decimal_number() {
+        let category = CodePointMapData::<GeneralCategory>::new();
+        let mut found = Vec::new();
+        for cp in 0..=0x10FFFF {
+            if let Some(c) = char::from_u32(cp) {
+                if category.get(c) == GeneralCategory::DecimalNumber {
+                    found.push(cp);
+                }
+            }
+        }
+        let mut expect = Vec::new();
+        for &zero in DECIMAL_ZERO {
+            for i in 0..10 {
+                expect.push(zero + i);
+                let c = char::from_u32(zero + i).unwrap();
+                assert_eq!(decimal_digit(c), char::from(b'0' + i as u8));
+            }
+        }
+        assert_eq!(found, expect);
+        assert_eq!(decimal_digit('o'), 'o');
+        assert_eq!(decimal_digit('0'), '0');
     }
 
     #[test]
@@ -2730,13 +2865,24 @@ pair left right
     /// other spelling through.
     #[test]
     fn skeleton_prefix_matches_casefold_edges_both_ways() {
-        let hit = |to: &str, rule: &str| {
+        let verdict = |to: &str, rule: &str| {
             codes(
                 &plain(&format!("To: {to}\r\n")),
                 &format!("address {rule}\n"),
                 "",
-            ) == vec!["recipient-address-denied"]
+            )
         };
+        // A Greek letter beside Latin is `mixed-script` as well as a
+        // skeleton match. The address result is what this test checks.
+        let hit = |to: &str, rule: &str| {
+            let got = verdict(to, rule);
+            got.iter().any(|c| c == "recipient-address-denied")
+                && got
+                    .iter()
+                    .all(|c| c == "recipient-address-denied" || c == "mixed-script")
+        };
+        let not_this_rule =
+            |to: &str, rule: &str| verdict(to, rule).iter().all(|c| c == "mixed-script");
         let groups: &[&[&str]] = &[
             &[
                 "mai",
@@ -2784,24 +2930,17 @@ pair left right
                         "rule {rule_local} recipient {recip}x"
                     );
                     assert!(
-                        codes(
-                            &plain(&format!("To: {recip}@other.test\r\n")),
-                            &format!("address {rule}\n"),
-                            ""
-                        )
-                        .is_empty(),
+                        not_this_rule(&format!("{recip}@other.test"), &rule),
                         "rule {rule_local} other domain {recip}"
                     );
                 }
             }
             let first = group[0];
             assert!(
-                codes(
-                    &plain(&format!("To: x{first}@example.test\r\n")),
-                    &format!("address {first}@example.test\n"),
-                    ""
-                )
-                .is_empty(),
+                not_this_rule(
+                    &format!("x{first}@example.test"),
+                    &format!("{first}@example.test")
+                ),
                 "prefix is at the start: {first}"
             );
         }
@@ -2839,12 +2978,10 @@ pair left right
                 "{short}"
             );
             assert!(
-                codes(
-                    &plain(&format!("To: {short}x@example.test\r\n")),
-                    &format!("address {short}@example.test\n"),
-                    ""
-                )
-                .is_empty(),
+                not_this_rule(
+                    &format!("{short}x@example.test"),
+                    &format!("{short}@example.test")
+                ),
                 "{short}x"
             );
         }
