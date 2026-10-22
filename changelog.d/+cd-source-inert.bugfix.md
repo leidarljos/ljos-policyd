@@ -1,0 +1,1 @@
+A `source` or `.` of a file named with a `/` that the line can read, and in which nothing moves the shell, defines an alias, turns on `lastpipe` or writes `HOME`, `CDPATH` or `PWD`, leaves the line followed, so `source .venv/bin/activate && make test` is allowed again. A sourced file that may `cd`, or one the line cannot read, still leaves the line untracked.

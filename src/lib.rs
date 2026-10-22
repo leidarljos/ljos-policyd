@@ -302,7 +302,7 @@ fn runner_commands(
         }
         let words = peel_cd_command_word(&shown);
         let b = words.first().map_or("", |w| base_of(w));
-        if unseen(&cmd) && (!piped || lastpipe && end != "|") {
+        if unseen(&cmd) && !sources_inert(&shown, &at) && (!piped || lastpipe && end != "|") {
             here = vec![UNTRACKED.into()];
             old = vec![UNTRACKED.into()];
             pushed.clear();
@@ -610,6 +610,47 @@ fn unseen(cmd: &[&str]) -> bool {
         .first()
         .is_some_and(|w| matches!(base_of(w), "eval" | "source" | ".") || w.contains(['$', '`']))
         || trap_action(words).is_some_and(|a| commands(&shell_words(a)).iter().any(moves))
+}
+
+/// Whether `cmd` sources (`source FILE`, `. FILE`) a script that, read
+/// from each of `dirs`, leaves alone what the walk follows: no command
+/// in it is [`unseen`], moves the shell, defines an alias, may turn on
+/// `lastpipe`, or writes `HOME`, `CDPATH` or `PWD`. A virtualenv's
+/// `activate` is one. FILE must hold a `/`, since bash looks a bare name
+/// up on `PATH` first.
+fn sources_inert(cmd: &[&str], dirs: &[std::path::PathBuf]) -> bool {
+    let words = operands(cmd);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    let [w, file, ..] = peel_cd_command_word(&words[front..]) else {
+        return false;
+    };
+    if !matches!(base_of(w), "source" | ".") || !file.contains('/') || file.contains(['$', '`']) {
+        return false;
+    }
+    let inert = |c: &Vec<&str>| {
+        let mut probe = Vars {
+            cdpath: Some(UNTRACKED.into()),
+            home: Some(UNTRACKED.into()),
+            pwd: Some(UNTRACKED.into()),
+            lastpipe: false,
+        };
+        set_vars(c, &mut probe);
+        let first = peel_cd_command_word(c).first().map(|w| base_of(w));
+        !unseen(c)
+            && !(matches!(first, Some("shopt" | "set" | "eval")) && may_set_lastpipe(c))
+            && !matches!(first, Some("cd" | "pushd" | "popd" | "alias"))
+            && [probe.cdpath, probe.home, probe.pwd]
+                .iter()
+                .all(|v| v.as_deref() == Some(UNTRACKED))
+            && !probe.lastpipe
+    };
+    dirs.iter().all(|d| {
+        !is_untracked(d)
+            && std::fs::read_to_string(d.join(file))
+                .is_ok_and(|body| commands(&shell_words(&body)).iter().all(inert))
+    })
 }
 
 /// Whether the command `cmd` may turn on `lastpipe`: `shopt -s` or `set
