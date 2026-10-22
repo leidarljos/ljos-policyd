@@ -1867,13 +1867,57 @@ From: other@example.test\r\n";
         );
     }
 
-    /// A rule loads exactly when a recipient at its own domain is
-    /// refused by it. A rule that loads and matches nothing is a deny
-    /// that is not there; a refused rule that could match is a parser
-    /// that has drifted from the recipient's.
+    /// A rule that loads refuses a recipient at its own domain. A rule
+    /// that is refused names a domain a recipient cannot have: with no
+    /// rule at all, that recipient is refused as unparsed. A rule that
+    /// loads and matches nothing is a deny that is not there; a refused
+    /// rule whose recipient is allowed is a recipient no rule can deny.
     #[test]
     fn a_rule_loads_only_when_a_recipient_at_its_domain_matches() {
+        let a61 = "a".repeat(61);
+        let a62 = "a".repeat(62);
+        let a63 = "a".repeat(63);
+        let a64 = "a".repeat(64);
+        let long = [
+            format!("{a63}.test"),
+            format!("{a64}.test"),
+            format!("{a63}.{a63}.{a63}.{a61}"),
+            format!("{a63}.{a63}.{a63}.{a62}"),
+        ];
         let domains = [
+            "foo_bar.test",
+            "_under.test",
+            "-lead.test",
+            "trail-.test",
+            "a.-lead.test",
+            "a-b.test",
+            long[0].as_str(),
+            long[1].as_str(),
+            long[2].as_str(),
+            long[3].as_str(),
+            "xn--a.test",
+            "xn--ls8h-.test",
+            "xn--bcher-kva-.test",
+            "p\u{0430}ypal.test",
+            "xn--pypal-4ve.test",
+            "\u{0440}\u{0430}\u{0443}\u{0440}\u{0430}l.test",
+            "a!b.test",
+            "a#b.test",
+            "a$b.test",
+            "a%b.test",
+            "a&b.test",
+            "a'b.test",
+            "a*b.test",
+            "a+b.test",
+            "a/b.test",
+            "a=b.test",
+            "a?b.test",
+            "a^b.test",
+            "a`b.test",
+            "a{b.test",
+            "a|b.test",
+            "a}b.test",
+            "a~b.test",
             "192.0.2.1",
             "192.0.2",
             "127.1",
@@ -1923,13 +1967,16 @@ From: other@example.test\r\n";
                     assert!(matched, "{deny:?} {law:?} loads and matches nothing");
                 } else {
                     assert_eq!(load, vec![invalid], "{deny:?} {law:?}");
-                    assert!(!matched, "{deny:?} {law:?}");
-                    if let Ok(list) = mail::mailboxes(&format!("user@{domain}")) {
-                        assert!(
-                            normalize_mailbox(&list[0]).is_none(),
-                            "{deny:?} {law:?} refused but a recipient parses"
-                        );
-                    }
+                    assert_eq!(
+                        codes(&to, "", ""),
+                        vec!["recipient-unparsed"],
+                        "{deny:?} {law:?} refused but a recipient at it is allowed"
+                    );
+                    assert!(
+                        !mail::mailboxes(&format!("user@{domain}"))
+                            .is_ok_and(|list| normalize_mailbox(&list[0]).is_some()),
+                        "{deny:?} {law:?} refused but a recipient parses"
+                    );
                 }
             }
         }
