@@ -6429,16 +6429,23 @@ fn host_argv_table_at(argv: &[String], depth: usize, moved: bool, parent: &Scrat
             token: Cow::Borrowed("stdin-variable-script"),
         };
     }
-    for inner in inner_commands(argv)
-        .into_iter()
-        .filter(|_| depth < MAX_DEPTH)
-    {
-        if inner.as_slice() == argv {
-            continue;
-        }
-        let c = host_argv_table_at(&inner, depth + 1, moved, &bound);
-        if c.decision != Decision::Allow {
-            return c;
+    // A later command runs where `cd` left it. Judging the `rm` on its
+    // own from the starting directory would see the wrong parent.
+    if depth < MAX_DEPTH {
+        let expanded = expand_aliases(argv);
+        let roots = command_roots(&expanded, bound.root.clone());
+        for (i, inner) in inner_commands_expanded(&expanded) {
+            if inner.as_slice() == argv {
+                continue;
+            }
+            let mut next = bound.clone();
+            if let Some(root) = roots.get(i) {
+                next.root = root.clone();
+            }
+            let c = host_argv_table_at(&inner, depth + 1, moved, &next);
+            if c.decision != Decision::Allow {
+                return c;
+            }
         }
     }
     // What an `env -S` string runs, with a value in it the line does not
@@ -9189,11 +9196,17 @@ impl Seat {
         if own.decision != Decision::Allow || depth >= MAX_DEPTH {
             return own;
         }
-        for inner in inner_commands(argv) {
+        let expanded = expand_aliases(argv);
+        let roots = command_roots(&expanded, bound.root.clone());
+        for (i, inner) in inner_commands_expanded(&expanded) {
             if inner.is_empty() || inner.as_slice() == argv {
                 continue;
             }
-            let c = self.check_at(&inner, depth + 1, &bound, moved);
+            let mut next = bound.clone();
+            if let Some(root) = roots.get(i) {
+                next.root = root.clone();
+            }
+            let c = self.check_at(&inner, depth + 1, &next, moved);
             if c.decision != Decision::Allow {
                 return c;
             }
@@ -11450,24 +11463,35 @@ fn operand_suffix_ok(rest: &str, bound: &Scratch) -> bool {
 /// plain relative path, nor a variable the same script assigns only to
 /// scratch. When the line can `cd` out of the working tree, a relative
 /// path no longer passes; a scratch variable still does, because its value
-/// does not depend on the directory.
+/// does not depend on the directory. A literal `cd` moves the directory
+/// the operand is judged in. A parent that is not there yet, or that the
+/// line creates before the `rm`, may be a symlink.
 fn recursive_delete_off_tmp(argv: &[String], moved: bool, bound: &Scratch) -> bool {
-    commands(argv).iter().any(|cmd| {
-        if !rm_recursive(cmd) {
-            return false;
+    let mut place = Place::new(bound.root.clone());
+    let mut prev = "";
+    let mut bad = false;
+    for (cmd, end) in ended_commands(argv) {
+        let in_pipe = end == "|" || prev == "|";
+        if rm_recursive(&cmd)
+            && !cmd
+                .iter()
+                .skip(1)
+                .filter(|a| !a.starts_with('-') && !is_redirection(a))
+                .all(|p| delete_ok(p, moved, bound, &place))
+        {
+            bad = true;
         }
-        !cmd.iter()
-            .skip(1)
-            .filter(|a| !a.starts_with('-') && !is_redirection(a))
-            .all(|p| delete_ok(p, moved, bound))
-    })
+        place.finish(&cmd, in_pipe);
+        prev = end;
+    }
+    bad
 }
 
-fn delete_ok(p: &str, moved: bool, bound: &Scratch) -> bool {
+fn delete_ok(p: &str, moved: bool, bound: &Scratch, place: &Place) -> bool {
     if under_tmp(p) || (!moved && (build_output(p) || scratch(p))) {
         return true;
     }
-    let linked = path_follows_symlink(p, bound.root.as_deref());
+    let linked = path_follows_symlink(p, place);
     if !moved && configure_scratch(p) && !linked {
         return true;
     }
@@ -11477,12 +11501,220 @@ fn delete_ok(p: &str, moved: bool, bound: &Scratch) -> bool {
     bare_var(p).is_some_and(|name| bound.vars.get(name).copied().flatten() == Some(Hold::Temp))
 }
 
-/// Whether `p`, relative to `root`, or any directory above it, is a
+/// The directory a command on the line runs in, and the paths the line
+/// has already created there. `open` is a created path whose name the
+/// line does not show: a later relative parent may be that path.
+struct Place {
+    root: Option<std::path::PathBuf>,
+    made: Vec<std::path::PathBuf>,
+    open: bool,
+}
+
+impl Place {
+    fn new(root: Option<std::path::PathBuf>) -> Self {
+        Self {
+            root,
+            made: Vec::new(),
+            open: false,
+        }
+    }
+
+    /// Move for a literal `cd` or `pushd`, then record what this command
+    /// creates. A pipeline stage does not move the shell that follows it.
+    fn finish(&mut self, cmd: &[&str], in_pipe: bool) {
+        if !in_pipe {
+            self.apply_cd(cmd);
+        }
+        self.note_created(cmd);
+    }
+
+    fn apply_cd(&mut self, cmd: &[&str]) {
+        let (name, args) = command_verb(cmd);
+        if name == "popd" {
+            // The stack below this line is not the one `popd` reads.
+            // `-n` only rotates that stack and leaves the directory.
+            if !args.iter().any(|a| a == "-n") {
+                self.root = None;
+            }
+            return;
+        }
+        if name != "cd" && name != "pushd" {
+            return;
+        }
+        // `pushd -n` changes the stack and leaves the directory.
+        if name == "pushd" && args.iter().any(|a| a == "-n") {
+            return;
+        }
+        let args: Vec<&str> = args
+            .iter()
+            .filter(|a| a.as_str() != "-n")
+            .map(String::as_str)
+            .collect();
+        let target = args
+            .iter()
+            .copied()
+            .find(|a| !a.starts_with('-') || *a == "-");
+        if name == "pushd" && target.is_none_or(stack_index) {
+            self.root = None;
+            return;
+        }
+        let Some(to) = target else {
+            self.root = None;
+            return;
+        };
+        if to == "-" {
+            self.root = None;
+            return;
+        }
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        let Some(next) = path_from(to, &root, None) else {
+            self.root = None;
+            return;
+        };
+        match std::fs::symlink_metadata(&next) {
+            Ok(m) if m.file_type().is_symlink() => self.root = None,
+            Ok(m) if m.is_dir() => self.root = Some(next),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => self.root = None,
+        }
+    }
+
+    fn note_created(&mut self, cmd: &[&str]) {
+        let (name, args) = command_verb(cmd);
+        let mut dests: Vec<&str> = Vec::new();
+        match name.as_str() {
+            "mkdir" => dests.extend(positionals(&args)),
+            "ln" | "cp" | "mv" | "install" => {
+                if let Some(last) = positionals(&args).last().copied() {
+                    dests.push(last);
+                }
+            }
+            _ => {}
+        }
+        dests.extend(command_output_targets(cmd));
+        if dests.is_empty() {
+            return;
+        }
+        let Some(root) = self.root.clone() else {
+            self.open = true;
+            return;
+        };
+        for d in dests {
+            match concrete_path(d, &root) {
+                Some(p) => self.made.push(p),
+                None => self.open = true,
+            }
+        }
+    }
+}
+
+/// Where each command of `argv` runs, in order. The entry is the directory
+/// before that command, so a `cd` moves the ones after it.
+fn command_roots(
+    argv: &[String],
+    start: Option<std::path::PathBuf>,
+) -> Vec<Option<std::path::PathBuf>> {
+    let mut place = Place::new(start);
+    let mut prev = "";
+    let mut roots = Vec::new();
+    for (cmd, end) in ended_commands(argv) {
+        let in_pipe = end == "|" || prev == "|";
+        roots.push(place.root.clone());
+        place.finish(&cmd, in_pipe);
+        prev = end;
+    }
+    roots
+}
+
+/// The command word and the words after it.
+fn command_verb(cmd: &[&str]) -> (String, Vec<String>) {
+    let words = operands(cmd);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    let rest = peel_cd_command_word(&words[front..]);
+    let name = rest
+        .first()
+        .map(|w| base_of(w).to_string())
+        .unwrap_or_default();
+    let args = rest
+        .get(1..)
+        .unwrap_or(&[])
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    (name, args)
+}
+
+/// Operands that are not flags. `--` ends the flags.
+fn positionals(args: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut bare = false;
+    for a in args {
+        if a == "--" {
+            bare = true;
+            continue;
+        }
+        if !bare && a.starts_with('-') {
+            continue;
+        }
+        out.push(a.as_str());
+    }
+    out
+}
+
+/// Files a command's output redirections name.
+fn command_output_targets<'a>(cmd: &'a [&'a str]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < cmd.len() {
+        let next = cmd.get(i + 1).copied();
+        if let Some((target, ate)) = output_target(cmd[i], next) {
+            out.push(target);
+            if ate {
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// `p` joined onto `root`, when every part of it is written out. A
+/// variable, a glob, a brace or `~` is not a path the line shows.
+fn concrete_path(p: &str, root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let p = p.trim_matches(|c| c == '\'' || c == '"');
+    if p.is_empty()
+        || p.contains(['$', '`', '*', '?', '['])
+        || p.starts_with('~')
+        || brace_expands(p)
+    {
+        return None;
+    }
+    let p = p.trim_end_matches('/');
+    if p.is_empty() {
+        return None;
+    }
+    let joined = if p.starts_with('/') {
+        std::path::PathBuf::from(p)
+    } else {
+        root.join(p)
+    };
+    Some(logical(&joined))
+}
+
+/// Whether `p`, relative to `place`, or any directory above it, is a
 /// symlink. GNU `rm -rf` on a symlink with a trailing slash deletes the
 /// target's contents. A glob is the same when any match is a symlink.
 /// No root means the path cannot be checked, so it is treated as linked.
-fn path_follows_symlink(p: &str, root: Option<&std::path::Path>) -> bool {
-    let Some(root) = root else {
+/// A parent that does not exist yet is the same: the line can create it
+/// as a link before `rm` runs. A parent the line already creates is too,
+/// even when a real directory stands there now.
+fn path_follows_symlink(p: &str, place: &Place) -> bool {
+    let Some(root) = place.root.as_deref() else {
         return true;
     };
     let p = p.trim_matches(|c| c == '\'' || c == '"');
@@ -11497,15 +11729,22 @@ fn path_follows_symlink(p: &str, root: Option<&std::path::Path>) -> bool {
     let Some((name, parents)) = parts.split_last() else {
         return true;
     };
+    if place.open && !parents.is_empty() {
+        return true;
+    }
     for part in parents {
         if part.contains(['*', '?', '[']) {
             return true;
         }
         dir.push(part);
+        let here = logical(&dir);
+        if place.made.iter().any(|m| m == &here) {
+            return true;
+        }
         match std::fs::symlink_metadata(&dir) {
             Ok(m) if m.file_type().is_symlink() => return true,
             Ok(_) => {}
-            Err(_) => return false,
+            Err(_) => return true,
         }
     }
     if name.contains(['*', '?', '[']) {
@@ -11517,12 +11756,13 @@ fn path_follows_symlink(p: &str, root: Option<&std::path::Path>) -> bool {
 
 /// Whether any directory entry matching `pat` is a symlink. `*` and `?`
 /// are the shell's. A `[` class is not read; the name is then refused.
+/// A directory that cannot be read is not shown to be free of links.
 fn glob_hits_symlink(dir: &std::path::Path, pat: &str) -> bool {
     if pat.contains('[') {
         return true;
     }
     let Ok(rd) = std::fs::read_dir(dir) else {
-        return false;
+        return true;
     };
     for ent in rd.flatten() {
         let os = ent.file_name();
@@ -11593,25 +11833,28 @@ fn rm_recursive(cmd: &[&str]) -> bool {
 /// The argv the pack judges. An operand the host already accepted and the
 /// pack's older rule would refuse is named as `/tmp/policyd-scratch`, so
 /// the pack still sees every other word. A secret or a force push on the
-/// same line is unchanged.
+/// same line is unchanged. The directory is the one the command runs in
+/// after `cd`, the same one [`delete_ok`] uses.
 #[cfg(has_phronesis)]
 fn argv_for_pack(argv: &[String], bound: &Scratch, moved: bool) -> Vec<String> {
     let mut out = argv.to_vec();
-    let mut cmd: Vec<usize> = Vec::new();
-    let mark = |cmd: &mut Vec<usize>, out: &mut [String]| {
-        let words: Vec<String> = cmd
+    let mut place = Place::new(bound.root.clone());
+    let mut prev = "";
+    for (idx, end) in ended_indices(argv) {
+        let in_pipe = end == "|" || prev == "|";
+        let words: Vec<String> = idx
             .iter()
-            .map(|&i| out[i].trim_end_matches(';').to_string())
+            .map(|&i| argv[i].trim_end_matches(';').to_string())
             .filter(|w| !w.is_empty())
             .collect();
         let refs: Vec<&str> = words.iter().map(String::as_str).collect();
         if rm_recursive(&refs) {
-            for &i in cmd.iter() {
+            for &i in &idx {
                 let w = out[i].trim_end_matches(';').to_string();
                 if w.is_empty() || w.starts_with('-') || is_redirection(&w) {
                     continue;
                 }
-                if delete_ok(&w, moved, bound) && !pack_delete_ok(&w, moved) {
+                if delete_ok(&w, moved, bound, &place) && !pack_delete_ok(&w, moved) {
                     let semi = out[i].ends_with(';');
                     out[i] = if semi {
                         "/tmp/policyd-scratch;".into()
@@ -11621,23 +11864,32 @@ fn argv_for_pack(argv: &[String], bound: &Scratch, moved: bool) -> Vec<String> {
                 }
             }
         }
-        cmd.clear();
-    };
-    let mut i = 0;
-    while i < out.len() {
-        if matches!(out[i].as_str(), ";" | "&&" | "||" | "|" | "&") {
-            mark(&mut cmd, &mut out);
-            i += 1;
+        place.finish(&refs, in_pipe);
+        prev = end;
+    }
+    out
+}
+
+/// [`ended_commands`], each as the indexes of its words in `argv`.
+#[cfg(has_phronesis)]
+fn ended_indices(argv: &[String]) -> Vec<(Vec<usize>, &str)> {
+    let mut out: Vec<(Vec<usize>, &str)> = vec![(Vec::new(), "")];
+    for (i, a) in argv.iter().enumerate() {
+        if matches!(a.as_str(), ";" | "&&" | "||" | "|" | "&") {
+            out.last_mut().expect("one command").1 = a.as_str();
+            out.push((Vec::new(), ""));
             continue;
         }
-        cmd.push(i);
-        let closes = out[i].ends_with(';');
-        i += 1;
+        let closes = a.ends_with(';');
+        if !a.trim_end_matches(';').is_empty() {
+            out.last_mut().expect("one command").0.push(i);
+        }
         if closes {
-            mark(&mut cmd, &mut out);
+            out.last_mut().expect("one command").1 = ";";
+            out.push((Vec::new(), ""));
         }
     }
-    mark(&mut cmd, &mut out);
+    out.retain(|(c, _)| !c.is_empty());
     out
 }
 
@@ -17814,6 +18066,44 @@ sed 's/[$]LINENO.*/&-/' <$as_myself >$as_me.lineno
         assert_eq!(at("sh ./configure").decision, Decision::Allow);
     }
 
+    /// A parent that is not there yet, or that the line creates, may be a
+    /// symlink by the time `rm` runs. `cd` moves which directory that is.
+    #[test]
+    fn a_parent_made_on_the_line_may_be_a_symlink() {
+        let root = startup_root("symlink-parent");
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        std::fs::create_dir(root.join("d")).unwrap();
+        std::fs::create_dir(root.join("conftest.d")).unwrap();
+        std::fs::create_dir(root.join("f")).unwrap();
+        std::fs::create_dir_all(root.join("sub/real")).unwrap();
+        std::os::unix::fs::symlink("/", root.join("sub/d")).unwrap();
+        std::os::unix::fs::symlink("/", root.join("real")).unwrap();
+        for line in [
+            "ln -s ~ d; rm -rf d/conftest*",
+            "ln -s ~ conftest.d; rm -rf conftest.d/conftest*",
+            "ln -s ~ e; rm -rf e/conftest*",
+            "mkdir f; rm -rf f/conftest*",
+            "mkdir g; rm -rf g/conftest*",
+            "cd sub && rm -rf d/conftest*",
+            "cd \"$X\" && rm -rf conftest*",
+            "cd {sub,} && rm -rf conftest*",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert_eq!(c.token, "rm-rf-outside-tmp", "{line}");
+        }
+        for line in [
+            "rm -rf conftest*",
+            "cd missing; rm -rf conftest*",
+            "cd sub && rm -rf real/conftest*",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        let direct = at("rm -rf real/conftest*");
+        assert_eq!(direct.decision, Decision::Deny, "{}", direct.token);
+    }
+
     /// `conftest*`, `conftest.*` and `autom4te.cache` are scratch a
     /// configure makes and removes. The pack's recursive-delete rule does
     /// not name them; the host does, and the words the pack sees for those
@@ -17821,6 +18111,7 @@ sed 's/[$]LINENO.*/&-/' <$as_myself >$as_me.lineno
     #[test]
     fn configure_scratch_is_regenerable() {
         let root = startup_root("conftest");
+        std::fs::create_dir(root.join("sub")).unwrap();
         let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
         for line in [
             "rm -rf conftest*",
