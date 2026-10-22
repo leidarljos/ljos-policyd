@@ -636,7 +636,7 @@ fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
         // The `-` of `2>&-` closes the descriptor and is the whole target;
         // only the heredoc `<<-` still wants the next word.
         let rest = a.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
-        if rest == "<<-" || rest.chars().all(|c| matches!(c, '>' | '<' | '&')) {
+        if rest == "<<-" || rest.chars().all(|c| matches!(c, '>' | '<' | '&' | '|')) {
             words.next();
         }
     }
@@ -1692,6 +1692,17 @@ fn shell_words(script: &str) -> Vec<String> {
                     || (!word && chars.get(i) == Some(&'>'))) =>
             {
                 cur.push('&');
+                word = true;
+            }
+            // `>|` overwrites a file under noclobber; the `>` before it is
+            // bare unless a backslash escapes it.
+            '|' if !single
+                && !double
+                && i >= 2
+                && chars[i - 2] == '>'
+                && (i < 3 || chars[i - 3] != '\\') =>
+            {
+                cur.push('|');
                 word = true;
             }
             c if !single && !double && (c.is_whitespace() || matches!(c, ';' | '|' | '&')) => {
