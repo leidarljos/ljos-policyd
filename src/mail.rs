@@ -7,6 +7,8 @@
 //! check refuses from what this read; it does not decide the address by
 //! which copy of `From` a later reader might keep.
 
+use unicode_normalization::UnicodeNormalization;
+
 /// A header whose value is unfolded. The name is lower case.
 #[derive(Debug)]
 pub(crate) struct Header {
@@ -35,7 +37,13 @@ pub(crate) enum MessageFault {
     /// CRLF and a bare LF in the same header block. One reader splits the
     /// body at the earlier blank line and drops the headers between them.
     LineEnding,
+    /// A header line over 998 octets. A hop that wraps it without
+    /// folding turns the tail into a new header.
+    LineTooLong,
 }
+
+/// RFC 5322 limit, excluding the CRLF.
+const HEADER_LINE_MAX: usize = 998;
 
 #[derive(Debug)]
 pub(crate) struct Message {
@@ -59,6 +67,9 @@ pub(crate) fn parse_message(input: &str) -> Result<Message, MessageFault> {
     let block = header_block(input)?;
     if has_bad_control(block) {
         return Err(MessageFault::Control);
+    }
+    if header_line_too_long(block) {
+        return Err(MessageFault::LineTooLong);
     }
     let fields = split_headers(block)?;
     let mut headers = Vec::with_capacity(fields.len());
@@ -138,7 +149,20 @@ fn has_bare_lf(s: &str) -> bool {
         .any(|(i, c)| *c == b'\n' && (i == 0 || bytes[i - 1] != b'\r'))
 }
 
+fn header_line_too_long(block: &str) -> bool {
+    block.lines().any(|line| line.len() > HEADER_LINE_MAX)
+}
+
 fn has_bad_control(block: &str) -> bool {
+    // U+0085, U+2028 and U+2029 are not C0 controls. A reader that
+    // splits lines on them, as Python's str.splitlines does, sees a
+    // new header. The bytes below never match those characters.
+    if block
+        .chars()
+        .any(|c| matches!(c, '\u{0085}' | '\u{2028}' | '\u{2029}'))
+    {
+        return true;
+    }
     let bytes = block.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -599,6 +623,14 @@ fn split_list(input: &str) -> Result<Vec<String>, AddressFault> {
     Ok(out)
 }
 
+/// True when `value` uses group syntax (`name: addr;`). The colon is
+/// outside quotes and angle brackets. A group in `From` is not a
+/// mailbox RFC 5322 allows there.
+pub(crate) fn contains_group(value: &str) -> Result<bool, AddressFault> {
+    let text = strip_comments(value)?;
+    Ok(group_colon(text.trim())?.is_some())
+}
+
 fn mailbox_segment(segment: &str) -> Result<Option<Mailbox>, AddressFault> {
     let segment = strip_group(segment.trim())?;
     let segment = segment.trim();
@@ -735,19 +767,15 @@ fn angle_contents(segment: &str) -> Result<Option<&str>, AddressFault> {
     Ok(Some(inner.trim()))
 }
 
+/// A source route (`@host:addr`) is not the addr-spec. An MTA that
+/// honours the route relays through those hosts, so the final mailbox
+/// is the wrong address to judge. The route is a refusal.
 fn route_addr(inner: &str) -> Result<&str, AddressFault> {
     let inner = inner.trim();
-    let Some(rest) = inner.strip_prefix('@') else {
-        return Ok(inner);
-    };
-    let idx = rest.find(':').ok_or(AddressFault)?;
-    for part in rest[..idx].split(',') {
-        let part = part.trim().strip_prefix('@').unwrap_or(part.trim());
-        if part.is_empty() || part.contains('@') || part.contains('[') || part.contains(']') {
-            return Err(AddressFault);
-        }
+    if inner.starts_with('@') {
+        return Err(AddressFault);
     }
-    Ok(rest[idx + 1..].trim())
+    Ok(inner)
 }
 
 fn parse_addr_spec(spec: &str) -> Result<Mailbox, AddressFault> {
@@ -833,6 +861,13 @@ fn parse_dot_atom(s: &str) -> Result<(String, usize), AddressFault> {
             local.push('.');
             continue;
         }
+        // `%` is the percent hack and `!` is a bang path. Postfix
+        // rewrites both when the domain is local and then relays to
+        // the rewritten address. A quoted local part may still hold
+        // either character: that form is not rewritten.
+        if c == '%' || c == '!' {
+            return Err(AddressFault);
+        }
         if !is_atext(c) {
             return Err(AddressFault);
         }
@@ -874,7 +909,22 @@ fn parse_domain(s: &str) -> Result<String, AddressFault> {
     if !any || prev_dot {
         return Err(AddressFault);
     }
+    // A dotted quad, or any domain whose labels are all digits, is an
+    // address a resolver will connect to. Fullwidth digits fold to the
+    // same shape. It is not a name this check can compare.
+    if numeric_domain(bare) {
+        return Err(AddressFault);
+    }
     Ok(bare.to_string())
+}
+
+fn numeric_domain(bare: &str) -> bool {
+    let folded: String = bare.nfkc().collect();
+    let folded = folded.trim_end_matches('.');
+    !folded.is_empty()
+        && folded
+            .split('.')
+            .all(|label| !label.is_empty() && label.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn is_atext(c: char) -> bool {
@@ -1029,6 +1079,18 @@ From: other@example.test\r\n\
     }
 
     #[test]
+    fn a_group_colon_marks_a_group() {
+        assert!(contains_group("G: mailseat@example.test;").unwrap());
+        assert!(contains_group("G: <mailseat@example.test>;").unwrap());
+        assert!(!contains_group("\"G: H\" <mailseat@example.test>").unwrap());
+        assert!(!contains_group("mailseat@example.test").unwrap());
+        assert_eq!(
+            mailboxes("Friends: one@example.test;").unwrap()[0].local,
+            "one"
+        );
+    }
+
+    #[test]
     fn a_list_and_a_group_yield_each_mailbox() {
         let value = "Friends: one@example.test, \"Two Three\"@example.test;";
         assert_eq!(
@@ -1052,6 +1114,18 @@ From: other@example.test\r\n\
     }
 
     #[test]
+    fn an_all_numeric_domain_is_not_a_mailbox() {
+        assert!(mailboxes("a@192.0.2.1").is_err());
+        assert!(mailboxes("a@192.0.2").is_err());
+        assert!(mailboxes("a@10.0.0.1.2").is_err());
+        assert!(mailboxes("<a@192.000.002.001>").is_err());
+        let full = "\u{FF11}\u{FF19}\u{FF12}.\u{FF10}.\u{FF12}.\u{FF11}";
+        assert!(mailboxes(&format!("a@{full}")).is_err());
+        assert!(mailboxes("a@mx1.example.test").is_ok());
+        assert!(mailboxes("a@192.0.2.example.test").is_ok());
+    }
+
+    #[test]
     fn a_domain_literal_is_not_a_mailbox() {
         assert!(mailboxes("a@[blocked.test]").is_err());
         assert!(mailboxes("a@[192.000.002.001]").is_err());
@@ -1060,15 +1134,31 @@ From: other@example.test\r\n\
     }
 
     #[test]
-    fn a_source_route_keeps_the_addr_spec() {
-        let value = "<@relay.example.test:mailseat@example.test>";
+    fn an_unquoted_percent_or_bang_is_not_a_mailbox() {
+        assert!(mailboxes("a%blocked.test@localhost").is_err());
+        assert!(mailboxes("blocked.test!a@localhost").is_err());
+        assert!(mailboxes("<a%b@example.test>").is_err());
         assert_eq!(
-            mailboxes(value).unwrap(),
+            mailboxes("\"a%b\"@example.test").unwrap(),
             vec![Mailbox {
-                local: "mailseat".into(),
+                local: "a%b".into(),
                 domain: "example.test".into(),
             }]
         );
+        assert_eq!(
+            mailboxes("\"a!b\"@example.test").unwrap(),
+            vec![Mailbox {
+                local: "a!b".into(),
+                domain: "example.test".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_source_route_is_not_a_mailbox() {
+        assert!(mailboxes("<@relay.example.test:mailseat@example.test>").is_err());
+        assert!(mailboxes("<@blocked.test:a@ok.test>").is_err());
+        assert!(mailboxes("<@a.example,@b.example:a@ok.test>").is_err());
     }
 
     #[test]
@@ -1078,11 +1168,40 @@ From: other@example.test\r\n\
     }
 
     #[test]
+    fn a_header_line_over_998_octets_is_refused() {
+        let mut line = String::from("Subject: ");
+        while line.len() < 998 {
+            line.push('a');
+        }
+        line.push_str("Bcc: a@example.test");
+        let raw = format!("From: mailseat@example.test\r\n{line}\r\n\r\n");
+        assert_eq!(parse_message(&raw).unwrap_err(), MessageFault::LineTooLong);
+        let mut ok = String::from("Subject: ");
+        while ok.len() < 998 {
+            ok.push('b');
+        }
+        let raw = format!("From: mailseat@example.test\r\n{ok}\r\n\r\n");
+        assert!(parse_message(&raw).is_ok());
+    }
+
+    #[test]
     fn mixed_line_endings_are_refused() {
         let raw = "From: mailseat@example.test\n\nBcc: hidden@example.test\r\n\r\n";
         assert_eq!(parse_message(raw).unwrap_err(), MessageFault::LineEnding);
         let raw = "From: mailseat@example.test\r\nTo: a@example.test\n";
         assert_eq!(parse_message(raw).unwrap_err(), MessageFault::LineEnding);
+    }
+
+    #[test]
+    fn a_unicode_line_separator_in_the_header_is_refused() {
+        for sep in ['\u{0085}', '\u{2028}', '\u{2029}'] {
+            let raw = format!(
+                "From: mailseat@example.test\r\nSubject: x{sep}Bcc: a@example.test\r\n\r\n"
+            );
+            assert_eq!(parse_message(&raw).unwrap_err(), MessageFault::Control);
+        }
+        let raw = "From: mailseat@example.test\r\n\r\nx\u{0085}y\r\n";
+        assert!(parse_message(raw).is_ok());
     }
 
     #[test]

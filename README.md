@@ -145,26 +145,40 @@ deny-file deny.txt
 pack-law law.txt
 ```
 
-`From` has to be that one address. The mailbox is the address in
-angle brackets, read from the raw header after a folded line is
-joined. An encoded-word in a display name is decoded for display
-only, and an encoded addr-spec is a refusal. A second `From`, a
-`From` that does not parse, or any other address is a refusal.
+`From` has to be that one address after ASCII case folding only.
+The mailbox is the address in angle brackets, read from the raw
+header after a folded line is joined. A local part or domain that
+NFKC or the removal of a skipped character would change is a
+refusal, including a zero-width character or a fullwidth spelling.
+An encoded-word in a display name is decoded for display only,
+and an encoded addr-spec is a refusal. A second `From`, a
+`From` that does not parse, a group in `From`, or any other
+address is a refusal.
 `Reply-To`, `Sender`, `Return-Path`, `Errors-To`,
-`Disposition-Notification-To` and `Return-Receipt-To` must stay
-clear of an identity in the deny file. Any `Resent-*` header is a
-refusal. `To`, `Cc` and `Bcc` are refused
-when that domain, or a parent of it, is named by the deny file or by
-the pack-law file. An address at `@[ ... ]` is a domain literal and
-is a refusal. A recipient domain, or a domain on a header checked
-against the deny file, is refused when one of its labels mixes
-Latin with Cyrillic or Greek after NFKC and IDNA.
+`Disposition-Notification-To`, `Return-Receipt-To`,
+`Delivery-Receipt-To`, `Mail-Followup-To` and `Mail-Reply-To` must
+stay clear of an identity in the deny file. Any `Resent-*` header
+is a refusal, and so is any `Apparently-To`. `To`, `Cc` and `Bcc`
+are refused when the mailbox is an `address` line in the deny
+file, and when that domain, or a parent of it, is named by the
+deny file or by the pack-law file. An `address` line is that
+mailbox, not the whole domain. It also covers a `local+tag`
+subaddress of that mailbox. An address at `@[ ... ]` is a
+domain literal and is a refusal. An all-numeric domain, such as
+a dotted quad, is a refusal. A source route
+(`<@host:mailbox>`) is a refusal. `%` or `!` in an unquoted local
+part is a refusal. A quoted local part may hold either character.
+A recipient domain, or a domain on a header checked against the
+deny file, is refused when one of its labels mixes Latin with
+Cyrillic or Greek after NFKC and IDNA.
 
-A domain is compared after NFKC and IDNA, so a fullwidth spelling and
-the punycode form are the same domain. ASCII case is folded. A
-character a reader skips, such as a zero-width space, is removed
-before the comparison. A homoglyph that those two passes leave alone
-stays a different domain, so it is not the configured identity.
+A deny-file domain is compared after NFKC and IDNA, so a fullwidth
+spelling and the punycode form are the same domain. ASCII case is
+folded. A character a reader skips, such as a zero-width space, is
+removed before that comparison. A homoglyph that those two passes
+leave alone stays a different domain. `From` is not compared that
+way: only ASCII case folding, and a spelling those passes would
+change is refused.
 
 The deny file's lines are `address`, `domain`, `handle`, `term` and
 `pair`. This check uses `address` and `domain`. The other three can
@@ -172,9 +186,11 @@ share the file and are ignored here. The pack-law file's lines are
 `deny-domain`. A line that would allow a domain is not a rule, and
 the file is refused.
 
-A message over 1 MiB, a control character in the header block, a
-header block that mixes CRLF and a bare LF, or a config that cannot
-be read is a refusal. The body is not part of this check.
+A message over 1 MiB, a control character in the header block,
+U+0085, U+2028 or U+2029 in that block, a header line over 998
+octets, a header block that mixes CRLF and a bare LF, or a config
+that cannot be read is a refusal. The body is not part of this
+check.
 
 ## How ljos uses it
 
