@@ -6426,6 +6426,12 @@ fn host_argv_table_at(argv: &[String], depth: usize, moved: bool, parent: &Scrat
             token: Cow::Borrowed("stdin-variable-script"),
         };
     }
+    // `xargs` appends words the line does not show, and so does `parallel`,
+    // `find -exec {}` and `while read`. A command whose verdict depends on
+    // those words is judged as if each one could be any operand or flag.
+    if let Some(c) = fed_operand(argv, depth, moved, &bound) {
+        return c;
+    }
     // A later command runs where `cd` left it. Judging the `rm` on its
     // own from the starting directory would see the wrong parent.
     if depth < MAX_DEPTH {
@@ -6855,6 +6861,687 @@ fn xargs_script_unshown(argv: &[String]) -> bool {
         };
         script_takes_input(run, &fed, appended)
     })
+}
+
+/// A command whose allow or deny turns on an operand or a flag the line
+/// may not show. `grep`, `cat` and `wc` are not among them: every extra
+/// word leaves the same verdict.
+fn fed_sensitive(cmd: &[String]) -> bool {
+    let Some(head) = cmd.first() else {
+        return false;
+    };
+    let b = base_of(head);
+    if matches!(
+        b,
+        "rm" | "rmdir"
+            | "unlink"
+            | "shred"
+            | "dd"
+            | "truncate"
+            | "mv"
+            | "cp"
+            | "chmod"
+            | "chown"
+            | "chgrp"
+            | "setfacl"
+            | "rsync"
+            | "find"
+    ) || TRASHERS.contains(&b)
+        || (b == "gio" && cmd.get(1).map(String::as_str) == Some("trash"))
+    {
+        return true;
+    }
+    if b != "git" {
+        return false;
+    }
+    // No subcommand yet: the words still to come can be `push -f`.
+    matches!(
+        git_subcommand(cmd).map(|(s, _)| s),
+        Some("clean" | "push" | "reset") | None
+    )
+}
+
+fn operand_unshown() -> Checked {
+    Checked {
+        decision: Decision::Deny,
+        code: PolicyReason::ShellDangerousRunner,
+        token: Cow::Borrowed("operand-unshown"),
+    }
+}
+
+fn feed_allows() -> Checked {
+    Checked {
+        decision: Decision::Allow,
+        code: PolicyReason::Unspecified,
+        token: Cow::Borrowed("allow"),
+    }
+}
+
+/// How `xargs` or `parallel` turns the text it reads into arguments.
+struct FeedSplit {
+    /// `Blank` is the default. `-0` is a NUL. `-d` is one character.
+    /// A replace string takes whole lines.
+    nul: bool,
+    delim: Option<char>,
+    lines: bool,
+    /// `Some(n)` keeps `n` arguments for each invocation. `None` appends
+    /// every argument to one invocation, which is what `xargs` does.
+    group: Option<usize>,
+    replace: Option<String>,
+    /// `-a FILE` reads a file the line does not show.
+    argfile: bool,
+}
+
+/// The text a literal `printf` writes, reusing its format while arguments
+/// remain. `\0` is a NUL. Any other conversion is not this text.
+fn printf_feed(args: &[String]) -> Option<String> {
+    let args = if args.first().is_some_and(|a| a == "--") {
+        &args[1..]
+    } else {
+        args
+    };
+    if args.first().is_some_and(|a| a.starts_with('-')) {
+        return None;
+    }
+    let (fmt, mut rest) = args.split_first()?;
+    if !literal_text(fmt) || rest.iter().any(|a| !literal_text(a)) {
+        return None;
+    }
+    let mut out = String::new();
+    loop {
+        let (piece, used) = printf_feed_once(fmt, rest)?;
+        out.push_str(&piece);
+        if used == 0 || used >= rest.len() {
+            break;
+        }
+        rest = &rest[used..];
+    }
+    Some(out)
+}
+
+fn printf_feed_once(fmt: &str, args: &[String]) -> Option<(String, usize)> {
+    let mut out = String::new();
+    let mut chars = fmt.chars();
+    let mut ai = 0;
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('\\') => out.push('\\'),
+                Some('0') => out.push('\0'),
+                _ => return None,
+            }
+            continue;
+        }
+        if c == '%' {
+            match chars.next() {
+                Some('%') => out.push('%'),
+                Some('s') => {
+                    out.push_str(args.get(ai)?);
+                    ai += 1;
+                }
+                _ => return None,
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    Some((out, ai))
+}
+
+/// The words `text` contributes. A trailing separator does not add an
+/// empty word. Blank-separated input drops empty fields.
+fn split_feed(text: &str, spec: &FeedSplit) -> Vec<String> {
+    let mut parts: Vec<String> = if spec.nul {
+        text.split('\0').map(str::to_string).collect()
+    } else if let Some(c) = spec.delim {
+        text.split(c).map(str::to_string).collect()
+    } else if spec.lines {
+        text.split('\n').map(str::to_string).collect()
+    } else {
+        return text.split_whitespace().map(str::to_string).collect();
+    };
+    if parts.last().is_some_and(|s| s.is_empty()) {
+        parts.pop();
+    }
+    parts
+}
+
+fn feed_invocations(template: &[String], inputs: &[String], spec: &FeedSplit) -> Vec<Vec<String>> {
+    if let Some(mark) = &spec.replace {
+        return inputs
+            .iter()
+            .map(|v| {
+                template
+                    .iter()
+                    .map(|w| w.replace(mark.as_str(), v))
+                    .collect()
+            })
+            .collect();
+    }
+    let n = spec.group.unwrap_or(inputs.len().max(1));
+    if inputs.is_empty() {
+        return vec![template.to_vec()];
+    }
+    inputs
+        .chunks(n.max(1))
+        .map(|g| {
+            let mut cmd = template.to_vec();
+            cmd.extend(g.iter().cloned());
+            cmd
+        })
+        .collect()
+}
+
+/// Flags of one `xargs` or `parallel` that say where its arguments come
+/// from. `None` when a flag could hide that, so the input is not taken
+/// as shown.
+fn parse_feed_flags(flags: &[String]) -> Option<FeedSplit> {
+    let mut spec = FeedSplit {
+        nul: false,
+        delim: None,
+        lines: false,
+        group: None,
+        replace: None,
+        argfile: false,
+    };
+    let mut i = 0;
+    while i < flags.len() {
+        let a = flags[i].as_str();
+        if a == "--" {
+            break;
+        }
+        if let Some(long) = a.strip_prefix("--") {
+            let (name, inline) = match long.split_once('=') {
+                Some((n, v)) => (n, Some(v.to_string())),
+                None => (long, None),
+            };
+            let mut take = |inline: Option<String>| -> Option<String> {
+                if inline.is_some() {
+                    inline
+                } else {
+                    i += 1;
+                    flags.get(i).cloned()
+                }
+            };
+            match name {
+                "null" => spec.nul = true,
+                "delimiter" => {
+                    let v = take(inline)?;
+                    spec.delim = Some(v.chars().next().filter(|_| v.chars().count() == 1)?);
+                }
+                "replace" => spec.replace = Some(inline.unwrap_or_else(|| "{}".into())),
+                "max-args" | "max-lines" => {
+                    spec.group = Some(take(inline)?.parse().ok()?);
+                }
+                "arg-file" => {
+                    spec.argfile = true;
+                    if inline.is_none() {
+                        i += 1;
+                    }
+                }
+                "max-procs" | "eof" | "no-run-if-empty" | "exit" | "verbose" | "interactive"
+                | "show-limits" | "process-slot-var" | "help" | "version" | "jobs" => {
+                    if matches!(name, "max-procs" | "eof" | "process-slot-var" | "jobs")
+                        && inline.is_none()
+                    {
+                        i += 1;
+                    }
+                }
+                _ => return None,
+            }
+            i += 1;
+            continue;
+        }
+        let cluster = a.strip_prefix('-').filter(|s| !s.is_empty())?;
+        let chars: Vec<char> = cluster.chars().collect();
+        let mut k = 0;
+        while k < chars.len() {
+            let c = chars[k];
+            k += 1;
+            let rest: String = chars[k..].iter().collect();
+            let mut need = |rest: String| -> Option<String> {
+                if rest.is_empty() {
+                    i += 1;
+                    flags.get(i).cloned()
+                } else {
+                    k = chars.len();
+                    Some(rest)
+                }
+            };
+            match c {
+                '0' => spec.nul = true,
+                'd' => {
+                    let v = need(rest)?;
+                    spec.delim = Some(v.chars().next().filter(|_| v.chars().count() == 1)?);
+                }
+                'I' => spec.replace = Some(need(rest)?),
+                'i' => {
+                    spec.replace = Some(if rest.is_empty() {
+                        "{}".into()
+                    } else {
+                        k = chars.len();
+                        rest
+                    });
+                }
+                'n' | 'L' => spec.group = Some(need(rest)?.parse().ok()?),
+                'a' => {
+                    spec.argfile = true;
+                    need(rest)?;
+                }
+                'P' | 'E' | 's' => {
+                    need(rest)?;
+                }
+                'j' => {
+                    if rest.is_empty() && flags.get(i + 1).is_some_and(|w| !w.starts_with('-')) {
+                        i += 1;
+                    } else {
+                        k = chars.len();
+                    }
+                }
+                'r' | 't' | 'p' | 'x' => {}
+                _ => return None,
+            }
+        }
+        i += 1;
+    }
+    if spec.replace.is_some() {
+        spec.lines = !spec.nul && spec.delim.is_none();
+        spec.group = Some(1);
+    }
+    Some(spec)
+}
+
+fn producer_text(cmd: &[String]) -> Option<String> {
+    let owned = split_env_strings(cmd).into_owned();
+    let run = unwrap_wrappers(&owned).0;
+    let (head, args) = run.split_first()?;
+    match base_of(head) {
+        "echo" => echo_text(args),
+        "printf" => printf_feed(args),
+        _ => None,
+    }
+}
+
+fn benign_fed(cmd: &[String], marks: &[String]) -> Vec<String> {
+    const MARK: &str = "/tmp/fed-arg";
+    cmd.iter()
+        .map(|w| {
+            let mut s = w.clone();
+            for m in marks {
+                if !m.is_empty() {
+                    s = s.replace(m.as_str(), MARK);
+                }
+            }
+            s
+        })
+        .collect()
+}
+
+/// The denial already named when `marks` are a path under `/tmp`. That
+/// denial does not depend on the word stdin would have put there.
+fn benign_denial(
+    cmd: &[String],
+    marks: &[String],
+    moved: bool,
+    bound: &Scratch,
+) -> Option<Checked> {
+    let filled = if marks.is_empty() {
+        cmd.to_vec()
+    } else {
+        benign_fed(cmd, marks)
+    };
+    let c = host_argv_rules(&filled, moved, bound);
+    (c.decision != Decision::Allow).then_some(c)
+}
+
+fn judge_lines(
+    lines: &[Vec<String>],
+    depth: usize,
+    moved: bool,
+    bound: &Scratch,
+) -> Option<Checked> {
+    if depth >= MAX_DEPTH {
+        return Some(operand_unshown());
+    }
+    for line in lines {
+        let c = host_argv_table_at(line, depth + 1, moved, bound);
+        if c.decision != Decision::Allow {
+            return Some(c);
+        }
+    }
+    None
+}
+
+fn ended_owned(argv: &[String]) -> Vec<(Vec<String>, String)> {
+    ended_commands(argv)
+        .into_iter()
+        .map(|(c, s)| (c.iter().map(|w| (*w).to_string()).collect(), s.to_string()))
+        .collect()
+}
+
+/// Rebuild `ended` with the producer and the feeder replaced by the
+/// invocations `concrete`. A `cd` in front of them still applies.
+fn splice_feed(
+    ended: &[(Vec<String>, String)],
+    producer: Option<usize>,
+    feeder: usize,
+    concrete: &[Vec<String>],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, (cmd, sep)) in ended.iter().enumerate() {
+        if Some(i) == producer {
+            continue;
+        }
+        if i == feeder {
+            for (k, c) in concrete.iter().enumerate() {
+                out.extend(c.iter().cloned());
+                if k + 1 != concrete.len() {
+                    out.push(";".into());
+                }
+            }
+            if !sep.is_empty() && sep != "|" {
+                out.push(sep.clone());
+            }
+            continue;
+        }
+        out.extend(cmd.iter().cloned());
+        if !sep.is_empty() {
+            out.push(sep.clone());
+        }
+    }
+    out
+}
+
+fn parallel_inputs(run: &[String]) -> Option<Result<Vec<String>, ()>> {
+    let at = run.iter().position(|w| w == ":::" || w == "::::")?;
+    if run[at] == "::::" || run[at..].iter().any(|w| w == "::::") {
+        return Some(Err(()));
+    }
+    let args = &run[at + 1..];
+    if args.iter().any(|a| !literal_text(a)) {
+        return Some(Err(()));
+    }
+    Some(Ok(args.to_vec()))
+}
+
+fn parallel_mark(template: &[String], explicit: Option<String>) -> Option<String> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    let slot = |w: &str| {
+        w.match_indices('{').any(|(i, _)| {
+            w[i + 1..].starts_with(|c: char| "}./#%=".contains(c) || c.is_ascii_digit())
+        })
+    };
+    template.iter().any(|w| slot(w)).then(|| "{}".into())
+}
+
+/// `xargs` and `parallel` on `argv`. Shown `printf` and `echo` words are
+/// the arguments. Anything else is whatever stdin holds.
+fn xargs_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Option<Checked> {
+    let ended = ended_owned(argv);
+    let mut judged = false;
+    for (i, (cmd, _)) in ended.iter().enumerate() {
+        let owned = split_env_strings(cmd).into_owned();
+        let run_all = unwrap_wrappers(&owned).0;
+        if run_all.is_empty() {
+            continue;
+        }
+        let wrappers = &owned[..owned.len() - run_all.len()];
+        let Some(at) = wrappers
+            .iter()
+            .rposition(|w| matches!(base_of(w), "xargs" | "parallel"))
+        else {
+            continue;
+        };
+        let parallel = base_of(&wrappers[at]) == "parallel";
+        let flags = &wrappers[at + 1..];
+        let parsed = parse_feed_flags(flags);
+        let opaque = parsed.is_none();
+        let end = run_all
+            .iter()
+            .position(|w| w == ":::" || w == "::::")
+            .unwrap_or(run_all.len());
+        let template = run_all[..end].to_vec();
+        if template.is_empty() || !fed_sensitive(&template) {
+            continue;
+        }
+        let mut spec = parsed.unwrap_or(FeedSplit {
+            nul: false,
+            delim: None,
+            lines: false,
+            group: None,
+            replace: None,
+            argfile: false,
+        });
+        if parallel {
+            spec.group = spec.group.or(Some(1));
+            if spec.replace.is_none() {
+                spec.replace = parallel_mark(&template, None);
+            }
+            if spec.replace.is_some() {
+                spec.lines = !spec.nul && spec.delim.is_none();
+            }
+        }
+        let marks: Vec<String> = spec.replace.clone().into_iter().collect();
+        if let Some(c) = benign_denial(&template, &marks, moved, bound) {
+            return Some(c);
+        }
+        let colon = parallel_inputs(run_all);
+        let producer = i.checked_sub(1).filter(|&p| ended[p].1 == "|");
+        let from_colon = colon.is_some();
+        let shown = if spec.argfile {
+            None
+        } else if let Some(found) = colon {
+            found.ok()
+        } else if opaque {
+            None
+        } else {
+            producer.and_then(|p| producer_text(&ended[p].0).map(|t| split_feed(&t, &spec)))
+        };
+        let Some(inputs) = shown else {
+            return Some(operand_unshown());
+        };
+        if spec.replace.is_some() && inputs.is_empty() {
+            continue;
+        }
+        let concrete = feed_invocations(&template, &inputs, &spec);
+        // `:::` is the input. A pipe is a previous command, and it goes.
+        let drop_producer = producer.filter(|_| !from_colon);
+        let line = splice_feed(&ended, drop_producer, i, &concrete);
+        if let Some(c) = judge_lines(&[line], depth, moved, bound) {
+            return Some(c);
+        }
+        // The words are on the line now. The template without them is not
+        // a second command.
+        judged = true;
+    }
+    judged.then(feed_allows)
+}
+
+fn find_slot(w: &str) -> bool {
+    ["{}", "{//}", "{.}", "{/}", "{%}", "{#}"]
+        .iter()
+        .any(|t| w.contains(t))
+}
+
+/// `find -exec` and `-execdir` substitute a path the line does not list.
+fn find_feed(argv: &[String], moved: bool, bound: &Scratch) -> Option<Checked> {
+    for cmd in ended_owned(argv) {
+        let owned = split_env_strings(&cmd.0).into_owned();
+        let run = unwrap_wrappers(&owned).0.to_vec();
+        for payload in find_payloads(&run) {
+            if payload_unshown(&payload) || !payload.iter().any(|w| find_slot(w)) {
+                continue;
+            }
+            if !fed_sensitive(&payload) {
+                continue;
+            }
+            let benign = subst_find_braces(&payload);
+            if let Some(c) = benign_denial(&benign, &[], moved, bound) {
+                return Some(c);
+            }
+            return Some(operand_unshown());
+        }
+    }
+    None
+}
+
+fn here_string(cmd: &[String]) -> Option<String> {
+    for (i, w) in cmd.iter().enumerate() {
+        let Some(rest) = w.strip_prefix("<<<") else {
+            continue;
+        };
+        if rest.is_empty() {
+            let next = cmd.get(i + 1)?;
+            return literal_text(next).then(|| next.clone());
+        }
+        return literal_text(rest).then(|| rest.to_string());
+    }
+    None
+}
+
+fn read_var_names(run: &[String]) -> Vec<String> {
+    let all = read_names(run);
+    let named: Vec<String> = all
+        .iter()
+        .filter(|n| n.as_str() != "REPLY" && n.as_str() != "MAPFILE")
+        .cloned()
+        .collect();
+    if named.is_empty() {
+        all
+    } else {
+        named
+    }
+}
+
+fn word_replaced(word: &str, name: &str, value: &str) -> Option<String> {
+    if word == format!("${name}") || word == format!("${{{name}}}") {
+        return Some(value.to_string());
+    }
+    if expands(word, name) {
+        return None;
+    }
+    Some(word.to_string())
+}
+
+/// `while read x; do rm -rf "$x"; done`. A `printf` or `echo` piped into
+/// the `read`, or a here-string, is the value. Anything else is not.
+fn read_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Option<Checked> {
+    let ended = ended_owned(argv);
+    let mut fed: Vec<(String, Option<Vec<String>>)> = Vec::new();
+    for (i, (cmd, _)) in ended.iter().enumerate() {
+        let owned = split_env_strings(cmd).into_owned();
+        let run = unwrap_wrappers(&owned).0;
+        if !run
+            .first()
+            .is_some_and(|w| matches!(base_of(w), "read" | "mapfile" | "readarray"))
+        {
+            continue;
+        }
+        let text = if let Some(p) = i.checked_sub(1).filter(|&p| ended[p].1 == "|") {
+            producer_text(&ended[p].0)
+        } else {
+            here_string(cmd)
+        };
+        let lines = text.map(|t| {
+            let mut lines: Vec<String> = t
+                .split('\n')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if lines.is_empty() {
+                lines.push(String::new());
+            }
+            lines
+        });
+        for name in read_var_names(run) {
+            fed.push((name, lines.clone()));
+        }
+    }
+    if fed.is_empty() {
+        return None;
+    }
+    let mut used = false;
+    let mut shown: Option<Vec<Vec<String>>> = None;
+    for (cmd, _) in &ended {
+        let owned = split_env_strings(cmd).into_owned();
+        let run = unwrap_wrappers(&owned).0.to_vec();
+        if run
+            .first()
+            .is_some_and(|w| matches!(base_of(w), "read" | "mapfile" | "readarray"))
+            || !fed_sensitive(&run)
+        {
+            continue;
+        }
+        let hits: Vec<&(String, Option<Vec<String>>)> = fed
+            .iter()
+            .filter(|(n, _)| run.iter().any(|w| expands(w, n)))
+            .collect();
+        if hits.is_empty() {
+            continue;
+        }
+        used = true;
+        let (name, vals) = &hits[0];
+        let Some(vals) = vals else {
+            shown = None;
+            break;
+        };
+        if hits.len() != 1 {
+            shown = None;
+            break;
+        }
+        let benign: Vec<String> = run
+            .iter()
+            .map(|w| word_replaced(w, name, "/tmp/fed-arg").unwrap_or_else(|| w.clone()))
+            .collect();
+        if let Some(c) = benign_denial(&benign, &[], moved, bound) {
+            return Some(c);
+        }
+        let mut lines = Vec::new();
+        let mut ok = true;
+        for value in vals {
+            let mut line = Vec::new();
+            for (c, sep) in &ended {
+                for w in c {
+                    match word_replaced(w, name, value) {
+                        Some(n) => line.push(n),
+                        None => ok = false,
+                    }
+                }
+                if !sep.is_empty() {
+                    line.push(sep.clone());
+                }
+            }
+            if !ok {
+                break;
+            }
+            lines.push(line);
+        }
+        shown = ok.then_some(lines);
+        break;
+    }
+    if !used {
+        return None;
+    }
+    let Some(lines) = shown else {
+        // The variable is the operand. A stand-in under `/tmp` is not a
+        // denial, and the real value is not on the line.
+        return Some(operand_unshown());
+    };
+    judge_lines(&lines, depth, moved, bound).or_else(|| Some(feed_allows()))
+}
+
+/// Arguments a command is handed from `xargs`, `parallel`, `find -exec`
+/// or `read`. Words the line writes out in full are that command.
+/// Words it does not are refused when the verdict could go either way.
+fn fed_operand(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Option<Checked> {
+    xargs_feed(argv, depth, moved, bound)
+        .or_else(|| find_feed(argv, moved, bound))
+        .or_else(|| read_feed(argv, depth, moved, bound))
 }
 
 /// The replace strings the `xargs` or `parallel` call `call` takes: `-I
@@ -15705,7 +16392,7 @@ hash -r 2> /dev/null
         );
         assert_eq!(
             v(&["find", "/tmp/build", "-exec", "rm", "{}", "+"]),
-            "allow"
+            "deny\toperand-unshown"
         );
         assert_eq!(v(&["find", ".", "-exec", "grep", "x", "{}", "+"]), "allow");
     }
@@ -15717,7 +16404,6 @@ hash -r 2> /dev/null
             "find . -name .DS_Store -delete",
             "find . -name '.DS_Store' -delete",
             "find ./src -type f -name '*.orig' -delete",
-            "find . -type d -name __pycache__ -exec rm -rf {} +",
             "find . -path '*/__pycache__/*' -delete",
             "find . -maxdepth 2 -iname '*~' -delete",
             "find build/obj -name '*.o' -delete",
@@ -16349,7 +17035,7 @@ hash -r 2> /dev/null
             "git -C repo status",
             "npm run build",
             "cargo xtask",
-            "find . -name '*.pyc' -exec rm -rf {} +",
+            "find . -name '*.pyc' -delete",
             "f(){ echo hi; }; f",
             "./configure && make",
             "echo x > out.txt; cat out.txt",
@@ -16706,6 +17392,117 @@ hash -r 2> /dev/null
         assert_everyday_allowed(&root);
     }
 
+    /// Words `xargs`, `parallel`, `find -exec` or `read` add are part of
+    /// the command. A `printf` or `echo` that shows them is that command.
+    /// A word the line does not show can be any operand or flag, so a
+    /// command whose verdict turns on one is refused. `grep`, `cat` and
+    /// `wc` do not.
+    #[test]
+    fn fed_operands_are_the_command() {
+        let v = |s: &str| verdict(&shell_words(s));
+        assert_eq!(v("printf '/\\n' | xargs rm -rf"), "deny\trm-rf-outside-tmp");
+        assert_eq!(
+            v("printf '%s\\n' -fdx | xargs git clean"),
+            "deny\tgit-clean-force"
+        );
+        assert_eq!(
+            v("printf '/\\n' | xargs -I{} rsync -a --delete empty/ {}"),
+            "deny\trsync-delete-root-tree"
+        );
+        assert_eq!(
+            v("printf '/\\n' | while read x; do rm -rf \"$x\"; done"),
+            "deny\trm-rf-outside-tmp"
+        );
+        assert_eq!(
+            v("printf '%s' / | xargs -0 rm -rf"),
+            "deny\trm-rf-outside-tmp"
+        );
+        assert_eq!(
+            v("printf '%s\\n' / /etc | xargs -n 1 rm -rf"),
+            "deny\trm-rf-outside-tmp"
+        );
+        assert_eq!(v("parallel rm -rf ::: /"), "deny\trm-rf-outside-tmp");
+        assert_eq!(
+            v("printf '/\\n' | parallel -j 4 rm -rf"),
+            "deny\trm-rf-outside-tmp"
+        );
+        for s in [
+            "find . -name '*.o' | xargs rm -f",
+            "find . -print0 | xargs -0 rm -f",
+            "xargs rm -rf",
+            "xargs -n 1 git clean",
+            "xargs -0 rm -rf",
+            "parallel rm -rf ::: \"$x\"",
+            "parallel rm -rf :::: files",
+            "find . -name '*.pyc' -exec rm -rf {} +",
+            "find . -execdir rm -rf {} +",
+            "while read x; do rm -rf \"$x\"; done",
+            "cat list | xargs rm -f",
+            "xargs -a list rm -rf",
+            "xargs rmdir",
+            "xargs unlink",
+            "xargs shred",
+            "xargs dd",
+            "xargs truncate",
+            "xargs mv",
+            "xargs cp",
+            "xargs chmod",
+            "xargs chown",
+        ] {
+            let got = v(s);
+            assert!(
+                got == "deny\toperand-unshown" || got.starts_with("deny\tfind-delete"),
+                "{s}: {got}"
+            );
+        }
+        assert_eq!(
+            v("find . -name '*.o' | xargs rm -f"),
+            "deny\toperand-unshown"
+        );
+        for s in [
+            "xargs grep pattern",
+            "xargs cat",
+            "xargs wc -l",
+            "printf '/tmp/a.o\\n' | xargs rm -rf",
+            "printf '%s\\n' /tmp/a /tmp/b | xargs rm -rf",
+            "printf '/tmp/a\\n' | while read x; do rm -rf \"$x\"; done",
+            "printf '/tmp/a\\n' | xargs -I{} rm -rf {}",
+            "xargs git status",
+            "find . -exec grep x {} +",
+            "find . -exec echo {} \\;",
+            "parallel echo hi ::: a b",
+            "parallel -j 4 echo hi",
+            "echo /tmp/a | xargs rm -rf",
+        ] {
+            assert_eq!(v(s), "allow", "{s}");
+        }
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-fedop", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("configure"), "#!/bin/sh\necho ok\n").unwrap();
+        std::fs::write(
+            root.join("Makefile"),
+            "all:\n\techo built\ndistclean:\n\techo cleaned\n",
+        )
+        .unwrap();
+        let at = |s: &str| check_shell_in(&shell_words(s), &root, 0);
+        let c = at("find . -name '*.o' | xargs rm -f");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert_eq!(c.token, "operand-unshown");
+        for s in [
+            "printf '/tmp/a.o\\n' | xargs rm -rf",
+            "make",
+            "make distclean",
+            "cargo clean",
+            "npm ci",
+            "autoreconf -fi",
+            "./configure && make",
+        ] {
+            let c = at(s);
+            assert_eq!(c.decision, Decision::Allow, "{s}: {}", c.token);
+        }
+    }
+
     /// `cp evil.sh ok.sh; source ok.sh` was allowed: ok.sh was judged
     /// as it stood before the copy. The target of `cp`, `mv` and `ln` is
     /// written as a redirection's file is.
@@ -16863,6 +17660,8 @@ hash -r 2> /dev/null
             "find . -exec {} \\;",
             "find . -exec \"$cmd\" \\;",
             "find . -execdir {} +",
+            "find . -name '*.pyc' -exec rm -rf {} +",
+            "find /tmp/build -exec rm {} +",
             "parallel ::: \"$cmd\"",
             "parallel :::: cmds.txt",
         ] {
@@ -16872,8 +17671,6 @@ hash -r 2> /dev/null
         for s in [
             "find . -exec echo {} \\;",
             "find . -exec grep x {} +",
-            "find . -name '*.pyc' -exec rm -rf {} +",
-            "find /tmp/build -exec rm {} +",
             "parallel echo hi",
             "parallel -j 4 echo hi ::: a b",
             "xargs echo hi",
@@ -17497,7 +18294,6 @@ hash -r 2> /dev/null
             "node -e 1; sh ok.sh",
             "make; sh ok.sh",
             "./target/debug/app; sh ok.sh",
-            "find . -exec mv {} ok.sh \\; ; sh ok.sh",
             "sed -n 'w ok.sh' evil/force.sh; sh ok.sh",
         ] {
             let c = at(line);
@@ -17508,12 +18304,14 @@ hash -r 2> /dev/null
                 c.token
             );
         }
+        let c = at("find . -exec mv {} ok.sh \\; ; sh ok.sh");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert_eq!(c.token, "operand-unshown");
         for line in [
             "git status && sh ok.sh",
             "git -C . log; sh ok.sh",
             "grep -q ok ok.sh && sh ok.sh",
             "ls; cat ok.sh; sh ok.sh",
-            "find . -name '*.pyc' -exec rm -f {} + ; sh ok.sh",
             "cargo build && ./target/debug/app",
             "make && cargo test",
             "sh ok.sh; make",
@@ -18168,7 +18966,7 @@ sed 's/[$]LINENO.*/&-/' <$as_myself >$as_me.lineno
             "cargo xtask",
             "cargo build && ./target/debug/app",
             "xargs -I{} echo {}",
-            "find . -name '*.pyc' -exec rm -f {} +",
+            "find . -name '*.pyc' -delete",
             "source .venv/bin/activate",
             "conda activate",
             "nvm use",
