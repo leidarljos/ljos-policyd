@@ -1,7 +1,9 @@
 //! RFC 5322 header block for an outbound envelope.
 //!
-//! The fold is part of the header it continues, an encoded-word is the
-//! text it names, and a second `From` stays a second header. The envelope
+//! The fold is part of the header it continues, and a second `From` stays
+//! a second header. An encoded-word in a display name is the text it
+//! names, for display only. The mailbox is read from the raw unfolded
+//! value, so a decoded parenthesis cannot become a comment. The envelope
 //! check refuses from what this read; it does not decide the address by
 //! which copy of `From` a later reader might keep.
 
@@ -9,7 +11,10 @@
 #[derive(Debug)]
 pub(crate) struct Header {
     pub name: String,
-    /// Decoded text, or why the value cannot be trusted.
+    /// Unfolded field body. Mailbox extraction reads this and not `value`.
+    pub raw: String,
+    /// Display-name encoded-words decoded, for display only, or why an
+    /// encoded-word cannot be trusted.
     pub value: Result<String, HeaderFault>,
 }
 
@@ -27,6 +32,9 @@ pub(crate) enum MessageFault {
     Control,
     /// The block is not a header list, so there is no envelope to read.
     Structure,
+    /// CRLF and a bare LF in the same header block. One reader splits the
+    /// body at the earlier blank line and drops the headers between them.
+    LineEnding,
 }
 
 #[derive(Debug)]
@@ -48,25 +56,27 @@ pub(crate) struct AddressFault;
 /// Headers of `input`, split from the body at the first blank line.
 /// A message with no blank line is all headers.
 pub(crate) fn parse_message(input: &str) -> Result<Message, MessageFault> {
-    let block = header_block(input);
+    let block = header_block(input)?;
     if has_bad_control(block) {
         return Err(MessageFault::Control);
     }
-    let raw = split_headers(block)?;
-    let mut headers = Vec::with_capacity(raw.len());
-    for (name, value) in raw {
-        let value = decode_encoded_words(&value).map_err(|()| HeaderFault::EncodedWord);
-        headers.push(Header { name, value });
+    let fields = split_headers(block)?;
+    let mut headers = Vec::with_capacity(fields.len());
+    for (name, raw) in fields {
+        let value = display_value(&raw).map_err(|()| HeaderFault::EncodedWord);
+        headers.push(Header { name, raw, value });
     }
     Ok(Message { headers })
 }
 
-/// Mailboxes in one decoded header value.
+/// Mailboxes in one raw unfolded header value.
 ///
-/// `<>` is the empty return path and contributes no mailbox. A group such
-/// as `Friends: a@example.test;` contributes the mailboxes and not the
-/// group name. The address in angle brackets is the mailbox; a phrase that
-/// looks like an address is not.
+/// Encoded-words are not decoded. A parenthesis that exists only as an
+/// encoded-word is not a comment, and an encoded addr-spec is not a
+/// mailbox. `<>` is the empty return path and contributes no mailbox. A
+/// group such as `Friends: a@example.test;` contributes the mailboxes and
+/// not the group name. The address in angle brackets is the mailbox; a
+/// phrase that looks like an address is not.
 pub(crate) fn mailboxes(value: &str) -> Result<Vec<Mailbox>, AddressFault> {
     let text = strip_comments(value)?;
     let mut out = Vec::new();
@@ -78,15 +88,54 @@ pub(crate) fn mailboxes(value: &str) -> Result<Vec<Mailbox>, AddressFault> {
     Ok(out)
 }
 
-fn header_block(message: &str) -> &str {
+fn header_block(message: &str) -> Result<&str, MessageFault> {
     let crlf = message.find("\r\n\r\n");
     let lf = message.find("\n\n");
     match (crlf, lf) {
-        (Some(i), Some(j)) => &message[..i.min(j)],
-        (Some(i), None) => &message[..i],
-        (None, Some(j)) => &message[..j],
-        (None, None) => message.trim_end_matches(['\r', '\n']),
+        // A bare LF blank before the CRLF blank hides every header between
+        // them from the reader that stops at the earlier one.
+        (Some(i), Some(j)) if j < i => Err(MessageFault::LineEnding),
+        (Some(i), _) => {
+            let block = &message[..i];
+            if has_bare_lf(block) {
+                Err(MessageFault::LineEnding)
+            } else {
+                Ok(block)
+            }
+        }
+        (None, Some(j)) => {
+            let block = &message[..j];
+            if has_crlf(block) || block.ends_with('\r') {
+                Err(MessageFault::LineEnding)
+            } else {
+                Ok(block)
+            }
+        }
+        (None, None) => {
+            let end = message.trim_end_matches(['\r', '\n']).len();
+            let block = &message[..end];
+            let tail = &message[end..];
+            if (has_bare_lf(block) || has_bare_lf(tail))
+                && (has_crlf(block) || tail.contains("\r\n"))
+            {
+                Err(MessageFault::LineEnding)
+            } else {
+                Ok(block)
+            }
+        }
     }
+}
+
+fn has_crlf(s: &str) -> bool {
+    s.contains("\r\n")
+}
+
+fn has_bare_lf(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes
+        .iter()
+        .enumerate()
+        .any(|(i, c)| *c == b'\n' && (i == 0 || bytes[i - 1] != b'\r'))
 }
 
 fn has_bad_control(block: &str) -> bool {
@@ -167,6 +216,150 @@ fn decode_encoded_words(input: &str) -> Result<String, ()> {
         i += ch.len_utf8();
     }
     Ok(out)
+}
+
+/// Display text. Encoded-words in a display name become the text they
+/// name. An addr-spec is left encoded, and so is a word whose text would
+/// be address syntax, so this string is not a second parse of the mailbox.
+fn display_value(raw: &str) -> Result<String, ()> {
+    if !encoded_words_well_formed(raw) {
+        return Err(());
+    }
+    let Ok(segments) = split_list(raw) else {
+        return Ok(raw.to_string());
+    };
+    let mut out = String::new();
+    for (i, segment) in segments.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&decode_segment_display(segment));
+    }
+    Ok(out)
+}
+
+fn encoded_words_well_formed(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'=' && bytes.get(i + 1) == Some(&b'?') {
+            let Ok((_, n)) = take_encoded_word(&input[i..]) else {
+                return false;
+            };
+            if n == 0 {
+                return false;
+            }
+            i += n;
+            continue;
+        }
+        let Some(ch) = input[i..].chars().next() else {
+            return false;
+        };
+        i += ch.len_utf8();
+    }
+    true
+}
+
+fn decode_segment_display(segment: &str) -> String {
+    let Some(idx) = display_name_end(segment) else {
+        return segment.to_string();
+    };
+    let phrase = &segment[..idx];
+    let rest = &segment[idx..];
+    let decoded = match decode_span_for_display(phrase) {
+        Ok(text) => text,
+        Err(()) => phrase.to_string(),
+    };
+    let mut out = decoded;
+    out.push_str(rest);
+    out
+}
+
+/// Byte index of the `<` that opens a name-addr, when this segment has one.
+fn display_name_end(segment: &str) -> Option<usize> {
+    let mut quote = false;
+    let mut escape = false;
+    let mut comment = 0i32;
+    for (i, c) in segment.char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if quote {
+            match c {
+                '\\' => escape = true,
+                '"' => quote = false,
+                _ => {}
+            }
+            continue;
+        }
+        if comment > 0 {
+            match c {
+                '\\' => escape = true,
+                '(' => comment += 1,
+                ')' => comment -= 1,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '\\' => escape = true,
+            '"' => quote = true,
+            '(' => comment = 1,
+            '<' => return Some(i),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn decode_span_for_display(span: &str) -> Result<String, ()> {
+    if !encoded_words_are_display_safe(span)? {
+        return Ok(span.to_string());
+    }
+    decode_encoded_words(span)
+}
+
+/// A word that decodes to address syntax stays encoded. Decoding it into
+/// the display string would make a later parse see a different mailbox.
+fn encoded_words_are_display_safe(span: &str) -> Result<bool, ()> {
+    let bytes = span.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'=' && bytes.get(i + 1) == Some(&b'?') {
+            let (word, n) = take_encoded_word(&span[i..])?;
+            if word.chars().any(|c| is_addr_special(c) || c.is_control()) {
+                return Ok(false);
+            }
+            i += n;
+            continue;
+        }
+        let Some(ch) = span[i..].chars().next() else {
+            return Err(());
+        };
+        i += ch.len_utf8();
+    }
+    Ok(true)
+}
+
+fn is_addr_special(c: char) -> bool {
+    matches!(
+        c,
+        '(' | ')' | '<' | '>' | '[' | ']' | ':' | ';' | '@' | '\\' | ',' | '"'
+    )
+}
+
+fn contains_encoded_word(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'=' && bytes.get(i + 1) == Some(&b'?') && take_encoded_word(&s[i..]).is_ok()
+        {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 fn whitespace_before_encoded_word(s: &str) -> Option<usize> {
@@ -414,8 +607,20 @@ fn mailbox_segment(segment: &str) -> Result<Option<Mailbox>, AddressFault> {
     }
     let spec = match angle_contents(segment)? {
         Some("") => return Ok(None),
-        Some(inner) => route_addr(inner)?,
-        None => segment,
+        Some(inner) => {
+            // An encoded-word is not an addr-spec. Decoding it would name
+            // a mailbox the raw text does not.
+            if contains_encoded_word(inner) {
+                return Err(AddressFault);
+            }
+            route_addr(inner)?
+        }
+        None => {
+            if contains_encoded_word(segment) {
+                return Err(AddressFault);
+            }
+            segment
+        }
     };
     parse_addr_spec(spec).map(Some)
 }
@@ -538,7 +743,7 @@ fn route_addr(inner: &str) -> Result<&str, AddressFault> {
     let idx = rest.find(':').ok_or(AddressFault)?;
     for part in rest[..idx].split(',') {
         let part = part.trim().strip_prefix('@').unwrap_or(part.trim());
-        if part.is_empty() || part.contains('@') {
+        if part.is_empty() || part.contains('@') || part.contains('[') || part.contains(']') {
             return Err(AddressFault);
         }
     }
@@ -640,23 +845,10 @@ fn parse_dot_atom(s: &str) -> Result<(String, usize), AddressFault> {
 
 fn parse_domain(s: &str) -> Result<String, AddressFault> {
     let s = s.trim_end();
-    if s.is_empty() {
+    // A domain literal (`@[ ... ]`) is not a name this check can compare.
+    // Accepting the brackets lets the same host through in another shape.
+    if s.is_empty() || s.contains('[') || s.contains(']') {
         return Err(AddressFault);
-    }
-    if let Some(rest) = s.strip_prefix('[') {
-        let end = rest.find(']').ok_or(AddressFault)?;
-        if !rest[end + 1..].trim().is_empty() {
-            return Err(AddressFault);
-        }
-        let lit = &rest[..end];
-        if lit.is_empty()
-            || lit
-                .chars()
-                .any(|c| c.is_whitespace() || c == '[' || c == ']')
-        {
-            return Err(AddressFault);
-        }
-        return Ok(format!("[{lit}]"));
     }
     let bare = s.strip_suffix('.').unwrap_or(s);
     if bare.is_empty() {
@@ -783,20 +975,13 @@ mod tests {
         assert_eq!(value, "Mail Seat <mailseat@example.test>");
     }
 
-    /// Whitespace between adjacent encoded-words is removed, including the
-    /// space a fold leaves behind.
+    /// An encoded addr-spec is not a mailbox. Decoding it first would
+    /// accept the address the words spell.
     #[test]
-    fn adjacent_encoded_words_join_across_a_fold() {
+    fn an_encoded_addr_spec_is_not_a_mailbox() {
         let raw = "From: =?utf-8?q?mailseat?=\r\n =?utf-8?q?=40example=2etest?=\r\n\r\n";
         let value = froms(raw)[0].as_ref().unwrap().clone();
-        assert_eq!(value, "mailseat@example.test");
-        assert_eq!(
-            mailboxes(&value).unwrap(),
-            vec![Mailbox {
-                local: "mailseat".into(),
-                domain: "example.test".into(),
-            }]
-        );
+        assert!(mailboxes(&value).is_err());
     }
 
     #[test]
@@ -867,6 +1052,14 @@ From: other@example.test\r\n\
     }
 
     #[test]
+    fn a_domain_literal_is_not_a_mailbox() {
+        assert!(mailboxes("a@[blocked.test]").is_err());
+        assert!(mailboxes("a@[192.000.002.001]").is_err());
+        assert!(mailboxes("<a@[mx.blocked.test]>").is_err());
+        assert!(mailboxes("<@[192.0.2.1]:a@example.test>").is_err());
+    }
+
+    #[test]
     fn a_source_route_keeps_the_addr_spec() {
         let value = "<@relay.example.test:mailseat@example.test>";
         assert_eq!(
@@ -882,6 +1075,14 @@ From: other@example.test\r\n\
     fn a_broken_encoded_word_is_not_read_as_text() {
         let raw = "From: =?utf-8?q?unterminated <mailseat@example.test>\r\n\r\n";
         assert_eq!(froms(raw), vec![Err(HeaderFault::EncodedWord)]);
+    }
+
+    #[test]
+    fn mixed_line_endings_are_refused() {
+        let raw = "From: mailseat@example.test\n\nBcc: hidden@example.test\r\n\r\n";
+        assert_eq!(parse_message(raw).unwrap_err(), MessageFault::LineEnding);
+        let raw = "From: mailseat@example.test\r\nTo: a@example.test\n";
+        assert_eq!(parse_message(raw).unwrap_err(), MessageFault::LineEnding);
     }
 
     #[test]

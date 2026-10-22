@@ -146,12 +146,19 @@ pack-law law.txt
 ```
 
 `From` has to be that one address. The mailbox is the address in
-angle brackets, after a folded line is joined and an encoded-word is
-decoded. A second `From`, a `From` that does not parse, or any other
-address is a refusal. `Reply-To`, `Sender` and `Return-Path` must stay
-clear of an identity in the deny file. `To`, `Cc` and `Bcc` are refused
+angle brackets, read from the raw header after a folded line is
+joined. An encoded-word in a display name is decoded for display
+only, and an encoded addr-spec is a refusal. A second `From`, a
+`From` that does not parse, or any other address is a refusal.
+`Reply-To`, `Sender`, `Return-Path`, `Errors-To`,
+`Disposition-Notification-To` and `Return-Receipt-To` must stay
+clear of an identity in the deny file. Any `Resent-*` header is a
+refusal. `To`, `Cc` and `Bcc` are refused
 when that domain, or a parent of it, is named by the deny file or by
-the pack-law file.
+the pack-law file. An address at `@[ ... ]` is a domain literal and
+is a refusal. A recipient domain, or a domain on a header checked
+against the deny file, is refused when one of its labels mixes
+Latin with Cyrillic or Greek after NFKC and IDNA.
 
 A domain is compared after NFKC and IDNA, so a fullwidth spelling and
 the punycode form are the same domain. ASCII case is folded. A
@@ -165,9 +172,9 @@ share the file and are ignored here. The pack-law file's lines are
 `deny-domain`. A line that would allow a domain is not a rule, and
 the file is refused.
 
-A message over 1 MiB, a control character in the header block, or a
-config that cannot be read is a refusal. The body is not part of this
-check.
+A message over 1 MiB, a control character in the header block, a
+header block that mixes CRLF and a bare LF, or a config that cannot
+be read is a refusal. The body is not part of this check.
 
 ## How ljos uses it
 
