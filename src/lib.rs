@@ -4863,6 +4863,22 @@ mod tests {
         }
     }
 
+    /// An assignment to an array element, `NAME[i]=value`, in front of a
+    /// command does not hide it, and one to `HOME` is not followed.
+    #[test]
+    fn reads_past_a_subscripted_assignment() {
+        for line in [
+            "a[0]=1 cd evil && make clean-all",
+            "a[k]+=1 pushd evil && make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("subscript", line), Decision::Deny, "{line}");
+        }
+        assert!(v(&["a[0]=1", "git", "push", "--force", "origin", "main"]).starts_with("deny\t"));
+        let files = [("Makefile", MAKEFILE)];
+        let c = entering("subscript", &files, "HOME[0]=/x; cd && make test");
+        assert_eq!(c.decision, Decision::Deny);
+    }
+
     /// The `time` keyword, with or without `-p`, runs `cd` in this shell.
     #[test]
     fn follows_a_cd_behind_time() {
