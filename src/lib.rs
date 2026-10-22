@@ -6089,6 +6089,30 @@ mod tests {
         assert_eq!(c.decision, Decision::Allow);
     }
 
+    /// An unset or empty `HOME` makes `$HOME/path` the path from `/`, and
+    /// an empty one does the same to `~/path`.
+    #[test]
+    fn a_cd_through_an_unset_or_empty_home_starts_at_the_root() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "unset HOME; cd $HOME{dir} && make clean-all",
+            "unset HOME; cd ${HOME}{dir} && make clean-all",
+            "export HOME=; cd $HOME{dir} && make clean-all",
+            "export HOME=; cd ~{dir} && make clean-all",
+        ] {
+            let c = entering("home-unset", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        for line in [
+            "export HOME=; cd ~ && make clean-all",
+            "unset HOME; cd $HOME{dir} && make test",
+            "export HOME=; cd ~{dir} && make test",
+        ] {
+            let c = entering("home-unset", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+    }
+
     /// `$PWD` in a value names the one directory the line is in, unless
     /// the line sets `PWD` itself.
     #[test]
