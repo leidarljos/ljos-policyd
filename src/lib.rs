@@ -2227,10 +2227,115 @@ fn var_name(name: &str) -> Option<&str> {
     .then_some(name)
 }
 
+/// Empty, or a shell name. Either may stand in for `$name` inside `eval`.
+/// `cd`, a space, or `$` may be a command, so those stay unshown.
+fn eval_literal(v: &str) -> bool {
+    v.is_empty() || var_name(v).is_some()
+}
+
+/// `$name` and `${name}` in `text`, not `${name+word}`.
+fn dollar_names(text: &str) -> Vec<String> {
+    let b = text.as_bytes();
+    let mut i = 0;
+    let mut names = Vec::new();
+    while i < b.len() {
+        if b[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let braced = i < b.len() && b[i] == b'{';
+        if braced {
+            i += 1;
+        }
+        let start = i;
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+        }
+        if i == start {
+            continue;
+        }
+        if braced && (i >= b.len() || b[i] != b'}') {
+            continue;
+        }
+        let name = text[start..i].to_string();
+        if var_name(&name).is_some() && !names.contains(&name) {
+            names.push(name);
+        }
+        if braced {
+            i += 1;
+        }
+    }
+    names
+}
+
+fn replace_name(text: &str, name: &str, value: &str) -> String {
+    let b = text.as_bytes();
+    let nb = name.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'$' {
+            let mut j = i + 1;
+            let braced = j < b.len() && b[j] == b'{';
+            if braced {
+                j += 1;
+            }
+            if j + nb.len() <= b.len() && &b[j..j + nb.len()] == nb {
+                let after = j + nb.len();
+                let matched = if braced {
+                    after < b.len() && b[after] == b'}'
+                } else {
+                    after == b.len() || !(b[after].is_ascii_alphanumeric() || b[after] == b'_')
+                };
+                if matched {
+                    out.push_str(value);
+                    i = if braced { after + 1 } else { after };
+                    continue;
+                }
+            }
+        }
+        let ch = text[i..].chars().next().expect("char");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Each way `$name` in an `eval` can be filled from a value the line
+/// assigned. A name with no literal value is left as `$name`.
+fn expand_eval_scripts(
+    text: &str,
+    values: &std::collections::HashMap<String, Vec<String>>,
+) -> Option<Vec<String>> {
+    let mut cur = vec![text.to_string()];
+    for name in dollar_names(text) {
+        let Some(vals) = values.get(&name) else {
+            continue;
+        };
+        if vals.is_empty() || vals.iter().any(|v| v.contains('\0') || !eval_literal(v)) {
+            continue;
+        }
+        if cur.len().saturating_mul(vals.len()) > 64 {
+            return None;
+        }
+        let mut next = Vec::new();
+        for s in &cur {
+            for v in vals {
+                next.push(replace_name(s, &name, v));
+            }
+        }
+        cur = next;
+    }
+    Some(cur)
+}
+
 /// Whether every value `cmd`'s command word may hold leaves this shell
 /// where it is. `c=cd` does not. `as_echo='printf %s\n'` does.
 /// `eval` of a script the line shows, when every command in it leaves
 /// this shell where it is. `eval cd` does not. `eval test ...` does.
+/// `$name` inside it is that value when every assignment is a shell name,
+/// so `eval $ac_prev=\$ac_option` is the assignment `prefix=$ac_option`.
 fn shown_eval_keeps(
     cmd: &[&str],
     values: &std::collections::HashMap<String, Vec<String>>,
@@ -2251,8 +2356,22 @@ fn shown_eval_keeps(
     if base_of(w) != "eval" {
         return false;
     }
+    let Some(texts) = expand_eval_scripts(&args.join(" "), values) else {
+        return false;
+    };
+    texts
+        .iter()
+        .all(|script| eval_text_keeps(script, values, depth))
+}
+
+/// Whether the script `eval` runs leaves this shell where it is.
+fn eval_text_keeps(
+    script: &str,
+    values: &std::collections::HashMap<String, Vec<String>>,
+    depth: usize,
+) -> bool {
     // A function defined in the script does not run its body. A call does.
-    let script = shell_words(&args.join(" "));
+    let script = shell_words(script);
     let (top, defs) = lift_functions(&script);
     if top.iter().any(|w| w == "\0lose") {
         return false;
@@ -2271,6 +2390,13 @@ fn shown_eval_keeps(
         }
         if moves_shell(c) || trap_moves(c) {
             return false;
+        }
+        // `eval $ac_prev=\$x` with `ac_prev` empty is `=...`. The `=` is
+        // part of the command name, not `cd`.
+        if c.iter()
+            .all(|w| is_assignment(w) || (w.starts_with('=') && !w.contains([';', '|', '&', '\n'])))
+        {
+            return true;
         }
         if assigned_command_keeps(c, values) || shown_eval_keeps(c, values, depth + 1) {
             return true;
@@ -14998,6 +15124,27 @@ hash -r 2> /dev/null
             let c = at(line);
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
             assert!(c.token.contains(token), "{line}: {}", c.token);
+        }
+    }
+
+    /// `eval $ac_prev=\$ac_option` assigns the option. `$ac_prev` is a
+    /// shell name on every branch (`prefix`, `bindir`, or empty). It is
+    /// not `cd`. An unshown value, or a value that is `cd`, still moves.
+    #[test]
+    fn an_eval_of_an_assigned_name_is_an_assignment() {
+        for line in [
+            "ac_prev=bindir; eval \\$ac_prev=\\$ac_option; make -C safe test",
+            "ac_prev=; case $o in --prefix) ac_prev=prefix ;; --bindir) ac_prev=bindir ;; esac; eval \\$ac_prev=\\$ac_option; make -C safe test",
+            "ac_prev=prefix; if test -n \"$ac_prev\"; then eval \\$ac_prev=\\$ac_option; ac_prev=; fi; make -C safe test",
+        ] {
+            assert_eq!(evil_and_safe("evalname", line), Decision::Allow, "{line}");
+        }
+        for line in [
+            "ac_prev=cd; eval \\$ac_prev evil; make clean-all",
+            "eval \"$X\"; make clean-all",
+            "eval cd evil; make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("evalname", line), Decision::Deny, "{line}");
         }
     }
 }
