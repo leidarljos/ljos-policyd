@@ -91,7 +91,11 @@ const SCRIPT_DEPTH: usize = 3;
 /// or `pushd` before the runner on the line moves where its file is read,
 /// so `cd ~/proj && make clean-all` reads `~/proj/Makefile`.
 fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Checked {
-    let table = host_argv_table(argv);
+    let parent = Scratch {
+        root: Some(cwd.to_path_buf()),
+        ..Scratch::default()
+    };
+    let table = host_argv_table_at(argv, 0, leaves_tree(argv, 0), &parent);
     #[cfg(has_phronesis)]
     let table = if table.decision == Decision::Allow {
         check_shell_phronesis(argv)
@@ -1595,8 +1599,13 @@ fn judge_body_in(words: &[String], shell: &Shell, autoconf: bool) -> Option<Chec
     }
     let moved =
         shell.left_tree || shell.here.iter().any(|d| is_untracked(d)) || leaves_tree(words, 0);
+    let root = match shell.here.as_slice() {
+        [d] if !is_untracked(d) => Some(d.clone()),
+        _ => None,
+    };
     let parent = Scratch {
         autoconf,
+        root,
         ..Scratch::default()
     };
     let c = host_argv_table_at(words, 0, moved, &parent);
@@ -5380,10 +5389,6 @@ fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
             _ => return words,
         }
     }
-}
-
-fn host_argv_table(argv: &[String]) -> Checked {
-    host_argv_table_at(argv, 0, leaves_tree(argv, 0), &Scratch::default())
 }
 
 /// How deep `sh -c` scripts nest before the table stops reading them.
@@ -9834,20 +9839,20 @@ fn configure_scratch_word(p: &str) -> bool {
 }
 
 /// What an autoconf `configure` makes as it runs and removes again:
-/// `conftest`, `conftest.dir`, the glob `conftest*`, `confdefs.h`,
-/// `autom4te.cache`. They are regenerated on the next run, like build
-/// output. `confdefs.h` is that header file in the build directory; it
-/// is not a pass for `/` or a home directory.
+/// `conftest`, `conftest.dir`, the glob `conftest*`, `autom4te.cache`.
+/// They are regenerated on the next run, like build output. A trailing
+/// `/` is not one of them: GNU `rm` follows a symlink written that way.
+/// `confdefs.h` needs the generated header; the name alone is not scratch.
 fn configure_scratch(p: &str) -> bool {
-    let p = p.trim_end_matches('/');
+    if p.ends_with('/') {
+        return false;
+    }
     let (dir, name) = p.rsplit_once('/').unwrap_or(("", p));
     (dir.is_empty() || dir == "." || plain_relative(dir))
-        && (matches!(name, "conftest*" | "conftest.*" | "confdefs*")
+        && (matches!(name, "conftest*" | "conftest.*")
             || (plain_relative(name)
                 && (name == "conftest"
                     || name.starts_with("conftest.")
-                    || name == "confdefs"
-                    || name == "confdefs.h"
                     || name == "autom4te.cache")))
 }
 
@@ -9912,6 +9917,10 @@ struct Scratch {
     /// Set when the file's own text carries the autoconf header. A hint
     /// for the temps a generated `configure` removes, not a pass.
     autoconf: bool,
+    /// Directory a relative scratch path is judged in. `None` when that
+    /// directory is not a single tracked one: a symlink there would be
+    /// followed, so the name is refused.
+    root: Option<std::path::PathBuf>,
 }
 
 impl Scratch {
@@ -10233,13 +10242,12 @@ fn has_pid(s: &str) -> bool {
 /// A name a generated `configure` removes. The header is required; the
 /// name alone is not a pass for `/` or a home directory.
 fn autoconf_operand(p: &str, bound: &Scratch) -> bool {
-    if climbs(p) || p.contains('~') {
+    if climbs(p) || p.contains('~') || p.ends_with('/') {
         return false;
     }
     if configure_scratch(p) {
         return true;
     }
-    let p = p.trim_end_matches('/');
     let name = match p.rsplit_once('/') {
         Some((".", name) | ("", name)) => name,
         Some((dir, name)) if plain_relative(dir) => name,
@@ -10319,13 +10327,102 @@ fn recursive_delete_off_tmp(argv: &[String], moved: bool, bound: &Scratch) -> bo
 }
 
 fn delete_ok(p: &str, moved: bool, bound: &Scratch) -> bool {
-    if under_tmp(p) || (!moved && (build_output(p) || scratch(p) || configure_scratch(p))) {
+    if under_tmp(p) || (!moved && (build_output(p) || scratch(p))) {
         return true;
     }
-    if bound.autoconf && autoconf_operand(p, bound) {
+    let linked = path_follows_symlink(p, bound.root.as_deref());
+    if !moved && configure_scratch(p) && !linked {
+        return true;
+    }
+    if bound.autoconf && autoconf_operand(p, bound) && !linked {
         return true;
     }
     bare_var(p).is_some_and(|name| bound.vars.get(name).copied().flatten() == Some(Hold::Temp))
+}
+
+/// Whether `p`, relative to `root`, or any directory above it, is a
+/// symlink. GNU `rm -rf` on a symlink with a trailing slash deletes the
+/// target's contents. A glob is the same when any match is a symlink.
+/// No root means the path cannot be checked, so it is treated as linked.
+fn path_follows_symlink(p: &str, root: Option<&std::path::Path>) -> bool {
+    let Some(root) = root else {
+        return true;
+    };
+    let p = p.trim_matches(|c| c == '\'' || c == '"');
+    if p.is_empty() || p.starts_with('/') || p.starts_with('~') {
+        return true;
+    }
+    let mut dir = root.to_path_buf();
+    let parts: Vec<&str> = p
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    let Some((name, parents)) = parts.split_last() else {
+        return true;
+    };
+    for part in parents {
+        if part.contains(['*', '?', '[']) {
+            return true;
+        }
+        dir.push(part);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(m) if m.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    if name.contains(['*', '?', '[']) {
+        return glob_hits_symlink(&dir, name);
+    }
+    dir.push(name);
+    std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// Whether any directory entry matching `pat` is a symlink. `*` and `?`
+/// are the shell's. A `[` class is not read; the name is then refused.
+fn glob_hits_symlink(dir: &std::path::Path, pat: &str) -> bool {
+    if pat.contains('[') {
+        return true;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for ent in rd.flatten() {
+        let os = ent.file_name();
+        let Some(name) = os.to_str() else {
+            return true;
+        };
+        if glob_match(pat, name) && ent.file_type().is_ok_and(|t| t.is_symlink()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn glob_match(pat: &str, name: &str) -> bool {
+    let (p, n) = (pat.as_bytes(), name.as_bytes());
+    let (mut i, mut j) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize);
+    while j < n.len() {
+        if i < p.len() && (p[i] == b'?' || p[i] == n[j]) {
+            i += 1;
+            j += 1;
+        } else if i < p.len() && p[i] == b'*' {
+            star = Some(i);
+            mark = j;
+            i += 1;
+        } else if let Some(s) = star {
+            i = s + 1;
+            mark += 1;
+            j = mark;
+        } else {
+            return false;
+        }
+    }
+    while i < p.len() && p[i] == b'*' {
+        i += 1;
+    }
+    i == p.len()
 }
 
 /// What phronesis v0.2.5's recursive-delete rule allows on its own: a path
@@ -16335,6 +16432,42 @@ hash -r 2> /dev/null
         assert!(c.token.starts_with("script-unread:"), "{}", c.token);
     }
 
+    /// A trailing `/` makes GNU rm follow a symlink, and `confdefs` is
+    /// not scratch without the generated header. A symlink in the path
+    /// is not scratch either.
+    #[test]
+    fn a_trailing_slash_or_symlink_is_not_configure_scratch() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = startup_root("confslash");
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        std::fs::create_dir(root.join("victim")).unwrap();
+        std::os::unix::fs::symlink(root.join("victim"), root.join("confdefs")).unwrap();
+        std::os::unix::fs::symlink(root.join("victim"), root.join("conftest")).unwrap();
+        std::os::unix::fs::symlink("/", root.join("linked")).unwrap();
+        for l in ["rm -rf confdefs/", "rm -rf confdefs*/"] {
+            assert_eq!(at(l).decision, Decision::Deny, "{l}");
+        }
+        assert_eq!(at("rm -rf conftest").decision, Decision::Deny);
+        assert_eq!(at("rm -rf conftest/").decision, Decision::Deny);
+        assert_eq!(at("rm -rf autom4te.cache/").decision, Decision::Deny);
+        let script = root.join("configure");
+        std::fs::write(
+            &script,
+            "# Generated by GNU Autoconf 2.71\nrm -rf linked/confdefs.h\n",
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&script).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&script, perm).unwrap();
+        assert_eq!(at("sh ./configure").decision, Decision::Deny);
+        std::fs::write(
+            &script,
+            "# Generated by GNU Autoconf 2.71\nrm -rf confdefs.h\n",
+        )
+        .unwrap();
+        assert_eq!(at("sh ./configure").decision, Decision::Allow);
+    }
+
     /// `conftest*`, `conftest.*` and `autom4te.cache` are scratch a
     /// configure makes and removes. The pack's recursive-delete rule does
     /// not name them; the host does, and the words the pack sees for those
@@ -16346,7 +16479,7 @@ hash -r 2> /dev/null
         for line in [
             "rm -rf conftest*",
             "rm -f -r conftest* autom4te.cache",
-            "rm -rf conftest.dir conftest ./autom4te.cache/",
+            "rm -rf conftest.dir conftest ./autom4te.cache",
             "rm -rf sub/conftest.*",
         ] {
             let c = at(line);
@@ -16356,6 +16489,8 @@ hash -r 2> /dev/null
             "rm -rf conftest* src",
             "rm -rf ../conftest",
             "rm -rf conftest*/../x",
+            "rm -rf conftest/",
+            "rm -rf ./autom4te.cache/",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
@@ -16703,9 +16838,8 @@ make -C safe test
     }
 
     /// The comment a generated configure starts with marks the temps that
-    /// file removes (`a.out`, `config.status`). It is not a pass for `/`
-    /// or a home directory. `confdefs.h` is rebuilt every run, like
-    /// `conftest*`, so that name does not need the header.
+    /// file removes (`a.out`, `config.status`, `confdefs.h`). It is not a
+    /// pass for `/` or a home directory. `confdefs.h` needs that header.
     #[test]
     fn a_generated_configure_header_marks_its_temps() {
         use std::os::unix::fs::PermissionsExt;
@@ -16740,15 +16874,7 @@ make -C safe test
             "note.sh",
             "# this is not a generated configure\nrm -rf a.out\n",
         );
-        for line in [
-            "rm -rf conftest* confdefs.h",
-            "rm -f -r conftest* confdefs.h",
-            "rm -rf confdefs.h",
-            "rm -rf confdefs*",
-        ] {
-            let c = at(line);
-            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
-        }
+        assert_eq!(at("rm -rf conftest*").decision, Decision::Allow);
         for line in [
             "sh plain.sh",
             "sh root.sh",
@@ -16758,6 +16884,10 @@ make -C safe test
             "rm -rf confdefs.h /",
             "rm -rf ../confdefs.h",
             "rm -rf \"$HOME\"",
+            "rm -rf conftest* confdefs.h",
+            "rm -f -r conftest* confdefs.h",
+            "rm -rf confdefs.h",
+            "rm -rf confdefs*",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);

@@ -1,0 +1,1 @@
+`confdefs` was scratch with no generated header, and a trailing `/` was stripped before the name was checked. GNU `rm` follows a symlink written that way, so `rm -rf confdefs/` deletes the target. A trailing slash is not scratch, `confdefs` needs the header, and a symlink in the path is refused.
