@@ -5381,6 +5381,29 @@ mod tests {
         );
     }
 
+    /// bash takes its shopt options from `BASHOPTS` in its environment, so
+    /// a value naming `lastpipe`, or one the line does not show, may turn
+    /// it on in a shell the line starts. The first stage of a pipeline
+    /// runs in a subshell even then.
+    #[test]
+    fn bashopts_may_turn_lastpipe_on_in_a_nested_shell() {
+        for line in [
+            "BASHOPTS=lastpipe bash -c \"true | cd evil; make clean-all\"",
+            "export BASHOPTS=lastpipe; bash -c 'true | cd evil; make clean-all'",
+            "env SHELLOPTS=$opts bash -c 'true | cd evil; make clean-all'",
+            "BASHOPTS=\"$O\" bash -c 'true | cd evil; make clean-all'",
+        ] {
+            assert_eq!(evil_and_safe("bashopts", line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "BASHOPTS=lastpipe bash -c \"cd evil | cat; make clean-all\"",
+            "BASHOPTS=extglob bash -c 'true | cd evil; make clean-all'",
+            "bash -c 'true | cd evil; make clean-all'",
+        ] {
+            assert_eq!(evil_and_safe("bashopts", line), Decision::Allow, "{line}");
+        }
+    }
+
     /// Arithmetic runs in this shell, so `((HOME=5))` or `$((HOME=5))`
     /// leaves `HOME` untracked.
     #[test]
