@@ -5,8 +5,9 @@
 //! This module reads the recipe from the file the runner would read, in
 //! the working directory, and returns each line it would run.
 //! Nothing is spawned; each file is parsed once per mtime and size.
-//! A missing or unreadable file yields no lines, so the line is judged as
-//! written, as before.
+//! A missing or unreadable runner file yields no lines, so the line is
+//! judged as written. An included makefile that cannot be read does not:
+//! the recipes it would add are unknown, and the line is refused.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,28 +15,38 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 /// How many dependency levels a Makefile, justfile or Makefile.toml target
-/// is followed through.
+/// is followed through. Makefile `include` nesting stops at the same bound.
 const DEP_DEPTH: usize = 8;
+
+/// What [`resolved`] found. `Closed` is a file the guard cannot judge:
+/// the line is refused rather than read as if that file were absent.
+pub(crate) enum Recipes {
+    Lines(Vec<String>),
+    Closed(&'static str),
+}
 
 /// Lines a runner invocation would hand to a shell, with `cwd` as the
 /// working directory, or nothing when `run` names no runner the module
-/// reads or its file is missing.
-pub(crate) fn resolved(run: &[String], cwd: &Path) -> Vec<String> {
+/// reads or its file is missing. An included makefile that cannot be
+/// read is [`Recipes::Closed`].
+pub(crate) fn resolved(run: &[String], cwd: &Path) -> Recipes {
     let Some(first) = run.first() else {
-        return Vec::new();
+        return Recipes::Lines(Vec::new());
     };
     let base = first.rsplit('/').next().unwrap_or(first);
     let rest = &run[1..];
     match base {
         "make" | "gmake" => make(rest, cwd),
-        "npm" => node("npm", rest, cwd),
-        "pnpm" => node("pnpm", rest, cwd),
-        "yarn" => node("yarn", rest, cwd),
-        "bun" => node("bun", rest, cwd),
-        "just" => just(rest, cwd),
-        "cargo" if rest.first().map(String::as_str) == Some("make") => cargo_make(&rest[1..], cwd),
-        "cargo-make" | "makers" => cargo_make(rest, cwd),
-        _ => Vec::new(),
+        "npm" => Recipes::Lines(node("npm", rest, cwd)),
+        "pnpm" => Recipes::Lines(node("pnpm", rest, cwd)),
+        "yarn" => Recipes::Lines(node("yarn", rest, cwd)),
+        "bun" => Recipes::Lines(node("bun", rest, cwd)),
+        "just" => Recipes::Lines(just(rest, cwd)),
+        "cargo" if rest.first().map(String::as_str) == Some("make") => {
+            Recipes::Lines(cargo_make(&rest[1..], cwd))
+        }
+        "cargo-make" | "makers" => Recipes::Lines(cargo_make(rest, cwd)),
+        _ => Recipes::Lines(Vec::new()),
     }
 }
 
@@ -57,7 +68,6 @@ pub(crate) fn runner(run: &[String]) -> bool {
 // ---------------------------------------------------------------- cache
 
 enum Parsed {
-    Make(Makefile),
     Scripts(HashMap<String, String>),
     Just(Makefile),
     Toml(HashMap<String, Task>),
@@ -110,7 +120,7 @@ struct Makefile {
     default: Option<String>,
 }
 
-fn make(args: &[String], cwd: &Path) -> Vec<String> {
+fn make(args: &[String], cwd: &Path) -> Recipes {
     let mut dir = cwd.to_path_buf();
     let mut file: Option<PathBuf> = None;
     let mut targets = Vec::new();
@@ -144,13 +154,18 @@ fn make(args: &[String], cwd: &Path) -> Vec<String> {
     }
     let Some(path) = file.or_else(|| first_file(&dir, &["GNUmakefile", "makefile", "Makefile"]))
     else {
-        return Vec::new();
+        return Recipes::Lines(Vec::new());
     };
-    let Some(parsed) = load(&path, |t| Parsed::Make(parse_makefile(t))) else {
-        return Vec::new();
+    // A missing top makefile is judged as written. An include that cannot
+    // be read is not: the recipes it would add are unknown.
+    let text = match read_make_text(&path) {
+        ReadMake::Text(t) => t,
+        ReadMake::Missing | ReadMake::Unreadable => return Recipes::Lines(Vec::new()),
     };
-    let Parsed::Make(mf) = parsed.as_ref() else {
-        return Vec::new();
+    let mut stack = vec![path];
+    let mf = match parse_makefile_in(&text, &dir, 0, &mut stack) {
+        Ok(mf) => mf,
+        Err(token) => return Recipes::Closed(token),
     };
     let mut vars = mf.vars.clone();
     vars.extend(overrides);
@@ -162,9 +177,9 @@ fn make(args: &[String], cwd: &Path) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = Vec::new();
     for t in &targets {
-        walk(mf, t, 0, &mut seen, &mut out);
+        walk(&mf, t, 0, &mut seen, &mut out);
     }
-    out.iter().map(|l| expand(l, &vars, 0)).collect()
+    Recipes::Lines(out.iter().map(|l| expand(l, &vars, 0)).collect())
 }
 
 /// Dependencies first, then the target's own recipe, as make runs them.
@@ -181,7 +196,79 @@ fn walk(mf: &Makefile, target: &str, depth: usize, seen: &mut Vec<String>, out: 
     }
 }
 
-fn parse_makefile(text: &str) -> Makefile {
+/// What opening an included makefile found.
+enum ReadMake {
+    Text(String),
+    /// No file at that path.
+    Missing,
+    /// There, but not a regular file the guard can read: a directory, a
+    /// link loop, or a file that will not open.
+    Unreadable,
+}
+
+fn read_make_text(path: &Path) -> ReadMake {
+    match std::fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ReadMake::Missing,
+        Err(_) => ReadMake::Unreadable,
+        Ok(meta) if !meta.is_file() => ReadMake::Unreadable,
+        Ok(_) => match std::fs::read_to_string(path) {
+            Ok(text) => ReadMake::Text(text),
+            Err(_) => ReadMake::Unreadable,
+        },
+    }
+}
+
+/// `include`, `-include` or `sinclude`, and the files it names. `included`
+/// is not this. An empty list is the directive with no file.
+fn include_directive(code: &str) -> Option<(bool, Vec<String>)> {
+    let code = code.trim();
+    let (optional, rest) = [("include", false), ("-include", true), ("sinclude", true)]
+        .into_iter()
+        .find_map(|(word, optional)| {
+            code.strip_prefix(word)
+                .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+                .map(|rest| (optional, rest))
+        })?;
+    Some((
+        optional,
+        rest.split_whitespace().map(str::to_string).collect(),
+    ))
+}
+
+fn include_path(name: &str, dir: &Path) -> PathBuf {
+    let path = Path::new(name);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        dir.join(path)
+    }
+}
+
+fn merge_makefile(into: &mut Makefile, from: Makefile) {
+    for (name, value) in from.vars {
+        into.vars.insert(name, value);
+    }
+    if into.default.is_none() {
+        into.default = from.default;
+    }
+    for (name, (deps, recipe)) in from.rules {
+        let rule = into.rules.entry(name).or_default();
+        rule.0.extend(deps);
+        rule.1.extend(recipe);
+    }
+}
+
+/// `text` as a makefile whose `include` paths are relative to `dir`, the
+/// directory make is running in. `stack` is the files already being read,
+/// so a cycle is not followed. Past [`DEP_DEPTH`] includes, or an include
+/// that is missing when it is required or unreadable either way, the
+/// makefile cannot be judged.
+fn parse_makefile_in(
+    text: &str,
+    dir: &Path,
+    depth: usize,
+    stack: &mut Vec<PathBuf>,
+) -> Result<Makefile, &'static str> {
     let mut mf = Makefile::default();
     let mut current: Vec<String> = Vec::new();
     let mut lines = text.lines().peekable();
@@ -207,6 +294,38 @@ fn parse_makefile(text: &str) -> Makefile {
         }
         let code = line.split('#').next().unwrap_or("").trim_end();
         if code.trim().is_empty() {
+            continue;
+        }
+        if let Some((optional, names)) = include_directive(code) {
+            if depth >= DEP_DEPTH {
+                return Err("makefile-include-unread");
+            }
+            for name in names {
+                let name = expand(&name, &mf.vars, 0);
+                if name.is_empty() || name.contains('$') {
+                    if optional {
+                        continue;
+                    }
+                    return Err("makefile-include-unread");
+                }
+                let path = include_path(&name, dir);
+                if stack.iter().any(|seen| seen == &path) {
+                    return Err("makefile-include-unread");
+                }
+                match read_make_text(&path) {
+                    ReadMake::Missing if optional => {}
+                    ReadMake::Missing | ReadMake::Unreadable => {
+                        return Err("makefile-include-unread");
+                    }
+                    ReadMake::Text(inner) => {
+                        stack.push(path);
+                        let included = parse_makefile_in(&inner, dir, depth + 1, stack)?;
+                        stack.pop();
+                        merge_makefile(&mut mf, included);
+                    }
+                }
+            }
+            current.clear();
             continue;
         }
         let colon = code.find(':');
@@ -261,7 +380,7 @@ fn parse_makefile(text: &str) -> Makefile {
             current.push(n);
         }
     }
-    mf
+    Ok(mf)
 }
 
 /// `$(VAR)` and `${VAR}` from the file's own assignments, `$$` as `$`.
@@ -820,6 +939,13 @@ mod tests {
         xs.iter().map(|s| (*s).to_string()).collect()
     }
 
+    fn recipes(run: &[String], cwd: &Path) -> Vec<String> {
+        match resolved(run, cwd) {
+            Recipes::Lines(lines) => lines,
+            Recipes::Closed(token) => panic!("closed: {token}"),
+        }
+    }
+
     #[test]
     fn reads_a_make_target_and_its_dependencies() {
         let d = dir(
@@ -829,10 +955,10 @@ mod tests {
                 "BUILD := build\n.PHONY: clean-all\nall: build\nclean: ; rm -rf $(BUILD)\nclean-all: clean distclean\n\t@echo done\ndistclean:\n\t-rm -rf ~ \\\n\t  /opt\n",
             )],
         );
-        let lines = resolved(&argv(&["make", "clean-all"]), &d);
+        let lines = recipes(&argv(&["make", "clean-all"]), &d);
         assert_eq!(lines, ["rm -rf build", "rm -rf ~ /opt", "echo done"]);
         assert_eq!(
-            resolved(&argv(&["make", "-C", ".", "distclean"]), &d),
+            recipes(&argv(&["make", "-C", ".", "distclean"]), &d),
             ["rm -rf ~ /opt"]
         );
     }
@@ -840,7 +966,7 @@ mod tests {
     #[test]
     fn stops_on_a_dependency_cycle() {
         let d = dir("cycle", &[("Makefile", "a: b\n\techo a\nb: a\n\techo b\n")]);
-        assert_eq!(resolved(&argv(&["make", "a"]), &d), ["echo b", "echo a"]);
+        assert_eq!(recipes(&argv(&["make", "a"]), &d), ["echo b", "echo a"]);
     }
 
     #[test]
@@ -853,22 +979,22 @@ mod tests {
             )],
         );
         assert_eq!(
-            resolved(&argv(&["npm", "run", "nuke"]), &d),
+            recipes(&argv(&["npm", "run", "nuke"]), &d),
             ["echo \"go\"", "rm -rf / --no-preserve-root"]
         );
-        assert_eq!(resolved(&argv(&["yarn", "nuke"]), &d).len(), 2);
-        assert_eq!(resolved(&argv(&["pnpm", "build"]), &d), ["tsc"]);
-        assert!(resolved(&argv(&["npm", "install"]), &d).is_empty());
-        assert_eq!(resolved(&argv(&["bun", "run", "nuke"]), &d).len(), 2);
+        assert_eq!(recipes(&argv(&["yarn", "nuke"]), &d).len(), 2);
+        assert_eq!(recipes(&argv(&["pnpm", "build"]), &d), ["tsc"]);
+        assert!(recipes(&argv(&["npm", "install"]), &d).is_empty());
+        assert_eq!(recipes(&argv(&["bun", "run", "nuke"]), &d).len(), 2);
         let at = d.to_string_lossy();
         assert_eq!(
-            resolved(
+            recipes(
                 &argv(&["bun", "--cwd", &at, "run", "build"]),
                 Path::new("/")
             ),
             ["tsc"]
         );
-        assert!(resolved(&argv(&["bun", "build"]), &d).is_empty());
+        assert!(recipes(&argv(&["bun", "build"]), &d).is_empty());
     }
 
     #[test]
@@ -884,11 +1010,11 @@ mod tests {
             ],
         );
         assert_eq!(
-            resolved(&argv(&["just", "wipe"]), &d),
+            recipes(&argv(&["just", "wipe"]), &d),
             ["cargo build", "rm -rf /"]
         );
         assert_eq!(
-            resolved(&argv(&["cargo", "make", "wipe"]), &d),
+            recipes(&argv(&["cargo", "make", "wipe"]), &d),
             ["echo hi", "rm -rf /"]
         );
     }
@@ -896,7 +1022,99 @@ mod tests {
     #[test]
     fn a_missing_file_yields_nothing() {
         let d = dir("empty", &[]);
-        assert!(resolved(&argv(&["make", "clean-all"]), &d).is_empty());
-        assert!(resolved(&argv(&["npm", "run", "nuke"]), &d).is_empty());
+        assert!(recipes(&argv(&["make", "clean-all"]), &d).is_empty());
+        assert!(recipes(&argv(&["npm", "run", "nuke"]), &d).is_empty());
+    }
+
+    /// A recipe that lives in an included makefile is the one make runs.
+    #[test]
+    fn follows_a_makefile_include() {
+        let d = dir(
+            "inc",
+            &[
+                ("Makefile", "include extra.mk\nall:\n\techo top\n"),
+                ("extra.mk", "clean-all:\n\trm -rf ~\n"),
+            ],
+        );
+        assert_eq!(recipes(&argv(&["make", "clean-all"]), &d), ["rm -rf ~"]);
+        let sub = d.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("Makefile"), "include extra.mk\n").unwrap();
+        std::fs::write(sub.join("extra.mk"), "clean-all:\n\trm -rf ~\n").unwrap();
+        assert_eq!(
+            recipes(&argv(&["make", "-C", "sub", "clean-all"]), &d),
+            ["rm -rf ~"]
+        );
+    }
+
+    /// A required include that is missing, and an include that is there
+    /// but cannot be read, hide whatever recipe make would run.
+    #[test]
+    fn an_unreadable_include_fails_closed() {
+        let d = dir(
+            "inc-miss",
+            &[("Makefile", "include missing.mk\nclean-all:\n\techo ok\n")],
+        );
+        assert!(matches!(
+            resolved(&argv(&["make", "clean-all"]), &d),
+            Recipes::Closed("makefile-include-unread")
+        ));
+        let d = dir(
+            "inc-dir",
+            &[("Makefile", "include nested\nclean-all:\n\techo ok\n")],
+        );
+        std::fs::create_dir_all(d.join("nested")).unwrap();
+        assert!(matches!(
+            resolved(&argv(&["make", "clean-all"]), &d),
+            Recipes::Closed("makefile-include-unread")
+        ));
+        let d = dir(
+            "inc-opt-dir",
+            &[("Makefile", "-include nested\nclean-all:\n\techo ok\n")],
+        );
+        std::fs::create_dir_all(d.join("nested")).unwrap();
+        assert!(matches!(
+            resolved(&argv(&["make", "clean-all"]), &d),
+            Recipes::Closed("makefile-include-unread")
+        ));
+        let d = dir(
+            "inc-opt",
+            &[("Makefile", "-include missing.mk\nclean-all:\n\techo ok\n")],
+        );
+        assert_eq!(recipes(&argv(&["make", "clean-all"]), &d), ["echo ok"]);
+        let d = dir(
+            "inc-s",
+            &[("Makefile", "sinclude missing.mk\nclean-all:\n\techo ok\n")],
+        );
+        assert_eq!(recipes(&argv(&["make", "clean-all"]), &d), ["echo ok"]);
+    }
+
+    #[test]
+    fn an_include_cycle_or_a_deep_chain_fails_closed() {
+        let d = dir(
+            "inc-cycle",
+            &[
+                ("Makefile", "include a.mk\n"),
+                ("a.mk", "include Makefile\nclean-all:\n\techo ok\n"),
+            ],
+        );
+        assert!(matches!(
+            resolved(&argv(&["make", "clean-all"]), &d),
+            Recipes::Closed("makefile-include-unread")
+        ));
+        let d = dir("inc-deep", &[]);
+        std::fs::write(d.join("n9.mk"), "clean-all:\n\techo ok\n").unwrap();
+        for i in (0..9).rev() {
+            std::fs::write(
+                d.join(format!("n{i}.mk")),
+                format!("include n{}.mk\n", i + 1),
+            )
+            .unwrap();
+        }
+        std::fs::write(d.join("Makefile"), "include n0.mk\n").unwrap();
+        assert!(matches!(
+            resolved(&argv(&["make", "clean-all"]), &d),
+            Recipes::Closed("makefile-include-unread")
+        ));
     }
 }

@@ -166,7 +166,16 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
                 )),
             };
         }
-        let lines = scripts::resolved(&run, &dir);
+        let lines = match scripts::resolved(&run, &dir) {
+            scripts::Recipes::Closed(token) => {
+                return Checked {
+                    decision: Decision::Deny,
+                    code: PolicyReason::ShellDangerousRunner,
+                    token: Cow::Borrowed(token),
+                };
+            }
+            scripts::Recipes::Lines(lines) => lines,
+        };
         for line in &lines {
             let sh = ["sh".to_string(), "-c".to_string(), line.clone()];
             let c = check_shell_in(&sh, &dir, depth + 1);
@@ -8600,6 +8609,24 @@ mod tests {
             ),
             Decision::Deny
         );
+    }
+
+    /// A recipe that lives only in an included makefile is still judged.
+    /// An include that cannot be read is not treated as absent.
+    #[test]
+    fn a_makefile_include_is_part_of_the_recipe() {
+        let d = std::env::temp_dir().join(format!("policyd-lib-{}-make-inc", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("Makefile"), "include extra.mk\n").unwrap();
+        std::fs::write(d.join("extra.mk"), "clean-all:\n\trm -rf ~\n").unwrap();
+        let c = check_shell_in(&["make".into(), "clean-all".into()], &d, 0);
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(c.token.contains("rm-rf-outside-tmp"), "{}", c.token);
+        std::fs::write(d.join("Makefile"), "include missing.mk\nall:\n\techo ok\n").unwrap();
+        let c = check_shell_in(&["make".into(), "all".into()], &d, 0);
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(c.token.contains("makefile-include-unread"), "{}", c.token);
     }
 
     #[test]
