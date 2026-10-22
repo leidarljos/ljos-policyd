@@ -294,7 +294,8 @@ fn load_deny(
     let text = read_text(path).map_err(|()| reason("deny-file-unreadable", "deny-file"))?;
     let mut addresses = BTreeSet::new();
     let mut domains = BTreeSet::new();
-    for line in text.lines() {
+    for (idx, line) in text.lines().enumerate() {
+        let line_no = idx + 1;
         let Some((key, value)) =
             rule_line(line).map_err(|()| reason("deny-file-invalid", "deny-file"))?
         else {
@@ -309,6 +310,15 @@ fn load_deny(
                 }
                 let addr = normalize_mailbox(&list[0])
                     .ok_or_else(|| reason("deny-file-invalid", "deny-file"))?;
+                // An empty skeleton matches every local part, because
+                // `starts_with("")` is true, and one or two characters
+                // match most of a domain. A typo there would deny the
+                // family with no sign that the file was wrong. Refuse
+                // the line. The detail names it and not the address,
+                // and the failed load denies every send.
+                if skeleton(&addr.local).chars().count() < MIN_SKELETON {
+                    return Err(reason("deny-file-invalid", format!("line {line_no}")));
+                }
                 for (local, domain) in alias_forms(&addr.local, &addr.domain, aliases) {
                     addresses.insert(format!("{local}@{domain}"));
                 }
@@ -704,6 +714,10 @@ fn address_denied(addr: &NormAddr, config: &Config) -> bool {
 
 /// Characters a provider may ignore or cut on in a local part.
 const TRANSPARENT: &[char] = &['.', '_', '-', '+', '='];
+
+/// Shorter than this, an address rule's skeleton is refused at load.
+/// Empty matches every local part in the family.
+const MIN_SKELETON: usize = 3;
 
 /// NFKC, case folded, with every `TRANSPARENT` character removed and
 /// nothing cut. A recipient whose skeleton starts with a rule's
@@ -1871,6 +1885,121 @@ pair left right
             "address strasse@example.test\n",
             ""
         ));
+    }
+
+    /// `starts_with("")` matches every local part. A one or two character
+    /// skeleton matches most of a domain. The file is refused, and the
+    /// refusal names the line, not the address, so every send is denied.
+    #[test]
+    fn a_short_or_empty_skeleton_refuses_the_deny_file() {
+        let clean = "From: mailseat@example.test\r\nTo: person@ok.test\r\n";
+        let cases: &[(&str, usize, &str)] = &[
+            ("address +@example.test\n", 1, "+@example.test"),
+            ("address ++@example.test\n", 1, "++@example.test"),
+            ("address +-=@example.test\n", 1, "+-=@example.test"),
+            ("address \".+_\"@example.test\n", 1, "\".+_\"@example.test"),
+            ("address a@example.test\n", 1, "a@example.test"),
+            ("address ab@example.test\n", 1, "ab@example.test"),
+            ("address a.b@example.test\n", 1, "a.b@example.test"),
+            ("address a+b@example.test\n", 1, "a+b@example.test"),
+            ("address A.B@example.test\n", 1, "A.B@example.test"),
+            ("address \"a.b\"@example.test\n", 1, "\"a.b\"@example.test"),
+            (
+                "address a\u{200B}b@example.test\n",
+                1,
+                "a\u{200B}b@example.test",
+            ),
+            ("# note\naddress a@example.test\n", 2, "a@example.test"),
+            (
+                "domain blocked.test\n\naddress ab@example.test\n",
+                3,
+                "ab@example.test",
+            ),
+            (
+                "address abc@example.test\naddress +@example.test\n",
+                2,
+                "+@example.test",
+            ),
+            ("address +@example.test\r\n", 1, "+@example.test"),
+        ];
+        for (deny, line, addr) in cases {
+            let v = verdict(clean, deny, "");
+            assert_eq!(
+                v.reasons.len(),
+                1,
+                "{deny:?} {:?}",
+                v.reasons.iter().map(|r| r.code).collect::<Vec<_>>()
+            );
+            assert_eq!(v.reasons[0].code, "deny-file-invalid", "{deny:?}");
+            assert_eq!(v.reasons[0].detail, format!("line {line}"), "{deny:?}");
+            assert!(!v.reasons[0].detail.contains(addr), "{deny:?}");
+            assert!(!v.reasons[0].detail.contains('@'), "{deny:?}");
+            assert!(!v.json().contains(addr), "{deny:?}");
+            assert!(v.is_refused());
+        }
+        assert_eq!(
+            codes(
+                "From: mailseat@example.test\r\n",
+                "address a@example.test\n",
+                ""
+            ),
+            vec!["deny-file-invalid"]
+        );
+        assert_eq!(
+            codes(
+                &plain("To: person@blocked.test\r\n"),
+                "domain blocked.test\naddress a@example.test\n",
+                ""
+            ),
+            vec!["deny-file-invalid"]
+        );
+        assert_eq!(
+            codes_argv(
+                "From: mailseat@example.test\r\nTo: person@ok.test\r\n",
+                "address ab@example.test\n",
+                "",
+                &["person@ok.test"]
+            ),
+            vec!["deny-file-invalid"]
+        );
+        assert_eq!(
+            codes(
+                &plain("To: abcd@example.test\r\n"),
+                "address abc@example.test\n",
+                ""
+            ),
+            vec!["recipient-address-denied"]
+        );
+        assert_eq!(
+            codes(
+                &plain("To: a.b.c@example.test\r\n"),
+                "address a+b=c@example.test\n",
+                ""
+            ),
+            vec!["recipient-address-denied"]
+        );
+        assert!(codes(
+            &plain("To: person@ok.test\r\n"),
+            "address a.b.c@example.test\n",
+            ""
+        )
+        .is_empty());
+        assert_eq!(
+            codes(
+                &plain("To: abcx@example.test\r\n"),
+                "address a\u{200B}bc@example.test\n",
+                ""
+            ),
+            vec!["recipient-address-denied"]
+        );
+        assert_eq!(
+            codes(
+                &plain("To: abc@example.test\r\n"),
+                "address abc@example.test\naddress a@example.test\n",
+                ""
+            ),
+            vec!["deny-file-invalid"]
+        );
     }
 
     /// The default separators are `+-=`. Gmail and Googlemail are one

@@ -1,0 +1,1 @@
+An address rule whose local-part skeleton is empty or shorter than three characters refuses the deny file. The error names the line and not the address. A deny file that does not load refuses every send, so a rule of only transparent characters cannot match every local part at that domain.
