@@ -18,6 +18,8 @@ Built-in denials
 ================
 
 First match wins. The head is the last path component of argv[0].
+Leading assignments, ``NAME=value`` or ``NAME+=value``, and runner words
+such as ``env``, ``nice`` and ``timeout`` come off first.
 
 ===================== ======================== ============================
 Token                 Cap'n PolicyReason       When

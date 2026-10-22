@@ -918,9 +918,10 @@ fn substitutions(script: &str) -> Vec<String> {
     out
 }
 
-/// A `NAME=value` word.
+/// A `NAME=value` or `NAME+=value` word.
 fn is_assignment(w: &str) -> bool {
     w.split_once('=').is_some_and(|(k, _)| {
+        let k = k.strip_suffix('+').unwrap_or(k);
         !k.is_empty()
             && !k.starts_with(|c: char| c.is_ascii_digit())
             && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -4280,13 +4281,16 @@ mod tests {
         }
     }
 
-    /// An assignment in front of `cd`, `pushd` or `popd` does not hide it.
+    /// An assignment, `NAME=value` or `NAME+=value`, in front of `cd`,
+    /// `pushd`, `popd` or a task runner does not hide it.
     #[test]
     fn follows_a_cd_behind_an_assignment() {
         let files = [("Makefile", MAKEFILE)];
         for line in [
             "FOO=1 cd project && make clean-all",
             "A=1 B=2 pushd project && make clean-all",
+            "FOO+=1 cd project && make clean-all",
+            "A=1 B+=2 pushd project && make clean-all",
         ] {
             let c = entering("assign-cd", &files, line);
             assert_eq!(c.decision, Decision::Deny, "{line}");
@@ -4297,6 +4301,10 @@ mod tests {
             "pushd project && FOO=1 popd && make clean-all",
         );
         assert_eq!(c.decision, Decision::Allow);
+        assert_eq!(
+            leaving("assign-run", "FOO+=1 make clean-all"),
+            Decision::Deny
+        );
     }
 
     /// `command`, `command -p` and `builtin` do not hide `cd`.
@@ -5255,6 +5263,8 @@ mod tests {
             &["env", "git", "push", "-f", "origin", "main"][..],
             &["env", "-i", "FOO=1", "git", "push", "--force"],
             &["GIT_TRACE=1", "git", "push", "-f"],
+            &["FOO+=1", "git", "push", "-f"],
+            &["env", "A+=1", "git", "push", "--force"],
             &["sh", "-c", "git push -f origin main"],
             &["bash", "-lc", "cd repo && git push --force"],
             &["sh", "-c", "env git push -f"],
