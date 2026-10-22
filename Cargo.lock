@@ -166,6 +166,7 @@ version = "0.4.6"
 dependencies = [
  "capnp",
  "cc",
+ "icu_properties",
  "idna",
  "libc",
  "pkg-config",

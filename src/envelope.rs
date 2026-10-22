@@ -9,6 +9,8 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use icu_properties::props::GeneralCategory;
+use icu_properties::CodePointMapData;
 use unicode_normalization::UnicodeNormalization;
 
 use crate::mail::{self, Header, Mailbox, Message, MessageFault};
@@ -187,6 +189,9 @@ impl NormAddr {
 struct Config {
     identity: NormAddr,
     deny_addresses: BTreeSet<String>,
+    /// Rules whose own skeleton is long enough for the prefix match.
+    /// A shorter rule stays in `deny_addresses` only.
+    deny_prefixes: BTreeSet<String>,
     deny_domains: BTreeSet<String>,
     pack_domains: BTreeSet<String>,
     /// Characters that split a local part into a mailbox and a tag.
@@ -239,12 +244,13 @@ fn load_config(path: &Path) -> Result<Config, MailReason> {
     };
     let identity =
         normalize_identity(&identity).ok_or_else(|| reason("identity-invalid", "identity"))?;
-    let (deny_addresses, deny_domains) = load_deny(&resolve(path, &deny_file), &aliases)?;
+    let loaded = load_deny(&resolve(path, &deny_file), &aliases)?;
     let pack_domains = load_pack_law(&resolve(path, &pack_law))?;
     Ok(Config {
         identity,
-        deny_addresses,
-        deny_domains,
+        deny_addresses: loaded.addresses,
+        deny_prefixes: loaded.prefixes,
+        deny_domains: loaded.domains,
         pack_domains,
         subaddress,
         aliases,
@@ -287,80 +293,101 @@ fn normalize_identity(value: &str) -> Option<NormAddr> {
     normalize_mailbox(&list[0])
 }
 
-fn load_deny(
-    path: &Path,
-    aliases: &[AliasFamily],
-) -> Result<(BTreeSet<String>, BTreeSet<String>), MailReason> {
+struct LoadedDeny {
+    addresses: BTreeSet<String>,
+    prefixes: BTreeSet<String>,
+    domains: BTreeSet<String>,
+}
+
+fn load_deny(path: &Path, aliases: &[AliasFamily]) -> Result<LoadedDeny, MailReason> {
     let text = read_text(path).map_err(|()| reason("deny-file-unreadable", "deny-file"))?;
     let mut addresses = BTreeSet::new();
+    let mut prefixes = BTreeSet::new();
     let mut domains = BTreeSet::new();
     for (idx, line) in text.lines().enumerate() {
         let line_no = idx + 1;
         let Some((key, value)) =
-            rule_line(line).map_err(|()| reason("deny-file-invalid", "deny-file"))?
+            rule_line(line).map_err(|()| reason("deny-file-invalid", format!("line {line_no}")))?
         else {
             continue;
         };
         match key {
             "address" => {
-                let list =
-                    mail::mailboxes(value).map_err(|_| reason("deny-file-invalid", "deny-file"))?;
+                let list = mail::mailboxes(value)
+                    .map_err(|_| reason("deny-file-invalid", format!("line {line_no}")))?;
                 if list.len() != 1 {
-                    return Err(reason("deny-file-invalid", "deny-file"));
+                    return Err(reason("deny-file-invalid", format!("line {line_no}")));
                 }
+                // A star, or a character a parsed recipient cannot carry,
+                // loads and then matches nothing. So does a domain that
+                // is not a hostname. The line is refused. The detail
+                // names it and not the value, and the failed load denies
+                // every send.
                 let addr = normalize_mailbox(&list[0])
-                    .ok_or_else(|| reason("deny-file-invalid", "deny-file"))?;
+                    .filter(|addr| address_rule_can_match(&list[0], addr))
+                    .ok_or_else(|| reason("deny-file-invalid", format!("line {line_no}")))?;
                 // An empty skeleton matches every local part, because
-                // `starts_with("")` is true, and one or two characters
-                // match most of a domain. A typo there would deny the
-                // family with no sign that the file was wrong. Refuse
-                // the line. The detail names it and not the address,
-                // and the failed load denies every send.
-                if skeleton(&addr.local).chars().count() < MIN_SKELETON {
+                // `starts_with("")` is true. Refuse that line. One or
+                // two characters are a real mailbox (`jo@`, `x@user`),
+                // so they keep exact and subaddress matching. The
+                // prefix, which would cover most of a domain, does not
+                // apply to them. The detail names the line and not the
+                // address, and the failed load denies every send.
+                let skel_len = skeleton(&addr.local).chars().count();
+                if skel_len == 0 {
                     return Err(reason("deny-file-invalid", format!("line {line_no}")));
                 }
                 for (local, domain) in alias_forms(&addr.local, &addr.domain, aliases) {
-                    addresses.insert(format!("{local}@{domain}"));
+                    let key = format!("{local}@{domain}");
+                    if skel_len >= MIN_SKELETON {
+                        prefixes.insert(key.clone());
+                    }
+                    addresses.insert(key);
                 }
             }
             "domain" => {
-                let domain = normalize_domain(value)
-                    .ok_or_else(|| reason("deny-file-invalid", "deny-file"))?;
+                let domain = rule_domain(value)
+                    .ok_or_else(|| reason("deny-file-invalid", format!("line {line_no}")))?;
                 domains.insert(domain);
             }
             "handle" | "term" => {
                 if value.is_empty() {
-                    return Err(reason("deny-file-invalid", "deny-file"));
+                    return Err(reason("deny-file-invalid", format!("line {line_no}")));
                 }
             }
             "pair" => {
                 let mut parts = value.split_whitespace();
                 if parts.next().is_none() || parts.next().is_none() {
-                    return Err(reason("deny-file-invalid", "deny-file"));
+                    return Err(reason("deny-file-invalid", format!("line {line_no}")));
                 }
             }
-            _ => return Err(reason("deny-file-invalid", "deny-file")),
+            _ => return Err(reason("deny-file-invalid", format!("line {line_no}"))),
         }
     }
-    Ok((addresses, domains))
+    Ok(LoadedDeny {
+        addresses,
+        prefixes,
+        domains,
+    })
 }
 
 fn load_pack_law(path: &Path) -> Result<BTreeSet<String>, MailReason> {
     let text = read_text(path).map_err(|()| reason("pack-law-unreadable", "pack-law"))?;
     let mut domains = BTreeSet::new();
-    for line in text.lines() {
+    for (idx, line) in text.lines().enumerate() {
+        let line_no = idx + 1;
         let Some((key, value)) =
-            rule_line(line).map_err(|()| reason("pack-law-invalid", "pack-law"))?
+            rule_line(line).map_err(|()| reason("pack-law-invalid", format!("line {line_no}")))?
         else {
             continue;
         };
         // A line that would allow a domain is not a rule this check can
         // apply. The file is refused so an allow cannot override a deny.
         if key != "deny-domain" || value.is_empty() {
-            return Err(reason("pack-law-invalid", "pack-law"));
+            return Err(reason("pack-law-invalid", format!("line {line_no}")));
         }
-        let domain =
-            normalize_domain(value).ok_or_else(|| reason("pack-law-invalid", "pack-law"))?;
+        let domain = rule_domain(value)
+            .ok_or_else(|| reason("pack-law-invalid", format!("line {line_no}")))?;
         domains.insert(domain);
     }
     Ok(domains)
@@ -692,8 +719,16 @@ fn address_denied(addr: &NormAddr, config: &Config) -> bool {
             let Some((rule_local, rule_domain)) = rule.split_once('@') else {
                 continue;
             };
+            let rule_skeleton = skeleton(rule_local);
+            // Equal skeletons on this domain still meet when the rule
+            // is short, so transparent characters and case folding
+            // compare. The prefix does not: `jo` is not `john`, and a
+            // short rule does not cross to another domain in the family.
+            let equal_here = local_skeleton == rule_skeleton && domain == rule_domain;
             if same_family(&domain, rule_domain, &config.aliases)
-                && local_skeleton.starts_with(&skeleton(rule_local))
+                && !rule_skeleton.is_empty()
+                && local_skeleton.starts_with(&rule_skeleton)
+                && (equal_here || config.deny_prefixes.contains(rule))
             {
                 return true;
             }
@@ -715,25 +750,37 @@ fn address_denied(addr: &NormAddr, config: &Config) -> bool {
 /// Characters a provider may ignore or cut on in a local part.
 const TRANSPARENT: &[char] = &['.', '_', '-', '+', '='];
 
-/// Shorter than this, an address rule's skeleton is refused at load.
-/// Empty matches every local part in the family.
+/// Shorter than this, an address rule does not use the skeleton prefix.
+/// An empty skeleton is refused at load: `starts_with("")` is true.
 const MIN_SKELETON: usize = 3;
 
-/// NFKC, case folded twice, with U+0307 and every `TRANSPARENT`
-/// character removed and nothing cut. One upper-then-lower leaves
-/// capital sharp s as ß, so the fold runs again and ß becomes ss.
-/// İ lowercases to i plus a combining dot; leaving the dot makes the
-/// rule skeleton longer than i, and the prefix check misses a
-/// recipient written with i. A recipient whose skeleton starts with
-/// a rule's skeleton, at that domain or one in the same family, is
-/// denied. This over-blocks on purpose: `john` also denies `johnny`
-/// and `jo.hn-x`, so a provider that ignores a character no family
-/// lists cannot deliver a denied mailbox.
+/// NFD, combining marks (general category Mn) removed, case folded
+/// twice, marks removed again, then NFC, with every `TRANSPARENT`
+/// character removed and nothing cut. `normalize_local` has already
+/// composed, so the decomposition runs here on the rule and the
+/// recipient: `abc` + U+0301 + `x` is `abćx` by then, and the mark
+/// has to come off or the prefix never sees `abc`. Case folding İ
+/// produces i and U+0307, so the second strip is what makes that one
+/// skeleton with i. One upper-then-lower leaves capital sharp s as
+/// ß, so the fold runs again and ß becomes ss. A recipient whose
+/// skeleton starts with a rule's skeleton, at that domain or one in
+/// the same family, is denied. This over-blocks on purpose: `john`
+/// also denies `johnny` and `jo.hn-x`, so a provider that ignores a
+/// character no family lists cannot deliver a denied mailbox.
 fn skeleton(local: &str) -> String {
-    let folded = casefold(&casefold(local));
-    folded
+    let folded = casefold(&casefold(&strip_marks(local)));
+    let composed: String = strip_marks(&folded).nfc().collect();
+    composed
         .chars()
-        .filter(|c| *c != '\u{0307}' && !TRANSPARENT.contains(c))
+        .filter(|c| !TRANSPARENT.contains(c))
+        .collect()
+}
+
+fn strip_marks(local: &str) -> String {
+    let category = CodePointMapData::<GeneralCategory>::new();
+    local
+        .nfd()
+        .filter(|c| category.get(*c) != GeneralCategory::NonspacingMark)
         .collect()
 }
 
@@ -787,8 +834,11 @@ const ALIAS_FAMILIES: &[&str] = &[
     // Plus and subdomain addressing, one subdomain level only:
     // https://www.fastmail.help/hc/en-us/articles/360060591053-Plus-addressing-and-subdomain-addressing
     "fastmail.com + subdomain",
-    // Plus addressing only. The domains and their country variants are
-    // separate mailboxes, so none of them is shared:
+    // Plus addressing only. The domains are separate mailboxes, so none
+    // of them is shared and an exact or subaddress match stays on the
+    // domain the rule names. The skeleton prefix still crosses the
+    // family: john@outlook.com also denies john@hotmail.com,
+    // john@live.com, john@msn.com and john@outlook.de.
     // https://support.microsoft.com/en-us/outlook/send-email-from-a-different-address-in-outlook-com
     "outlook.*,hotmail.*,live.*,msn.* +",
     // One account across the four Proton domains, with plus aliases:
@@ -1020,6 +1070,75 @@ fn normalize_local(raw: &str) -> Option<String> {
         return None;
     }
     Some(lower)
+}
+
+/// A deny-file or pack-law domain. `None` when the value is not a
+/// hostname after IDNA. A star, a colon or a slash is not a hostname,
+/// so the line would load and then match no real recipient. A domain
+/// rule already covers its subdomains, so a wildcard is not another
+/// way to write it.
+fn rule_domain(raw: &str) -> Option<String> {
+    if raw.chars().any(forbidden_in_domain) {
+        return None;
+    }
+    let ascii = normalize_domain(raw)?;
+    if ascii.chars().any(forbidden_in_domain) || !is_hostname(&ascii) {
+        return None;
+    }
+    Some(ascii)
+}
+
+fn forbidden_in_domain(c: char) -> bool {
+    matches!(c, '*' | ':' | '/' | '@') || c.is_whitespace()
+}
+
+/// LDH labels of 1 to 63 characters, no leading or trailing hyphen, and
+/// the whole name at most 253. That is a hostname after IDNA. A label
+/// outside it does not compare with a recipient domain.
+fn is_hostname(ascii: &str) -> bool {
+    if ascii.is_empty() || ascii.len() > 253 || ascii.starts_with('.') || ascii.ends_with('.') {
+        return false;
+    }
+    ascii.split('.').all(is_hostname_label)
+}
+
+fn is_hostname_label(label: &str) -> bool {
+    let bytes = label.as_bytes();
+    let (Some(&first), Some(&last)) = (bytes.first(), bytes.last()) else {
+        return false;
+    };
+    if bytes.len() > 63 || first == b'-' || last == b'-' {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+}
+
+/// An address rule has to be a mailbox a parsed recipient can be.
+/// A star is a wildcard a reader might write, and it matches only a
+/// mailbox that itself contains a star.
+fn address_rule_can_match(mailbox: &Mailbox, addr: &NormAddr) -> bool {
+    if mailbox.local.contains('*')
+        || mailbox.domain.contains('*')
+        || addr.local.contains('*')
+        || addr.domain.contains('*')
+    {
+        return false;
+    }
+    if mailbox.domain.chars().any(forbidden_in_domain)
+        || addr.domain.chars().any(forbidden_in_domain)
+        || !is_hostname(&addr.domain)
+    {
+        return false;
+    }
+    mailbox.local.chars().all(recipient_local_char) && addr.local.chars().all(recipient_local_char)
+}
+
+/// `@`, `%` and `!` are routes the parser refuses. A control other than
+/// a tab cannot be in a parsed local part either.
+fn recipient_local_char(c: char) -> bool {
+    !matches!(c, '@' | '%' | '!' | '*') && (!c.is_control() || c == '\t')
 }
 
 /// NFKC, then IDNA, so a fullwidth label and a punycode label of the same
@@ -1609,6 +1728,123 @@ From: other@example.test\r\n";
         assert!(codes(&plain("To: a@blocked.test.example.test\r\n"), deny, "").is_empty());
     }
 
+    /// A star, a URL, a port or any other non-hostname loads and then
+    /// matches no recipient. The file is refused, and the detail is the
+    /// line, not the value. `domain example.test` already covers
+    /// subdomains, which is what a wildcard would have been for.
+    #[test]
+    fn a_domain_rule_that_matches_nothing_refuses_the_file() {
+        let clean = "From: mailseat@example.test\r\nTo: john@example.test\r\n";
+        let cases: &[(&str, &str, usize, &str)] = &[
+            ("domain *.example.test\n", "", 1, "*.example.test"),
+            ("domain *\n", "", 1, "*"),
+            ("domain http://example.test\n", "", 1, "http://"),
+            ("domain example.test:25\n", "", 1, ":25"),
+            ("domain example.test/path\n", "", 1, "/path"),
+            ("domain user@example.test\n", "", 1, "user@"),
+            ("domain exam ple.test\n", "", 1, "exam ple"),
+            ("domain _under.test\n", "", 1, "_under"),
+            ("domain -bad.test\n", "", 1, "-bad"),
+            ("domain bad-.test\n", "", 1, "bad-"),
+            ("# note\n\ndomain *.example.test\n", "", 3, "*.example.test"),
+            (
+                "domain \u{FF0A}.example.test\n",
+                "",
+                1,
+                "\u{FF0A}.example.test",
+            ),
+            ("", "deny-domain *.example.test\n", 1, "*.example.test"),
+            ("", "deny-domain http://example.test\n", 1, "http://"),
+            ("", "deny-domain example.test:25\n", 1, ":25"),
+            ("", "deny-domain example.test/path\n", 1, "/path"),
+            ("", "#\n\ndeny-domain *\n", 3, "*"),
+            ("address *john@example.test\n", "", 1, "*john"),
+            ("address john@*.example.test\n", "", 1, "*."),
+            ("address \"*john\"@example.test\n", "", 1, "*john"),
+            ("address john@ex/ample.test\n", "", 1, "ex/ample"),
+            ("address john@example.test:25\n", "", 1, ":25"),
+            ("address john@http://example.test\n", "", 1, "http://"),
+        ];
+        for (deny, law, line, value) in cases {
+            let v = verdict(clean, deny, law);
+            let code = if law.is_empty() {
+                "deny-file-invalid"
+            } else {
+                "pack-law-invalid"
+            };
+            assert_eq!(v.reasons.len(), 1, "{deny:?} {law:?}");
+            assert_eq!(v.reasons[0].code, code, "{deny:?} {law:?}");
+            assert_eq!(
+                v.reasons[0].detail,
+                format!("line {line}"),
+                "{deny:?} {law:?}"
+            );
+            assert!(!v.reasons[0].detail.contains(value), "{deny:?} {law:?}");
+            assert!(!v.json().contains(value), "{deny:?} {law:?}");
+            assert!(v.is_refused());
+        }
+        assert_eq!(
+            codes(
+                &plain("To: a@b.example.test\r\n"),
+                "domain example.test\n",
+                ""
+            ),
+            vec!["recipient-domain-denied"]
+        );
+        assert_eq!(
+            codes(
+                &plain("To: a@example.test\r\n"),
+                "domain example.test.\n",
+                ""
+            ),
+            vec!["recipient-domain-denied"]
+        );
+        assert_eq!(
+            codes(
+                &plain("To: a@sub.blocked.test\r\n"),
+                "",
+                "deny-domain blocked.test\n"
+            ),
+            vec!["recipient-domain-denied"]
+        );
+    }
+
+    /// The detail is the line, for a bad key as well as a bad value, and
+    /// it does not repeat the value.
+    #[test]
+    fn every_invalid_deny_line_names_its_line() {
+        let clean = "From: mailseat@example.test\r\n";
+        let deny_cases: &[(&str, usize, &str)] = &[
+            ("address\n", 1, "address"),
+            ("nope evil@example.test\n", 1, "nope"),
+            ("handle\n", 1, "handle"),
+            ("term\n", 1, "term"),
+            ("pair onlyone\n", 1, "onlyone"),
+            ("# c\naddress\n", 2, "address"),
+            ("address two@example.test two@example.test\n", 1, "two@"),
+            ("domain\n", 1, "domain"),
+        ];
+        for (deny, line, value) in deny_cases {
+            let v = verdict(clean, deny, "");
+            assert_eq!(v.reasons.len(), 1, "{deny:?}");
+            assert_eq!(v.reasons[0].code, "deny-file-invalid", "{deny:?}");
+            assert_eq!(v.reasons[0].detail, format!("line {line}"), "{deny:?}");
+            assert!(!v.json().contains(value), "{deny:?} {}", v.json());
+        }
+        let law_cases: &[(&str, usize, &str)] = &[
+            ("allow-domain blocked.test\n", 1, "allow-domain"),
+            ("deny-domain\n", 1, "deny-domain"),
+            ("#\n\nnot-a-rule x\n", 3, "not-a-rule"),
+        ];
+        for (law, line, value) in law_cases {
+            let v = verdict(clean, "", law);
+            assert_eq!(v.reasons.len(), 1, "{law:?}");
+            assert_eq!(v.reasons[0].code, "pack-law-invalid", "{law:?}");
+            assert_eq!(v.reasons[0].detail, format!("line {line}"), "{law:?}");
+            assert!(!v.json().contains(value), "{law:?} {}", v.json());
+        }
+    }
+
     /// A domain rule on one domain of a shared family is the whole
     /// family. Microsoft domains are not shared, so they stay apart.
     #[test]
@@ -1900,34 +2136,18 @@ pair left right
         ));
     }
 
-    /// `starts_with("")` matches every local part. A one or two character
-    /// skeleton matches most of a domain. The file is refused, and the
-    /// refusal names the line, not the address, so every send is denied.
+    /// `starts_with("")` matches every local part, so an empty skeleton
+    /// refuses the file. A one or two character skeleton is a real
+    /// mailbox: it matches exactly, as a subaddress and as an equal
+    /// skeleton, and it does not prefix a longer name.
     #[test]
-    fn a_short_or_empty_skeleton_refuses_the_deny_file() {
+    fn a_short_skeleton_matches_exactly_and_an_empty_one_refuses() {
         let clean = "From: mailseat@example.test\r\nTo: person@ok.test\r\n";
-        let cases: &[(&str, usize, &str)] = &[
+        let empty: &[(&str, usize, &str)] = &[
             ("address +@example.test\n", 1, "+@example.test"),
             ("address ++@example.test\n", 1, "++@example.test"),
             ("address +-=@example.test\n", 1, "+-=@example.test"),
             ("address \".+_\"@example.test\n", 1, "\".+_\"@example.test"),
-            ("address a@example.test\n", 1, "a@example.test"),
-            ("address ab@example.test\n", 1, "ab@example.test"),
-            ("address a.b@example.test\n", 1, "a.b@example.test"),
-            ("address a+b@example.test\n", 1, "a+b@example.test"),
-            ("address A.B@example.test\n", 1, "A.B@example.test"),
-            ("address \"a.b\"@example.test\n", 1, "\"a.b\"@example.test"),
-            (
-                "address a\u{200B}b@example.test\n",
-                1,
-                "a\u{200B}b@example.test",
-            ),
-            ("# note\naddress a@example.test\n", 2, "a@example.test"),
-            (
-                "domain blocked.test\n\naddress ab@example.test\n",
-                3,
-                "ab@example.test",
-            ),
             (
                 "address abc@example.test\naddress +@example.test\n",
                 2,
@@ -1935,14 +2155,9 @@ pair left right
             ),
             ("address +@example.test\r\n", 1, "+@example.test"),
         ];
-        for (deny, line, addr) in cases {
+        for (deny, line, addr) in empty {
             let v = verdict(clean, deny, "");
-            assert_eq!(
-                v.reasons.len(),
-                1,
-                "{deny:?} {:?}",
-                v.reasons.iter().map(|r| r.code).collect::<Vec<_>>()
-            );
+            assert_eq!(v.reasons.len(), 1, "{deny:?}");
             assert_eq!(v.reasons[0].code, "deny-file-invalid", "{deny:?}");
             assert_eq!(v.reasons[0].detail, format!("line {line}"), "{deny:?}");
             assert!(!v.reasons[0].detail.contains(addr), "{deny:?}");
@@ -1950,30 +2165,57 @@ pair left right
             assert!(!v.json().contains(addr), "{deny:?}");
             assert!(v.is_refused());
         }
-        assert_eq!(
-            codes(
-                "From: mailseat@example.test\r\n",
-                "address a@example.test\n",
-                ""
-            ),
-            vec!["deny-file-invalid"]
-        );
+        let denied = |to: &str, deny: &str| {
+            codes(&plain(&format!("To: {to}\r\n")), deny, "") == vec!["recipient-address-denied"]
+        };
+        let allowed =
+            |to: &str, deny: &str| codes(&plain(&format!("To: {to}\r\n")), deny, "").is_empty();
+        let a = "address a@example.test\n";
+        assert!(denied("a@example.test", a));
+        assert!(denied("A@Example.test", a));
+        assert!(denied("a+tag@example.test", a));
+        assert!(denied("a-tag@example.test", a));
+        assert!(allowed("ax@example.test", a));
+        assert!(allowed("abc@example.test", a));
+        assert!(allowed("b@example.test", a));
+        let ab = "address ab@example.test\n";
+        assert!(denied("ab@example.test", ab));
+        assert!(denied("a.b@example.test", ab));
+        assert!(denied("ab+tag@example.test", ab));
+        assert!(allowed("abc@example.test", ab));
+        assert!(allowed("abx@example.test", ab));
+        assert!(allowed("xab@example.test", ab));
+        assert!(denied("ab@example.test", "address a.b@example.test\n"));
+        assert!(denied("a+b@example.test", "address ab@example.test\n"));
+        assert!(allowed("abc@example.test", "address a+b@example.test\n"));
+        assert!(denied(
+            "ab@example.test",
+            "address a\u{200B}b@example.test\n"
+        ));
+        assert!(codes("From: mailseat@example.test\r\n", a, "").is_empty());
         assert_eq!(
             codes(
                 &plain("To: person@blocked.test\r\n"),
                 "domain blocked.test\naddress a@example.test\n",
                 ""
             ),
-            vec!["deny-file-invalid"]
+            vec!["recipient-domain-denied"]
         );
+        assert!(codes_argv(
+            "From: mailseat@example.test\r\nTo: person@ok.test\r\n",
+            ab,
+            "",
+            &["person@ok.test"]
+        )
+        .is_empty());
         assert_eq!(
             codes_argv(
-                "From: mailseat@example.test\r\nTo: person@ok.test\r\n",
-                "address ab@example.test\n",
+                "From: mailseat@example.test\r\n",
+                a,
                 "",
-                &["person@ok.test"]
+                &["a+x@example.test"]
             ),
-            vec!["deny-file-invalid"]
+            vec!["argv-recipient-denied"]
         );
         assert_eq!(
             codes(
@@ -1991,28 +2233,24 @@ pair left right
             ),
             vec!["recipient-address-denied"]
         );
-        assert!(codes(
-            &plain("To: person@ok.test\r\n"),
-            "address a.b.c@example.test\n",
-            ""
-        )
-        .is_empty());
-        assert_eq!(
-            codes(
-                &plain("To: abcx@example.test\r\n"),
-                "address a\u{200B}bc@example.test\n",
-                ""
-            ),
-            vec!["recipient-address-denied"]
-        );
-        assert_eq!(
-            codes(
-                &plain("To: abc@example.test\r\n"),
-                "address abc@example.test\naddress a@example.test\n",
-                ""
-            ),
-            vec!["deny-file-invalid"]
-        );
+        assert!(allowed("person@ok.test", "address a.b.c@example.test\n"));
+        assert!(denied(
+            "abcx@example.test",
+            "address a\u{200B}bc@example.test\n"
+        ));
+        assert!(denied(
+            "abc@example.test",
+            "address abc@example.test\naddress a@example.test\n"
+        ));
+        assert!(allowed(
+            "ax@example.test",
+            "address abc@example.test\naddress a@example.test\n"
+        ));
+        let gmail = "address a@gmail.com\n";
+        assert!(denied("a@googlemail.com", gmail));
+        assert!(denied("a+x@gmail.com", gmail));
+        assert!(allowed("ab@gmail.com", gmail));
+        assert!(allowed("ax@googlemail.com", gmail));
     }
 
     /// The prefix check has to meet on both spellings. A rule written
@@ -2108,12 +2346,70 @@ pair left right
             ""
         )
         .is_empty());
-        for short in ["\u{0130}", "\u{1E9E}", "\u{00DF}", "\u{03C2}"] {
-            let v = verdict(&plain(""), &format!("address {short}@example.test\n"), "");
-            assert_eq!(v.reasons[0].code, "deny-file-invalid", "{short}");
-            assert_eq!(v.reasons[0].detail, "line 1", "{short}");
-            assert!(!v.reasons[0].detail.contains(short), "{short}");
+        // These skeletons are shorter than three, so the file loads and
+        // the equal fold matches. A longer local part does not.
+        for (short, folded) in [
+            ("\u{0130}", "i"),
+            ("\u{1E9E}", "ss"),
+            ("\u{00DF}", "ss"),
+            ("\u{03C2}", "\u{03C3}"),
+        ] {
+            assert!(
+                hit(
+                    &format!("{short}@example.test"),
+                    &format!("{short}@example.test")
+                ),
+                "{short}"
+            );
+            assert!(
+                hit(
+                    &format!("{folded}@example.test"),
+                    &format!("{short}@example.test")
+                ),
+                "{short}"
+            );
+            assert!(
+                codes(
+                    &plain(&format!("To: {short}x@example.test\r\n")),
+                    &format!("address {short}@example.test\n"),
+                    ""
+                )
+                .is_empty(),
+                "{short}x"
+            );
         }
+    }
+
+    /// A mark that composes with the letter before it used to leave the
+    /// skeleton as a different letter. NFD takes the mark off again, on
+    /// the rule and the recipient.
+    #[test]
+    fn a_combining_mark_does_not_escape_the_skeleton() {
+        let denied = |to: &str, deny: &str| {
+            codes(&plain(&format!("To: {to}\r\n")), deny, "") == vec!["recipient-address-denied"]
+        };
+        let abc = "address abc@example.test\n";
+        assert!(denied("abc\u{0301}x@example.test", abc));
+        assert!(denied("ab\u{0107}x@example.test", abc));
+        assert!(denied("ab\u{0307}c@example.test", abc));
+        assert!(denied(
+            "abc@example.test",
+            "address ab\u{0107}@example.test\n"
+        ));
+        let grave = "i\u{0307}\u{0300}";
+        assert!(denied(
+            &format!("{grave}@example.test"),
+            "address \u{00EC}@example.test\n"
+        ));
+        assert!(denied(
+            "\u{00EC}@example.test",
+            &format!("address {grave}@example.test\n")
+        ));
+        assert!(denied(
+            &format!("{grave}x@example.test"),
+            "address \u{00EC}x@example.test\n"
+        ));
+        assert!(!denied("abd@example.test", abc));
     }
 
     /// The default separators are `+-=`. Gmail and Googlemail are one
@@ -2205,7 +2501,17 @@ pair left right
         assert!(denied("bad+x@outlook.com", outlook));
         assert!(denied("bad-x@outlook.com", outlook));
         assert!(denied("bad@hotmail.com", outlook));
+        assert!(denied("bad@live.com", outlook));
+        assert!(denied("bad@msn.com", outlook));
+        assert!(denied("bad@outlook.de", outlook));
         assert!(!denied("bad@gmail.com", outlook));
+        assert!(!denied("other@hotmail.com", outlook));
+        // A short rule does not use the prefix, so it does not cross.
+        let short = "address ed@outlook.com\n";
+        assert!(denied("ed@outlook.com", short));
+        assert!(denied("ed+x@outlook.com", short));
+        assert!(!denied("ed@hotmail.com", short));
+        assert!(!denied("ed@outlook.de", short));
         assert!(denied("bad+x@hotmail.co.uk", "address bad@hotmail.co.uk\n"));
         let yahoo = "address base-shop@yahoo.com\n";
         for to in [
@@ -2263,16 +2569,21 @@ pair left right
         ] {
             assert!(denied(to, unicode, ""), "{to}");
         }
-        // The tag's skeleton has to be at least three characters. `x`
-        // would refuse the file before the user label is folded.
-        let label = "address shop@b\u{FC}cher.fastmail.com\n";
+        // A one-character tag is exact, including the plus form Fastmail
+        // delivers. It does not prefix a longer tag.
+        let label = "address x@b\u{FC}cher.fastmail.com\n";
         for to in [
-            "b\u{FC}cher+shop@fastmail.com",
-            "shop@xn--bcher-kva.fastmail.com",
+            "b\u{FC}cher+x@fastmail.com",
+            "x@xn--bcher-kva.fastmail.com",
+            "x@b\u{FC}cher.fastmail.com",
         ] {
             assert!(denied(to, label, ""), "{to}");
         }
-        assert!(!denied("bucher+shop@fastmail.com", label, ""));
+        assert!(!denied("xy@b\u{FC}cher.fastmail.com", label, ""));
+        assert!(!denied("b\u{FC}cher+xy@fastmail.com", label, ""));
+        assert!(!denied("b\u{FC}cher+xshop@fastmail.com", label, ""));
+        // ü is u plus a combining diaeresis, so the skeletons are equal.
+        assert!(denied("bucher+x@fastmail.com", label, ""));
         let dotted = "alias example.test + dots subdomain\n";
         for deny in [
             "address jdoe@example.test\n",

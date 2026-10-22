@@ -1,0 +1,2 @@
+A domain or deny-domain value that is not a hostname after IDNA refuses the file. A star, a colon, a slash, an at-sign and whitespace are in that set. The error names the line and not the value. A domain rule already covers subdomains, so a wildcard is not how to write one.
+An address rule with a star, or with a character a parsed recipient cannot carry, is refused the same way. A rule that loaded and matched nothing would let the recipient through.
