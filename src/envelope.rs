@@ -9,8 +9,8 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use icu_properties::props::GeneralCategory;
-use icu_properties::CodePointMapData;
+use icu_properties::props::{DefaultIgnorableCodePoint, GeneralCategory, NoncharacterCodePoint};
+use icu_properties::{CodePointMapData, CodePointSetData};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::mail::{self, Header, Mailbox, Message, MessageFault};
@@ -170,8 +170,9 @@ fn check_argv_recipients(config: &Config, recipients: &[String], reasons: &mut V
 }
 
 struct NormAddr {
-    /// Deny-file form: NFKC, ignorables removed, local part lowercased,
-    /// domain in IDNA ASCII.
+    /// Deny-file form: NFKC, a zero-width space or braille blank removed,
+    /// local part lowercased, domain in IDNA ASCII. A closed code point
+    /// is not a form.
     local: String,
     domain: String,
     /// The mailbox as written, before that folding. `From` is compared
@@ -677,8 +678,10 @@ fn read_mailboxes(header: &Header) -> Parsed {
 }
 
 /// `From` equals the identity after ASCII case folding only. A local
-/// part or domain that NFKC or ignorable-stripping would change is a
-/// different mailbox on the wire, so it does not match.
+/// part or domain that NFKC, or the removal of a zero-width space or a
+/// braille blank, would change is a different mailbox on the wire, so
+/// it does not match. A closed code point never reaches this: the
+/// mailbox is refused first.
 fn one_identity(header: &Header, list: &[NormAddr], identity: &NormAddr) -> bool {
     matches!(mail::contains_group(&header.raw), Ok(false))
         && list.len() == 1
@@ -694,7 +697,7 @@ fn same(addr: &NormAddr, identity: &NormAddr) -> bool {
 }
 
 fn wire_rewritten(raw: &str) -> bool {
-    let stripped: String = raw.chars().filter(|c| !is_ignorable(*c)).collect();
+    let stripped: String = raw.chars().filter(|c| !is_documented_fold(*c)).collect();
     if stripped != raw {
         return true;
     }
@@ -1060,9 +1063,25 @@ fn normalize_mailbox(mailbox: &Mailbox) -> Option<NormAddr> {
     })
 }
 
+/// A zero-width space and a braille blank come off. Those two folds are
+/// the ones the reference names. Every other closed code point refuses
+/// the local part, before NFKC and after it: U+2000 to U+200A become a
+/// plain space, and a space the parser let through a quoted local part
+/// is still closed.
 fn normalize_local(raw: &str) -> Option<String> {
-    let folded: String = raw.nfkc().filter(|c| !is_ignorable(*c)).collect();
-    if folded.chars().any(|c| c.is_control()) {
+    let sets = unicode_sets();
+    let stripped: String = raw.chars().filter(|c| !is_documented_fold(*c)).collect();
+    if stripped.chars().any(|c| local_closed(&sets, c)) {
+        return None;
+    }
+    let folded: String = stripped
+        .nfkc()
+        .filter(|c| !is_documented_fold(*c))
+        .collect();
+    if folded
+        .chars()
+        .any(|c| local_closed(&sets, c) || c.is_control())
+    {
         return None;
     }
     let lower: String = folded.chars().flat_map(|c| c.to_lowercase()).collect();
@@ -1073,20 +1092,16 @@ fn normalize_local(raw: &str) -> Option<String> {
 }
 
 /// A deny-file or pack-law domain. `None` when a recipient domain could
-/// not be written the same way, or the value is not a hostname after
-/// IDNA. A star, a colon, a slash or a dotted quad would load and then
-/// match no real recipient. A domain rule already covers its
-/// subdomains, so a wildcard is not another way to write it.
+/// not be written the same way. A star, a colon, a slash or a dotted
+/// quad would load and then match no real recipient. A domain rule
+/// already covers its subdomains, so a wildcard is not another way to
+/// write it.
 fn rule_domain(raw: &str) -> Option<String> {
     if raw.chars().any(forbidden_in_domain) {
         return None;
     }
     let bare = mail::parse_domain(raw).ok()?;
-    let ascii = normalize_domain(&bare)?;
-    if ascii.chars().any(forbidden_in_domain) || !is_hostname(&ascii) {
-        return None;
-    }
-    Some(ascii)
+    normalize_domain(&bare)
 }
 
 fn forbidden_in_domain(c: char) -> bool {
@@ -1094,8 +1109,9 @@ fn forbidden_in_domain(c: char) -> bool {
 }
 
 /// LDH labels of 1 to 63 characters, no leading or trailing hyphen, and
-/// the whole name at most 253. That is a hostname after IDNA. A label
-/// outside it does not compare with a recipient domain.
+/// the whole name at most 253. That is a hostname after IDNA. A rule
+/// and a recipient both have to be one, so every recipient domain is a
+/// domain a rule can name.
 fn is_hostname(ascii: &str) -> bool {
     if ascii.is_empty() || ascii.len() > 253 || ascii.starts_with('.') || ascii.ends_with('.') {
         return false;
@@ -1129,7 +1145,6 @@ fn address_rule_can_match(mailbox: &Mailbox, addr: &NormAddr) -> bool {
     }
     if mailbox.domain.chars().any(forbidden_in_domain)
         || addr.domain.chars().any(forbidden_in_domain)
-        || !is_hostname(&addr.domain)
     {
         return false;
     }
@@ -1144,17 +1159,30 @@ fn recipient_local_char(c: char) -> bool {
 
 /// NFKC, then IDNA, so a fullwidth label and a punycode label of the same
 /// domain compare equal. A trailing dot is the same name. A homoglyph that
-/// NFKC leaves alone stays a different domain.
+/// NFKC leaves alone stays a different domain. Rules and recipients are
+/// both read here, and a name that is not a hostname after IDNA is
+/// `None` for both: a recipient at an underscore or edge-hyphen label is
+/// refused, because no rule could name it.
+///
+/// Each label then gets the case fold of the local-part skeleton, so ß
+/// is ss and dotless ı and dotted İ are i. Marks are kept, and a label
+/// wholly in Cyrillic or Greek is not mapped to the Latin it looks like:
+/// it is a different domain, and only Latin mixed with either script in
+/// one label is refused as `mixed-script`.
 fn normalize_domain(raw: &str) -> Option<String> {
     if raw.contains('@') {
         return None;
     }
-    let folded: String = raw.nfkc().filter(|c| !is_ignorable(*c)).collect();
+    let sets = unicode_sets();
+    let folded: String = raw.nfkc().filter(|c| !domain_skips(&sets, *c)).collect();
     let folded = folded.trim().trim_end_matches('.');
     if folded.is_empty() || folded.starts_with('.') || folded.contains("..") {
         return None;
     }
-    if folded.chars().any(|c| c.is_control() || c.is_whitespace()) {
+    if folded
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || domain_closed(&sets, c))
+    {
         return None;
     }
     // A domain literal is not a name. NFKC cannot turn the brackets into
@@ -1162,7 +1190,13 @@ fn normalize_domain(raw: &str) -> Option<String> {
     if folded.contains('[') || folded.contains(']') {
         return None;
     }
-    idna::domain_to_ascii(folded).ok().filter(|d| !d.is_empty())
+    let ascii = idna::domain_to_ascii(folded).ok()?;
+    let (unicode, result) = idna::domain_to_unicode(&ascii);
+    result.ok()?;
+    let folded = casefold(&casefold(&unicode)).replace("i\u{0307}", "i");
+    idna::domain_to_ascii(&folded)
+        .ok()
+        .filter(|d| is_hostname(d))
 }
 
 /// Latin together with Cyrillic or Greek in one label, after NFKC and
@@ -1234,31 +1268,80 @@ fn is_cyrillic_letter(c: char) -> bool {
         )
 }
 
-/// Characters a reader skips. A deny-file comparison removes them so
-/// they cannot hide an address. `From` does not: a mailbox these
-/// change is a different address on the wire and is refused.
-fn is_ignorable(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'
-            | '\u{180E}'
-            | '\u{034F}'
-            | '\u{061C}'
-            | '\u{115F}'
-            | '\u{1160}'
-            | '\u{17B4}'
-            | '\u{17B5}'
-            | '\u{180B}'..='\u{180D}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206F}'
-            | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{1BCA0}'..='\u{1BCA3}'
-            | '\u{1D173}'..='\u{1D17A}'
-            | '\u{E0000}'..='\u{E0FFF}'
-    )
+struct UnicodeSets {
+    category: icu_properties::CodePointMapDataBorrowed<'static, GeneralCategory>,
+    ignorable: icu_properties::CodePointSetDataBorrowed<'static>,
+    noncharacter: icu_properties::CodePointSetDataBorrowed<'static>,
+}
+
+fn unicode_sets() -> UnicodeSets {
+    UnicodeSets {
+        category: CodePointMapData::<GeneralCategory>::new(),
+        ignorable: CodePointSetData::new::<DefaultIgnorableCodePoint>(),
+        noncharacter: CodePointSetData::new::<NoncharacterCodePoint>(),
+    }
+}
+
+/// Removed, not refused. The reference names these two and no other
+/// local-part fold. ZWJ is a format character and is refused with the
+/// rest: no name fold in this check depends on it.
+fn is_documented_fold(c: char) -> bool {
+    matches!(c, '\u{200B}' | '\u{2800}')
+}
+
+/// A recipient local part that contains one of these is refused. The
+/// parser already rejects some of them in an atom. A quoted local part
+/// still carries the others, including a space separator, so the check
+/// is here and not in the parser. A hand list of ranges is what left
+/// U+FFF0..U+FFF8 in place.
+fn local_closed(sets: &UnicodeSets, c: char) -> bool {
+    if is_documented_fold(c) {
+        return false;
+    }
+    sets.ignorable.contains(c)
+        || sets.noncharacter.contains(c)
+        || matches!(
+            sets.category.get(c),
+            GeneralCategory::Unassigned
+                | GeneralCategory::PrivateUse
+                | GeneralCategory::Surrogate
+                | GeneralCategory::Format
+                | GeneralCategory::Control
+                | GeneralCategory::SpaceSeparator
+        )
+}
+
+/// A domain comparison still removes a character a reader skips. It
+/// does not remove an unassigned, private-use, or noncharacter code
+/// point: that would turn a name IDNA rejects into one that can be
+/// delivered.
+fn domain_skips(sets: &UnicodeSets, c: char) -> bool {
+    if sets.noncharacter.contains(c)
+        || matches!(
+            sets.category.get(c),
+            GeneralCategory::Unassigned
+                | GeneralCategory::PrivateUse
+                | GeneralCategory::Surrogate
+                | GeneralCategory::Control
+        )
+    {
+        return false;
+    }
+    is_documented_fold(c) || sets.ignorable.contains(c)
+}
+
+fn domain_closed(sets: &UnicodeSets, c: char) -> bool {
+    if domain_skips(sets, c) {
+        return false;
+    }
+    sets.noncharacter.contains(c)
+        || matches!(
+            sets.category.get(c),
+            GeneralCategory::Unassigned
+                | GeneralCategory::PrivateUse
+                | GeneralCategory::Surrogate
+                | GeneralCategory::Control
+        )
 }
 
 #[cfg(test)]
@@ -1526,6 +1609,96 @@ From: other@example.test\r\n";
         let raw = plain("To: person@bücher.test\r\n");
         assert_eq!(
             codes(&raw, "domain xn--bcher-kva.test\n", ""),
+            vec!["recipient-domain-denied"]
+        );
+    }
+
+    /// The recipient parser takes any atext in a domain, and IDNA does
+    /// not check hyphens or lengths. A domain no rule can name is
+    /// refused, not allowed.
+    #[test]
+    fn a_recipient_domain_no_rule_can_name_is_refused() {
+        let a61 = "a".repeat(61);
+        let a62 = "a".repeat(62);
+        let a63 = "a".repeat(63);
+        let a64 = "a".repeat(64);
+        let refused = [
+            "foo_bar.test".to_string(),
+            "_under.test".to_string(),
+            "-lead.test".to_string(),
+            "trail-.test".to_string(),
+            "a.-lead.test".to_string(),
+            format!("{a64}.test"),
+            format!("{a63}.{a63}.{a63}.{a62}"),
+            "a!b.test".to_string(),
+            "a*b.test".to_string(),
+            "a+b.test".to_string(),
+            "a%b.test".to_string(),
+            "a$b.test".to_string(),
+        ];
+        for domain in &refused {
+            let to = format!("user@{domain}");
+            assert_eq!(
+                codes(&plain(&format!("To: {to}\r\n")), "", ""),
+                vec!["recipient-unparsed"],
+                "{to}"
+            );
+            assert_eq!(
+                codes_argv(&plain(""), "", "", &[&to]),
+                vec!["argv-recipient-unparsed"],
+                "{to}"
+            );
+        }
+        for domain in [
+            "a-b.test".to_string(),
+            format!("{a63}.test"),
+            format!("{a63}.{a63}.{a63}.{a61}"),
+        ] {
+            let to = plain(&format!("To: user@{domain}\r\n"));
+            assert!(codes(&to, "", "").is_empty(), "{domain}");
+            assert_eq!(
+                codes(&to, &format!("domain {domain}\n"), ""),
+                vec!["recipient-domain-denied"],
+                "{domain}"
+            );
+        }
+    }
+
+    /// A domain label gets the case fold a local part does: ß, ẞ, ı
+    /// and İ compare with ss and i, each way round.
+    #[test]
+    fn a_domain_label_is_case_folded_like_a_local_part() {
+        for (written, plain_form) in [
+            ("stra\u{DF}e.test", "strasse.test"),
+            ("STRA\u{1E9E}E.test", "strasse.test"),
+            ("\u{0131}nfo.test", "info.test"),
+            ("\u{0130}nfo.test", "info.test"),
+        ] {
+            for (to, rule) in [(written, plain_form), (plain_form, written)] {
+                let raw = plain(&format!("To: a@{to}\r\n"));
+                assert_eq!(
+                    codes(&raw, &format!("domain {rule}\n"), ""),
+                    vec!["recipient-domain-denied"],
+                    "{to} {rule}"
+                );
+                assert_eq!(
+                    codes(&raw, "", &format!("deny-domain {rule}\n")),
+                    vec!["recipient-domain-denied"],
+                    "{to} {rule}"
+                );
+                assert_eq!(
+                    codes(&raw, &format!("address a@{rule}\n"), ""),
+                    vec!["recipient-address-denied"],
+                    "{to} {rule}"
+                );
+            }
+        }
+        assert_eq!(
+            codes(
+                &plain("To: a@mail.\u{0130}nfo.test\r\n"),
+                "domain info.test\n",
+                ""
+            ),
             vec!["recipient-domain-denied"]
         );
     }
@@ -1815,13 +1988,57 @@ From: other@example.test\r\n";
         );
     }
 
-    /// A rule loads exactly when a recipient at its own domain is
-    /// refused by it. A rule that loads and matches nothing is a deny
-    /// that is not there; a refused rule that could match is a parser
-    /// that has drifted from the recipient's.
+    /// A rule that loads refuses a recipient at its own domain. A rule
+    /// that is refused names a domain a recipient cannot have: with no
+    /// rule at all, that recipient is refused as unparsed. A rule that
+    /// loads and matches nothing is a deny that is not there; a refused
+    /// rule whose recipient is allowed is a recipient no rule can deny.
     #[test]
     fn a_rule_loads_only_when_a_recipient_at_its_domain_matches() {
+        let a61 = "a".repeat(61);
+        let a62 = "a".repeat(62);
+        let a63 = "a".repeat(63);
+        let a64 = "a".repeat(64);
+        let long = [
+            format!("{a63}.test"),
+            format!("{a64}.test"),
+            format!("{a63}.{a63}.{a63}.{a61}"),
+            format!("{a63}.{a63}.{a63}.{a62}"),
+        ];
         let domains = [
+            "foo_bar.test",
+            "_under.test",
+            "-lead.test",
+            "trail-.test",
+            "a.-lead.test",
+            "a-b.test",
+            long[0].as_str(),
+            long[1].as_str(),
+            long[2].as_str(),
+            long[3].as_str(),
+            "xn--a.test",
+            "xn--ls8h-.test",
+            "xn--bcher-kva-.test",
+            "p\u{0430}ypal.test",
+            "xn--pypal-4ve.test",
+            "\u{0440}\u{0430}\u{0443}\u{0440}\u{0430}l.test",
+            "a!b.test",
+            "a#b.test",
+            "a$b.test",
+            "a%b.test",
+            "a&b.test",
+            "a'b.test",
+            "a*b.test",
+            "a+b.test",
+            "a/b.test",
+            "a=b.test",
+            "a?b.test",
+            "a^b.test",
+            "a`b.test",
+            "a{b.test",
+            "a|b.test",
+            "a}b.test",
+            "a~b.test",
             "192.0.2.1",
             "192.0.2",
             "127.1",
@@ -1871,13 +2088,16 @@ From: other@example.test\r\n";
                     assert!(matched, "{deny:?} {law:?} loads and matches nothing");
                 } else {
                     assert_eq!(load, vec![invalid], "{deny:?} {law:?}");
-                    assert!(!matched, "{deny:?} {law:?}");
-                    if let Ok(list) = mail::mailboxes(&format!("user@{domain}")) {
-                        assert!(
-                            normalize_mailbox(&list[0]).is_none(),
-                            "{deny:?} {law:?} refused but a recipient parses"
-                        );
-                    }
+                    assert_eq!(
+                        codes(&to, "", ""),
+                        vec!["recipient-unparsed"],
+                        "{deny:?} {law:?} refused but a recipient at it is allowed"
+                    );
+                    assert!(
+                        !mail::mailboxes(&format!("user@{domain}"))
+                            .is_ok_and(|list| normalize_mailbox(&list[0]).is_some()),
+                        "{deny:?} {law:?} refused but a recipient parses"
+                    );
                 }
             }
         }
@@ -2818,6 +3038,165 @@ pair left right
         let deny = "address other@example.test\n";
         let raw = plain("Reply-To: oth\u{200B}er@example.test\r\n");
         assert_eq!(codes(&raw, deny, ""), vec!["reply-to-denied"]);
+    }
+
+    /// A zero-width space and a braille blank are removed, so the rule
+    /// matches. Every other blank is refused, including an unassigned
+    /// code point in the specials block.
+    #[test]
+    fn a_blank_character_does_not_hide_a_denied_address() {
+        let deny = "address other@example.test\n";
+        for blank in ['\u{200B}', '\u{2800}'] {
+            let raw = plain(&format!("To: oth{blank}er@example.test\r\n"));
+            assert_eq!(
+                codes(&raw, deny, ""),
+                vec!["recipient-address-denied"],
+                "U+{:04X}",
+                u32::from(blank)
+            );
+        }
+        for blank in [
+            '\u{115F}',
+            '\u{1160}',
+            '\u{3164}',
+            '\u{FFA0}',
+            '\u{2000}',
+            '\u{2003}',
+            '\u{200A}',
+            '\u{2065}',
+            '\u{FEFF}',
+            '\u{E0001}',
+            '\u{E0FFF}',
+            '\u{FFF0}',
+            '\u{FFF8}',
+            '\u{FFF9}',
+        ] {
+            let to = if blank.is_whitespace() {
+                format!("\"oth{blank}er\"@example.test")
+            } else {
+                format!("oth{blank}er@example.test")
+            };
+            let raw = plain(&format!("To: {to}\r\n"));
+            assert_eq!(
+                codes(&raw, deny, ""),
+                vec!["recipient-unparsed"],
+                "U+{:04X}",
+                u32::from(blank)
+            );
+        }
+    }
+
+    /// Every code point in a local part is refused, or the skeleton it
+    /// leaves is denied by an address rule for that skeleton. None is
+    /// accepted and missed. A surrogate is not a scalar value, so the
+    /// UTF-8 decoder refuses those bytes.
+    #[test]
+    fn every_code_point_in_a_local_part_is_refused_or_denied_by_its_skeleton() {
+        let sets = unicode_sets();
+        let other = rule_config("other");
+        let mut config = rule_config("other");
+        let base = skeleton("other");
+        let mut bare = String::new();
+        let mut quoted = String::new();
+        for cp in 0..=0x10FFFF {
+            let Some(ch) = char::from_u32(cp) else {
+                assert_eq!(
+                    surrogate_verdict(cp).reasons[0].code,
+                    "message-invalid",
+                    "U+{cp:04X}"
+                );
+                continue;
+            };
+            let Some(mailbox) = placed_local(ch, &mut bare, &mut quoted) else {
+                continue;
+            };
+            let Some(addr) = normalize_mailbox(&mailbox) else {
+                continue;
+            };
+            assert!(
+                !local_closed(&sets, ch),
+                "U+{cp:04X} is closed and was accepted"
+            );
+            let skel = skeleton(&addr.local);
+            if skel == base {
+                assert!(
+                    address_denied(&addr, &other),
+                    "U+{cp:04X} folded away and missed"
+                );
+                continue;
+            }
+            let rule = normalize_local(&skel)
+                .unwrap_or_else(|| panic!("U+{cp:04X} skeleton {skel:?} is not a local part"));
+            install_rule(&mut config, &rule);
+            assert!(
+                address_denied(&addr, &config),
+                "U+{cp:04X} accepted and missed, skeleton {skel:?}"
+            );
+        }
+    }
+
+    fn rule_config(local: &str) -> Config {
+        let mut config = Config {
+            identity: normalize_identity(IDENTITY).unwrap(),
+            deny_addresses: std::collections::BTreeSet::new(),
+            deny_prefixes: std::collections::BTreeSet::new(),
+            deny_domains: std::collections::BTreeSet::new(),
+            pack_domains: std::collections::BTreeSet::new(),
+            subaddress: "+-=".to_string(),
+            aliases: builtin_families().unwrap(),
+        };
+        install_rule(&mut config, local);
+        config
+    }
+
+    fn install_rule(config: &mut Config, local: &str) {
+        config.deny_addresses.clear();
+        config.deny_prefixes.clear();
+        let key = format!("{local}@example.test");
+        if skeleton(local).chars().count() >= MIN_SKELETON {
+            config.deny_prefixes.insert(key.clone());
+        }
+        config.deny_addresses.insert(key);
+    }
+
+    fn placed_local(ch: char, bare: &mut String, quoted: &mut String) -> Option<Mailbox> {
+        bare.clear();
+        bare.push_str("oth");
+        bare.push(ch);
+        bare.push_str("er@example.test");
+        if let Some(mailbox) = mailbox_keeping(bare, ch) {
+            return Some(mailbox);
+        }
+        if matches!(ch, '"' | '\\' | '\r' | '\n') {
+            return None;
+        }
+        quoted.clear();
+        quoted.push('"');
+        quoted.push_str("oth");
+        quoted.push(ch);
+        quoted.push_str("er\"@example.test");
+        mailbox_keeping(quoted, ch)
+    }
+
+    fn mailbox_keeping(spec: &str, ch: char) -> Option<Mailbox> {
+        let list = mail::mailboxes(spec).ok()?;
+        if list.len() == 1 && list[0].domain == "example.test" && list[0].local.contains(ch) {
+            Some(list.into_iter().next().unwrap())
+        } else {
+            None
+        }
+    }
+
+    fn surrogate_verdict(cp: u32) -> MailVerdict {
+        let bytes = [
+            0xE0 | ((cp >> 12) as u8),
+            0x80 | (((cp >> 6) & 0x3F) as u8),
+            0x80 | ((cp & 0x3F) as u8),
+        ];
+        let mut msg = Vec::from(&b"From: mailseat@example.test\r\nTo: oth"[..]);
+        msg.extend_from_slice(&bytes);
+        msg.extend_from_slice(b"er@example.test\r\n\r\n");
+        check_mail_bytes(&msg, std::path::Path::new("/no/such"))
     }
 
     #[test]

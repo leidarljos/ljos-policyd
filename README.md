@@ -186,7 +186,11 @@ On an address rule for `fastmail.com`, a mailbox at
 is `<user>@fastmail.com`. A hyphen in that label is part of the
 user name. Domain rules and `From` are not matched this way.
 An address at `@[ ... ]` is a
-domain literal and is a refusal. An all-numeric domain is a
+domain literal and is a refusal. So is a domain that is not a
+hostname after IDNA, such as one with an underscore, a `!` or a
+`+`, a label that starts or ends with a hyphen, a label over 63
+characters or a name over 253: no rule could name it. An
+all-numeric domain is a
 refusal, judged after IDNA. That includes a dotted quad, a
 shorter form `inet_aton` accepts, a hex label (`0x`) and a
 label with a leading zero. U+3002 or U+FF61 between the
@@ -195,14 +199,20 @@ numbers is still that address. A source route
 part is a refusal, quoted or not, including a backslash escape
 inside the quotes. A local part that NFKC changes into ASCII
 punctuation, such as a fullwidth `@`, `%`, `!` or `+`, is a
-refusal.
+refusal. A local part that contains a default ignorable code point,
+a noncharacter, an unassigned or private-use code point, a format
+or control character, or a space separator is a refusal. A
+zero-width space or a braille blank is still removed before the
+address is compared.
 A recipient domain, or a domain on a header checked against the
 deny file, is refused when one of its labels mixes Latin with
 Cyrillic or Greek after NFKC and IDNA.
 
 A deny-file domain is compared after NFKC and IDNA, so a fullwidth
-spelling and the punycode form are the same domain. ASCII case is
-folded. A character a reader skips, such as a zero-width space, is
+spelling and the punycode form are the same domain. Case is folded
+as the address skeleton folds it, so ß is ss and ı and İ are i. A
+character a reader skips, such as a zero-width space or a braille
+blank, is
 removed before that comparison. A homoglyph that those two passes
 leave alone stays a different domain. `From` is not compared that
 way: only ASCII case folding, and a spelling those passes would
