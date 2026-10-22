@@ -1654,14 +1654,47 @@ impl Vars {
         }
         self.lastpipe |= other.lastpipe;
         self.physical |= other.physical;
-        // A startup file one side set and the other did not is not known.
-        if self.bash_env != other.bash_env || self.bash_env_exported != other.bash_env_exported {
-            self.bash_env = Some("$".into());
-            self.bash_env_exported = true;
+        merge_startup(
+            &mut self.bash_env,
+            &mut self.bash_env_exported,
+            other.bash_env,
+            other.bash_env_exported,
+        );
+        merge_startup(
+            &mut self.sh_env,
+            &mut self.sh_env_exported,
+            other.sh_env,
+            other.sh_env_exported,
+        );
+    }
+}
+
+/// A startup file after two branches. One side may leave it unset, which
+/// sources nothing; the other side is then the only file a later shell
+/// might read, and a value the line shows stays that value. Turning it
+/// into `$` called a shown `/dev/null` an unshown script. Two different
+/// values are not one file.
+fn merge_startup(
+    slot: &mut Option<String>,
+    exported: &mut bool,
+    other: Option<String>,
+    other_ex: bool,
+) {
+    if slot.as_deref() == other.as_deref() {
+        if *exported != other_ex {
+            *exported = true;
         }
-        if self.sh_env != other.sh_env || self.sh_env_exported != other.sh_env_exported {
-            self.sh_env = Some("$".into());
-            self.sh_env_exported = true;
+        return;
+    }
+    match (slot.is_some(), other) {
+        (true, None) => {}
+        (false, other @ Some(_)) => {
+            *slot = other;
+            *exported = other_ex;
+        }
+        _ => {
+            *slot = Some("$".into());
+            *exported = true;
         }
     }
 }
@@ -1904,12 +1937,11 @@ fn note_startup(cmd: &[&str], vars: &mut Vars) {
                     vars.sh_env = None;
                     vars.sh_env_exported = false;
                 }
-                _ if a.contains(['$', '`']) => {
-                    vars.bash_env = Some("$".into());
-                    vars.bash_env_exported = true;
-                    vars.sh_env = Some("$".into());
-                    vars.sh_env_exported = true;
-                }
+                // `unset $name` may name BASH_ENV or ENV. A value the
+                // line shows stays shown: the unset may have missed it,
+                // and a later shell that still has the file is judged.
+                // It does not turn that file into one the line hid, and
+                // it does not create a startup file that was never set.
                 _ => {}
             }
         }
@@ -2026,6 +2058,11 @@ fn judge_startup(
     };
     if value == "$" {
         *denied = Some(startup_unshown());
+        return;
+    }
+    // `ENV=/dev/null` is how a generated configure turns the startup
+    // file off. The device is empty, not a script the line hid.
+    if value == "/dev/null" {
         return;
     }
     shell
@@ -12238,6 +12275,46 @@ hash -r 2> /dev/null
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
+        assert_everyday_allowed(&root);
+    }
+
+    /// Generated configure sets `ENV=/dev/null` and then
+    /// `(unset ENV) && unset ENV`. One side of that `&&` still holds
+    /// `/dev/null` and the other has unset it. Joining those into `$`
+    /// refused the next `sh` as an unshown startup file. A branch that
+    /// may leave a real file in place still judges that file.
+    #[test]
+    fn an_unset_beside_a_shown_startup_file_keeps_the_file() {
+        let root = startup_root("stmerge");
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "ENV=/dev/null; (unset ENV) >/dev/null 2>&1 && unset ENV; sh -c 'echo ok'",
+            "BASH_ENV=/dev/null; (unset BASH_ENV) >/dev/null 2>&1 && unset BASH_ENV; bash -c 'echo ok'",
+            "export ENV=/dev/null; sh -c 'echo ok'",
+            "export ENV=/dev/null; unset ENV; sh -c 'echo ok'",
+            "export ENV=/dev/null; unset $NAME; sh -c 'echo ok'",
+            "ENV=/dev/null sh -c 'echo ok'",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for line in [
+            "export ENV=evil/force.sh; (unset ENV) >/dev/null 2>&1 && unset ENV; sh -c 'echo ok'",
+            "export BASH_ENV=evil/force.sh && unset BASH_ENV; bash -c 'echo ok'",
+            "export ENV=evil/force.sh; unset $NAME; sh -c 'echo ok'",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
+        }
+        let line = "export ENV=$F && unset ENV; sh -c 'echo ok'";
+        let c = at(line);
+        assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+        assert!(
+            c.token.contains("startup-script-unshown"),
+            "{line}: {}",
+            c.token
+        );
         assert_everyday_allowed(&root);
     }
 
