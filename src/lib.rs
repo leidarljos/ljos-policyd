@@ -1172,18 +1172,23 @@ struct Vars {
 const VAR_NAMES: [&str; 3] = ["CDPATH", "HOME", "PWD"];
 
 impl Vars {
+    /// The guard's own environment. A `BASH_ENV` or `ENV` in it is
+    /// exported to every shell the line starts.
     fn from_env() -> Self {
         let var = |n| std::env::var_os(n).map(|v| v.to_string_lossy().into_owned());
+        let startup = |n| var(n).filter(|v| !v.is_empty()).map(|v| shown_startup(&v));
+        let bash_env = startup("BASH_ENV");
+        let sh_env = startup("ENV");
         Vars {
             cdpath: var("CDPATH"),
             home: var("HOME"),
             pwd: None,
             lastpipe: false,
             physical: false,
-            bash_env: None,
-            bash_env_exported: false,
-            sh_env: None,
-            sh_env_exported: false,
+            bash_env_exported: bash_env.is_some(),
+            bash_env,
+            sh_env_exported: sh_env.is_some(),
+            sh_env,
         }
     }
 
