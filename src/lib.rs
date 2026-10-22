@@ -555,6 +555,9 @@ struct Shell {
     cmd_values: std::collections::HashMap<String, Vec<String>>,
     /// Open `if` and `case`. Each branch's values join at `fi` or `esac`.
     assign_stack: Vec<AssignFrame>,
+    /// `exit` ran here. A side of `||` or `&&` that exits does not fall
+    /// through, so the commands after that list keep only the other side.
+    halted: bool,
 }
 
 /// One `if` or `case`, so a variable set in every branch can be read as
@@ -928,8 +931,141 @@ fn runner_commands(
         },
         cmd_values: initial_cmd_values(),
         assign_stack: Vec::new(),
+        halted: false,
     };
     walk(argv, &mut shell, depth, out, denied);
+}
+
+/// One side of `||` or `&&`. `open` is the `{` depth before the side. The
+/// side runs until that depth returns. `exit` on the side sets `dies`: the
+/// shell does not come back from that side, so its directory is dropped.
+struct Side<'a> {
+    saved: Saved,
+    open: usize,
+    dies: bool,
+    /// `exit` was followed by `;`. A later `||` on the next command cannot
+    /// skip it.
+    stuck: bool,
+    op: &'a str,
+    /// Directories a gated `cd` had left when this side began. A `;`
+    /// inside the side merges the live list into `here` and empties it,
+    /// so the failure path is kept here.
+    failed: Vec<std::path::PathBuf>,
+    old_failed: Vec<std::path::PathBuf>,
+    vars_failed: Option<Vars>,
+}
+
+/// Leading `{` opens a group. A command that is `}` closes one. `echo }`
+/// does not: `}` is a closer only as the command word.
+fn brace_move(cmd: &[&str]) -> (usize, usize) {
+    let mut i = 0;
+    let mut opens = 0usize;
+    while i < cmd.len() {
+        if is_assignment(cmd[i]) || (cmd[i] != "{" && KEYWORDS.contains(&cmd[i])) {
+            i += 1;
+            continue;
+        }
+        if cmd[i] == "{" {
+            opens += 1;
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    let mut closes = 0usize;
+    if opens == 0 {
+        while cmd.get(i) == Some(&"}") {
+            closes += 1;
+            i += 1;
+        }
+    }
+    (opens, closes)
+}
+
+fn command_exits(cmd: &[&str]) -> bool {
+    head_word(cmd).is_some_and(|w| base_of(&w) == "exit")
+}
+
+fn note_halt(shell: &Shell, sides: &mut [Side<'_>]) {
+    if shell.halted {
+        if let Some(side) = sides.last_mut() {
+            side.dies = true;
+        }
+    }
+}
+
+/// The side that just ended called `exit`. The commands after the list
+/// run only on the side that did not. `||` keeps the snapshot from before
+/// the exiting side. `&&` keeps the directories a `cd` left in `failed`
+/// when that `cd` is what would have been skipped.
+fn discard_exited_side(
+    shell: &mut Shell,
+    side: Side<'_>,
+    failed: &mut Vec<std::path::PathBuf>,
+    old_failed: &mut Vec<std::path::PathBuf>,
+    vars_failed: &mut Option<Vars>,
+) {
+    let failure = side.op == "&&"
+        && (!side.failed.is_empty() || !side.old_failed.is_empty() || side.vars_failed.is_some());
+    shell.restore(side.saved);
+    if failure {
+        if !side.failed.is_empty() {
+            shell.here = side.failed;
+        }
+        if !side.old_failed.is_empty() {
+            shell.old = side.old_failed;
+        }
+        if let Some(was) = side.vars_failed {
+            shell.vars = was;
+        }
+        if let [d] = shell.here.as_slice() {
+            if !is_untracked(d) {
+                shell.known = Some(d.clone());
+            }
+        }
+        // The exiting side already folded these into `here`. Putting
+        // them back would return the directory that exited.
+        failed.clear();
+        old_failed.clear();
+        *vars_failed = None;
+    }
+    shell.halted = false;
+}
+
+/// Brace depth and the `||` / `&&` sides still open in one walk.
+struct Groups<'a> {
+    armed: bool,
+    closers: usize,
+    brace: usize,
+    sides: Vec<Side<'a>>,
+}
+
+fn finish_conditional(
+    groups: &mut Groups<'_>,
+    ended: &str,
+    shell: &mut Shell,
+    failed: &mut Vec<std::path::PathBuf>,
+    old_failed: &mut Vec<std::path::PathBuf>,
+    vars_failed: &mut Option<Vars>,
+) {
+    if !groups.armed {
+        return;
+    }
+    groups.armed = false;
+    groups.brace = groups.brace.saturating_sub(groups.closers);
+    groups.closers = 0;
+    if matches!(ended, ";" | "") && (shell.halted || groups.sides.last().is_some_and(|s| s.dies)) {
+        if let Some(side) = groups.sides.last_mut() {
+            side.dies = true;
+            side.stuck = true;
+        }
+    }
+    while groups.sides.last().is_some_and(|s| groups.brace <= s.open) {
+        let side = groups.sides.pop().expect("side");
+        if side.dies {
+            discard_exited_side(shell, side, failed, old_failed, vars_failed);
+        }
+    }
 }
 
 /// Commands of `argv` in `shell`. A function body and a sourced file are
@@ -968,6 +1104,16 @@ fn walk(
     // What the variables held after an assignment behind `&&` that may
     // not have run, for the next `;` or `||`.
     let mut vars_failed: Option<Vars> = None;
+    // `{` depth, and each `||` / `&&` side still open. A side that
+    // `exit`s does not fall through: the next list keeps the other side
+    // only, so `lose` on `. "./$as_me.lineno"` before `exit` does not
+    // stick.
+    let mut groups = Groups {
+        armed: false,
+        closers: 0,
+        brace: 0,
+        sides: Vec::new(),
+    };
     // Where the list now running started, for a `&` to put back.
     let mut list = shell.save();
     let mut after = ";";
@@ -984,6 +1130,14 @@ fn walk(
     let (heredocs, data) = heredoc_bodies(&ended_commands(&argv));
     let pattern_skip = case_pattern_skips(&argv);
     for (ci, (cmd, end)) in ended_commands(&argv).into_iter().enumerate() {
+        finish_conditional(
+            &mut groups,
+            after,
+            shell,
+            &mut failed,
+            &mut old_failed,
+            &mut vars_failed,
+        );
         shell.aliases.extend(alias_defs(&cmd));
         if after == "&" {
             shell.restore(list.clone());
@@ -1095,6 +1249,30 @@ fn walk(
         if data[ci] || pat {
             continue;
         }
+        // A `{ ... }` after `||` or `&&` is one side, through its matching
+        // `}`. `exit` there cannot fall through to the next list.
+        if matches!(before, "||" | "&&") {
+            if let Some(parent) = groups.sides.last_mut() {
+                if !parent.stuck && groups.brace > parent.open {
+                    parent.dies = false;
+                    shell.halted = false;
+                }
+            }
+            groups.sides.push(Side {
+                saved: shell.save(),
+                open: groups.brace,
+                dies: false,
+                stuck: false,
+                op: before,
+                failed: failed.clone(),
+                old_failed: old_failed.clone(),
+                vars_failed: vars_failed.clone(),
+            });
+        }
+        let (opens, closes) = brace_move(&cmd);
+        groups.brace += opens;
+        groups.closers = closes;
+        groups.armed = true;
         // After the substitutions, which run before the command does.
         let walked = data[ci] || called_fn(&cmd, &shell.funcs).is_some();
         shell.files.borrow_mut().note(
@@ -1162,6 +1340,13 @@ fn walk(
         // A pipeline stage runs in a subshell, so it cannot move this
         // shell. The last stage can, once `lastpipe` is on.
         let in_shell = !piped || (shell.lastpipe && end != "|");
+        // `exit` in this shell does not return. A background `exit &` does
+        // not, and a function named `exit` is the function.
+        if in_shell && end != "&" && command_exits(&cmd) && called_fn(&cmd, &shell.funcs).is_none()
+        {
+            shell.halted = true;
+            note_halt(shell, &mut groups.sides);
+        }
         // `source` runs the file. The deny rules see that text here, in
         // the same walk that tracks the directory, whether or not the
         // file can move this shell. A pipeline stage's source moves only
@@ -1192,6 +1377,7 @@ fn walk(
                     if denied.is_some() {
                         return;
                     }
+                    note_halt(shell, &mut groups.sides);
                     shell.lastpipe = lastpipe;
                     shell.pwd_set = pwd_set;
                     shell.follow_unseen = follow;
@@ -1275,6 +1461,7 @@ fn walk(
                     shell.fn_depth += 1;
                     shell.stack.push(name);
                     walk(&body.words, shell, depth, out, denied);
+                    note_halt(shell, &mut groups.sides);
                     shell.stack.pop();
                     shell.fn_depth -= 1;
                     shell.follow_unseen = follow;
@@ -1453,6 +1640,14 @@ fn walk(
             }
         }
     }
+    finish_conditional(
+        &mut groups,
+        after,
+        shell,
+        &mut failed,
+        &mut old_failed,
+        &mut vars_failed,
+    );
     if after == "&" {
         shell.restore(list.clone());
     }
@@ -14759,5 +14954,50 @@ hash -r 2> /dev/null
             v(&["sh", "-c", "f ()\n{\n  git push -f\n}\nf"]),
             "deny\tgit-force-push"
         );
+    }
+
+    /// Configure's `|| { . "./$as_me.lineno"; exit; }` sources a path the
+    /// line does not show and then exits. That `exit` does not fall
+    /// through, so `lose` on that side must not move the commands that
+    /// run only when the other side did. The same source without `exit`
+    /// still drops the directory. A command before `exit` is still judged.
+    #[test]
+    fn an_exiting_or_side_does_not_drop_the_directory() {
+        let root = startup_root("orexit");
+        std::fs::write(root.join("evil/Makefile"), MAKEFILE).unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "eval 'test \"x$a\" = \"x$a\"' || { . \"./$as_me.lineno\"; exit; }; make -C safe test",
+            "eval 'test lineno' || {\n  . \"./$as_me.lineno\"\n  exit\n}\nmake -C safe test",
+            "as_fn_exit ()\n{\n  exit $1\n}\neval 'test x' || { cd evil; as_fn_exit 1; }; make clean-all",
+            "as_fn_exit ()\n{\n  exit $1\n}\neval 'test x' || {\n  true || as_fn_exit 1\n  . \"./$as_me.lineno\"\n  exit\n}\nmake -C safe test",
+            "false && exit; make -C safe test",
+            "cd evil && { exit; }; make clean-all",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for (line, token) in [
+            (
+                ". \"./$as_me.lineno\"; make -C safe test",
+                "untracked directory",
+            ),
+            (
+                "eval true || { . \"./$as_me.lineno\"; }; make -C safe test",
+                "untracked directory",
+            ),
+            ("eval true || { git push -f; exit; }", "git-force-push"),
+            ("false && exit; git push -f", "git-force-push"),
+            ("exit; git push -f", "git-force-push"),
+            (
+                "(exit); . \"./$x\"; make -C safe test",
+                "untracked directory",
+            ),
+            ("cd evil || { exit; }; make clean-all", "rm-rf-outside-tmp"),
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains(token), "{line}: {}", c.token);
+        }
     }
 }
