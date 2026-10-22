@@ -5095,6 +5095,31 @@ mod tests {
         }
     }
 
+    /// `lastpipe` is on only where `shopt -s` or `set -o` turns it on; a
+    /// word that only names it does not.
+    #[test]
+    fn only_shopt_or_set_turns_lastpipe_on() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "HOME={dir}; echo lastpipe | read HOME; cd ~ && make test",
+            "unset CDPATH; grep lastpipe notes | read CDPATH; cd project && make test",
+            "shopt -u lastpipe; true | cd project && make clean-all",
+            "set -- lastpipe \"$@\"; true | cd project && make clean-all",
+        ] {
+            let c = entering("lastpipe-named", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+        for line in [
+            "builtin shopt -s extglob lastpipe; true | cd project && make clean-all",
+            "eval 'shopt -s lastpipe'; true | cd project && make clean-all",
+            "set -euo lastpipe; true | cd project && make clean-all",
+            "set $opts; true | cd project && make clean-all",
+        ] {
+            let c = entering("lastpipe-named", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+    }
+
     /// A `shopt` whose option or flags the line does not show, or a
     /// command word it does not show, may turn `lastpipe` on.
     #[test]
