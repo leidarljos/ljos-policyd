@@ -3418,7 +3418,9 @@ fn host_argv_table_at(argv: &[String], depth: usize, moved: bool, parent: &Scrat
     }
     // `bash <(echo "$cmd")`: the substitution runs, and its output is the
     // script. An output the line does not show may be any script.
-    if procsub_script_unshown(argv) {
+    // `source <(cat x.sh)` and `source /dev/stdin` are the same: the text
+    // is not a file the guard opens.
+    if procsub_script_unshown(argv) || source_reads_unshown(argv) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellDangerousRunner,
@@ -4682,6 +4684,39 @@ fn procsub_script_unshown(argv: &[String]) -> bool {
     each_unwrapped(argv)
         .iter()
         .any(|run| matches!(procsub_of(run), ProcKind::Unshown))
+}
+
+/// Whether `path` is a process substitution or an fd the process already
+/// has open. `source` runs that text in this shell. It is not a path the
+/// guard can open and read back.
+fn unshown_source_operand(path: &str) -> bool {
+    path.starts_with("<(")
+        || path.starts_with(">(")
+        || path == "/dev/stdin"
+        || path.starts_with("/dev/fd/")
+        || path.starts_with("/proc/self/fd/")
+}
+
+/// `source` or `.` of a process substitution, `/dev/stdin`, `/dev/fd/*`
+/// or `/proc/self/fd/*`. The operand is spelled as a path, and it is not
+/// one: the script is whatever the substitution or the fd holds. A
+/// `<(...)` word is also a redirection to [`operands`], so it is read
+/// from the command itself.
+fn source_reads_unshown(argv: &[String]) -> bool {
+    commands(argv).iter().any(|cmd| {
+        let words = operands(cmd);
+        let front = (0..words.len())
+            .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+            .count();
+        let rest = peel_cd_command_word(&words[front..]);
+        let Some((w, _)) = rest.split_first() else {
+            return false;
+        };
+        if !matches!(base_of(w), "source" | ".") {
+            return false;
+        }
+        cmd.iter().any(|w| unshown_source_operand(w))
+    })
 }
 
 /// Text with no parameter, command substitution, glob or `~`.
@@ -12596,6 +12631,48 @@ hash -r 2> /dev/null
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
+    }
+
+    /// `source <(cat x.sh)` runs the substitution's output in this shell.
+    /// The operand is not a file the guard can open, nor is `/dev/stdin`
+    /// or a `/dev/fd` or `/proc/self/fd` path: that text is unshown.
+    #[test]
+    fn source_of_a_process_substitution_is_unshown() {
+        let root =
+            std::env::temp_dir().join(format!("policyd-lib-{}-source-procsub", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("x.sh"), "git push -f origin\n").unwrap();
+        std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "source <(cat x.sh)",
+            ". <(cat x.sh)",
+            "source <(cat ok.sh)",
+            ". <(echo echo ok)",
+            "builtin source <(cat x.sh)",
+            "command . <(cat x.sh)",
+            "source /dev/stdin",
+            ". /dev/stdin",
+            "source /dev/fd/0",
+            "source /dev/fd/3",
+            ". /proc/self/fd/0",
+            "source /proc/self/fd/1",
+            "source /dev/fd/$n",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(
+                c.token.contains("procsub-script-unshown"),
+                "{line}: {}",
+                c.token
+            );
+        }
+        let c = at("source ./ok.sh");
+        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
+        let c = at(". ./x.sh");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(c.token.contains("git-force-push"), "{}", c.token);
     }
 
     #[test]
