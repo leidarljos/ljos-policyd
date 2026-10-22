@@ -210,9 +210,11 @@ mailbox is the address in angle brackets, read from the raw unfolded
 value. A display-name encoded-word is decoded for display only, and
 an encoded addr-spec is a refusal. A second =From= is a refusal.
 =Reply-To=, =Sender=, =Return-Path=, =Errors-To=,
-=Disposition-Notification-To= and =Return-Receipt-To= must stay
-clear of a deny-file identity (=address=, or a mailbox at a
-=domain=). Any =Resent-*= header is a refusal. =To=, =Cc= and
+=Disposition-Notification-To=, =Return-Receipt-To=,
+=Delivery-Receipt-To=, =Mail-Followup-To= and =Mail-Reply-To=
+must stay clear of a deny-file identity (=address=, or a mailbox
+at a =domain=). Any =Resent-*= header is a refusal, and so is
+any =Apparently-To=. =To=, =Cc= and
 =Bcc= are refused when the domain or a parent
 of it is named by the deny file or by a =deny-domain= line in the
 pack-law file. A domain literal (an address at =@[ ... ]=) in a
@@ -248,6 +250,13 @@ that cannot be read is a refusal.
 | =disposition-notification-to-unparsed= | Disposition-Notification-To does not parse |
 | =return-receipt-to-denied= | Return-Receipt-To names a deny-file identity |
 | =return-receipt-to-unparsed= | Return-Receipt-To does not parse |
+| =delivery-receipt-to-denied= | Delivery-Receipt-To names a deny-file identity |
+| =delivery-receipt-to-unparsed= | Delivery-Receipt-To does not parse |
+| =mail-followup-to-denied= | Mail-Followup-To names a deny-file identity |
+| =mail-followup-to-unparsed= | Mail-Followup-To does not parse |
+| =mail-reply-to-denied= | Mail-Reply-To names a deny-file identity |
+| =mail-reply-to-unparsed= | Mail-Reply-To does not parse |
+| =apparently-to= | an Apparently-To header is present |
 | =resent-header= | a Resent-* header is present |
 | =mixed-script= | a label mixes Latin with Cyrillic or Greek |
 | =recipient-domain-denied= | To, Cc or Bcc is at a denied domain |

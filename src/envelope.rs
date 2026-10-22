@@ -118,6 +118,7 @@ pub fn check_mail_bytes(message: &[u8], config_path: &Path) -> MailVerdict {
     check_identity_headers(&message, &config, &mut reasons);
     check_recipients(&message, &config, &mut reasons);
     check_resent(&message, &mut reasons);
+    check_apparently_to(&message, &mut reasons);
     MailVerdict { reasons }
 }
 
@@ -338,6 +339,21 @@ fn check_identity_headers(message: &Message, config: &Config, reasons: &mut Vec<
             "return-receipt-to-unparsed",
             "return-receipt-to-denied",
         ),
+        (
+            "delivery-receipt-to",
+            "delivery-receipt-to-unparsed",
+            "delivery-receipt-to-denied",
+        ),
+        (
+            "mail-followup-to",
+            "mail-followup-to-unparsed",
+            "mail-followup-to-denied",
+        ),
+        (
+            "mail-reply-to",
+            "mail-reply-to-unparsed",
+            "mail-reply-to-denied",
+        ),
     ] {
         check_named(
             message,
@@ -400,6 +416,16 @@ fn check_resent(message: &Message, reasons: &mut Vec<MailReason>) {
     for header in &message.headers {
         if header.name.starts_with("resent-") {
             reasons.push(reason("resent-header", header.name.as_str()));
+        }
+    }
+}
+
+/// Sendmail `-t` delivers to `Apparently-To`. The header is a refusal
+/// on its own, whatever address it names.
+fn check_apparently_to(message: &Message, reasons: &mut Vec<MailReason>) {
+    for header in &message.headers {
+        if header.name == "apparently-to" {
+            reasons.push(reason("apparently-to", header.name.as_str()));
         }
     }
 }
@@ -901,6 +927,47 @@ pair left right
         );
         let both = plain("Resent-From: mailseat@example.test\r\nResent-Cc: a@example.test\r\n");
         assert_eq!(codes(&both, "", ""), vec!["resent-header", "resent-header"]);
+    }
+
+    /// Sendmail `-t` treats Apparently-To as a recipient, and a MUA
+    /// follows Mail-Followup-To and Mail-Reply-To. Apparently-To is a
+    /// refusal on its own. The other three are deny-file identities,
+    /// the same way Reply-To is.
+    #[test]
+    fn headers_outside_to_cc_bcc_cannot_name_a_denied_mailbox() {
+        let deny = "address evil@example.test\ndomain blocked.test\n";
+        let law = "deny-domain packblocked.test\n";
+        let apparent = "From: mailseat@example.test\r\nApparently-To: a@blocked.test\r\n\r\n";
+        assert_eq!(codes(apparent, deny, law), vec!["apparently-to"]);
+        let apparent_self =
+            "From: mailseat@example.test\r\nApparently-To: mailseat@example.test\r\n\r\n";
+        assert_eq!(codes(apparent_self, deny, law), vec!["apparently-to"]);
+        let receipt =
+            "From: mailseat@example.test\r\nDelivery-Receipt-To: evil@example.test\r\n\r\n";
+        assert_eq!(
+            codes(receipt, deny, law),
+            vec!["delivery-receipt-to-denied"]
+        );
+        let followup = "From: mailseat@example.test\r\nMail-Followup-To: evil@example.test\r\n\r\n";
+        assert_eq!(codes(followup, deny, law), vec!["mail-followup-to-denied"]);
+        let reply = "From: mailseat@example.test\r\nMail-Reply-To: evil@example.test\r\n\r\n";
+        assert_eq!(codes(reply, deny, law), vec!["mail-reply-to-denied"]);
+        let domain = "From: mailseat@example.test\r\nDelivery-Receipt-To: a@blocked.test\r\n\r\n";
+        assert_eq!(codes(domain, deny, law), vec!["delivery-receipt-to-denied"]);
+        assert!(codes(
+            "From: mailseat@example.test\r\nMail-Reply-To: mailseat@example.test\r\n\r\n",
+            deny,
+            law
+        )
+        .is_empty());
+        assert_eq!(
+            codes(
+                "From: mailseat@example.test\r\nMail-Followup-To: not-an-address\r\n\r\n",
+                "",
+                ""
+            ),
+            vec!["mail-followup-to-unparsed"]
+        );
     }
 
     #[test]

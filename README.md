@@ -151,9 +151,10 @@ joined. An encoded-word in a display name is decoded for display
 only, and an encoded addr-spec is a refusal. A second `From`, a
 `From` that does not parse, or any other address is a refusal.
 `Reply-To`, `Sender`, `Return-Path`, `Errors-To`,
-`Disposition-Notification-To` and `Return-Receipt-To` must stay
-clear of an identity in the deny file. Any `Resent-*` header is a
-refusal. `To`, `Cc` and `Bcc` are refused
+`Disposition-Notification-To`, `Return-Receipt-To`,
+`Delivery-Receipt-To`, `Mail-Followup-To` and `Mail-Reply-To` must
+stay clear of an identity in the deny file. Any `Resent-*` header
+is a refusal, and so is any `Apparently-To`. `To`, `Cc` and `Bcc` are refused
 when that domain, or a parent of it, is named by the deny file or by
 the pack-law file. An address at `@[ ... ]` is a domain literal and
 is a refusal. A recipient domain, or a domain on a header checked
