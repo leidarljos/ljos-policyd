@@ -247,10 +247,7 @@ fn runner_commands(
                 }
             }
         }
-        // An assignment in front of a builtin is set for that command
-        // alone: `FOO=1 cd dir` still moves the shell.
-        let words = &cmd[cmd.iter().take_while(|w| is_assignment(w)).count()..];
-        let words = peel_cd_command_word(words);
+        let words = peel_cd_command_word(&cmd);
         let b = words.first().map_or("", |w| base_of(w));
         if piped && matches!(b, "cd" | "pushd" | "popd") {
             continue;
@@ -627,12 +624,18 @@ fn env_dir(wrappers: &[String], dir: &std::path::Path) -> std::path::PathBuf {
     at
 }
 
-/// Words that keep `cd` in this shell when they run before it.
+/// Words that keep `cd` in this shell when they run before it. An
+/// assignment among them is set for that command alone: `FOO=1 cd dir`
+/// and `if FOO=1 cd dir` still move the shell.
 fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
     loop {
         let Some((w, rest)) = words.split_first() else {
             return words;
         };
+        if is_assignment(w) {
+            words = rest;
+            continue;
+        }
         match base_of(w) {
             "command" => {
                 words = rest;
@@ -4321,7 +4324,8 @@ mod tests {
         }
     }
 
-    /// A control keyword before `cd` does not hide it.
+    /// A control keyword before `cd`, or an assignment after one, does not
+    /// hide it.
     #[test]
     fn follows_a_cd_behind_control_keywords() {
         let files = [("Makefile", MAKEFILE)];
@@ -4330,6 +4334,9 @@ mod tests {
             "while cd project; do make clean-all; done",
             "until cd project; do make clean-all; done",
             "! cd project; make clean-all",
+            "if FOO=1 cd project; then make clean-all; fi",
+            "! FOO=1 cd project; make clean-all",
+            "{ FOO=1 cd project && make clean-all; }",
         ] {
             let c = entering("control-cd", &files, line);
             assert_eq!(c.decision, Decision::Deny, "{line}");

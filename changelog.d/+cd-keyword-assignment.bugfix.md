@@ -1,0 +1,1 @@
+An assignment after a control keyword no longer hides the `cd` behind it: `if FOO=1 cd project; then make clean-all; fi` and `{ FOO=1 cd project && make clean-all; }` read the Makefile where the line started and allowed the `rm -rf ~` in `project/Makefile`, where the shell runs make.
