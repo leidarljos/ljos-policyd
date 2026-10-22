@@ -1452,13 +1452,19 @@ fn judge_startup(
         *denied = Some(startup_unshown());
         return;
     };
+    // Each bash the file starts sources it again, so a file that starts
+    // one would be read without end.
+    if depth >= MAX_DEPTH {
+        *denied = Some(startup_unshown());
+        return;
+    }
     let mut aliases = shell.aliases.clone();
     let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
     if let Some(c) = judge_body(&words, shell) {
         *denied = Some(c);
         return;
     }
-    replay_subshell(&words, shell, depth, out, denied);
+    replay_subshell(&words, shell, depth + 1, out, denied);
 }
 
 /// A `bash <(cat file)` runs `file` as its script, in the child. A `cd`
@@ -10264,6 +10270,25 @@ hash -r 2> /dev/null
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
         assert_everyday_allowed(&root);
+    }
+
+    /// A startup file that starts another bash is sourced again by it.
+    /// `export BASH_ENV=loop.sh; bash -c 'echo ok'`, with `bash -c 'echo
+    /// hi'` in loop.sh, overflowed the stack: each read replayed the file
+    /// at the same depth.
+    #[test]
+    fn a_startup_file_that_starts_bash_is_read_a_bounded_number_of_times() {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-stloop", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("loop.sh"), "bash -c 'echo hi'\n").unwrap();
+        let c = check_shell_in(
+            &shell_words("export BASH_ENV=loop.sh; bash -c 'echo ok'"),
+            &root,
+            0,
+        );
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert_eq!(c.token, "startup-script-unshown");
     }
 
     /// `find -exec` runs its payload, and so does a wrapper in front of a
