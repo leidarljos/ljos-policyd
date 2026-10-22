@@ -1647,7 +1647,8 @@ fn decode_ansi_c_quoted(chars: &[char], i: &mut usize, out: &mut String) {
 }
 
 /// A script split into words the way a shell would: quotes group, a
-/// backslash escapes the next character outside single quotes, and `;`,
+/// backslash escapes the next character outside single quotes, a `#`
+/// that starts a word comments out the rest of its line, and `;`,
 /// `&&`, `||`, `|` and `&` stand as words of their own. The `&` of a
 /// redirection (`2>&1`, `<&3`, `&>log`) stays in its word.
 fn shell_words(script: &str) -> Vec<String> {
@@ -1707,6 +1708,11 @@ fn shell_words(script: &str) -> Vec<String> {
             {
                 cur.push('|');
                 word = true;
+            }
+            '#' if !single && !double && !word => {
+                while i < chars.len() && !matches!(chars[i], '\n' | '\r') {
+                    i += 1;
+                }
             }
             c if !single && !double && (c.is_whitespace() || matches!(c, ';' | '|' | '&')) => {
                 if word {
