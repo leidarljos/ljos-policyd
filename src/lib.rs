@@ -165,7 +165,8 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
                 )),
             };
         }
-        for line in scripts::resolved(&run, &dir) {
+        let lines = scripts::resolved(&run, &dir);
+        for line in &lines {
             let sh = ["sh".to_string(), "-c".to_string(), line.clone()];
             let c = check_shell_in(&sh, &dir, depth + 1);
             if c.decision != Decision::Allow {
@@ -173,6 +174,20 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
                     decision: c.decision,
                     code: c.code,
                     token: Cow::Owned(format!("{} runs `{}`: {}", run.join(" "), line, c.token)),
+                };
+            }
+        }
+        // The lines run one after another, each in its own shell, so one
+        // may write the script a later one runs.
+        if lines.len() > 1 {
+            let whole: Vec<String> = lines.iter().map(|l| format!("(\n{l}\n)")).collect();
+            let sh = ["sh".to_string(), "-c".to_string(), whole.join("\n")];
+            let c = check_shell_in(&sh, &dir, depth + 1);
+            if c.decision != Decision::Allow {
+                return Checked {
+                    decision: c.decision,
+                    code: c.code,
+                    token: Cow::Owned(format!("{} runs its recipe: {}", run.join(" "), c.token)),
                 };
             }
         }
@@ -12807,6 +12822,33 @@ hash -r 2> /dev/null
             "find . -print0 | xargs -0 sh -c 'for f; do wc -l \"$f\"; done' _",
             "sh -c 'eval \"$1\"' _ 'echo hi'",
         ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+    }
+
+    #[test]
+    fn a_recipe_is_judged_as_one_script() {
+        let root = startup_root("wholerecipe");
+        std::fs::write(
+            root.join("Makefile"),
+            "gen:\n\techo 'git push -f origin' > x.sh\n\tsh x.sh\n\
+             cp:\n\tcp evil/force.sh run.sh\n\t@sh ./run.sh\n\
+             ok:\n\techo 'echo ok' > y.sh\n\tsh y.sh\n\
+             two:\n\tcd safe && echo one\n\techo two # done)\n",
+        )
+        .unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in ["make gen", "make cp"] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(
+                c.token.contains("runs its recipe: script-written-on-line"),
+                "{line}: {}",
+                c.token
+            );
+        }
+        for line in ["make ok", "make two"] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
