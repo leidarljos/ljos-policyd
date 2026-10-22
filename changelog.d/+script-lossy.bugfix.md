@@ -1,0 +1,1 @@
+A script with bytes that are not UTF-8 is judged with each bad byte replaced, as bash still runs the commands it can parse: `sh bin.sh`, with a stray byte before `git push -f`, was allowed because the file was not read as text.

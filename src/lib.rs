@@ -1815,7 +1815,7 @@ enum ScriptText {
     Missing,
     Text(String),
     /// A file the guard cannot judge: past [`SCRIPT_MAX`], not a regular
-    /// file, a loop of links, unreadable, or not UTF-8.
+    /// file, a loop of links, or unreadable.
     Unread,
 }
 
@@ -1849,7 +1849,12 @@ fn read_script(path: &std::path::Path) -> ScriptText {
     if file.take(SCRIPT_MAX + 1).read_to_end(&mut buf).is_err() || buf.len() as u64 > SCRIPT_MAX {
         return ScriptText::Unread;
     }
-    String::from_utf8(buf).map_or(ScriptText::Unread, ScriptText::Text)
+    // bash runs the bytes it parses whatever the encoding, so a refused
+    // command beside a bad byte still runs.
+    ScriptText::Text(match String::from_utf8(buf) {
+        Ok(t) => t,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    })
 }
 
 /// [`read_script`] where only the text matters.
@@ -11564,6 +11569,32 @@ hash -r 2> /dev/null
             "sh evil",
             "cd \"$X\" && sh /no/such.sh",
         ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        assert_everyday_allowed(&root);
+    }
+
+    /// `sh bin.sh`, with a byte that is not UTF-8 before `git push -f`,
+    /// was allowed: the file was not read as text. bash runs the bytes it
+    /// can parse, so the text is judged with each bad byte replaced.
+    #[test]
+    fn a_script_that_is_not_utf8_is_judged_lossily() {
+        let root = startup_root("lossy");
+        std::fs::write(root.join("bin.sh"), b"echo \xff\ngit push -f origin\n").unwrap();
+        std::fs::write(root.join("latin.sh"), b"echo caf\xe9\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "sh bin.sh",
+            "source bin.sh",
+            ". ./bin.sh",
+            "BASH_ENV=bin.sh bash -c 'echo ok'",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
+        }
+        for line in ["sh latin.sh", "source latin.sh"] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
