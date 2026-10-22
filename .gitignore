@@ -2,3 +2,4 @@
 **/*.rs.bk
 .venv-docs/
 docs/build/
+tests/fixtures/tiny-autotools/state/
