@@ -49,8 +49,7 @@ the one the runner's own =-C=, =--prefix= or =--cwd= names.
 Each recipe line is judged as a =sh -c= script, and a refusal names the
 target and the line: =make clean-all runs `rm -rf ~`: rm-rf-outside-tmp=.
 Nothing is spawned. A missing or unreadable file, or a directory the
-line does not name (a variable, =cd -=), leaves the line judged as
-written.
+line does not name (a variable), leaves the line judged as written.
 
 A =cd= or =pushd= to a relative path whose first part is not =.= or
 =..= may enter that path under any =CDPATH= entry, so the runner after
@@ -61,6 +60,12 @@ read in each directory the line may be in, up to sixteen. A =cd= into a
 directory without the search bit moves nothing. A runner that may run
 in a directory past those sixteen is refused, as
 =make clean-all may run in an untracked directory=.
+
+A =cd -= or =pushd -= enters =OLDPWD=, which each =cd=, =pushd= and
+=popd= on the line moves, and a script the line runs starts with the
+one its command has. Without =OLDPWD= in the environment, and in a
+recipe's line, where it is not followed, a runner after =cd -= is
+refused the same way.
 
 The words =xargs= adds from stdin can name any target, so a runner that
 =xargs= runs is refused, as =xargs make may take a target from stdin=.

@@ -97,8 +97,14 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
     if table.decision != Decision::Allow || depth >= SCRIPT_DEPTH {
         return table;
     }
+    // A recipe's shell has the OLDPWD of wherever the line ran its runner,
+    // which is not followed, and without OLDPWD the line's own `cd -`
+    // may be in another shell's.
+    let oldpwd = std::env::var_os("OLDPWD")
+        .filter(|p| depth == 0 && !p.is_empty())
+        .map_or_else(|| UNTRACKED.into(), |p| cwd.join(p));
     let mut runs = Vec::new();
-    runner_commands(argv, cwd, 0, &mut runs);
+    runner_commands(argv, cwd, &[oldpwd], 0, &mut runs);
     for (run, dir, stdin) in runs {
         if is_untracked(&dir) && scripts::runner(&run) {
             return Checked {
@@ -180,38 +186,45 @@ fn add_dirs(set: &mut Vec<std::path::PathBuf>, dirs: impl IntoIterator<Item = st
 /// in a subshell: a stage of a pipeline, or a list sent to the background
 /// with `&`. The line goes on past a `cd` that fails at a `;` or `||`, so
 /// the commands there are read both where it went and where it was. A
-/// script nested in the line starts where the command that runs it does.
+/// script nested in the line starts where the command that runs it does,
+/// and with its `cd -`, which goes to one of `oldpwd` at the start.
 /// Each command also says whether `xargs` adds words to it from stdin.
 fn runner_commands(
     argv: &[String],
     cwd: &std::path::Path,
+    oldpwd: &[std::path::PathBuf],
     depth: usize,
     out: &mut Vec<(Vec<String>, std::path::PathBuf, bool)>,
 ) {
-    // Every directory the next command may run in. A `cd` before `&&`
-    // holds for the commands after it, and the directories it left wait
-    // in `failed` for the next `;` or `||`.
+    // Every directory the next command may run in, and every one its
+    // `cd -` may enter. A `cd` before `&&` holds for the commands after
+    // it, and the directories it left wait in `failed` and `old_failed`
+    // for the next `;` or `||`.
     let mut here = vec![cwd.to_path_buf()];
+    let mut old = oldpwd.to_vec();
     let mut failed = Vec::new();
+    let mut old_failed = Vec::new();
     // Each `pushd`'s directories, and whether it surely ran.
     let mut pushed: Vec<(Vec<std::path::PathBuf>, bool)> = Vec::new();
     // Where the list now running started, for a `&` to put back.
-    let mut list = (here.clone(), pushed.clone());
+    let mut list = (here.clone(), old.clone(), pushed.clone());
     let mut after = ";";
     let mut ran_in = Vec::new();
     for (cmd, end) in ended_commands(argv) {
         if after == "&" {
-            (here, pushed) = list.clone();
+            (here, old, pushed) = list.clone();
             failed.clear();
+            old_failed.clear();
         }
         if matches!(after, ";" | "||") {
             add_dirs(&mut here, failed.drain(..));
+            add_dirs(&mut old, old_failed.drain(..));
             for p in &mut pushed {
                 p.1 = false;
             }
         }
         if matches!(after, ";" | "&") {
-            list = (here.clone(), pushed.clone());
+            list = (here.clone(), old.clone(), pushed.clone());
         }
         let piped = after == "|" || end == "|";
         // A `cd` before `&&` holds for what runs after it, unless a `||`
@@ -224,13 +237,13 @@ fn runner_commands(
         // shell, in DIR, and moves nothing after it.
         let wrappers = &owned[..owned.len() - run.len()];
         let at: Vec<_> = here.iter().map(|d| env_dir(wrappers, d)).collect();
-        ran_in.push(at.clone());
+        ran_in.push((at.clone(), old.clone()));
         // A subshell or substitution in the command runs where the
         // command does, and a `cd` inside it moves only itself.
         if depth < MAX_DEPTH {
             for body in cmd.iter().flat_map(|w| substitutions(w)) {
                 for dir in &here {
-                    runner_commands(&shell_words(&body), dir, depth + 1, out);
+                    runner_commands(&shell_words(&body), dir, &old, depth + 1, out);
                 }
             }
         }
@@ -244,8 +257,10 @@ fn runner_commands(
         if b == "popd" {
             if let Some((back, sure)) = pushed.pop() {
                 let now = std::mem::replace(&mut here, back);
+                let was = std::mem::replace(&mut old, now.clone());
                 if !sure {
                     add_dirs(&mut here, now);
+                    add_dirs(&mut old, was);
                 }
             }
             continue;
@@ -272,15 +287,23 @@ fn runner_commands(
                         .collect();
                     if !keep {
                         let from = std::mem::replace(&mut here, top);
+                        let was = std::mem::replace(&mut old, from.clone());
+                        add_dirs(if gates { &mut old_failed } else { &mut old }, was);
                         add_dirs(if gates { &mut failed } else { &mut here }, from);
                     }
                 }
                 continue;
             }
-            let named: Vec<_> = here.iter().flat_map(|d| entered(&args, d, pushd)).collect();
+            let named: Vec<_> = here
+                .iter()
+                .flat_map(|d| entered(&args, d, pushd, &old))
+                .collect();
             if pushd && (keep || named.is_empty()) {
                 // A directory the line does not name still takes its place
                 // on the stack, and is read as the one the line is in.
+                if !keep {
+                    add_dirs(&mut old, here.clone());
+                }
                 let mut dirs = Vec::new();
                 add_dirs(
                     &mut dirs,
@@ -295,17 +318,24 @@ fn runner_commands(
             }
             // A `cd` that may have failed keeps the directories it left,
             // and one into a directory that is not there, or that lacks
-            // the search bit, moves nothing.
+            // the search bit, moves nothing. One the line does not name
+            // is read as staying, and a `cd -` after it may come back.
             let mut to = Vec::new();
             add_dirs(
                 &mut to,
-                named.into_iter().filter(|d| gates || d.join(".").is_dir()),
+                named
+                    .into_iter()
+                    .filter(|d| gates || is_untracked(d) || d.join(".").is_dir()),
             );
-            if !to.is_empty() {
+            if to.is_empty() {
+                add_dirs(&mut old, here.clone());
+            } else {
                 let from = std::mem::replace(&mut here, to);
                 if b == "pushd" {
                     pushed.push((from.clone(), gates));
                 }
+                let was = std::mem::replace(&mut old, from.clone());
+                add_dirs(if gates { &mut old_failed } else { &mut old }, was);
                 add_dirs(if gates { &mut failed } else { &mut here }, from);
             }
             continue;
@@ -328,20 +358,26 @@ fn runner_commands(
     }
     for (i, inner) in inner_commands_at(argv) {
         if inner.as_slice() != argv {
-            for dir in &ran_in[i] {
-                runner_commands(&inner, dir, depth + 1, out);
+            let (dirs, old) = &ran_in[i];
+            for dir in dirs {
+                runner_commands(&inner, dir, old, depth + 1, out);
             }
         }
     }
 }
 
 /// The directories `cd` or `pushd` with `args` may enter from `dir`: a
-/// path, `~` or `~/path`, or home for a bare `cd`, and for a relative
-/// path whose first part is not `.` or `..`, each `CDPATH` entry that
-/// holds it. A bare `pushd`, `-`, a stack index, a variable or a
+/// path, `~` or `~/path`, home for a bare `cd`, `old` for `-`, and for a
+/// relative path whose first part is not `.` or `..`, each `CDPATH`
+/// entry that holds it. A bare `pushd`, a stack index, a variable or a
 /// substitution names no directory the line shows, so the caller keeps
 /// the one it has.
-fn entered(args: &[&str], dir: &std::path::Path, pushd: bool) -> Vec<std::path::PathBuf> {
+fn entered(
+    args: &[&str],
+    dir: &std::path::Path,
+    pushd: bool,
+    old: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
     let Some(to) = args
         .iter()
         .find(|a| !a.starts_with(['-', '+']) || **a == "-")
@@ -349,7 +385,7 @@ fn entered(args: &[&str], dir: &std::path::Path, pushd: bool) -> Vec<std::path::
         return if pushd { None } else { home_dir() }.into_iter().collect();
     };
     if *to == "-" {
-        return Vec::new();
+        return old.to_vec();
     }
     let Some(path) = path_from(to, dir) else {
         return Vec::new();

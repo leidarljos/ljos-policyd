@@ -72,8 +72,9 @@ or the one `-C`, `--prefix` or `--cwd` names. Each line of the recipe is
 judged as above, so `cd ~/proj && make clean-all` whose recipe runs
 `rm -rf ~` is ``make clean-all runs `rm -rf ~`: rm-rf-outside-tmp``, and
 `make test` and `npm run build` still run. Nothing is spawned. A missing
-or unreadable file, or a directory the line does not name (`cd "$DIR"`,
-`cd -`), leaves the line judged as written.
+or unreadable file, or a directory the line does not name (`cd "$DIR"`),
+leaves the line judged as written. `cd -` enters `OLDPWD`, and without
+it a runner after `cd -` is refused.
 
 ## Two backends: phronesis, or the table built in
 
