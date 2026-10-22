@@ -16950,6 +16950,17 @@ make -C safe test
         );
     }
 
+    /// `( c[d] ../[e]vil )` is a subshell, not a move into `evil`. The
+    /// words before `)` look like a case pattern. They do not change
+    /// the directory, so `make` stays here. Root has no Makefile.
+    #[test]
+    fn a_parenthesised_pattern_keeps_the_directory() {
+        assert_eq!(
+            evil_and_safe("casepin", "( c[d] ../[e]vil ) ; make clean-all"),
+            Decision::Allow
+        );
+    }
+
     /// An EXIT trap runs as the shell exits. It does not move the
     /// commands after it. The action is still judged, and a trap on
     /// any other signal still moves the shell.
