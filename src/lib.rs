@@ -2938,8 +2938,16 @@ fn function_at(words: &[String], i: usize) -> Option<(String, Vec<String>, usize
         return None;
     }
     let mut paren = raw.ends_with("()") || raw.ends_with("(){");
+    // A newline between the name and `()` or `{` is a separator. The
+    // definition does not run the body.
+    while words.get(k).map(String::as_str) == Some(";") {
+        k += 1;
+    }
     if words.get(k).is_some_and(|w| w == "()") {
         paren = true;
+        k += 1;
+    }
+    while words.get(k).map(String::as_str) == Some(";") {
         k += 1;
     }
     if !keyword && !paren {
@@ -14729,5 +14737,27 @@ hash -r 2> /dev/null
         ] {
             assert_eq!(evil_and_safe("cmdvar", line), Decision::Deny, "{line}");
         }
+    }
+
+    /// A newline between `()` and `{` is how a generated configure writes
+    /// its functions. The body does not run at the definition. A call
+    /// still does.
+    #[test]
+    fn a_function_brace_on_the_next_line_is_still_a_definition() {
+        for line in [
+            "as_fn_unset ()\n{\n  { eval $1=; unset $1; }\n}\nmake -C safe clean-all",
+            "f ()\n{\n  cd evil\n}\nmake -C safe clean-all",
+            "eval 'as_fn_append ()\n{\n  eval $1+=\\$2\n}\n'; make -C safe clean-all",
+        ] {
+            assert_eq!(evil_and_safe("fnnl", line), Decision::Allow, "{line}");
+        }
+        assert_eq!(
+            evil_and_safe("fnnl", "eval 'f ()\n{\n  cd evil\n}\nf'; make clean-all"),
+            Decision::Deny
+        );
+        assert_eq!(
+            v(&["sh", "-c", "f ()\n{\n  git push -f\n}\nf"]),
+            "deny\tgit-force-push"
+        );
     }
 }
