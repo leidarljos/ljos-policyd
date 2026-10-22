@@ -909,9 +909,11 @@ fn body_keeps(
     memo: &mut std::collections::HashMap<String, bool>,
     stack: &mut std::collections::HashSet<String>,
 ) -> bool {
+    // A stage before a `|` runs in a subshell even under lastpipe. A case
+    // arm's alternatives (`CYGWIN*|MSYS*)`) read as such stages.
     ended_commands(words)
         .iter()
-        .all(|(cmd, _)| command_keeps(cmd, funcs, memo, stack))
+        .all(|(cmd, end)| *end == "|" || command_keeps(cmd, funcs, memo, stack))
 }
 
 /// Whether `cmd`, run in this shell, leaves the directory, the stack,
