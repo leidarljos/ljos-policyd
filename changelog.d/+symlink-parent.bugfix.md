@@ -1,0 +1,1 @@
+A parent that is not there yet, or that the same line creates, may be a symlink by the time `rm -rf` runs. The check was reading the starting directory and treating a missing parent as a real one, so `cd` and an earlier `ln` were ignored.
