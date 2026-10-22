@@ -6171,7 +6171,10 @@ const WRAPPERS: &[&str] = &[
 fn command_at(stage: &[String]) -> Option<usize> {
     stage.iter().position(|w| {
         let b = base_of(w);
-        !(WRAPPERS.contains(&b) || w.starts_with('-') || (w.contains('=') && !w.starts_with('=')))
+        !(WRAPPERS.contains(&b)
+            || w.starts_with('-')
+            || (w.contains('=') && !w.starts_with('='))
+            || plain_redirection(w))
     })
 }
 
@@ -14151,6 +14154,32 @@ hash -r 2> /dev/null
             let c = at(line);
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
             assert!(c.token.contains(token), "{line}: {}", c.token);
+        }
+    }
+
+    /// A redirection before the command is not the command. `>file echo`
+    /// is `echo`, which writes only `file`. An unknown command there may
+    /// still write anything.
+    #[test]
+    fn a_leading_redirection_is_not_the_command() {
+        let root = startup_root("leadredir");
+        std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
+        std::fs::write(root.join("configure"), "#!/bin/sh\necho ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            ">conftest.c echo ok; sh ./ok.sh",
+            "2>/dev/null echo ok; sh ./configure",
+            ">conftest.c true; sh ./ok.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for line in [
+            ">run.sh echo 'git push -f'; sh run.sh",
+            ">out mysterybin; sh ./ok.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
         }
     }
 }
