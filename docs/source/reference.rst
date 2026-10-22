@@ -227,7 +227,8 @@ any ``Apparently-To``. ``To``, ``Cc`` and
 ``Bcc`` are refused when the domain or a
 parent of it is named by the deny file or by a ``deny-domain`` line in
 the pack-law file. A domain literal (an address at ``@[ ... ]``) in a
-watched header is a refusal. A recipient domain, or a domain on a
+watched header is a refusal. A source route (``<@host:mailbox>``) is
+a refusal. A recipient domain, or a domain on a
 header checked against the deny file, is refused when one label
 mixes Latin with Cyrillic or Greek after NFKC and IDNA.
 

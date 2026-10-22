@@ -841,6 +841,30 @@ From: other@example.test\r\n";
     }
 
     #[test]
+    fn a_source_route_is_refused() {
+        let deny = "address evil@example.test\ndomain blocked.test\n";
+        let law = "deny-domain packblocked.test\n";
+        let raw = "From: mailseat@example.test\r\nTo: <@blocked.test:a@ok.test>\r\n\r\n";
+        assert_eq!(codes(raw, deny, law), vec!["recipient-unparsed"]);
+        assert_eq!(
+            codes(
+                &plain("Cc: <@relay.example.test:person@ok.test>\r\n"),
+                deny,
+                law
+            ),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("Reply-To: <@blocked.test:a@ok.test>\r\n"), deny, law),
+            vec!["reply-to-unparsed"]
+        );
+        assert_eq!(
+            codes("From: <@example.test:mailseat@example.test>\r\n", "", ""),
+            vec!["from-unparsed"]
+        );
+    }
+
+    #[test]
     fn a_domain_literal_is_refused() {
         let deny = "domain blocked.test\n";
         assert_eq!(

@@ -735,19 +735,15 @@ fn angle_contents(segment: &str) -> Result<Option<&str>, AddressFault> {
     Ok(Some(inner.trim()))
 }
 
+/// A source route (`@host:addr`) is not the addr-spec. An MTA that
+/// honours the route relays through those hosts, so the final mailbox
+/// is the wrong address to judge. The route is a refusal.
 fn route_addr(inner: &str) -> Result<&str, AddressFault> {
     let inner = inner.trim();
-    let Some(rest) = inner.strip_prefix('@') else {
-        return Ok(inner);
-    };
-    let idx = rest.find(':').ok_or(AddressFault)?;
-    for part in rest[..idx].split(',') {
-        let part = part.trim().strip_prefix('@').unwrap_or(part.trim());
-        if part.is_empty() || part.contains('@') || part.contains('[') || part.contains(']') {
-            return Err(AddressFault);
-        }
+    if inner.starts_with('@') {
+        return Err(AddressFault);
     }
-    Ok(rest[idx + 1..].trim())
+    Ok(inner)
 }
 
 fn parse_addr_spec(spec: &str) -> Result<Mailbox, AddressFault> {
@@ -1060,15 +1056,10 @@ From: other@example.test\r\n\
     }
 
     #[test]
-    fn a_source_route_keeps_the_addr_spec() {
-        let value = "<@relay.example.test:mailseat@example.test>";
-        assert_eq!(
-            mailboxes(value).unwrap(),
-            vec![Mailbox {
-                local: "mailseat".into(),
-                domain: "example.test".into(),
-            }]
-        );
+    fn a_source_route_is_not_a_mailbox() {
+        assert!(mailboxes("<@relay.example.test:mailseat@example.test>").is_err());
+        assert!(mailboxes("<@blocked.test:a@ok.test>").is_err());
+        assert!(mailboxes("<@a.example,@b.example:a@ok.test>").is_err());
     }
 
     #[test]
