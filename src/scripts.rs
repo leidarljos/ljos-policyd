@@ -280,16 +280,14 @@ fn apply_make_words(
                 Some((name, value)) => (name, Some(value)),
                 None => (rest, None),
             };
-            match long_option(name)? {
+            let (canon, kind) = long_option(name)?;
+            match kind {
                 LongOpt::Flag => {
                     if inline.is_some() {
                         return Err(MAKE_FLAG_TOKEN);
                     }
                 }
                 LongOpt::Reject => return Err(MAKE_FLAG_TOKEN),
-                // A long option make only diagnoses does not name a file
-                // or a recipe. The value, if it wrote one, is not read.
-                LongOpt::Skip => {}
                 LongOpt::Value => {
                     let arg = if let Some(value) = inline {
                         value.to_string()
@@ -297,12 +295,12 @@ fn apply_make_words(
                         i += 1;
                         words.get(i).ok_or(MAKE_FLAG_TOKEN)?.clone()
                     };
-                    apply_long(name, &arg, state)?;
+                    apply_long(canon, &arg, state)?;
                 }
                 LongOpt::Optional => {
                     if let Some(value) = inline {
                         let _ = value;
-                    } else if matches!(name, "jobs" | "load-average")
+                    } else if matches!(canon, "jobs" | "load-average")
                         && words
                             .get(i + 1)
                             .is_some_and(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_digit()))
@@ -337,55 +335,87 @@ fn apply_make_words(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
 enum LongOpt {
     Flag,
     Value,
     Optional,
     Reject,
-    /// Not a file, a directory, or a recipe. Make prints a diagnostic.
-    Skip,
 }
 
-fn long_option(name: &str) -> Result<LongOpt, &'static str> {
-    Ok(match name {
-        "help"
-        | "version"
-        | "silent"
-        | "quiet"
-        | "no-silent"
-        | "keep-going"
-        | "stop"
-        | "no-keep-going"
-        | "ignore-errors"
-        | "just-print"
-        | "dry-run"
-        | "recon"
-        | "question"
-        | "touch"
-        | "always-make"
-        | "print-data-base"
-        | "warn-undefined-variables"
-        | "no-builtin-rules"
-        | "no-builtin-variables"
-        | "print-directory"
-        | "no-print-directory"
-        | "check-symlink-times"
-        | "trace" => LongOpt::Flag,
-        "file" | "makefile" | "directory" | "include-dir" => LongOpt::Value,
-        "jobs" | "load-average" | "max-load" | "output-sync" | "debug" | "jobserver-auth"
-        | "jobserver-fds" | "jobserver-style" | "shuffle" => LongOpt::Optional,
-        "eval"
-        | "environment-overrides"
-        | "assume-old"
-        | "assume-new"
-        | "old-file"
-        | "new-file"
-        | "what-if" => LongOpt::Reject,
-        // A long name this table does not know is the diagnostic make
-        // prints for it. It does not name a makefile. A short letter
-        // `apply_short` does not know is still refused.
-        _ => LongOpt::Skip,
-    })
+/// GNU make's long options. A prefix make accepts has to name one of
+/// these. `jobserver-auth` and `jobserver-fds` are how make records the
+/// jobserver in `MAKEFLAGS`. `shuffle` and `jobserver-style` are the
+/// names a newer make adds; this make does not know them, and a
+/// `MAKEFLAGS` from one must not close the read.
+const MAKE_LONG: &[(&str, LongOpt)] = &[
+    ("help", LongOpt::Flag),
+    ("version", LongOpt::Flag),
+    ("silent", LongOpt::Flag),
+    ("quiet", LongOpt::Flag),
+    ("no-silent", LongOpt::Flag),
+    ("keep-going", LongOpt::Flag),
+    ("stop", LongOpt::Flag),
+    ("no-keep-going", LongOpt::Flag),
+    ("ignore-errors", LongOpt::Flag),
+    ("just-print", LongOpt::Flag),
+    ("dry-run", LongOpt::Flag),
+    ("recon", LongOpt::Flag),
+    ("question", LongOpt::Flag),
+    ("touch", LongOpt::Flag),
+    ("always-make", LongOpt::Flag),
+    ("print-data-base", LongOpt::Flag),
+    ("warn-undefined-variables", LongOpt::Flag),
+    ("no-builtin-rules", LongOpt::Flag),
+    ("no-builtin-variables", LongOpt::Flag),
+    ("print-directory", LongOpt::Flag),
+    ("no-print-directory", LongOpt::Flag),
+    ("check-symlink-times", LongOpt::Flag),
+    ("trace", LongOpt::Flag),
+    ("file", LongOpt::Value),
+    ("makefile", LongOpt::Value),
+    ("directory", LongOpt::Value),
+    ("include-dir", LongOpt::Value),
+    ("jobs", LongOpt::Optional),
+    ("load-average", LongOpt::Optional),
+    ("max-load", LongOpt::Optional),
+    ("output-sync", LongOpt::Optional),
+    ("debug", LongOpt::Optional),
+    ("jobserver-auth", LongOpt::Optional),
+    ("jobserver-fds", LongOpt::Optional),
+    ("jobserver-style", LongOpt::Optional),
+    ("shuffle", LongOpt::Optional),
+    ("eval", LongOpt::Reject),
+    ("environment-overrides", LongOpt::Reject),
+    ("assume-old", LongOpt::Reject),
+    ("assume-new", LongOpt::Reject),
+    ("old-file", LongOpt::Reject),
+    ("new-file", LongOpt::Reject),
+    ("what-if", LongOpt::Reject),
+];
+
+/// The long option `name` is. Make takes an unambiguous prefix of a
+/// name (`--tr` is `--trace`). A prefix of an option that names a file,
+/// a directory or a recipe is refused: the guard would be guessing which
+/// file that prefix meant. An unknown name, or two names that share the
+/// prefix, is refused too.
+fn long_option(name: &str) -> Result<(&'static str, LongOpt), &'static str> {
+    if let Some((canon, kind)) = MAKE_LONG.iter().find(|(n, _)| *n == name) {
+        return Ok((*canon, *kind));
+    }
+    let mut hits = MAKE_LONG
+        .iter()
+        .filter(|(n, _)| !name.is_empty() && n.starts_with(name));
+    let Some((canon, kind)) = hits.next() else {
+        return Err(MAKE_FLAG_TOKEN);
+    };
+    if hits.next().is_some() {
+        return Err(MAKE_FLAG_TOKEN);
+    }
+    match kind {
+        LongOpt::Value | LongOpt::Reject => Err(MAKE_FLAG_TOKEN),
+        _ => Ok((*canon, *kind)),
+    }
 }
 
 fn apply_long(name: &str, arg: &str, state: &mut MakeCmd) -> Result<(), &'static str> {
@@ -426,8 +456,8 @@ fn apply_short(
         let c = chars[n];
         n += 1;
         match c {
-            'b' | 'B' | 'd' | 'h' | 'i' | 'k' | 'm' | 'n' | 'p' | 'q' | 'r' | 'R' | 's' | 'S'
-            | 't' | 'v' | 'w' => {}
+            'b' | 'B' | 'd' | 'h' | 'i' | 'k' | 'L' | 'm' | 'n' | 'p' | 'q' | 'r' | 'R' | 's'
+            | 'S' | 't' | 'v' | 'w' => {}
             // These choose which recipes run. The letter is enough; the
             // operand does not have to be read to refuse them.
             'e' | 'E' | 'o' | 'W' => return Err(MAKE_FLAG_TOKEN),
@@ -1528,18 +1558,17 @@ mod tests {
             ["rm -rf /opt"]
         );
         // Job, output and diagnostic flags do not choose a makefile.
-        // Make's own complaint about a long name it does not know is the
-        // same: the recipe is the one in this directory. A flag that
-        // changes which recipes run, or a short letter with no meaning
-        // here, is not that recipe.
+        // `--tr` is `--trace`. A flag that changes which recipes run, or
+        // a name make does not have, is not that recipe.
         std::fs::write(d.join("Makefile"), "clean-all:\n\techo main\n").unwrap();
         for flags in [
-            "--not-a-real-flag",
-            "--not-a-real-flag=1",
             " -j8 --jobserver-auth=fifo:/tmp/x -Otarget",
             "w -j8 -Otarget --jobserver-auth=3,4",
             "ks -j2 --jobserver-auth=3,4 --no-print-directory",
             "w --trace",
+            "--tr",
+            "L",
+            "--check-symlink-times",
             "--no-silent",
             "--max-load=2",
             "--jobserver-style=pipe",
@@ -1568,6 +1597,14 @@ mod tests {
             "--eval=$(info hi)",
             "-E$(info hi)",
             "-Z",
+            "--not-a-real-flag",
+            "--not-a-real-flag=1",
+            "--fi=evil.mk",
+            "--makef=evil.mk",
+            "--dir=sub",
+            "--ev=$(shell rm -rf ~)",
+            "--environment",
+            "--what=all",
         ] {
             assert!(
                 matches!(
@@ -1578,6 +1615,23 @@ mod tests {
                     Recipes::Closed("make-flags-unshown")
                 ),
                 "{flags}"
+            );
+        }
+        for args in [
+            &["make", "--fi=evil.mk", "all"][..],
+            &["make", "--makef", "evil.mk"],
+            &["make", "--dir=sub"],
+            &["make", "--direc", "sub"],
+            &["make", "--ev=$(shell rm -rf ~)"],
+            &["make", "--environment"],
+            &["make", "--what=all"],
+        ] {
+            assert!(
+                matches!(
+                    resolved(&argv(args), &d),
+                    Recipes::Closed("make-flags-unshown")
+                ),
+                "{args:?}"
             );
         }
     }

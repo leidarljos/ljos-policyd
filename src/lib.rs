@@ -540,14 +540,17 @@ fn written_reason(script: &str, w: &Written) -> String {
     match &w.path {
         None if !w.loose => format!(
             "{script}: `{}` may name it; write to a literal path",
-            w.word
+            quoted_body(&w.word)
         ),
         Some(dir) if w.loose => format!(
             "{script}: `{}` may write any file under {}",
-            w.word,
+            quoted_body(&w.word),
             dir.display()
         ),
-        None => format!("{script}: `{}` may write any file where it runs", w.word),
+        None => format!(
+            "{script}: `{}` may write any file where it runs",
+            quoted_body(&w.word)
+        ),
         Some(_) => script.to_string(),
     }
 }
@@ -3575,8 +3578,10 @@ fn union_assigns(
     out
 }
 
-/// `$name` or `${name}` and nothing after it.
+/// `$name` or `${name}` and nothing after it. Quotes kept around a
+/// `$` still name that variable.
 fn var_command_name(w: &str) -> Option<&str> {
+    let w = quoted_body(w);
     let rest = w.strip_prefix('$')?;
     if let Some(name) = rest.strip_prefix('{') {
         let name = name.strip_suffix('}')?;
@@ -4411,8 +4416,8 @@ fn source_operand(cmd: &[&str]) -> Option<String> {
     if !matches!(base_of(w), "source" | ".") {
         return None;
     }
-    let file = *args.first()?;
-    (!file.is_empty()).then(|| (*file).to_string())
+    let file = quoted_body(args.first()?);
+    (!file.is_empty()).then(|| file.to_string())
 }
 
 /// Whether `path` is a rewrite of the script being judged. Sourcing it
@@ -5708,7 +5713,7 @@ fn entered(
             .then(|| p.canonicalize().unwrap_or(p));
         by_name.into_iter().chain(resolved)
     };
-    let Some(to) = at.map(|i| args[i]) else {
+    let Some(to) = at.map(|i| quoted_body(args[i])) else {
         let bare = home_from(set.home.as_deref(), dir);
         return if pushd { None } else { bare }
             .into_iter()
@@ -5916,6 +5921,8 @@ fn tilde_home(home: Option<&str>) -> Cow<'_, str> {
 /// `dir`. Another variable or a substitution names no directory the line
 /// shows, and `~-` or a stack entry (`~1`) one the line does not follow.
 fn path_from(to: &str, dir: &std::path::Path, home: Option<&str>) -> Option<std::path::PathBuf> {
+    // `"$HOME"` is `$HOME`. The quotes only say the expansion is one word.
+    let to = quoted_body(to);
     // `{sub,}`, `su?` and `su[b]` are not directories. The shell expands
     // them before `cd`, and the walk does not follow that expansion.
     if brace_expands(to) || to.contains(['*', '?', '[']) {
@@ -6619,11 +6626,12 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
         }
         let mut owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
         if let Some(first) = owned.first_mut() {
-            let name = first
+            let body = quoted_body(first);
+            let name = body
                 .trim_start_matches('$')
                 .trim_start_matches('{')
                 .trim_end_matches('}');
-            if first.starts_with('$') {
+            if body.starts_with('$') {
                 if let Some((_, v)) = names.iter().rev().find(|(k, _)| k == name) {
                     let mut words = shell_words(v);
                     if !words.is_empty() {
@@ -6636,7 +6644,7 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
         // The shell expands a `-S` string before env splits it.
         if let Walk::Split(at, taken, _) = wrapper_walk(&owned) {
             for w in &mut owned[at..at + taken] {
-                *w = with_names(w, &names, argv);
+                *w = with_names(quoted_body(w), &names, argv);
             }
             out.push((i, owned.clone()));
         }
@@ -6746,7 +6754,7 @@ fn find_payloads(cmd: &[String]) -> Vec<Vec<String>> {
             while i < cmd.len() && !find_terminator(&cmd[i]) {
                 i += 1;
             }
-            out.push(cmd[start..i].to_vec());
+            out.push(peeled_payload(&cmd[start..i]));
             if i < cmd.len() {
                 i += 1;
             }
@@ -6755,6 +6763,20 @@ fn find_payloads(cmd: &[String]) -> Vec<Vec<String>> {
         }
     }
     out
+}
+
+/// `env`, `nice`, `timeout` and `bash -c` are not the program find runs.
+/// The command after them is, and a shell `-c` string is that command's
+/// words.
+fn peeled_payload(payload: &[String]) -> Vec<String> {
+    let run = unwrap_wrappers(payload).0.to_vec();
+    if let Some(script) = shell_script(&run) {
+        let words = shell_words(script);
+        if !words.is_empty() {
+            return words;
+        }
+    }
+    run
 }
 
 /// A find payload whose command word the line does not show: empty,
@@ -6873,7 +6895,9 @@ fn fed_sensitive(cmd: &[String]) -> bool {
     let b = base_of(head);
     if matches!(
         b,
-        "rm" | "rmdir"
+        "rm" | "srm"
+            | "wipe"
+            | "rmdir"
             | "unlink"
             | "shred"
             | "dd"
@@ -6897,7 +6921,7 @@ fn fed_sensitive(cmd: &[String]) -> bool {
     // No subcommand yet: the words still to come can be `push -f`.
     matches!(
         git_subcommand(cmd).map(|(s, _)| s),
-        Some("clean" | "push" | "reset") | None
+        Some("clean" | "push" | "reset" | "checkout") | None
     )
 }
 
@@ -6918,6 +6942,7 @@ fn feed_allows() -> Checked {
 }
 
 /// How `xargs` or `parallel` turns the text it reads into arguments.
+#[derive(Clone)]
 struct FeedSplit {
     /// `Blank` is the default. `-0` is a NUL. `-d` is one character.
     /// A replace string takes whole lines.
@@ -6930,6 +6955,8 @@ struct FeedSplit {
     replace: Option<String>,
     /// `-a FILE` reads a file the line does not show.
     argfile: bool,
+    /// `parallel --arg-sep SEP`. The inputs start at the next `SEP`.
+    argsep: Option<String>,
 }
 
 /// The text a literal `printf` writes, reusing its format while arguments
@@ -7046,6 +7073,7 @@ fn parse_feed_flags(flags: &[String]) -> Option<FeedSplit> {
         group: None,
         replace: None,
         argfile: false,
+        argsep: None,
     };
     let mut i = 0;
     while i < flags.len() {
@@ -7082,6 +7110,10 @@ fn parse_feed_flags(flags: &[String]) -> Option<FeedSplit> {
                         i += 1;
                     }
                 }
+                "env" | "results" | "tmpdir" => {
+                    take(inline)?;
+                }
+                "arg-sep" | "argsep" => spec.argsep = Some(take(inline)?),
                 "max-procs" | "eof" | "no-run-if-empty" | "exit" | "verbose" | "interactive"
                 | "show-limits" | "process-slot-var" | "help" | "version" | "jobs" => {
                     if matches!(name, "max-procs" | "eof" | "process-slot-var" | "jobs")
@@ -7117,7 +7149,10 @@ fn parse_feed_flags(flags: &[String]) -> Option<FeedSplit> {
                     let v = need(rest)?;
                     spec.delim = Some(v.chars().next().filter(|_| v.chars().count() == 1)?);
                 }
-                'I' => spec.replace = Some(need(rest)?),
+                'I' | 'J' => spec.replace = Some(need(rest)?),
+                'R' | 'S' => {
+                    need(rest)?;
+                }
                 'i' => {
                     spec.replace = Some(if rest.is_empty() {
                         "{}".into()
@@ -7255,8 +7290,28 @@ fn splice_feed(
     out
 }
 
-fn parallel_inputs(run: &[String]) -> Option<Result<Vec<String>, ()>> {
-    let at = run.iter().position(|w| w == ":::" || w == "::::")?;
+/// One template word that holds spaces is the shell command `parallel`
+/// runs. Several words are already the command.
+fn shell_template(template: &[String]) -> Vec<String> {
+    if template.len() == 1 {
+        let words = shell_words(&template[0]);
+        if words.len() > 1 {
+            return words;
+        }
+    }
+    template.to_vec()
+}
+
+fn feed_end(run: &[String], sep: Option<&str>) -> usize {
+    run.iter()
+        .position(|w| w == ":::" || w == "::::" || sep.is_some_and(|s| !s.is_empty() && w == s))
+        .unwrap_or(run.len())
+}
+
+fn parallel_inputs(run: &[String], sep: Option<&str>) -> Option<Result<Vec<String>, ()>> {
+    let at = run
+        .iter()
+        .position(|w| w == ":::" || w == "::::" || sep.is_some_and(|s| !s.is_empty() && w == s))?;
     if run[at] == "::::" || run[at..].iter().any(|w| w == "::::") {
         return Some(Err(()));
     }
@@ -7301,11 +7356,11 @@ fn xargs_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Op
         let flags = &wrappers[at + 1..];
         let parsed = parse_feed_flags(flags);
         let opaque = parsed.is_none();
-        let end = run_all
-            .iter()
-            .position(|w| w == ":::" || w == "::::")
-            .unwrap_or(run_all.len());
-        let template = run_all[..end].to_vec();
+        let argsep = parsed.as_ref().and_then(|s| s.argsep.clone());
+        let end = feed_end(run_all, argsep.as_deref());
+        // `parallel 'rm -rf {}'` is one word. parallel runs it through a
+        // shell, so the words inside it are the command.
+        let template = shell_template(&run_all[..end]);
         if template.is_empty() || !fed_sensitive(&template) {
             continue;
         }
@@ -7316,6 +7371,7 @@ fn xargs_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Op
             group: None,
             replace: None,
             argfile: false,
+            argsep: None,
         });
         if parallel {
             spec.group = spec.group.or(Some(1));
@@ -7330,7 +7386,7 @@ fn xargs_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Op
         if let Some(c) = benign_denial(&template, &marks, moved, bound) {
             return Some(c);
         }
-        let colon = parallel_inputs(run_all);
+        let colon = parallel_inputs(run_all, argsep.as_deref());
         let producer = i.checked_sub(1).filter(|&p| ended[p].1 == "|");
         let from_colon = colon.is_some();
         let shown = if spec.argfile {
@@ -7339,11 +7395,24 @@ fn xargs_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Op
             found.ok()
         } else if opaque {
             None
+        } else if let Some(p) = producer {
+            if let Some(t) = producer_text(&ended[p].0) {
+                Some(split_feed(&t, &spec))
+            } else if spec.nul {
+                nul_name_inputs(&ended[p].0)
+            } else {
+                None
+            }
         } else {
-            producer.and_then(|p| producer_text(&ended[p].0).map(|t| split_feed(&t, &spec)))
+            None
         };
         let Some(inputs) = shown else {
-            return Some(operand_unshown());
+            // The operand is missing. Refuse only when a stand-in for it
+            // would be refused: otherwise the verdict does not turn on it.
+            if fed_probe_denies(&template, &spec, moved, bound) {
+                return Some(operand_unshown());
+            }
+            continue;
         };
         if spec.replace.is_some() && inputs.is_empty() {
             continue;
@@ -7368,11 +7437,171 @@ fn find_slot(w: &str) -> bool {
         .any(|t| w.contains(t))
 }
 
-/// `find -exec` and `-execdir` substitute a path the line does not list.
+/// Paths `find` walks. Global options (`-L`, `-D`) come first. With none,
+/// find walks `.`.
+fn find_starts(cmd: &[String]) -> Vec<String> {
+    let mut i = 1;
+    while i < cmd.len() {
+        match cmd[i].as_str() {
+            "-H" | "-L" | "-P" => i += 1,
+            "-D" => i += 2,
+            s if s.starts_with("-O") => i += 1,
+            _ => break,
+        }
+    }
+    let mut starts = Vec::new();
+    while i < cmd.len() {
+        let a = cmd[i].as_str();
+        if a.starts_with('-') || matches!(a, "(" | "!" | "\\(") {
+            break;
+        }
+        starts.push(a.to_string());
+        i += 1;
+    }
+    starts
+}
+
+fn find_expr(cmd: &[String]) -> Vec<&str> {
+    let mut i = 1;
+    while i < cmd.len() {
+        match cmd[i].as_str() {
+            "-H" | "-L" | "-P" => i += 1,
+            "-D" => i += 2,
+            s if s.starts_with("-O") => i += 1,
+            _ => break,
+        }
+    }
+    while i < cmd.len() {
+        let a = cmd[i].as_str();
+        if a.starts_with('-') || matches!(a, "(" | "!" | "\\(") {
+            break;
+        }
+        i += 1;
+    }
+    cmd[i..].iter().map(String::as_str).collect()
+}
+
+fn subst_slot(w: &str, path: &str) -> String {
+    let mut w = w.to_string();
+    for tok in ["{//}", "{.}", "{/}", "{%}", "{#}", "{}"] {
+        w = w.replace(tok, path);
+    }
+    w
+}
+
+fn subst_find_with(payload: &[String], path: &str) -> Vec<String> {
+    payload
+        .iter()
+        .enumerate()
+        .map(|(n, w)| {
+            if n == 0 {
+                w.clone()
+            } else {
+                subst_slot(w, path)
+            }
+        })
+        .collect()
+}
+
+/// Words one fed operand can be. A command these all leave allowed does
+/// not change its verdict when the operand is missing.
+const FED_FILLS: &[&str] = &[
+    "/",
+    "~",
+    ".",
+    "..",
+    "/etc",
+    "-rf",
+    "--force",
+    "-delete",
+    "--hard",
+    "of=/dev/sda",
+];
+
+/// Extra operands a blank-separated feed can append from one record.
+const FED_TAILS: &[&[&str]] = &[
+    &["-rf", "/"],
+    &["/", "/dev/null"],
+    &["4755", "/"],
+    &["-R", "777", "/"],
+    &["-R", "root", "/"],
+    &["--delete", "/", "/"],
+];
+
+fn rules_deny(cmd: &[String], moved: bool, bound: &Scratch) -> Option<Checked> {
+    benign_denial(cmd, &[], moved, bound)
+}
+
+/// `true` when some stand-in for the missing operand is refused.
+fn fed_probe_denies(template: &[String], spec: &FeedSplit, moved: bool, bound: &Scratch) -> bool {
+    let mut one = spec.clone();
+    if one.replace.is_none() {
+        one.group = Some(1);
+    }
+    let fills: Vec<String> = FED_FILLS.iter().map(|s| (*s).to_string()).collect();
+    for cmd in feed_invocations(template, &fills, &one) {
+        if rules_deny(&cmd, moved, bound).is_some() {
+            return true;
+        }
+    }
+    if spec.replace.is_none() && !spec.nul {
+        for tail in FED_TAILS {
+            let mut cmd = template.to_vec();
+            cmd.extend(tail.iter().map(|s| (*s).to_string()));
+            if rules_deny(&cmd, moved, bound).is_some() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `find -print0` names its start paths, unsplit. `git ls-files -z`
+/// names paths in the tree, which `.` stands in for.
+fn nul_name_inputs(cmd: &[String]) -> Option<Vec<String>> {
+    let owned = split_env_strings(cmd).into_owned();
+    let run = unwrap_wrappers(&owned).0.to_vec();
+    let head = base_of(run.first()?);
+    if head == "find" && run.iter().any(|w| w == "-print0") {
+        let starts = find_starts(&run);
+        return Some(if starts.is_empty() {
+            vec![".".into()]
+        } else {
+            starts
+        });
+    }
+    if head == "git" {
+        let (sub, rest) = git_subcommand(&run)?;
+        let nul = rest.iter().any(|a| {
+            a == "-z"
+                || a == "--null"
+                || (a.starts_with('-') && !a.starts_with("--") && a.contains('z'))
+        });
+        if sub == "ls-files" && nul {
+            return Some(vec![".".into()]);
+        }
+    }
+    None
+}
+
+/// `find -exec` substitutes a path find walks. `{}` is one of those
+/// start paths (`.` when find is given none). A cleanup of regenerable
+/// names is that name, not the directory find started in.
 fn find_feed(argv: &[String], moved: bool, bound: &Scratch) -> Option<Checked> {
     for cmd in ended_owned(argv) {
         let owned = split_env_strings(&cmd.0).into_owned();
         let run = unwrap_wrappers(&owned).0.to_vec();
+        if run.first().is_none_or(|w| base_of(w) != "find") {
+            continue;
+        }
+        let starts = find_starts(&run);
+        let paths: Vec<String> = if starts.is_empty() {
+            vec![".".into()]
+        } else {
+            starts.clone()
+        };
+        let start_refs: Vec<&str> = starts.iter().map(String::as_str).collect();
+        let regen = regenerable_cleanup(&start_refs, &find_expr(&run));
         for payload in find_payloads(&run) {
             if payload_unshown(&payload) || !payload.iter().any(|w| find_slot(w)) {
                 continue;
@@ -7384,7 +7613,27 @@ fn find_feed(argv: &[String], moved: bool, bound: &Scratch) -> Option<Checked> {
             if let Some(c) = benign_denial(&benign, &[], moved, bound) {
                 return Some(c);
             }
-            return Some(operand_unshown());
+            let mut denied = None;
+            for path in &paths {
+                let concrete = subst_find_with(&payload, path);
+                if let Some(c) = rules_deny(&concrete, moved, bound) {
+                    denied = Some(c);
+                    break;
+                }
+            }
+            let Some(c) = denied else {
+                continue;
+            };
+            let cleaner = payload
+                .first()
+                .is_some_and(|h| matches!(base_of(h), "rm" | "shred" | "unlink"));
+            if regen && cleaner {
+                let named = subst_find_with(&payload, "__pycache__");
+                if rules_deny(&named, moved, bound).is_none() {
+                    continue;
+                }
+            }
+            return Some(c);
         }
     }
     None
@@ -7425,10 +7674,8 @@ fn temp_fed_marks(argv: &[String]) -> Vec<String> {
         let parallel = base_of(&wrappers[at]) == "parallel";
         let parsed = parse_feed_flags(&wrappers[at + 1..]);
         let opaque = parsed.is_none();
-        let end = run_all
-            .iter()
-            .position(|w| w == ":::" || w == "::::")
-            .unwrap_or(run_all.len());
+        let argsep = parsed.as_ref().and_then(|s| s.argsep.clone());
+        let end = feed_end(run_all, argsep.as_deref());
         let template = &run_all[..end];
         let mut spec = parsed.unwrap_or(FeedSplit {
             nul: false,
@@ -7437,6 +7684,7 @@ fn temp_fed_marks(argv: &[String]) -> Vec<String> {
             group: None,
             replace: None,
             argfile: false,
+            argsep: None,
         });
         if parallel {
             spec.group = spec.group.or(Some(1));
@@ -7453,7 +7701,7 @@ fn temp_fed_marks(argv: &[String]) -> Vec<String> {
         if mark.is_empty() || spec.argfile {
             continue;
         }
-        let colon = parallel_inputs(run_all);
+        let colon = parallel_inputs(run_all, argsep.as_deref());
         let producer = i.checked_sub(1).filter(|&p| ended[p].1 == "|");
         let inputs = if let Some(found) = colon {
             found.ok()
@@ -7472,48 +7720,367 @@ fn temp_fed_marks(argv: &[String]) -> Vec<String> {
     out
 }
 
-/// Names a `read` takes from a `printf` or `echo` of paths under `/tmp`.
-/// A name that also has an unshown read is not one of them.
-fn shown_temp_reads(argv: &[String]) -> Vec<String> {
-    let ended = ended_owned(argv);
-    let mut good = Vec::new();
-    let mut bad = Vec::new();
-    for (i, (cmd, _)) in ended.iter().enumerate() {
-        let owned = split_env_strings(cmd).into_owned();
-        let run = unwrap_wrappers(&owned).0;
-        let refs: Vec<&str> = run.iter().map(String::as_str).collect();
-        let tail: Vec<String> = command_after_keywords(&refs)
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        if !tail
-            .first()
-            .is_some_and(|w| matches!(base_of(w), "read" | "mapfile" | "readarray"))
-        {
-            continue;
+/// Which compound a command word opens or closes. `do` and `then` are
+/// the body, not another compound.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Nest {
+    Loop,
+    If,
+    Case,
+    Brace,
+    Paren,
+}
+
+fn nest_event(cmd: &[String]) -> Option<(bool, Nest)> {
+    let w = cmd.iter().map(String::as_str).find(|w| !is_assignment(w))?;
+    Some(match w {
+        "while" | "until" | "for" | "select" => (true, Nest::Loop),
+        "if" => (true, Nest::If),
+        "case" => (true, Nest::Case),
+        "{" => (true, Nest::Brace),
+        "(" => (true, Nest::Paren),
+        "done" => (false, Nest::Loop),
+        "fi" => (false, Nest::If),
+        "esac" => (false, Nest::Case),
+        "}" => (false, Nest::Brace),
+        ")" => (false, Nest::Paren),
+        _ => return None,
+    })
+}
+
+fn nest_bump(kind: Nest, open: bool, depth: &mut [i32; 5]) {
+    let i = match kind {
+        Nest::Loop => 0,
+        Nest::If => 1,
+        Nest::Case => 2,
+        Nest::Brace => 3,
+        Nest::Paren => 4,
+    };
+    if open {
+        depth[i] += 1;
+    } else if depth[i] > 0 {
+        depth[i] -= 1;
+    }
+}
+
+/// The command that closes the compound `ended[i]` opens, or `i` when
+/// it is a simple command. The scan stays inside `[i, hi)`.
+fn compound_end(ended: &[(Vec<String>, String)], i: usize, hi: usize) -> usize {
+    let Some((true, kind)) = nest_event(&ended[i].0) else {
+        return i;
+    };
+    let mut depth = [0; 5];
+    nest_bump(kind, true, &mut depth);
+    for (j, cmd) in ended.iter().enumerate().take(hi).skip(i + 1) {
+        if let Some((open, k)) = nest_event(&cmd.0) {
+            nest_bump(k, open, &mut depth);
         }
-        let names = read_var_names(&tail);
-        let text = if let Some(p) = i.checked_sub(1).filter(|&p| ended[p].1 == "|") {
-            producer_text(&ended[p].0)
-        } else {
-            here_string(cmd)
-        };
-        let temp = text.is_some_and(|t| {
-            let lines: Vec<&str> = t
-                .split('\n')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect();
-            !lines.is_empty() && lines.iter().copied().all(under_tmp)
-        });
-        if temp {
-            good.extend(names);
-        } else {
-            bad.extend(names);
+        if depth.iter().all(|d| *d == 0) {
+            return j;
         }
     }
+    hi.saturating_sub(1)
+}
+
+/// The shell each command writes. A pipeline stage is its own shell.
+/// The last stage is this shell only after `lastpipe` may be on. A
+/// `(...)` group and a command ended by `&` are their own shell too.
+/// The body of `while` stays in the shell that runs the `while`.
+fn command_shells(ended: &[(Vec<String>, String)]) -> Vec<u32> {
+    let n = ended.len();
+    let mut shells = vec![0u32; n];
+    let mut lastpipe = vec![false; n];
+    let mut on = false;
+    for (i, (cmd, _)) in ended.iter().enumerate() {
+        lastpipe[i] = on;
+        let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        if may_set_lastpipe(&refs) {
+            on = true;
+        }
+    }
+    let mut next = 1u32;
+    walk_shells(ended, 0, n, 0, &mut shells, &mut next, &lastpipe);
+    shells
+}
+
+fn walk_shells(
+    ended: &[(Vec<String>, String)],
+    lo: usize,
+    hi: usize,
+    shell: u32,
+    shells: &mut [u32],
+    next: &mut u32,
+    lastpipe: &[bool],
+) {
+    let mut i = lo;
+    while i < hi {
+        let end = compound_end(ended, i, hi).min(hi.saturating_sub(1));
+        let sep_before = if i > lo { ended[i - 1].1.as_str() } else { "" };
+        let sep_after = ended[end].1.as_str();
+        let in_pipe = sep_before == "|" || sep_after == "|";
+        let last = in_pipe && sep_after != "|";
+        let paren = nest_event(&ended[i].0).is_some_and(|(open, k)| open && k == Nest::Paren);
+        let fresh = paren || sep_after == "&" || (in_pipe && !(last && lastpipe[i]));
+        let stage = if fresh {
+            let id = *next;
+            *next += 1;
+            id
+        } else {
+            shell
+        };
+        shells[i] = stage;
+        if end > i {
+            shells[end] = stage;
+            if i + 1 < end {
+                walk_shells(ended, i + 1, end, stage, shells, next, lastpipe);
+            }
+        }
+        i = end + 1;
+    }
+}
+
+/// A `read` at `set_at` is the value a later command sees. It has to
+/// run in that command's shell, and before it. The last stage of a
+/// pipeline is a subshell until `lastpipe` is on, so it does not.
+fn read_reaches(shells: &[u32], set_at: usize, use_at: usize) -> bool {
+    set_at < use_at && shells.get(set_at) == shells.get(use_at)
+}
+
+struct ReadHit {
+    name: String,
+    /// The field this name took from each line. The last name keeps the
+    /// rest of the line. `None` when that text is not on the line.
+    values: Option<Vec<String>>,
+    at: usize,
+}
+
+fn read_command(cmd: &[String]) -> Option<Vec<String>> {
+    let owned = split_env_strings(cmd).into_owned();
+    let run = unwrap_wrappers(&owned).0;
+    let refs: Vec<&str> = run.iter().map(String::as_str).collect();
+    let tail: Vec<String> = command_after_keywords(&refs)
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    tail.first()
+        .is_some_and(|w| matches!(base_of(w), "read" | "mapfile" | "readarray"))
+        .then_some(tail)
+}
+
+fn read_text(ended: &[(Vec<String>, String)], i: usize, cmd: &[String]) -> Option<String> {
+    if let Some(p) = i.checked_sub(1).filter(|&p| ended[p].1 == "|") {
+        producer_text(&ended[p].0)
+    } else {
+        here_string(cmd)
+    }
+}
+
+fn read_lines(text: &str) -> Vec<String> {
+    // A trailing newline ends the last record. It is not another line.
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    if body.is_empty() {
+        return vec![String::new()];
+    }
+    body.split('\n').map(|s| s.to_string()).collect()
+}
+
+/// `IFS` after the pure assignments this shell has run. A prefix on
+/// `read` does not remain: `read` is not a special builtin.
+fn shell_ifs(ended: &[(Vec<String>, String)], shells: &[u32], at: usize) -> String {
+    let mut ifs = " \t\n".to_string();
+    let Some(&shell) = shells.get(at) else {
+        return ifs;
+    };
+    for (i, (cmd, _)) in ended.iter().enumerate().take(at) {
+        if shells.get(i) != Some(&shell) || cmd.is_empty() {
+            continue;
+        }
+        if !cmd.iter().all(|w| is_assignment(w)) {
+            continue;
+        }
+        for w in cmd {
+            apply_ifs_assign(w, &mut ifs);
+        }
+    }
+    ifs
+}
+
+/// `IFS=` replaces the value. `IFS+=` appends. Anything else is left.
+fn apply_ifs_assign(w: &str, ifs: &mut String) -> bool {
+    if let Some(v) = w.strip_prefix("IFS=") {
+        *ifs = v.to_string();
+        true
+    } else if let Some(v) = w.strip_prefix("IFS+=") {
+        ifs.push_str(v);
+        true
+    } else {
+        false
+    }
+}
+
+/// The `IFS` `read` splits on: this shell's value, then a prefix
+/// assignment on the `read` itself (`while IFS=: read x y`).
+fn read_input_ifs(
+    ended: &[(Vec<String>, String)],
+    shells: &[u32],
+    at: usize,
+    cmd: &[String],
+) -> String {
+    let mut ifs = shell_ifs(ended, shells, at);
+    let run = unwrap_wrappers(cmd).0;
+    let Some(head) = run.first() else {
+        return ifs;
+    };
+    if !matches!(base_of(head), "read" | "mapfile" | "readarray") {
+        return ifs;
+    }
+    if let Some(read_at) = cmd.iter().position(|w| std::ptr::eq(w, head)) {
+        for w in &cmd[..read_at] {
+            apply_ifs_assign(w, &mut ifs);
+        }
+    }
+    ifs
+}
+
+/// One field per name, the way `read` assigns them. Leading and trailing
+/// IFS whitespace is dropped. Each name but the last takes the text up to
+/// the next IFS character; a whitespace delimiter swallows the run after
+/// it, and any other delimiter is one character. The last name keeps the
+/// rest, delimiters included.
+fn read_fields(line: &str, nvars: usize, ifs: &str) -> Vec<String> {
+    if nvars == 0 {
+        return Vec::new();
+    }
+    let ws: Vec<char> = ifs.chars().filter(|c| c.is_whitespace()).collect();
+    let is_ws = |c: char| ws.contains(&c);
+    let is_ifs = |c: char| ifs.contains(c);
+    let chars: Vec<char> = line.chars().collect();
+    let mut end = chars.len();
+    while end > 0 && is_ws(chars[end - 1]) {
+        end -= 1;
+    }
+    let mut i = 0;
+    while i < end && is_ws(chars[i]) {
+        i += 1;
+    }
+    let mut fields = Vec::with_capacity(nvars);
+    for var_i in 0..nvars {
+        if var_i + 1 == nvars {
+            fields.push(chars[i..end].iter().collect());
+            break;
+        }
+        if i >= end {
+            fields.push(String::new());
+            continue;
+        }
+        let start = i;
+        while i < end && !is_ifs(chars[i]) {
+            i += 1;
+        }
+        fields.push(chars[start..i].iter().collect());
+        if i >= end {
+            continue;
+        }
+        if is_ws(chars[i]) {
+            while i < end && is_ws(chars[i]) {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    fields
+}
+
+fn read_hits(ended: &[(Vec<String>, String)]) -> Vec<ReadHit> {
+    let shells = command_shells(ended);
+    let mut out = Vec::new();
+    for (i, (cmd, _)) in ended.iter().enumerate() {
+        let Some(tail) = read_command(cmd) else {
+            continue;
+        };
+        let names = read_var_names(&tail);
+        if names.is_empty() {
+            continue;
+        }
+        let cols = read_text(ended, i, cmd).map(|t| {
+            let ifs = read_input_ifs(ended, &shells, i, cmd);
+            let mut cols = vec![Vec::new(); names.len()];
+            for line in read_lines(&t) {
+                let fields = read_fields(&line, names.len(), &ifs);
+                for (k, field) in fields.into_iter().enumerate() {
+                    if let Some(col) = cols.get_mut(k) {
+                        col.push(field);
+                    }
+                }
+            }
+            cols
+        });
+        for (k, name) in names.into_iter().enumerate() {
+            out.push(ReadHit {
+                name,
+                values: cols.as_ref().map(|c| c.get(k).cloned().unwrap_or_default()),
+                at: i,
+            });
+        }
+    }
+    out
+}
+
+/// Names a `read` takes from a `printf` or `echo` of paths under `/tmp`,
+/// when that `read` runs in the same shell and before the use, and the
+/// names a reaching `read` sets to something else. A name a later
+/// command still holds from an earlier assignment is in neither.
+fn shown_temp_reads(argv: &[String]) -> (Vec<String>, Vec<String>) {
+    let ended = ended_owned(argv);
+    let shells = command_shells(&ended);
+    let hits = read_hits(&ended);
+    let mut good = Vec::new();
+    let mut bad = Vec::new();
+    let mut uncovered = false;
+    for (use_at, (cmd, _)) in ended.iter().enumerate() {
+        let owned = split_env_strings(cmd).into_owned();
+        let run = unwrap_wrappers(&owned).0.to_vec();
+        if !fed_sensitive(&run) {
+            continue;
+        }
+        let names: Vec<String> = hits
+            .iter()
+            .map(|h| h.name.clone())
+            .filter(|n| run.iter().any(|w| expands(w, n)))
+            .collect();
+        let mut seen = Vec::new();
+        for name in names {
+            if seen.iter().any(|s| s == &name) {
+                continue;
+            }
+            seen.push(name.clone());
+            let reaching = hits
+                .iter()
+                .filter(|h| h.name == name && read_reaches(&shells, h.at, use_at));
+            let Some(hit) = reaching.max_by_key(|h| h.at) else {
+                // This use still has the assignment. A temp from another
+                // shell must not cover it.
+                uncovered = true;
+                continue;
+            };
+            let temp = hit
+                .values
+                .as_ref()
+                .is_some_and(|lines| !lines.is_empty() && lines.iter().all(|l| under_tmp(l)));
+            if temp {
+                good.push(name);
+            } else {
+                bad.push(name);
+            }
+        }
+    }
+    if uncovered {
+        good.clear();
+    }
     good.retain(|n| !bad.iter().any(|b| b == n));
-    good
+    bad.retain(|n| good.iter().all(|g| g != n));
+    (good, bad)
 }
 
 fn read_var_names(run: &[String]) -> Vec<String> {
@@ -7530,121 +8097,183 @@ fn read_var_names(run: &[String]) -> Vec<String> {
     }
 }
 
-fn word_replaced(word: &str, name: &str, value: &str) -> Option<String> {
-    if word == format!("${name}") || word == format!("${{{name}}}") {
-        return Some(value.to_string());
+/// `value` in place of a bare `$name` or `${name}`. A double-quoted
+/// expansion is one word. An unquoted one splits on `ifs`. A word that
+/// only partly expands the name is not the command the line shows.
+fn expand_read_word(word: &str, name: &str, value: &str, ifs: &str) -> Option<Vec<String>> {
+    if !expands(word, name) {
+        return Some(vec![word.to_string()]);
     }
-    if expands(word, name) {
+    let quoted = word.starts_with('"') && word.ends_with('"');
+    let body = quoted_body(word);
+    let pure = body == format!("${name}") || body == format!("${{{name}}}");
+    if !pure {
         return None;
     }
-    Some(word.to_string())
+    if quoted {
+        Some(vec![value.to_string()])
+    } else {
+        Some(split_unquoted(value, ifs))
+    }
+}
+
+/// The words an unquoted expansion of `value` becomes. An empty `ifs`
+/// does not split. Leading and trailing IFS whitespace drops out, and a
+/// run of IFS whitespace is one break.
+fn split_unquoted(value: &str, ifs: &str) -> Vec<String> {
+    if ifs.is_empty() {
+        return vec![value.to_string()];
+    }
+    let ws: Vec<char> = ifs.chars().filter(|c| c.is_whitespace()).collect();
+    let is_ws = |c: char| ws.contains(&c);
+    let is_delim = |c: char| ifs.contains(c);
+    let chars: Vec<char> = value.chars().collect();
+    let mut i = 0;
+    while i < chars.len() && is_ws(chars[i]) {
+        i += 1;
+    }
+    let mut out = Vec::new();
+    while i < chars.len() {
+        let start = i;
+        while i < chars.len() && !is_delim(chars[i]) {
+            i += 1;
+        }
+        out.push(chars[start..i].iter().collect());
+        if i >= chars.len() {
+            break;
+        }
+        if is_ws(chars[i]) {
+            while i < chars.len() && is_ws(chars[i]) {
+                i += 1;
+            }
+        } else {
+            i += 1;
+            while i < chars.len() && is_ws(chars[i]) {
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// `while read x; do rm -rf "$x"; done`. A `printf` or `echo` piped into
 /// the `read`, or a here-string, is the value. Anything else is not.
+/// The `read` counts only when it runs in the same shell, before the
+/// command that expands the name.
 fn read_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Option<Checked> {
     let ended = ended_owned(argv);
-    let mut fed: Vec<(String, Option<Vec<String>>)> = Vec::new();
-    for (i, (cmd, _)) in ended.iter().enumerate() {
-        let owned = split_env_strings(cmd).into_owned();
-        let run = unwrap_wrappers(&owned).0;
-        if !run
-            .first()
-            .is_some_and(|w| matches!(base_of(w), "read" | "mapfile" | "readarray"))
-        {
-            continue;
-        }
-        let text = if let Some(p) = i.checked_sub(1).filter(|&p| ended[p].1 == "|") {
-            producer_text(&ended[p].0)
-        } else {
-            here_string(cmd)
-        };
-        let lines = text.map(|t| {
-            let mut lines: Vec<String> = t
-                .split('\n')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if lines.is_empty() {
-                lines.push(String::new());
-            }
-            lines
-        });
-        for name in read_var_names(run) {
-            fed.push((name, lines.clone()));
-        }
-    }
+    let shells = command_shells(&ended);
+    let fed = read_hits(&ended);
     if fed.is_empty() {
         return None;
     }
     let mut used = false;
     let mut shown: Option<Vec<Vec<String>>> = None;
-    for (cmd, _) in &ended {
+    for (use_at, (cmd, _)) in ended.iter().enumerate() {
         let owned = split_env_strings(cmd).into_owned();
         let run = unwrap_wrappers(&owned).0.to_vec();
-        if run
-            .first()
-            .is_some_and(|w| matches!(base_of(w), "read" | "mapfile" | "readarray"))
-            || !fed_sensitive(&run)
-        {
+        if read_command(cmd).is_some() || !fed_sensitive(&run) {
             continue;
         }
-        let hits: Vec<&(String, Option<Vec<String>>)> = fed
+        let hits: Vec<&ReadHit> = fed
             .iter()
-            .filter(|(n, _)| run.iter().any(|w| expands(w, n)))
+            .filter(|h| {
+                read_reaches(&shells, h.at, use_at) && run.iter().any(|w| expands(w, &h.name))
+            })
             .collect();
         if hits.is_empty() {
             continue;
         }
         used = true;
-        let (name, vals) = &hits[0];
-        let Some(vals) = vals else {
-            shown = None;
-            break;
+        // The last `read` in this shell is the value. An earlier one is gone.
+        let hit = hits.iter().max_by_key(|h| h.at).expect("a hit");
+        let name = &hit.name;
+        if hits.iter().any(|h| h.name != *name) {
+            return Some(operand_unshown());
+        }
+        let ifs = shell_ifs(&ended, &shells, use_at);
+        let mut benign = Vec::new();
+        let mut benign_ok = true;
+        for w in &run {
+            match expand_read_word(w, name, "/tmp/fed-arg", " \t\n") {
+                Some(parts) => benign.extend(parts),
+                None => {
+                    benign_ok = false;
+                    benign.push(w.clone());
+                }
+            }
+        }
+        if benign_ok {
+            if let Some(c) = benign_denial(&benign, &[], moved, bound) {
+                return Some(c);
+            }
+        }
+        let Some(vals) = &hit.values else {
+            if read_unshown_denies(&run, name, &ifs, moved, bound) {
+                return Some(operand_unshown());
+            }
+            continue;
         };
-        if hits.len() != 1 {
-            shown = None;
-            break;
-        }
-        let benign: Vec<String> = run
-            .iter()
-            .map(|w| word_replaced(w, name, "/tmp/fed-arg").unwrap_or_else(|| w.clone()))
-            .collect();
-        if let Some(c) = benign_denial(&benign, &[], moved, bound) {
-            return Some(c);
-        }
         let mut lines = Vec::new();
-        let mut ok = true;
         for value in vals {
             let mut line = Vec::new();
             for (c, sep) in &ended {
                 for w in c {
-                    match word_replaced(w, name, value) {
-                        Some(n) => line.push(n),
-                        None => ok = false,
+                    match expand_read_word(w, name, value, &ifs) {
+                        Some(parts) => line.extend(parts),
+                        None => return Some(operand_unshown()),
                     }
                 }
                 if !sep.is_empty() {
                     line.push(sep.clone());
                 }
             }
-            if !ok {
-                break;
-            }
             lines.push(line);
         }
-        shown = ok.then_some(lines);
+        shown = Some(lines);
         break;
     }
     if !used {
         return None;
     }
     let Some(lines) = shown else {
-        // The variable is the operand. A stand-in under `/tmp` is not a
-        // denial, and the real value is not on the line.
-        return Some(operand_unshown());
+        // Every unshown value was probed, and none of them was refused.
+        return None;
     };
     judge_lines(&lines, depth, moved, bound).or_else(|| Some(feed_allows()))
+}
+
+/// `true` when a value stdin might have given `name` is refused. A quoted
+/// expansion is one word. An unquoted one can be several.
+fn read_unshown_denies(
+    run: &[String],
+    name: &str,
+    ifs: &str,
+    moved: bool,
+    bound: &Scratch,
+) -> bool {
+    let mut values: Vec<String> = FED_FILLS.iter().map(|s| (*s).to_string()).collect();
+    let unquoted = run
+        .iter()
+        .any(|w| expands(w, name) && !(w.starts_with('"') && w.ends_with('"')));
+    if unquoted {
+        for tail in FED_TAILS {
+            values.push(tail.join(" "));
+        }
+    }
+    for value in &values {
+        let mut line = Vec::new();
+        for w in run {
+            match expand_read_word(w, name, value, ifs) {
+                Some(parts) => line.extend(parts),
+                None => return true,
+            }
+        }
+        if rules_deny(&line, moved, bound).is_some() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Arguments a command is handed from `xargs`, `parallel`, `find -exec`
@@ -7686,8 +8315,8 @@ fn replace_strings(call: &[String]) -> Vec<String> {
         for (k, c) in short.char_indices() {
             let rest = &short[k + 1..];
             match c {
-                'I' if rest.is_empty() => out.extend(words.next().map(str::to_string)),
-                'I' => out.push(rest.to_string()),
+                'I' | 'J' if rest.is_empty() => out.extend(words.next().map(str::to_string)),
+                'I' | 'J' => out.push(rest.to_string()),
                 'i' => out.push(if rest.is_empty() { "{}" } else { rest }.into()),
                 c if valued.contains(&format!("-{c}").as_str()) => {
                     if rest.is_empty() {
@@ -8268,6 +8897,12 @@ const RUNNERS: &[(&str, &[&str])] = &[
     ("taskset", &[]),
     ("timeout", &["-k", "--kill-after", "-s", "--signal"]),
     (
+        "strace",
+        &[
+            "-o", "--output", "-e", "-E", "-p", "-u", "-s", "-P", "-I", "-D",
+        ],
+    ),
+    (
         "xargs",
         &[
             "-I",
@@ -8278,6 +8913,9 @@ const RUNNERS: &[(&str, &[&str])] = &[
             "-E",
             "-a",
             "-s",
+            "-J",
+            "-R",
+            "-S",
             "--delimiter",
             "--max-args",
             "--max-procs",
@@ -8295,6 +8933,10 @@ const RUNNERS: &[(&str, &[&str])] = &[
             "-a",
             "--arg-file",
             "--argsep",
+            "--arg-sep",
+            "--env",
+            "--results",
+            "--tmpdir",
             "-d",
             "--delimiter",
             "--colsep",
@@ -9164,18 +9806,34 @@ fn decode_ansi_c_quoted(chars: &[char], i: &mut usize, out: &mut String) {
     }
 }
 
+/// `$name` or `${name}` with nothing else in the word.
+fn pure_param(w: &str) -> bool {
+    let Some(rest) = w.strip_prefix('$') else {
+        return false;
+    };
+    if let Some(name) = rest.strip_prefix('{') {
+        return name.strip_suffix('}').is_some_and(is_name);
+    }
+    is_name(rest)
+}
+
 /// A script split into words the way a shell would: quotes group, a
 /// backslash escapes the next character outside single quotes, a
 /// backslash and the newline after it drop out, a `#` that starts a word
 /// comments out the rest of its line, and `;`, `&&`, `||`, `|` and `&`
 /// stand as words of their own. The `&` of a redirection (`2>&1`, `<&3`,
-/// `&>log`) stays in its word.
+/// `&>log`) stays in its word. A double-quoted `$name` or `${name}` keeps
+/// its quotes so a later split can tell `"$x"` from `$x`.
 fn shell_words(script: &str) -> Vec<String> {
     let chars: Vec<char> = script.chars().collect();
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut word = false;
     let (mut single, mut double) = (false, false);
+    // A double-quoted `$` keeps its quotes, so a later split can tell
+    // `"$x"` from `$x`. A quoted word with no `$` stays bare.
+    let mut dq_at: Option<usize> = None;
+    let mut dq_dollar = false;
     let mut i = 0;
     // Here-documents opened on the command just finished, read from the
     // next line. A body is not the script that follows it: a quote in
@@ -9212,7 +9870,25 @@ fn shell_words(script: &str) -> Vec<String> {
                 word = true;
             }
             '"' if !single => {
-                double = !double;
+                if double {
+                    double = false;
+                    // Only a quoted `$name` or `${name}` keeps its quotes.
+                    // A longer quoted value is the text inside, as before.
+                    if dq_dollar {
+                        if let Some(at) = dq_at {
+                            if pure_param(&cur[at..]) {
+                                cur.insert(at, '"');
+                                cur.push('"');
+                            }
+                        }
+                    }
+                    dq_at = None;
+                    dq_dollar = false;
+                } else {
+                    double = true;
+                    dq_at = Some(cur.len());
+                    dq_dollar = false;
+                }
                 word = true;
             }
             '&' if !single
@@ -9264,6 +9940,9 @@ fn shell_words(script: &str) -> Vec<String> {
                 }
             }
             c => {
+                if double && c == '$' {
+                    dq_dollar = true;
+                }
                 cur.push(c);
                 word = true;
             }
@@ -10001,6 +10680,11 @@ impl Seat {
             let mut next = bound.clone();
             if let Some(root) = roots.get(i) {
                 next.root = root.clone();
+            }
+            // The mark belongs to the feeder. A later command on the line
+            // is not that command, so its copy of the same word stays.
+            if !command_is_feeder(&expanded, i) {
+                next.fed_marks.clear();
             }
             let c = self.check_at(&inner, depth + 1, &next, moved);
             if c.decision != Decision::Allow {
@@ -11263,7 +11947,7 @@ fn lease_push_guarded(argv: &[String]) -> bool {
 
 /// A command word that is still a parameter expansion (`$g`, `${GIT}`).
 fn unresolved(base: &str) -> bool {
-    base.starts_with('$')
+    quoted_body(base).starts_with('$')
 }
 
 /// Git's subcommand and the words after it, past global options such as
@@ -11858,8 +12542,13 @@ impl Scratch {
             }
         }
         // `read x` from a `printf` of `/tmp/...` holds that path. The pack
-        // still sees `$x`, and its older rule refuses the name.
-        for name in shown_temp_reads(argv) {
+        // still sees `$x`, and its older rule refuses the name. A `read`
+        // in another shell does not, and neither does one that comes later.
+        let (temps, other) = shown_temp_reads(argv);
+        for name in other {
+            self.poison(&name);
+        }
+        for name in temps {
             // `read` poisons the name: stdin is not an assignment. The
             // producer on this line is the value, so the poison is wrong.
             self.vars.insert(name, Some(Hold::Temp));
@@ -12154,7 +12843,16 @@ fn command_body(value: &str) -> Option<&str> {
 }
 
 /// `$name` or `${name}`, and not `${name:-default}`.
+/// `"$name"` with the quotes `shell_words` kept around a `$`.
+fn quoted_body(w: &str) -> &str {
+    w.strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .filter(|s| !s.is_empty() && !s.contains('"'))
+        .unwrap_or(w)
+}
+
 fn bare_var(w: &str) -> Option<&str> {
+    let w = quoted_body(w);
     let w = w.strip_prefix('$')?;
     if let Some(name) = w.strip_prefix('{') {
         let name = name.strip_suffix('}')?;
@@ -12629,7 +13327,7 @@ fn rm_recursive(cmd: &[&str]) -> bool {
         return false;
     };
     let b = base_of(head);
-    if b != "rm" && b != "rtrash" {
+    if b != "rm" && b != "rtrash" && b != "srm" && b != "wipe" {
         return false;
     }
     cmd.iter()
@@ -12646,10 +13344,71 @@ fn rm_recursive(cmd: &[&str]) -> bool {
 /// the pack still sees every other word. A secret or a force push on the
 /// same line is unchanged. The directory is the one the command runs in
 /// after `cd`, the same one [`delete_ok`] uses.
+/// Whether command `i` is an `xargs` or `parallel`. Its unwrapped body
+/// still carries the replace mark; a later command does not.
+#[cfg(has_phronesis)]
+fn command_is_feeder(argv: &[String], i: usize) -> bool {
+    commands(argv).into_iter().nth(i).is_some_and(|cmd| {
+        cmd.iter()
+            .any(|w| matches!(base_of(w), "xargs" | "parallel"))
+    })
+}
+
+/// Words a replace mark may be rewritten in. On a line, only the feeder's
+/// own words. On the unwrapped command the walk hands down alone, every
+/// word, because that argv is the command.
+#[cfg(any(test, has_phronesis))]
+fn mark_rewrite_mask(argv: &[String], has_marks: bool) -> Vec<bool> {
+    let feed = feeder_word(argv);
+    if feed.iter().any(|f| *f) || !has_marks {
+        feed
+    } else {
+        vec![true; argv.len()]
+    }
+}
+
+/// Words that belong to an `xargs` or `parallel` command. A replace mark
+/// is one of those words. The same text later on the line is not.
+#[cfg(any(test, has_phronesis))]
+fn feeder_word(argv: &[String]) -> Vec<bool> {
+    let mut flags = vec![false; argv.len()];
+    let mut cur: Vec<usize> = Vec::new();
+    let take = |cur: &mut Vec<usize>, flags: &mut [bool]| {
+        let is_feeder = cur
+            .iter()
+            .any(|&i| matches!(base_of(argv[i].trim_end_matches(';')), "xargs" | "parallel"));
+        if is_feeder {
+            for &i in cur.iter() {
+                flags[i] = true;
+            }
+        }
+        cur.clear();
+    };
+    for (i, a) in argv.iter().enumerate() {
+        if matches!(a.as_str(), ";" | "&&" | "||" | "|" | "&") {
+            take(&mut cur, &mut flags);
+            continue;
+        }
+        let closes = a.ends_with(';');
+        if !a.trim_end_matches(';').is_empty() {
+            cur.push(i);
+        }
+        if closes {
+            take(&mut cur, &mut flags);
+        }
+    }
+    take(&mut cur, &mut flags);
+    flags
+}
+
 #[cfg(has_phronesis)]
 fn argv_for_pack(argv: &[String], bound: &Scratch, moved: bool) -> Vec<String> {
     let mut out = argv.to_vec();
-    for w in &mut out {
+    let feed = mark_rewrite_mask(argv, !bound.fed_marks.is_empty());
+    for (i, w) in out.iter_mut().enumerate() {
+        if !feed[i] {
+            continue;
+        }
         let bare = w.trim_end_matches(';');
         if bound.fed_marks.iter().any(|m| m == bare) && !pack_delete_ok(bare, moved) {
             let semi = w.ends_with(';');
@@ -13314,7 +14073,7 @@ fn deletes_a_root_tree(argv: &[String]) -> bool {
                     && !a.starts_with("--")
                     && (a.contains('r') || a.contains('R')))
         });
-        if !(gio || TRASHERS.contains(&b) || (b == "rm" && recursive)) {
+        if !(gio || TRASHERS.contains(&b) || (matches!(b, "rm" | "srm" | "wipe") && recursive)) {
             return false;
         }
         let from = usize::from(gio) + 1;
@@ -13621,6 +14380,25 @@ mod tests {
         }
         let c = check_shell_in(&shell_words("make clean-all"), &d, 0);
         assert_eq!(c.decision, Decision::Allow, "{}", c.token);
+    }
+
+    /// Make takes an unambiguous prefix of a long option. A prefix of one
+    /// that names a file, a directory or a recipe is not that option, and
+    /// a name make does not have is not a diagnostic it prints and ignores.
+    #[test]
+    fn a_make_long_option_prefix_fails_closed() {
+        let v = |s: &str| verdict(&shell_words(s));
+        for line in [
+            "make --fi=evil.mk all",
+            "make --makef evil.mk",
+            "make --dir=sub",
+            "make --direc sub",
+            "make --ev='$(shell rm -rf ~)'",
+            "make --environment",
+            "make --what=all",
+        ] {
+            assert_eq!(v(line), "deny\tmake-flags-unshown", "{line}");
+        }
     }
 
     #[test]
@@ -16562,7 +17340,7 @@ hash -r 2> /dev/null
         );
         assert_eq!(
             v(&["find", "/tmp/build", "-exec", "rm", "{}", "+"]),
-            "deny\toperand-unshown"
+            "allow"
         );
         assert_eq!(v(&["find", ".", "-exec", "grep", "x", "{}", "+"]), "allow");
     }
@@ -17498,13 +18276,16 @@ hash -r 2> /dev/null
         for line in [
             "read x; echo \"$x\"",
             "read -r x; sh -c 'echo \"$1\"' _ \"$x\"",
-            "read name; git checkout \"$name\"",
             "read xy; sh -c \"$x\"",
             "sh -c \"$x\"; read x",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
+        // The name is not on the line, and it can be `.`.
+        let c = at("read name; git checkout \"$name\"");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert_eq!(c.token, "operand-unshown");
         assert_everyday_allowed(&root);
     }
 
@@ -17562,6 +18343,186 @@ hash -r 2> /dev/null
         assert_everyday_allowed(&root);
     }
 
+    /// A `read` counts only in the shell that runs it, and only for a
+    /// command after it. A pipeline stage is a subshell until `lastpipe`.
+    #[test]
+    fn a_read_in_another_shell_keeps_the_earlier_value() {
+        let v = |s: &str| verdict(&shell_words(s));
+        for line in [
+            "x=/; printf '/tmp/a\\n' | read x; rm -rf \"$x\"",
+            "x=/; rm -rf \"$x\"; read x <<< /tmp/a",
+            "x=/; printf '/tmp/a\\n' | while read x; do :; done; rm -rf \"$x\"",
+        ] {
+            assert_eq!(v(line), "deny\trm-rf-outside-tmp", "{line}");
+        }
+        assert_eq!(
+            v("printf '/tmp/a\\n' | while read x; do rm -rf \"$x\"; done"),
+            "allow"
+        );
+        assert_eq!(
+            v("shopt -s lastpipe; x=/; printf '/tmp/a\\n' | read x; rm -rf \"$x\""),
+            "allow"
+        );
+    }
+
+    /// Each name takes one field. The last keeps the rest of the line.
+    /// An unquoted expansion splits on the shell's IFS; a quoted one
+    /// stays one word. `IFS=` in front of `read` does not outlive it.
+    #[test]
+    fn a_read_gives_each_name_one_field() {
+        let v = |s: &str| verdict(&shell_words(s));
+        assert_eq!(
+            shell_words("rm -rf \"$x\" $x"),
+            ["rm", "-rf", "\"$x\"", "$x"]
+        );
+        for line in [
+            "printf '/tmp/a /\\n' | while read x y; do rm -rf \"$y\"; done",
+            "printf '/tmp/a:/\\n' | while IFS=: read x y; do rm -rf \"$y\"; done",
+            "printf '/tmp/a/ /home\\n' | while read x; do rm -rf $x; done",
+            "read x y <<< '/tmp/a /'; rm -rf \"$y\"",
+        ] {
+            assert_eq!(v(line), "deny\trm-rf-outside-tmp", "{line}");
+        }
+        assert_eq!(
+            v("printf '/tmp/x --force\\n' | while read a b; do git push $b; done"),
+            "deny\tgit-force-push"
+        );
+        assert_eq!(
+            v("printf '/tmp/a/ /home\\n' | while read x; do rm -rf \"$x\"; done"),
+            "allow"
+        );
+        assert_eq!(
+            v("printf '/tmp/a \\n' | while read x y; do rm -rf \"$x\"; done"),
+            "allow"
+        );
+    }
+
+    /// A valued flag of `xargs` or `parallel` is not the command. The
+    /// command after the value is, and so is an input after `--arg-sep`.
+    #[test]
+    fn a_valued_runner_flag_is_not_the_command() {
+        let v = |s: &str| verdict(&shell_words(s));
+        for line in [
+            "parallel --env X rm -rf ::: /",
+            "parallel --results out rm -rf ::: /",
+            "parallel --tmpdir /tmp rm -rf ::: /",
+            "parallel --arg-sep ,, rm -rf ,, /",
+            "parallel --argsep ,, rm -rf ,, /",
+            "printf '/\\n' | xargs -J % rm -rf %",
+            "printf '/\\n' | xargs -R 1 -I % rm -rf %",
+            "printf '/\\n' | xargs -S 1024 -I % rm -rf %",
+        ] {
+            assert_eq!(v(line), "deny\trm-rf-outside-tmp", "{line}");
+        }
+    }
+
+    /// `parallel` runs a one-word command through a shell. The words of
+    /// that string are the command, including a `{}` it replaces.
+    #[test]
+    fn a_parallel_shell_string_is_the_command() {
+        let v = |s: &str| verdict(&shell_words(s));
+        for line in ["parallel 'rm -rf' ::: /", "parallel 'rm -rf {}' ::: /"] {
+            assert_eq!(v(line), "deny\trm-rf-outside-tmp", "{line}");
+        }
+    }
+
+    /// `find -exec env rm` runs `rm`, not `env`. A shell `-c` string is
+    /// the command find runs.
+    #[test]
+    fn a_find_exec_wrapper_is_not_the_command() {
+        let v = |s: &str| verdict(&shell_words(s));
+        for line in [
+            "find / -exec env rm -rf {} \\;",
+            "find / -exec nice rm -rf {} \\;",
+            "find / -exec timeout 5 rm -rf {} \\;",
+            "find / -exec bash -c 'rm -rf {}' \\;",
+        ] {
+            let got = v(line);
+            assert!(
+                got == "deny\toperand-unshown"
+                    || got.starts_with("deny\tfind-delete")
+                    || got == "deny\trm-rf-outside-tmp"
+                    || got == "deny\tfind-exec-unshown",
+                "{line}: {got}"
+            );
+        }
+    }
+
+    /// `srm` and `wipe` remove a tree the way `rm` does. `strace` runs the
+    /// command after it. `git checkout` can discard the work tree, so an
+    /// `xargs` that does not show the path is refused.
+    #[test]
+    fn a_shredder_or_traced_delete_is_still_a_delete() {
+        let v = |s: &str| verdict(&shell_words(s));
+        assert_eq!(v("srm -r /"), "deny\trm-rf-outside-tmp");
+        assert_eq!(v("wipe -r /"), "deny\trm-rf-outside-tmp");
+        assert_eq!(v("strace rm -rf /"), "deny\trm-rf-outside-tmp");
+        assert_eq!(v("xargs git checkout --"), "deny\toperand-unshown");
+    }
+
+    /// An `xargs -I` mark is a word of that `xargs`. The same word in a
+    /// later command is still that command's operand.
+    #[test]
+    fn an_xargs_mark_stops_at_the_feeder() {
+        let argv = shell_words("printf '/tmp/a\\n' | xargs -I/ echo /; rm -rf /");
+        let feed = feeder_word(&argv);
+        let slashes: Vec<usize> = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.as_str() == "/")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(slashes.len(), 2, "{argv:?}");
+        assert!(feed[slashes[0]], "{argv:?}");
+        assert!(!feed[slashes[1]], "{argv:?}");
+        let rm = argv.iter().position(|w| w == "rm").unwrap();
+        assert_eq!(argv[rm + 2], "/");
+        assert!(!feed[rm + 2]);
+        let mask = mark_rewrite_mask(&argv, true);
+        assert!(mask[slashes[0]] && !mask[slashes[1]]);
+        // The walk then judges `rm -rf {}` on its own. That argv is the
+        // command, so the mark is still rewritten there.
+        let body = shell_words("rm -rf {}");
+        let body_mask = mark_rewrite_mask(&body, true);
+        assert!(body_mask.iter().any(|f| *f));
+        assert!(!mark_rewrite_mask(&body, false).iter().any(|f| *f));
+    }
+
+    /// `{}` in `find -exec` is a path find walks, and `-print0 | xargs -0`
+    /// keeps those names whole. A missing operand is refused only when
+    /// some value it could take is refused. `make -L` is
+    /// `--check-symlink-times`.
+    #[test]
+    fn a_fed_name_under_the_tree_is_that_tree() {
+        let v = |s: &str| verdict(&shell_words(s));
+        for line in [
+            "find . -name '*.o' -exec rm {} +",
+            "find . -name '*.o' -exec rm -f {} \\;",
+            "find build -name '*.o' -exec rm -f {} +",
+            "find /tmp/build -name '*.o' -exec rm {} +",
+            "find . -type d -name __pycache__ -exec rm -rf {} +",
+            "find . -name '*.tmp' -print0 | xargs -0 rm -f",
+            "git ls-files -z '*.sh' | xargs -0 chmod +x",
+            "find . -name '*.sh' -exec chmod +x {} +",
+            "ls *.txt | xargs -I{} cp {} backup/",
+            "ls *.txt | xargs -I{} mv {} {}.bak",
+            "cat files.txt | while read f; do cp \"$f\" /tmp/; done",
+            "printf '/tmp/../'",
+        ] {
+            assert_eq!(v(line), "allow", "{line}");
+        }
+        assert_eq!(v("find . | xargs rm -f"), "deny\toperand-unshown");
+        assert_eq!(v("find . -delete"), "deny\tfind-delete-outside-tmp");
+        let d = std::env::temp_dir().join(format!("policyd-lib-{}-make-L", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("Makefile"), "all:\n\techo ok\n").unwrap();
+        for line in ["make -L", "make --check-symlink-times"] {
+            let c = check_shell_in(&shell_words(line), &d, 0);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+    }
+
     /// Words `xargs`, `parallel`, `find -exec` or `read` add are part of
     /// the command. A `printf` or `echo` that shows them is that command.
     /// A word the line does not show can be any operand or flag, so a
@@ -17598,24 +18559,17 @@ hash -r 2> /dev/null
         );
         for s in [
             "find . -name '*.o' | xargs rm -f",
-            "find . -print0 | xargs -0 rm -f",
             "xargs rm -rf",
             "xargs -n 1 git clean",
             "xargs -0 rm -rf",
             "parallel rm -rf ::: \"$x\"",
             "parallel rm -rf :::: files",
-            "find . -name '*.pyc' -exec rm -rf {} +",
             "find . -execdir rm -rf {} +",
             "while read x; do rm -rf \"$x\"; done",
             "cat list | xargs rm -f",
             "xargs -a list rm -rf",
-            "xargs rmdir",
-            "xargs unlink",
-            "xargs shred",
             "xargs dd",
-            "xargs truncate",
             "xargs mv",
-            "xargs cp",
             "xargs chmod",
             "xargs chown",
         ] {
@@ -17633,10 +18587,17 @@ hash -r 2> /dev/null
             "xargs grep pattern",
             "xargs cat",
             "xargs wc -l",
+            "xargs rmdir",
+            "xargs unlink",
+            "xargs shred",
+            "xargs truncate",
+            "xargs cp",
             "printf '/tmp/a.o\\n' | xargs rm -rf",
             "printf '%s\\n' /tmp/a /tmp/b | xargs rm -rf",
             "printf '/tmp/a\\n' | while read x; do rm -rf \"$x\"; done",
             "printf '/tmp/a\\n' | xargs -I{} rm -rf {}",
+            "find . -print0 | xargs -0 rm -f",
+            "find . -name '*.pyc' -exec rm -rf {} +",
             "xargs git status",
             "find . -exec grep x {} +",
             "find . -exec echo {} \\;",
@@ -17830,8 +18791,6 @@ hash -r 2> /dev/null
             "find . -exec {} \\;",
             "find . -exec \"$cmd\" \\;",
             "find . -execdir {} +",
-            "find . -name '*.pyc' -exec rm -rf {} +",
-            "find /tmp/build -exec rm {} +",
             "parallel ::: \"$cmd\"",
             "parallel :::: cmds.txt",
         ] {
@@ -17841,6 +18800,8 @@ hash -r 2> /dev/null
         for s in [
             "find . -exec echo {} \\;",
             "find . -exec grep x {} +",
+            "find . -name '*.pyc' -exec rm -rf {} +",
+            "find /tmp/build -exec rm {} +",
             "parallel echo hi",
             "parallel -j 4 echo hi ::: a b",
             "xargs echo hi",
@@ -18474,9 +19435,14 @@ hash -r 2> /dev/null
                 c.token
             );
         }
+        // `{}` is `.`, so `mv` writes `ok.sh` and the `sh` after it runs that write.
         let c = at("find . -exec mv {} ok.sh \\; ; sh ok.sh");
         assert_eq!(c.decision, Decision::Deny, "{}", c.token);
-        assert_eq!(c.token, "operand-unshown");
+        assert!(
+            c.token.starts_with("script-written-on-line: ") && c.token.contains("ok.sh"),
+            "{}",
+            c.token
+        );
         for line in [
             "git status && sh ok.sh",
             "git -C . log; sh ok.sh",
@@ -19144,7 +20110,6 @@ sed 's/[$]LINENO.*/&-/' <$as_myself >$as_me.lineno
             "pyenv init -",
             "git -C repo status",
             "tee build.log",
-            "read -r name; git checkout \"$name\"",
             "cp config.mk . && sh ./configure",
             "echo 'echo ok' > build/run.sh && sh build/run.sh",
         ] {
