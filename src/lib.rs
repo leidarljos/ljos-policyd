@@ -10184,6 +10184,13 @@ fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
             token: Cow::Borrowed("find-delete-outside-tmp"),
         };
     }
+    if find_print_off_tmp(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: Cow::Borrowed("find-write-outside-tmp"),
+        };
+    }
     if interpreter_rmtree(argv) {
         return Checked {
             decision: Decision::Deny,
@@ -12184,6 +12191,55 @@ fn git_dangerous(argv: &[String]) -> Option<&'static str> {
 fn under_tmp(p: &str) -> bool {
     !climbs(p)
         && (p == "/tmp" || p.starts_with("/tmp/") || p == "/var/tmp" || p.starts_with("/var/tmp/"))
+}
+
+/// `find -fprint`, `-fprint0`, `-fprintf` or `-fls` names a file that is
+/// not a literal path under `/tmp` or `/var/tmp`. Each of those predicates
+/// creates or truncates that file. The command inside `-exec` is not a
+/// find predicate.
+fn find_print_off_tmp(argv: &[String]) -> bool {
+    commands(argv).iter().any(|cmd| {
+        cmd.first().is_some_and(|w| base_of(w) == "find") && find_print_file_off_tmp(cmd)
+    })
+}
+
+fn find_print_file_off_tmp(cmd: &[&str]) -> bool {
+    let mut i = 0;
+    let mut off = false;
+    while i < cmd.len() {
+        let a = cmd[i];
+        if matches!(a, "-exec" | "-execdir" | "-ok" | "-okdir") {
+            i += 1;
+            while i < cmd.len() && !find_terminator(cmd[i]) {
+                i += 1;
+            }
+            if i < cmd.len() {
+                i += 1;
+            }
+            continue;
+        }
+        if !matches!(a, "-fprint" | "-fprint0" | "-fls" | "-fprintf") {
+            i += 1;
+            continue;
+        }
+        let file = cmd.get(i + 1).copied();
+        if !file.is_some_and(literal_under_tmp) {
+            off = true;
+        }
+        if file.is_some() {
+            i += 2;
+        } else {
+            i += 1;
+        }
+        if a == "-fprintf" && i < cmd.len() && !cmd[i].starts_with('-') {
+            i += 1;
+        }
+    }
+    off
+}
+
+fn literal_under_tmp(p: &str) -> bool {
+    literal_text(p) && under_tmp(p)
 }
 
 /// `find ... -delete`, or `-exec rm` (also `-execdir`, `-ok`, `shred`,
@@ -17400,6 +17456,43 @@ hash -r 2> /dev/null
             "allow"
         );
         assert_eq!(v(&["find", ".", "-exec", "grep", "x", "{}", "+"]), "allow");
+    }
+
+    /// `-fprint`, `-fprint0`, `-fprintf` and `-fls` create or truncate the
+    /// file they name. A path that is not under `/tmp` or `/var/tmp` is
+    /// refused. The words of `-exec` are that command, not find predicates.
+    #[test]
+    fn find_fprint_outside_tmp_is_a_write() {
+        let v = |s: &str| verdict(&shell_words(s));
+        for line in [
+            "find / -fprint /etc/x",
+            "find / -fprint0 /etc/x",
+            "find / -fprintf /etc/x '%p\\n'",
+            "find / -fls /etc/x",
+            "find . -fprint out",
+            "find /tmp -fprint /etc/x",
+            "find / -fprint /tmp/../etc/x",
+            "find / -fprint \"$f\"",
+            "find / -fprint",
+            "find /tmp -name x -fprint /etc/x",
+            "find / -fprint /tmp/out -fprintf /etc/y '%p'",
+            "sh -c 'find / -fprint /etc/x'",
+        ] {
+            assert_eq!(v(line), "deny\tfind-write-outside-tmp", "{line}");
+        }
+        for line in [
+            "find /tmp -fprint /tmp/out",
+            "find /tmp -fprint0 /var/tmp/out",
+            "find / -fprintf /tmp/out '%p\\n'",
+            "find /var/tmp -fls /var/tmp/ls",
+            "find . -name x",
+            "find . -print",
+            "find /tmp -printf '%p\\n'",
+            "find /tmp -name x -fprint /tmp/out",
+            "find . -exec echo -fprint /etc/x \\;",
+        ] {
+            assert_eq!(v(line), "allow", "{line}");
+        }
     }
 
     #[test]
