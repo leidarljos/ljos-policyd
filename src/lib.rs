@@ -843,13 +843,7 @@ fn walk(
         // the same walk that tracks the directory, whether or not the
         // file can move this shell. A pipeline stage's source moves only
         // its own subshell.
-        let read = {
-            let dir = match shell.here.as_slice() {
-                [d] if !is_untracked(d) => Some(d.as_path()),
-                _ => None,
-            };
-            sourced(&cmd, dir, &shell.aliases)
-        };
+        let read = sourced(&cmd, &shell.here, &shell.aliases);
         match read {
             Sourced::Read { keeps, words } => {
                 if let Some(c) = judge_body(&words, shell) {
@@ -881,10 +875,24 @@ fn walk(
                     }
                 }
             }
-            Sourced::Loses => {
+            Sourced::Loses(bodies) => {
+                for words in &bodies {
+                    if let Some(c) = judge_body(words, shell) {
+                        *denied = Some(c);
+                        return;
+                    }
+                    replay_subshell(words, shell, depth, out, denied);
+                    if denied.is_some() {
+                        return;
+                    }
+                }
                 if in_shell {
                     shell.lose();
                 }
+            }
+            Sourced::Unread(c) => {
+                *denied = Some(c);
+                return;
             }
             Sourced::No => {
                 if in_shell && shell.follow_unseen && (bare_unseen(&cmd) || blinds_functions(&cmd))
@@ -1378,29 +1386,41 @@ enum Sourced {
     /// defines or calls is judged with the line, and the deny rules see
     /// the same words.
     Read { keeps: bool, words: Vec<String> },
-    /// The file cannot be read, or the path is not one literal file.
-    Loses,
+    /// The file is missing, or the line may be in several directories:
+    /// the words of each file found, which are judged, though where the
+    /// shell ends up is not followed.
+    Loses(Vec<Vec<String>>),
+    /// The file cannot be judged.
+    Unread(Checked),
 }
 
-/// `source FILE` or `. FILE` when `FILE` is a literal path. The file is
-/// read from the one directory the line is in. Several directories, a
-/// path the line does not show, or a file that is not a regular file the
-/// guard can open, lose the line.
-fn sourced(cmd: &[&str], cwd: Option<&std::path::Path>, aliases: &[(String, String)]) -> Sourced {
+/// `source FILE` or `. FILE` when `FILE` is a literal path, read from
+/// each directory the line may be in. One directory and one file is
+/// followed; several directories or a missing file lose the line, and a
+/// file the guard cannot read, or a relative path in a directory the
+/// walk does not follow, is refused.
+fn sourced(cmd: &[&str], dirs: &[std::path::PathBuf], aliases: &[(String, String)]) -> Sourced {
     let Some(path) = literal_source_path(cmd) else {
         return Sourced::No;
     };
-    let Some(cwd) = cwd.filter(|d| !is_untracked(d)) else {
-        return Sourced::Loses;
+    let mut texts = match script_texts(&path, dirs) {
+        Ok(t) => t,
+        Err(c) => return Sourced::Unread(c),
     };
-    let Some(text) = read_regular(&cwd.join(path)) else {
-        return Sourced::Loses;
-    };
-    let scan = scan_script(&text, aliases);
-    Sourced::Read {
-        keeps: scan.keeps,
-        words: scan.words,
+    let one = std::path::Path::new(&path).is_absolute() || dirs.len() == 1;
+    if one && texts.len() == 1 {
+        let scan = scan_script(&texts.remove(0).1, aliases);
+        return Sourced::Read {
+            keeps: scan.keeps,
+            words: scan.words,
+        };
     }
+    Sourced::Loses(
+        texts
+            .into_iter()
+            .map(|(_, t)| scan_script(&t, aliases).words)
+            .collect(),
+    )
 }
 
 /// A startup-file value the line shows as a path, or `"$"` when it does
@@ -1654,30 +1674,38 @@ fn judge_script_file(
         return;
     }
     let wrappers = &owned[..owned.len() - run.len()];
-    let path = std::path::Path::new(op);
-    let full = match shell.here.as_slice() {
-        _ if path.is_absolute() => path.to_path_buf(),
-        [d] if !is_untracked(d) => env_dir(wrappers, d, shell.vars.home.as_deref()).join(path),
-        _ => return,
+    let dirs: Vec<_> = shell
+        .here
+        .iter()
+        .map(|d| env_dir(wrappers, d, shell.vars.home.as_deref()))
+        .collect();
+    let texts = match script_texts(op, &dirs) {
+        Ok(t) => t,
+        Err(c) => {
+            *denied = Some(c);
+            return;
+        }
     };
-    let Some(text) = read_regular(&full) else {
-        return;
-    };
-    if depth >= MAX_DEPTH {
-        *denied = Some(Checked {
-            decision: Decision::Deny,
-            code: PolicyReason::ShellDangerousRunner,
-            token: Cow::Borrowed("script-file-unshown"),
-        });
-        return;
+    for (_, text) in texts {
+        if depth >= MAX_DEPTH {
+            *denied = Some(Checked {
+                decision: Decision::Deny,
+                code: PolicyReason::ShellDangerousRunner,
+                token: Cow::Borrowed("script-file-unshown"),
+            });
+            return;
+        }
+        let mut aliases = shell.aliases.clone();
+        let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
+        if let Some(c) = judge_body(&words, shell) {
+            *denied = Some(c);
+            return;
+        }
+        replay_subshell(&words, shell, depth + 1, out, denied);
+        if denied.is_some() {
+            return;
+        }
     }
-    let mut aliases = shell.aliases.clone();
-    let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
-    if let Some(c) = judge_body(&words, shell) {
-        *denied = Some(c);
-        return;
-    }
-    replay_subshell(&words, shell, depth + 1, out, denied);
 }
 
 /// A `bash <(cat file)` runs `file` as its script, in the child. A `cd`
@@ -1777,31 +1805,94 @@ fn literal_source_path(cmd: &[&str]) -> Option<String> {
     (!file.is_empty() && !file.contains(['$', '`', '*', '?', '['])).then(|| file.to_string())
 }
 
-/// How large a sourced file is read. Past this the line is untracked.
-const SOURCE_MAX: u64 = 64 * 1024;
+/// How large a script is read. A generated `configure` runs to a few
+/// hundred KiB; past this the script is not judged and is refused.
+const SCRIPT_MAX: u64 = 4 * 1024 * 1024;
+
+/// What opening a script file found.
+enum ScriptText {
+    /// No file there, or a directory: the shell runs nothing.
+    Missing,
+    Text(String),
+    /// A file the guard cannot judge: past [`SCRIPT_MAX`], not a regular
+    /// file, a loop of links, unreadable, or not UTF-8.
+    Unread,
+}
 
 /// The text of the regular file at `path`, opened through any symlink as
 /// the shell opens it, and with `O_NONBLOCK` so a fifo cannot stall the
-/// check. A loop of links fails to open. `None` when it cannot be read,
-/// is not a regular file, is larger than [`SOURCE_MAX`], or is not UTF-8.
-fn read_regular(path: &std::path::Path) -> Option<String> {
+/// check. A loop of links fails to open.
+fn read_script(path: &std::path::Path) -> ScriptText {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
-    let file = std::fs::OpenOptions::new()
+    let file = match std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(path)
-        .ok()?;
-    let meta = file.metadata().ok()?;
-    if !meta.file_type().is_file() || meta.len() > SOURCE_MAX {
-        return None;
+    {
+        Ok(f) => f,
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) => {
+            return ScriptText::Missing
+        }
+        Err(_) => return ScriptText::Unread,
+    };
+    let Ok(meta) = file.metadata() else {
+        return ScriptText::Unread;
+    };
+    if meta.is_dir() {
+        return ScriptText::Missing;
+    }
+    if !meta.file_type().is_file() || meta.len() > SCRIPT_MAX {
+        return ScriptText::Unread;
     }
     let mut buf = Vec::new();
-    file.take(SOURCE_MAX + 1).read_to_end(&mut buf).ok()?;
-    if buf.len() as u64 > SOURCE_MAX {
-        return None;
+    if file.take(SCRIPT_MAX + 1).read_to_end(&mut buf).is_err() || buf.len() as u64 > SCRIPT_MAX {
+        return ScriptText::Unread;
     }
-    String::from_utf8(buf).ok()
+    String::from_utf8(buf).map_or(ScriptText::Unread, ScriptText::Text)
+}
+
+/// [`read_script`] where only the text matters.
+fn read_regular(path: &std::path::Path) -> Option<String> {
+    match read_script(path) {
+        ScriptText::Text(t) => Some(t),
+        _ => None,
+    }
+}
+
+fn script_unread(word: &str) -> Checked {
+    Checked {
+        decision: Decision::Deny,
+        code: PolicyReason::ShellDangerousRunner,
+        token: Cow::Owned(format!("script-unread: {word}")),
+    }
+}
+
+/// The text of the script `word` as a shell in each of `dirs` would open
+/// it, one entry per file found. A relative path in a directory the walk
+/// does not follow, or a file the guard cannot read, is refused. A
+/// missing file runs nothing and has no entry.
+fn script_texts(
+    word: &str,
+    dirs: &[std::path::PathBuf],
+) -> Result<Vec<(std::path::PathBuf, String)>, Checked> {
+    let path = std::path::Path::new(word);
+    let fulls: Vec<std::path::PathBuf> = if path.is_absolute() {
+        vec![path.to_path_buf()]
+    } else if dirs.iter().any(|d| is_untracked(d)) {
+        return Err(script_unread(word));
+    } else {
+        dirs.iter().map(|d| d.join(path)).collect()
+    };
+    let mut out = Vec::new();
+    for full in fulls {
+        match read_script(&full) {
+            ScriptText::Missing => {}
+            ScriptText::Text(t) => out.push((full, t)),
+            ScriptText::Unread => return Err(script_unread(word)),
+        }
+    }
+    Ok(out)
 }
 
 /// Whether the script `text`, read by a shell that holds `aliases`,
@@ -11418,6 +11509,61 @@ hash -r 2> /dev/null
             assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
         }
         for line in ["sh dangling.sh", "source dangling.sh"] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        assert_everyday_allowed(&root);
+    }
+
+    /// A script past 64 KiB, a loop of links, a fifo, or one in a
+    /// directory the walk does not follow was allowed unread. A missing
+    /// file or a directory runs nothing.
+    #[test]
+    fn a_script_the_guard_cannot_read_is_refused() {
+        use std::os::unix::ffi::OsStringExt;
+        let root = startup_root("unread");
+        let pad = "#".repeat(70 * 1024);
+        std::fs::write(root.join("long.sh"), format!("{pad}\ngit push -f origin\n")).unwrap();
+        let huge = "#".repeat(usize::try_from(SCRIPT_MAX).unwrap() + 1);
+        std::fs::write(root.join("huge.sh"), huge).unwrap();
+        std::os::unix::fs::symlink("loop.sh", root.join("loop.sh")).unwrap();
+        let fifo =
+            std::ffi::CString::new(root.join("fifo.sh").into_os_string().into_vec()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "sh long.sh",
+            "source long.sh",
+            "cd evil; bash force.sh",
+            "cd evil || true; source force.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
+        }
+        for line in [
+            "sh huge.sh",
+            ". ./huge.sh",
+            "bash loop.sh",
+            "source loop.sh",
+            "sh fifo.sh",
+            "cd \"$X\" && sh x.sh",
+            "cd \"$X\" && source x.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(
+                c.token.starts_with("script-unread: "),
+                "{line}: {}",
+                c.token
+            );
+        }
+        for line in [
+            "sh missing.sh",
+            "source missing.sh",
+            "sh evil",
+            "cd \"$X\" && sh /no/such.sh",
+        ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
