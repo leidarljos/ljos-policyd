@@ -7221,6 +7221,20 @@ fn build_output(p: &str) -> bool {
     plain_relative(p) && p.split('/').any(|part| BUILD_OUTPUT_DIRS.contains(&part))
 }
 
+/// What an autoconf `configure` makes as it runs and removes again:
+/// `conftest`, `conftest.dir`, the glob `conftest*`, `autom4te.cache`.
+/// They are regenerated on the next run, like build output.
+fn configure_scratch(p: &str) -> bool {
+    let p = p.trim_end_matches('/');
+    let (dir, name) = p.rsplit_once('/').unwrap_or(("", p));
+    (dir.is_empty() || dir == "." || plain_relative(dir))
+        && (matches!(name, "conftest*" | "conftest.*")
+            || (plain_relative(name)
+                && (name == "conftest"
+                    || name.starts_with("conftest.")
+                    || name == "autom4te.cache")))
+}
+
 /// Scratch directories a project keeps at its top for throwaway output.
 const SCRATCH_DIRS: &[&str] = &["tmp", ".tmp", "temp"];
 
@@ -7285,7 +7299,9 @@ fn recursive_delete_off_tmp(argv: &[String], moved: bool) -> bool {
         !cmd.iter()
             .skip(1)
             .filter(|a| !a.starts_with('-') && !is_redirection(a))
-            .all(|p| under_tmp(p) || (!moved && (build_output(p) || scratch(p))))
+            .all(|p| {
+                under_tmp(p) || (!moved && (build_output(p) || scratch(p) || configure_scratch(p)))
+            })
     })
 }
 
@@ -12851,6 +12867,29 @@ hash -r 2> /dev/null
         for line in ["make ok", "make two"] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+    }
+
+    #[test]
+    fn configure_scratch_is_regenerable() {
+        let root = startup_root("conftest");
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "rm -rf conftest*",
+            "rm -f -r conftest* autom4te.cache",
+            "rm -rf conftest.dir conftest ./autom4te.cache/",
+            "rm -rf sub/conftest.*",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for line in [
+            "rm -rf conftest* src",
+            "rm -rf ../conftest",
+            "rm -rf conftest*/../x",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
         }
     }
 }
