@@ -6845,6 +6845,48 @@ mod tests {
         );
     }
 
+    /// A shell with no script of its own runs what it reads on stdin. The
+    /// text of a here-string or heredoc is judged as that script; stdin
+    /// from a pipe, or a `-s` shell fed no such text, is not shown.
+    #[test]
+    fn a_script_fed_to_a_shell_on_stdin_is_judged() {
+        for script in [
+            "bash <<< \"git push -f\"",
+            "sh <<<'git push --force'",
+            "bash -s -- a <<< 'git push -f'",
+            "zsh 0<<< 'git push -f'",
+            "bash <<EOF\ngit push -f\nEOF",
+        ] {
+            assert_eq!(
+                v(&["bash", "-c", script]),
+                "deny\tgit-force-push",
+                "{script}"
+            );
+        }
+        for script in [
+            "echo \"git push -f\" | bash",
+            "printf '%s\\n' \"$X\" | sh -",
+            "cat cmds.txt | zsh",
+            "bash -s",
+            "bash <<< \"$cmd\"",
+        ] {
+            assert_eq!(
+                v(&["bash", "-c", script]),
+                "deny\tshell-stdin-unshown",
+                "{script}"
+            );
+        }
+        for script in [
+            "bash <<< 'echo hi'",
+            "echo hi | cat",
+            "bash script.sh < input.txt",
+            "echo hi | bash -c 'cat'",
+            "cat <<< 'git status'",
+        ] {
+            assert_eq!(v(&["bash", "-c", script]), "allow", "{script}");
+        }
+    }
+
     #[test]
     fn a_shell_script_does_not_hide_a_recursive_delete() {
         assert!(v(&["sh", "-c", "rm -rf /home/u/x"]).starts_with("deny"));
