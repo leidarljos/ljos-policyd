@@ -270,7 +270,12 @@ local part, so =x@xn--bcher-kva.fastmail.com= is
 domain, and so are =icloud.com=, =me.com= and =mac.com=,
 each with =+=. =outlook.*=, =hotmail.*=, =live.*= and
 =msn.*= (every domain with that first label, whatever the
-country suffix) are separate domains, each with =+=. On
+country suffix) are separate domains, each with =+=. Exact and
+subaddress matching stay on the domain the rule names. The
+skeleton prefix still crosses that family, so a rule for
+=john@outlook.com= also denies =john@hotmail.com=,
+=john@live.com=, =john@msn.com= and =john@outlook.de=. That
+over-block is the prefix, not a shared mailbox. On
 =yahoo.*=, =ymail.*= and =rocketmail.com=, =-= is a
 separator, and an address rule
 is also cut at its first separator, so a rule for one disposable

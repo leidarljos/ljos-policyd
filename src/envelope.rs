@@ -720,13 +720,15 @@ fn address_denied(addr: &NormAddr, config: &Config) -> bool {
                 continue;
             };
             let rule_skeleton = skeleton(rule_local);
-            // Equal skeletons still meet when the rule is short, so
-            // transparent characters and case folding compare. The
-            // prefix of a longer local part does not: `jo` is not `john`.
+            // Equal skeletons on this domain still meet when the rule
+            // is short, so transparent characters and case folding
+            // compare. The prefix does not: `jo` is not `john`, and a
+            // short rule does not cross to another domain in the family.
+            let equal_here = local_skeleton == rule_skeleton && domain == rule_domain;
             if same_family(&domain, rule_domain, &config.aliases)
                 && !rule_skeleton.is_empty()
                 && local_skeleton.starts_with(&rule_skeleton)
-                && (local_skeleton == rule_skeleton || config.deny_prefixes.contains(rule))
+                && (equal_here || config.deny_prefixes.contains(rule))
             {
                 return true;
             }
@@ -832,8 +834,11 @@ const ALIAS_FAMILIES: &[&str] = &[
     // Plus and subdomain addressing, one subdomain level only:
     // https://www.fastmail.help/hc/en-us/articles/360060591053-Plus-addressing-and-subdomain-addressing
     "fastmail.com + subdomain",
-    // Plus addressing only. The domains and their country variants are
-    // separate mailboxes, so none of them is shared:
+    // Plus addressing only. The domains are separate mailboxes, so none
+    // of them is shared and an exact or subaddress match stays on the
+    // domain the rule names. The skeleton prefix still crosses the
+    // family: john@outlook.com also denies john@hotmail.com,
+    // john@live.com, john@msn.com and john@outlook.de.
     // https://support.microsoft.com/en-us/outlook/send-email-from-a-different-address-in-outlook-com
     "outlook.*,hotmail.*,live.*,msn.* +",
     // One account across the four Proton domains, with plus aliases:
@@ -2460,7 +2465,17 @@ pair left right
         assert!(denied("bad+x@outlook.com", outlook));
         assert!(denied("bad-x@outlook.com", outlook));
         assert!(denied("bad@hotmail.com", outlook));
+        assert!(denied("bad@live.com", outlook));
+        assert!(denied("bad@msn.com", outlook));
+        assert!(denied("bad@outlook.de", outlook));
         assert!(!denied("bad@gmail.com", outlook));
+        assert!(!denied("other@hotmail.com", outlook));
+        // A short rule does not use the prefix, so it does not cross.
+        let short = "address ed@outlook.com\n";
+        assert!(denied("ed@outlook.com", short));
+        assert!(denied("ed+x@outlook.com", short));
+        assert!(!denied("ed@hotmail.com", short));
+        assert!(!denied("ed@outlook.de", short));
         assert!(denied("bad+x@hotmail.co.uk", "address bad@hotmail.co.uk\n"));
         let yahoo = "address base-shop@yahoo.com\n";
         for to in [
