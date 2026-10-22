@@ -152,7 +152,8 @@ NFKC or the removal of a skipped character would change is a
 refusal, including a zero-width character or a fullwidth spelling.
 An encoded-word in a display name is decoded for display only,
 and an encoded addr-spec is a refusal. A second `From`, a
-`From` that does not parse, or any other address is a refusal.
+`From` that does not parse, a group in `From`, or any other
+address is a refusal.
 `Reply-To`, `Sender`, `Return-Path`, `Errors-To`,
 `Disposition-Notification-To`, `Return-Receipt-To`,
 `Delivery-Receipt-To`, `Mail-Followup-To` and `Mail-Reply-To` must

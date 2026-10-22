@@ -623,6 +623,14 @@ fn split_list(input: &str) -> Result<Vec<String>, AddressFault> {
     Ok(out)
 }
 
+/// True when `value` uses group syntax (`name: addr;`). The colon is
+/// outside quotes and angle brackets. A group in `From` is not a
+/// mailbox RFC 5322 allows there.
+pub(crate) fn contains_group(value: &str) -> Result<bool, AddressFault> {
+    let text = strip_comments(value)?;
+    Ok(group_colon(text.trim())?.is_some())
+}
+
 fn mailbox_segment(segment: &str) -> Result<Option<Mailbox>, AddressFault> {
     let segment = strip_group(segment.trim())?;
     let segment = segment.trim();
@@ -1067,6 +1075,18 @@ From: other@example.test\r\n\
                 local: "mailseat".into(),
                 domain: "example.test".into(),
             }]
+        );
+    }
+
+    #[test]
+    fn a_group_colon_marks_a_group() {
+        assert!(contains_group("G: mailseat@example.test;").unwrap());
+        assert!(contains_group("G: <mailseat@example.test>;").unwrap());
+        assert!(!contains_group("\"G: H\" <mailseat@example.test>").unwrap());
+        assert!(!contains_group("mailseat@example.test").unwrap());
+        assert_eq!(
+            mailboxes("Friends: one@example.test;").unwrap()[0].local,
+            "one"
         );
     }
 

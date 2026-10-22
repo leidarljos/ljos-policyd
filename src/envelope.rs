@@ -309,12 +309,19 @@ fn check_from(message: &Message, identity: &NormAddr, reasons: &mut Vec<MailReas
     }
     let mut encoded = false;
     let mut unparsed = false;
+    let mut grouped = false;
     let mut not_identity = false;
     for header in froms {
         match read_mailboxes(header) {
             Parsed::EncodedWord => encoded = true,
             Parsed::Unparsed => unparsed = true,
             Parsed::Mailboxes(list) => {
+                // A group is not a From, even when its only mailbox is
+                // the identity. Receivers do not agree on the syntax.
+                match mail::contains_group(&header.raw) {
+                    Ok(true) | Err(_) => grouped = true,
+                    Ok(false) => {}
+                }
                 if list.len() != 1 || !same(&list[0], identity) {
                     not_identity = true;
                 }
@@ -326,6 +333,9 @@ fn check_from(message: &Message, identity: &NormAddr, reasons: &mut Vec<MailReas
     }
     if unparsed {
         reasons.push(reason("from-unparsed", "From"));
+    }
+    if grouped {
+        reasons.push(reason("from-group", "From"));
     }
     if not_identity {
         reasons.push(reason("from-not-identity", "From"));
@@ -795,6 +805,19 @@ From: =?utf-8?q?=28?= <other@evil.test> (=?utf-8?q?=29?= =?utf-8?q?=29?= mailsea
         assert!(codes(spoof, "", "").is_empty());
         let hidden = "From: =?utf-8?q?mailseat=40example=2etest?= <other@example.test>\r\n";
         assert_eq!(codes(hidden, "", ""), vec!["from-not-identity"]);
+    }
+
+    #[test]
+    fn a_group_in_from_is_refused() {
+        let raw = "From: G: mailseat@example.test;";
+        assert_eq!(codes(raw, "", ""), vec!["from-group"]);
+        let raw = "From: G: <mailseat@example.test>;\r\n";
+        assert_eq!(codes(raw, "", ""), vec!["from-group"]);
+        let raw = "From: G: other@example.test;\r\n";
+        assert_eq!(codes(raw, "", ""), vec!["from-group", "from-not-identity"]);
+        let raw = "From: \"G: H\" <mailseat@example.test>\r\n";
+        assert!(codes(raw, "", "").is_empty(), "{:?}", details(raw, "", ""));
+        assert!(codes(&plain("To: Friends: a@example.test;\r\n"), "", "").is_empty());
     }
 
     #[test]

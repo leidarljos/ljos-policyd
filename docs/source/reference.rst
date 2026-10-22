@@ -220,6 +220,8 @@ character would change is a refusal, including a zero-width
 character or a fullwidth spelling. The mailbox is the address in
 angle brackets, read from the raw unfolded value. A display-name encoded-word is decoded for display only, and
 an encoded addr-spec is a refusal. A second ``From`` is a refusal.
+A group in ``From`` is a refusal. A group in a recipient header
+still contributes its mailboxes.
 ``Reply-To``, ``Sender``, ``Return-Path``, ``Errors-To``,
 ``Disposition-Notification-To``, ``Return-Receipt-To``,
 ``Delivery-Receipt-To``, ``Mail-Followup-To`` and ``Mail-Reply-To``
@@ -256,6 +258,7 @@ Code                                     When
 ``duplicate-from``                       more than one From
 ``from-not-identity``                    From is not the configured identity
 ``from-unparsed``                        From does not parse as one mailbox
+``from-group``                           From uses group syntax
 ``encoded-word``                         an encoded-word in a watched header did not decode
 ``reply-to-denied``                      Reply-To names a deny-file identity
 ``reply-to-unparsed``                    Reply-To does not parse
