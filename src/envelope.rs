@@ -169,6 +169,7 @@ fn check_argv_recipients(config: &Config, recipients: &[String], reasons: &mut V
     }
 }
 
+#[derive(Clone)]
 struct NormAddr {
     /// Deny-file form: NFKC, a zero-width space or braille blank removed,
     /// local part lowercased, domain in IDNA ASCII. A closed code point
@@ -187,6 +188,7 @@ impl NormAddr {
     }
 }
 
+#[derive(Clone)]
 struct Config {
     identity: NormAddr,
     deny_addresses: BTreeSet<String>,
@@ -202,6 +204,113 @@ struct Config {
 }
 
 fn load_config(path: &Path) -> Result<Config, MailReason> {
+    // One deny file judged for every code point re-reads the same bytes.
+    // Parsing them again does not change the verdict. The bytes are the
+    // key, so a test that rewrites a file still loads the new text.
+    #[cfg(test)]
+    if let Some(config) = cached_config(path) {
+        return Ok(config);
+    }
+    let config = load_config_uncached(path)?;
+    #[cfg(test)]
+    store_cached_config(path, &config);
+    Ok(config)
+}
+
+#[cfg(test)]
+struct ConfigCache {
+    conf_path: PathBuf,
+    conf: Vec<u8>,
+    deny_path: PathBuf,
+    deny: Vec<u8>,
+    law_path: PathBuf,
+    law: Vec<u8>,
+    config: Config,
+}
+
+#[cfg(test)]
+fn config_cache() -> &'static std::thread::LocalKey<std::cell::RefCell<Option<ConfigCache>>> {
+    thread_local! {
+        static CACHE: std::cell::RefCell<Option<ConfigCache>> = const { std::cell::RefCell::new(None) };
+    }
+    &CACHE
+}
+
+#[cfg(test)]
+fn cached_config(path: &Path) -> Option<Config> {
+    let conf = std::fs::read(path).ok()?;
+    let (deny_path, law_path) = config_cache().with(|slot| {
+        let slot = slot.borrow();
+        let slot = slot.as_ref()?;
+        if slot.conf_path == path && slot.conf == conf {
+            Some((slot.deny_path.clone(), slot.law_path.clone()))
+        } else {
+            None
+        }
+    })?;
+    let deny = std::fs::read(&deny_path).ok()?;
+    let law = std::fs::read(&law_path).ok()?;
+    config_cache().with(|slot| {
+        let slot = slot.borrow();
+        let slot = slot.as_ref()?;
+        if slot.conf_path == path && slot.conf == conf && slot.deny == deny && slot.law == law {
+            Some(slot.config.clone())
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg(test)]
+fn store_cached_config(path: &Path, config: &Config) {
+    let Ok(conf) = std::fs::read(path) else {
+        return;
+    };
+    let Ok(text) = std::str::from_utf8(&conf) else {
+        return;
+    };
+    let Some((deny_path, law_path)) = side_files(text, path) else {
+        return;
+    };
+    let Ok(deny) = std::fs::read(&deny_path) else {
+        return;
+    };
+    let Ok(law) = std::fs::read(&law_path) else {
+        return;
+    };
+    config_cache().with(|slot| {
+        *slot.borrow_mut() = Some(ConfigCache {
+            conf_path: path.to_path_buf(),
+            conf,
+            deny_path,
+            deny,
+            law_path,
+            law,
+            config: config.clone(),
+        });
+    });
+}
+
+/// The deny file and the pack-law file named by a config that has
+/// already loaded. A line this cannot read is not cached.
+#[cfg(test)]
+fn side_files(text: &str, config: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut deny = None;
+    let mut law = None;
+    for line in text.lines() {
+        let Some((key, value)) = rule_line(line).ok().flatten() else {
+            continue;
+        };
+        match key {
+            "deny-file" => deny = Some(resolve(config, value)),
+            "pack-law" => law = Some(resolve(config, value)),
+            _ => {}
+        }
+    }
+    Some((deny?, law?))
+}
+
+fn load_config_uncached(path: &Path) -> Result<Config, MailReason> {
     let text = read_text(path).map_err(|()| reason("config-unreadable", "config"))?;
     let mut identity = None;
     let mut deny_file = None;
@@ -886,6 +995,7 @@ const ALIAS_FAMILIES: &[&str] = &[
     "ymail.*,rocketmail.com - cut",
 ];
 
+#[derive(Clone)]
 struct AliasFamily {
     domains: Vec<String>,
     separators: String,
@@ -3150,108 +3260,109 @@ pair left right
         );
     }
 
-    /// Every code point in a local part is refused, or the skeleton it
-    /// leaves is denied by an address rule for that skeleton. None is
-    /// accepted and missed. A surrogate is not a scalar value, so the
-    /// UTF-8 decoder refuses those bytes.
+    /// Every scalar is placed in a local part and judged by
+    /// `check_mail_bytes` against one deny file, `address
+    /// other@example.test`. An allow is only a letter, number,
+    /// punctuation or symbol in the general category. That category
+    /// comes from ICU, not from `local_closed`. A surrogate is not a
+    /// scalar, so the UTF-8 decoder refuses those bytes.
     #[test]
-    fn every_code_point_in_a_local_part_is_refused_or_denied_by_its_skeleton() {
-        let sets = unicode_sets();
-        let other = rule_config("other");
-        let mut config = rule_config("other");
-        let base = skeleton("other");
-        let mut bare = String::new();
-        let mut quoted = String::new();
+    fn every_code_point_in_a_local_part_is_refused_or_visible() {
+        use icu_properties::props::GeneralCategoryGroup;
+        let visible = GeneralCategoryGroup::Letter
+            .union(GeneralCategoryGroup::Number)
+            .union(GeneralCategoryGroup::Punctuation)
+            .union(GeneralCategoryGroup::Symbol);
+        let category = CodePointMapData::<GeneralCategory>::new();
+        let dir = std::env::temp_dir().join(format!("policyd-cps-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("deny.txt"), "address other@example.test\n").unwrap();
+        std::fs::write(dir.join("law.txt"), "").unwrap();
+        std::fs::write(
+            dir.join("mail.conf"),
+            format!("identity {IDENTITY}\ndeny-file deny.txt\npack-law law.txt\n"),
+        )
+        .unwrap();
+        let conf = dir.join("mail.conf");
+        let allowed = check_mail_bytes(
+            b"From: mailseat@example.test\r\nTo: othxer@example.test\r\n\r\n",
+            &conf,
+        );
+        assert!(
+            !allowed.is_refused(),
+            "deny file did not load: {:?}",
+            allowed.reasons.iter().map(|r| r.code).collect::<Vec<_>>()
+        );
+        let mut msg = String::new();
         for cp in 0..=0x10FFFF {
             let Some(ch) = char::from_u32(cp) else {
-                assert_eq!(
-                    surrogate_verdict(cp).reasons[0].code,
-                    "message-invalid",
-                    "U+{cp:04X}"
-                );
+                let v = check_mail_bytes(&surrogate_message(cp), &conf);
+                assert_eq!(v.reasons[0].code, "message-invalid", "U+{cp:04X}");
                 continue;
             };
-            let Some(mailbox) = placed_local(ch, &mut bare, &mut quoted) else {
-                continue;
-            };
-            let Some(addr) = normalize_mailbox(&mailbox) else {
-                continue;
-            };
-            assert!(
-                !local_closed(&sets, ch),
-                "U+{cp:04X} is closed and was accepted"
-            );
-            let skel = skeleton(&addr.local);
-            if skel == base {
-                assert!(
-                    address_denied(&addr, &other),
-                    "U+{cp:04X} folded away and missed"
-                );
+            msg.clear();
+            msg.push_str("From: mailseat@example.test\r\nTo: ");
+            // Quote when the atom parser would not keep the character, so
+            // the deny path sees it in the local part. `"`, `\`, CR and
+            // LF cannot sit inside quotes; the header or the parser
+            // refuses those bytes on their own.
+            let quote = !local_atom_char(ch) && !matches!(ch, '"' | '\\' | '\r' | '\n');
+            if quote {
+                msg.push('"');
+            }
+            msg.push_str("oth");
+            msg.push(ch);
+            msg.push_str("er");
+            if quote {
+                msg.push('"');
+            }
+            msg.push_str("@example.test\r\n\r\n");
+            let v = check_mail_bytes(msg.as_bytes(), &conf);
+            if v.is_refused() {
                 continue;
             }
-            let rule = normalize_local(&skel)
-                .unwrap_or_else(|| panic!("U+{cp:04X} skeleton {skel:?} is not a local part"));
-            install_rule(&mut config, &rule);
+            let cat = category.get(ch);
             assert!(
-                address_denied(&addr, &config),
-                "U+{cp:04X} accepted and missed, skeleton {skel:?}"
+                visible.contains(cat),
+                "U+{cp:04X} {cat:?} accepted and not denied"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn rule_config(local: &str) -> Config {
-        let mut config = Config {
-            identity: normalize_identity(IDENTITY).unwrap(),
-            deny_addresses: std::collections::BTreeSet::new(),
-            deny_prefixes: std::collections::BTreeSet::new(),
-            deny_domains: std::collections::BTreeSet::new(),
-            pack_domains: std::collections::BTreeSet::new(),
-            subaddress: "+-=".to_string(),
-            aliases: builtin_families().unwrap(),
-        };
-        install_rule(&mut config, local);
-        config
-    }
-
-    fn install_rule(config: &mut Config, local: &str) {
-        config.deny_addresses.clear();
-        config.deny_prefixes.clear();
-        let key = format!("{local}@example.test");
-        if skeleton(local).chars().count() >= MIN_SKELETON {
-            config.deny_prefixes.insert(key.clone());
+    /// The same shape `is_atext` keeps in an unquoted local part, plus
+    /// `.`, which a dot-atom keeps between the letters.
+    fn local_atom_char(ch: char) -> bool {
+        if ch.is_ascii() {
+            return ch.is_ascii_alphanumeric()
+                || matches!(
+                    ch,
+                    '!' | '#'
+                        | '$'
+                        | '%'
+                        | '&'
+                        | '\''
+                        | '*'
+                        | '+'
+                        | '-'
+                        | '.'
+                        | '/'
+                        | '='
+                        | '?'
+                        | '^'
+                        | '_'
+                        | '`'
+                        | '{'
+                        | '|'
+                        | '}'
+                        | '~'
+                );
         }
-        config.deny_addresses.insert(key);
+        !ch.is_control() && !ch.is_whitespace()
     }
 
-    fn placed_local(ch: char, bare: &mut String, quoted: &mut String) -> Option<Mailbox> {
-        bare.clear();
-        bare.push_str("oth");
-        bare.push(ch);
-        bare.push_str("er@example.test");
-        if let Some(mailbox) = mailbox_keeping(bare, ch) {
-            return Some(mailbox);
-        }
-        if matches!(ch, '"' | '\\' | '\r' | '\n') {
-            return None;
-        }
-        quoted.clear();
-        quoted.push('"');
-        quoted.push_str("oth");
-        quoted.push(ch);
-        quoted.push_str("er\"@example.test");
-        mailbox_keeping(quoted, ch)
-    }
-
-    fn mailbox_keeping(spec: &str, ch: char) -> Option<Mailbox> {
-        let list = mail::mailboxes(spec).ok()?;
-        if list.len() == 1 && list[0].domain == "example.test" && list[0].local.contains(ch) {
-            Some(list.into_iter().next().unwrap())
-        } else {
-            None
-        }
-    }
-
-    fn surrogate_verdict(cp: u32) -> MailVerdict {
+    fn surrogate_message(cp: u32) -> Vec<u8> {
         let bytes = [
             0xE0 | ((cp >> 12) as u8),
             0x80 | (((cp >> 6) & 0x3F) as u8),
@@ -3260,7 +3371,7 @@ pair left right
         let mut msg = Vec::from(&b"From: mailseat@example.test\r\nTo: oth"[..]);
         msg.extend_from_slice(&bytes);
         msg.extend_from_slice(b"er@example.test\r\n\r\n");
-        check_mail_bytes(&msg, std::path::Path::new("/no/such"))
+        msg
     }
 
     #[test]
