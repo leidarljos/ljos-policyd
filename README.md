@@ -76,6 +76,12 @@ or unreadable file, or a directory the line does not name (`cd "$DIR"`),
 leaves the line judged as written. `cd -` enters `OLDPWD`, and without
 it a runner after `cd -` is refused.
 
+`cargo build` and `cargo run` are not read that way. The `build.rs` they
+compile and run is project code, the same as any other program a build
+system builds and then executes. The guard does not try to judge build
+scripts. A build script that runs `git push -f` is outside what a line
+check can see.
+
 ## Two backends: phronesis, or the table built in
 
 When the [phronesis](https://github.com/leidarljos/phronesis) library
