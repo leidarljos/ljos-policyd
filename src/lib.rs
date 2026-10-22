@@ -340,6 +340,12 @@ impl LineFiles {
         };
         let from = self.written.len();
         for w in redirection_targets(owned) {
+            // `>conftest.$ac_ext` is the scratch file a configure run
+            // rewrites. The `$` is an extension, not a path the line
+            // could point at an arbitrary script.
+            if configure_scratch_word(w) {
+                continue;
+            }
             self.wrote(w, here, home, false);
         }
         let text = written_text(owned, heredoc.as_deref());
@@ -7721,6 +7727,18 @@ fn build_output(p: &str) -> bool {
     plain_relative(p) && p.split('/').any(|part| BUILD_OUTPUT_DIRS.contains(&part))
 }
 
+/// A redirection to configure's unshown scratch file: `conftest.$ac_ext`,
+/// `conftest*`. The `$` or `*` is an extension, not a path the line could
+/// point at an arbitrary script. A literal name (`conftest.in`) is a real
+/// file. A slash would let it name another directory.
+fn configure_scratch_word(p: &str) -> bool {
+    let p = p.trim_matches(|c| c == '\'' || c == '"');
+    if p.contains('/') || p.contains("..") || !p.contains(['$', '*']) {
+        return false;
+    }
+    p.starts_with("conftest") || p.starts_with("confdefs") || p == "autom4te.cache"
+}
+
 /// What an autoconf `configure` makes as it runs and removes again:
 /// `conftest`, `conftest.dir`, the glob `conftest*`, `autom4te.cache`.
 /// They are regenerated on the next run, like build output.
@@ -14223,5 +14241,33 @@ hash -r 2> /dev/null
         let c = at("not-a-builtin; sh ./ok.sh");
         assert_eq!(c.decision, Decision::Deny, "{}", c.token);
         assert!(c.token.contains("may write any file"), "{}", c.token);
+    }
+
+    /// `>conftest.$ac_ext` is configure's scratch file. The `$` is an
+    /// extension, not a path that might be some other script. A literal
+    /// `conftest.in` is a real file and is still judged.
+    #[test]
+    fn a_configure_scratch_redirection_is_not_an_unshown_script() {
+        let root = startup_root("confredir");
+        std::fs::write(root.join("configure"), "#!/bin/sh\necho ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "echo 'int x;' >conftest.$ac_ext; sh ./configure",
+            "echo 'int x;' >'conftest.$ac_ext'; sh ./configure",
+            "echo x >conftest*; sh ./configure",
+            "echo x >conftest.c; sh ./configure",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for line in [
+            "echo 'git push -f' > conftest.in; sh conftest.in",
+            "echo 'git push -f' > run.sh; sh run.sh",
+            "echo 'int x;' >\"$OUT\"; sh ./configure",
+            "echo x >../conftest.$ac_ext; sh ./configure",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+        }
     }
 }
