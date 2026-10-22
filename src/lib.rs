@@ -474,6 +474,25 @@ impl Vars {
         }
     }
 
+    /// Leave the variable the word `w` names as the target of a write not
+    /// shown: `NAME`, `NAME=value`, `NAME+=value` or `NAME[i]=value`.
+    fn lose_target(&mut self, w: &str) {
+        let name = w.split(['=', '+', '[']).next().unwrap_or_default();
+        if let Some(slot) = self.slot(name) {
+            *slot = Some("$".into());
+        }
+    }
+
+    /// Leave each variable the word `w` sets by default (`${NAME:=value}`,
+    /// `${NAME=value}`) not shown.
+    fn lose_default(&mut self, w: &str) {
+        for name in ["CDPATH", "HOME"] {
+            if w.contains(&format!("${{{name}:=")) || w.contains(&format!("${{{name}=")) {
+                self.lose_target(name);
+            }
+        }
+    }
+
     /// Hold what either `self` or `other` holds. Either `CDPATH` is
     /// searched; a `HOME` that may be either is not shown.
     fn merge(&mut self, other: Vars) {
@@ -495,10 +514,11 @@ const KEYWORDS: [&str; 9] = [
 
 /// Apply to `vars` what the command `cmd` leaves set in the shell that
 /// runs it: assignments alone set themselves, `export`, `declare` and the
-/// like with plain flags set theirs, and `unset` unsets. A word of any
-/// other command that may set one (`read CDPATH`, `case`'s `CDPATH=dir`,
-/// `${CDPATH:=dir}`) leaves it not shown, as does an assignment in front
-/// of a special builtin, which some shells keep (`CDPATH=dir :`).
+/// like with plain flags set theirs, and `unset` unsets. A command that
+/// writes one some other way ([`written`], `${CDPATH:=dir}`) leaves it
+/// not shown, as do `let` and `eval` naming it and an assignment in front
+/// of a special builtin, which some shells keep (`CDPATH=dir :`). A word
+/// that only names one (`grep HOME`, `env HOME=dir cmd`) sets nothing.
 fn set_vars(cmd: &[&str], vars: &mut Vars) {
     let words = operands(cmd);
     let front = words
@@ -522,11 +542,18 @@ fn set_vars(cmd: &[&str], vars: &mut Vars) {
                 }
             }
         }
-        // A subshell sets nothing here.
-        _ => words[front..]
-            .iter()
-            .filter(|w| !w.starts_with('('))
-            .for_each(|w| vars.lose(w)),
+        _ => {
+            // A subshell sets nothing here.
+            for w in words[front..].iter().filter(|w| !w.starts_with('(')) {
+                vars.lose_default(w);
+            }
+            match name {
+                "let" | "eval" => args.iter().for_each(|a| vars.lose(a)),
+                _ => written(name, args)
+                    .into_iter()
+                    .for_each(|a| vars.lose_target(a)),
+            }
+        }
     }
     let special = [
         ":", ".", "source", "eval", "exec", "exit", "export", "readonly", "return", "set", "shift",
@@ -534,6 +561,29 @@ fn set_vars(cmd: &[&str], vars: &mut Vars) {
     ];
     if special.contains(&name) {
         words[..front].iter().for_each(|w| vars.lose(w));
+    }
+}
+
+/// The words naming what the command `name` with `args` writes in the
+/// shell that runs it: the names `read`, `mapfile`, `getopts` and a
+/// `declare` with other than plain flags take, the one after `printf -v`
+/// or `wait -p`, and the loop variable of `for` and `select`.
+fn written<'a>(name: &str, args: &[&'a str]) -> Vec<&'a str> {
+    match name {
+        "read" | "mapfile" | "readarray" | "getopts" | "export" | "readonly" | "declare"
+        | "typeset" | "local" => args.to_vec(),
+        "printf" | "wait" => {
+            let flag = if name == "printf" { "-v" } else { "-p" };
+            args.iter()
+                .enumerate()
+                .filter_map(|(i, a)| match a.strip_prefix(flag) {
+                    Some("") => args.get(i + 1).copied(),
+                    v => v,
+                })
+                .collect()
+        }
+        "for" | "select" => args.first().copied().into_iter().collect(),
+        _ => Vec::new(),
     }
 }
 

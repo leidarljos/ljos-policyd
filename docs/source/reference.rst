@@ -81,10 +81,12 @@ the one searched, as is one the line sets before it, alone or with
 ``export``, ``declare`` and the like (``export CDPATH=dir; cd x``), unless a
 pipeline stage, a subshell or a list sent to the background set it.
 One set where it may not run, past a ``&&`` or ``||``, is searched along
-with the one before it. Another word that may set it (``read CDPATH``,
-``${CDPATH:=dir}``, or an assignment in front of a special builtin such
-as ``:``), or an entry with ``$``, a backquote or ``~`` in it, names no
-directory the line shows, so a runner after the ``cd`` is refused.
+with the one before it. Another command that writes it in this shell
+(``read CDPATH``, ``printf -v CDPATH``, ``${CDPATH:=dir}``, or an
+assignment in front of a special builtin such as ``:``), or an entry with
+``$``, a backquote or ``~`` in it, names no directory the line shows, so
+a runner after the ``cd`` is refused. A word that only names it
+(``grep CDPATH``, ``env CDPATH=dir cmd``) changes nothing.
 
 ``HOME`` is followed the same way: a bare ``cd`` enters the one set in
 front of it (``HOME=dir cd``) or earlier on the line (``export HOME=dir;
