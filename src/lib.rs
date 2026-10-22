@@ -6162,12 +6162,142 @@ fn nested_end(chars: &[char], i: usize) -> usize {
 }
 
 /// `#` starts a comment when it is the first character of a word. An
-/// apostrophe later on that line is text, not a quote.
+/// apostrophe later on that line is text, not a quote. A `)` that closes
+/// `$(...)`, `<(...)` or `>(...)` does not end the word, so `#` after it
+/// is still that word.
 fn starts_comment(chars: &[char], i: usize) -> bool {
-    chars.get(i) == Some(&'#')
-        && (i == 0
-            || chars[i - 1].is_whitespace()
-            || matches!(chars[i - 1], ';' | '&' | '|' | '(' | ')'))
+    if chars.get(i) != Some(&'#') {
+        return false;
+    }
+    if i == 0 || chars[i - 1].is_whitespace() || matches!(chars[i - 1], ';' | '&' | '|' | '(') {
+        return true;
+    }
+    chars[i - 1] == ')' && !hash_stays_in_word(chars, i - 1)
+}
+
+/// What a `(` opened, so the `)` that closes it can say whether `#` is
+/// still inside the word.
+#[derive(Clone, Copy, PartialEq)]
+enum Paren {
+    /// `$(`, `<(`, `>(`. The `)` does not end the word.
+    Sub,
+    /// A subshell. The `)` ends that token, and `#` is a new word.
+    Group,
+    /// An array or a function's `()`. The `)` does not end the word.
+    Word,
+}
+
+/// Whether `chars[close]` (a `)`) leaves the next character in the same
+/// word. A substitution, array or function does. A subshell or a case
+/// pattern does not.
+fn hash_stays_in_word(chars: &[char], close: usize) -> bool {
+    let n = chars.len();
+    if close >= n || chars[close] != ')' {
+        return true;
+    }
+    let mut stack: Vec<Paren> = Vec::new();
+    let mut j = 0;
+    while j <= close && j < n {
+        let c = chars[j];
+        if c == '\\' {
+            j += 2;
+            continue;
+        }
+        if c == '#' && j != close && hash_scan_comment(chars, j) {
+            while j <= close && j < n && !matches!(chars[j], '\n' | '\r') {
+                j += 1;
+            }
+            continue;
+        }
+        if c == '\'' {
+            j += 1;
+            while j <= close && j < n && chars[j] != '\'' {
+                j += 1;
+            }
+            j = (j + 1).min(close + 1);
+            continue;
+        }
+        if c == '"' {
+            j += 1;
+            let mut inner = 0i32;
+            while j <= close && j < n && chars[j] != '"' {
+                if chars[j] == '\\' {
+                    j += 2;
+                    continue;
+                }
+                if chars[j] == '`' {
+                    j = skip_backtick(chars, j, close);
+                    continue;
+                }
+                if chars[j] == '$' && chars.get(j + 1) == Some(&'(') {
+                    stack.push(Paren::Sub);
+                    inner += 1;
+                    j += 2;
+                    continue;
+                }
+                if chars[j] == ')' && inner > 0 && stack.last() == Some(&Paren::Sub) {
+                    stack.pop();
+                    inner -= 1;
+                    if j == close {
+                        return true;
+                    }
+                }
+                j += 1;
+            }
+            j = (j + 1).min(n);
+            continue;
+        }
+        if c == '`' {
+            j = skip_backtick(chars, j, close);
+            continue;
+        }
+        if c == '(' {
+            let nest = if j > 0 && matches!(chars[j - 1], '$' | '<' | '>') {
+                Paren::Sub
+            } else if opens_subshell(chars, j) {
+                Paren::Group
+            } else {
+                Paren::Word
+            };
+            stack.push(nest);
+            j += 1;
+            continue;
+        }
+        if c == ')' {
+            let kind = stack.pop();
+            if j == close {
+                return matches!(kind, Some(Paren::Sub | Paren::Word));
+            }
+            j += 1;
+            continue;
+        }
+        j += 1;
+    }
+    true
+}
+
+/// `#` during the paren scan. A `)` is not a comment start here: that is
+/// what [`starts_comment`] is deciding, and calling it would loop.
+fn hash_scan_comment(chars: &[char], i: usize) -> bool {
+    i == 0 || chars[i - 1].is_whitespace() || matches!(chars[i - 1], ';' | '&' | '|' | '(')
+}
+
+/// Just past the backtick that closes the one at `chars[open]`, or past
+/// `limit` when it does not close.
+fn skip_backtick(chars: &[char], open: usize, limit: usize) -> usize {
+    let mut k = open + 1;
+    let n = chars.len();
+    while k < n && k <= limit {
+        if chars[k] == '\\' {
+            k += 2;
+            continue;
+        }
+        if chars[k] == '`' {
+            return k + 1;
+        }
+        k += 1;
+    }
+    k
 }
 
 /// Just past the `"` that closes the string opening at `chars[i]`.
@@ -16005,6 +16135,34 @@ hash -r 2> /dev/null
         assert_eq!(at("sh ./s.sh").decision, Decision::Allow);
         write("as_me=$(echo conf)\necho 'git push -f' > conf.sh\nrm -f conf.sh && echo gone\n. \"./$as_me.sh\"\n");
         assert_eq!(at("sh ./s.sh").decision, Decision::Allow);
+    }
+
+    /// `#` starts a comment only at the start of a word. After `)` that
+    /// closes `$(...)` the word continues, and the next line still runs.
+    #[test]
+    fn a_hash_after_a_substitution_is_not_a_comment() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = startup_root("hashsub");
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        assert_eq!(
+            check_shell_in(
+                &[
+                    "sh".into(),
+                    "-c".into(),
+                    "echo a$(true)# $(git push -f)".into()
+                ],
+                &root,
+                0
+            )
+            .decision,
+            Decision::Deny
+        );
+        let p = root.join("s.sh");
+        std::fs::write(&p, "( echo $(true)# )\ngit push -f\n").unwrap();
+        let mut perm = std::fs::metadata(&p).unwrap().permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(&p, perm).unwrap();
+        assert_eq!(at("sh ./s.sh").decision, Decision::Deny);
     }
 
     #[test]
