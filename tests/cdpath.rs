@@ -103,6 +103,30 @@ fn reads_a_runner_where_a_cdpath_set_on_the_cd_enters() {
     let _ = std::fs::remove_dir_all(work.parent().unwrap());
 }
 
+/// The shell takes the first `CDPATH` entry that holds the path, and an
+/// empty or `.` entry is the working directory, so a later entry is not
+/// entered when the path is here.
+#[test]
+fn takes_the_first_cdpath_entry_that_holds_the_path() {
+    let work = work_and_lib("cdpath-first");
+    for line in [
+        "CDPATH=:../lib cd proj && make clean-all",
+        "CDPATH=.:../lib cd proj && make clean-all",
+        "CDPATH=./:../lib pushd proj && make clean-all",
+        "CDPATH=/nowhere::../lib cd proj && make clean-all",
+    ] {
+        assert_eq!(check(&work, None, line), "allow", "{line}");
+    }
+    for line in [
+        "CDPATH=../lib:. cd proj && make clean-all",
+        "CDPATH=$LIB:. cd proj && make clean-all",
+    ] {
+        let v = check(&work, None, line);
+        assert!(v.starts_with("deny\t"), "{line}: {v}");
+    }
+    let _ = std::fs::remove_dir_all(work.parent().unwrap());
+}
+
 /// A `CDPATH` the line sets earlier, alone or with `export` and the like,
 /// is searched by a later `cd`, unless a subshell set it.
 #[test]
