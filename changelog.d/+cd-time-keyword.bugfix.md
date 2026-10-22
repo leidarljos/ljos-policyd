@@ -1,0 +1,1 @@
+The `time` keyword, with or without `-p`, no longer hides a `cd` after it, so `time cd evil && make clean-all` reads `evil/Makefile` and refuses the `rm -rf ~` in it. `/usr/bin/time` is still read as a program that runs the `cd` in a child.

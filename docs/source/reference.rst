@@ -50,7 +50,8 @@ does. ``-S STRING`` (or ``-iS STRING``) splits STRING into words that take
 its place, so options in it (``env -S '-C dir' make``) and the words
 after it are read too.
 Leading words that still run ``cd`` in this shell (``command``,
-``builtin``, ``if``, ``while``, ``{`` and the other control keywords)
+``builtin``, ``if``, ``while``, ``{`` and the other control keywords, and
+the ``time`` keyword with its ``-p``)
 are peeled before this check, as are assignments among them
 (``if FOO=1 cd dir``), and a redirection among the words of a
 ``cd`` or ``pushd`` names neither the directory nor a ``pushd`` stack index.
