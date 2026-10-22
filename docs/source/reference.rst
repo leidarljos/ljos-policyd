@@ -218,9 +218,11 @@ the one address ``From`` must be, after folding, NFKC and IDNA. The
 mailbox is the address in angle brackets, read from the raw unfolded
 value. A display-name encoded-word is decoded for display only, and
 an encoded addr-spec is a refusal. A second ``From`` is a refusal.
-``Reply-To``, ``Sender`` and ``Return-Path``
-must stay clear of a deny-file identity (``address``, or a mailbox at a
-``domain``). ``To``, ``Cc`` and ``Bcc`` are refused when the domain or a
+``Reply-To``, ``Sender``, ``Return-Path``, ``Errors-To``,
+``Disposition-Notification-To`` and ``Return-Receipt-To`` must stay
+clear of a deny-file identity (``address``, or a mailbox at a
+``domain``). Any ``Resent-*`` header is a refusal. ``To``, ``Cc`` and
+``Bcc`` are refused when the domain or a
 parent of it is named by the deny file or by a ``deny-domain`` line in
 the pack-law file. A domain literal (an address at ``@[ ... ]``) in a
 watched header is a refusal.
@@ -234,27 +236,34 @@ the file. A message over 1 MiB, a control character in the header
 block, a header block that mixes CRLF and a bare LF, or a config
 that cannot be read is a refusal.
 
-=========================== =========================================================
-Code                        When
-=========================== =========================================================
-``from-missing``            no From
-``duplicate-from``          more than one From
-``from-not-identity``       From is not the configured identity
-``from-unparsed``           From does not parse as one mailbox
-``encoded-word``            an encoded-word in a watched header did not decode
-``reply-to-denied``         Reply-To names a deny-file identity
-``sender-denied``           Sender names a deny-file identity
-``return-path-denied``      Return-Path names a deny-file identity
-``recipient-domain-denied`` To, Cc or Bcc is at a denied domain
-``header-control``          a control character in the header block
-``header-line-ending``      the header block mixes CRLF and a bare LF
-``message-too-large``       the message is over 1 MiB
-``message-invalid``         the bytes are not a header block
-``config-unreadable``       the config path cannot be read
-``config-invalid``          the config is missing a key or names an unknown one
-``deny-file-invalid``       a deny-file line is not one of the known kinds
-``pack-law-invalid``        the pack-law file has a line other than deny-domain
-=========================== =========================================================
+======================================== ======================================================
+Code                                     When
+======================================== ======================================================
+``from-missing``                         no From
+``duplicate-from``                       more than one From
+``from-not-identity``                    From is not the configured identity
+``from-unparsed``                        From does not parse as one mailbox
+``encoded-word``                         an encoded-word in a watched header did not decode
+``reply-to-denied``                      Reply-To names a deny-file identity
+``sender-denied``                        Sender names a deny-file identity
+``return-path-denied``                   Return-Path names a deny-file identity
+``errors-to-denied``                     Errors-To names a deny-file identity
+``errors-to-unparsed``                   Errors-To does not parse
+``disposition-notification-to-denied``   Disposition-Notification-To names a deny-file identity
+``disposition-notification-to-unparsed`` Disposition-Notification-To does not parse
+``return-receipt-to-denied``             Return-Receipt-To names a deny-file identity
+``return-receipt-to-unparsed``           Return-Receipt-To does not parse
+``resent-header``                        a Resent-* header is present
+``recipient-domain-denied``              To, Cc or Bcc is at a denied domain
+``header-control``                       a control character in the header block
+``header-line-ending``                   the header block mixes CRLF and a bare LF
+``message-too-large``                    the message is over 1 MiB
+``message-invalid``                      the bytes are not a header block
+``config-unreadable``                    the config path cannot be read
+``config-invalid``                       the config is missing a key or names an unknown one
+``deny-file-invalid``                    a deny-file line is not one of the known kinds
+``pack-law-invalid``                     the pack-law file has a line other than deny-domain
+======================================== ======================================================
 
 Environment the seat reads
 ==========================

@@ -117,6 +117,7 @@ pub fn check_mail_bytes(message: &[u8], config_path: &Path) -> MailVerdict {
     check_from(&message, &config.identity, &mut reasons);
     check_identity_headers(&message, &config, &mut reasons);
     check_recipients(&message, &config, &mut reasons);
+    check_resent(&message, &mut reasons);
     MailVerdict { reasons }
 }
 
@@ -326,6 +327,17 @@ fn check_identity_headers(message: &Message, config: &Config, reasons: &mut Vec<
         ("reply-to", "reply-to-unparsed", "reply-to-denied"),
         ("sender", "sender-unparsed", "sender-denied"),
         ("return-path", "return-path-unparsed", "return-path-denied"),
+        ("errors-to", "errors-to-unparsed", "errors-to-denied"),
+        (
+            "disposition-notification-to",
+            "disposition-notification-to-unparsed",
+            "disposition-notification-to-denied",
+        ),
+        (
+            "return-receipt-to",
+            "return-receipt-to-unparsed",
+            "return-receipt-to-denied",
+        ),
     ] {
         check_named(
             message,
@@ -372,6 +384,16 @@ fn check_named(
     }
     for hit in hits {
         reasons.push(reason(denied_code, hit));
+    }
+}
+
+/// `Resent-*` replaces the envelope after the message was checked.
+/// The header is a refusal on its own; the name is the detail.
+fn check_resent(message: &Message, reasons: &mut Vec<MailReason>) {
+    for header in &message.headers {
+        if header.name.starts_with("resent-") {
+            reasons.push(reason("resent-header", header.name.as_str()));
+        }
     }
 }
 
@@ -752,6 +774,57 @@ pair left right
 
     /// An address entry is that mailbox. It does not deny every recipient
     /// at the same domain.
+    #[test]
+    fn a_resent_header_is_refused() {
+        assert_eq!(
+            codes(&plain("Resent-From: mailseat@example.test\r\n"), "", ""),
+            vec!["resent-header"]
+        );
+        assert_eq!(
+            details(&plain("Resent-To: person@example.test\r\n"), "", ""),
+            vec!["resent-to"]
+        );
+        let both = plain("Resent-From: mailseat@example.test\r\nResent-Cc: a@example.test\r\n");
+        assert_eq!(codes(&both, "", ""), vec!["resent-header", "resent-header"]);
+    }
+
+    #[test]
+    fn notification_headers_stay_clear_of_deny_identities() {
+        let deny = "address evil@example.test\ndomain blocked.test\n";
+        assert_eq!(
+            codes(&plain("Errors-To: evil@example.test\r\n"), deny, ""),
+            vec!["errors-to-denied"]
+        );
+        assert_eq!(
+            codes(
+                &plain("Disposition-Notification-To: a@blocked.test\r\n"),
+                deny,
+                ""
+            ),
+            vec!["disposition-notification-to-denied"]
+        );
+        assert_eq!(
+            codes(&plain("Return-Receipt-To: evil@example.test\r\n"), deny, ""),
+            vec!["return-receipt-to-denied"]
+        );
+        assert!(codes(&plain("Errors-To: mailseat@example.test\r\n"), deny, "").is_empty());
+        assert!(codes(
+            &plain("Disposition-Notification-To: mailseat@example.test\r\n"),
+            deny,
+            ""
+        )
+        .is_empty());
+        assert!(codes(&plain("Return-Receipt-To: <>\r\n"), deny, "").is_empty());
+        assert_eq!(
+            codes(&plain("Errors-To: not-an-address\r\n"), "", ""),
+            vec!["errors-to-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("Return-Receipt-To: a@[blocked.test]\r\n"), "", ""),
+            vec!["return-receipt-to-unparsed"]
+        );
+    }
+
     #[test]
     fn an_address_rule_is_not_a_recipient_domain_rule() {
         let deny = "address other@blocked.test\n";
