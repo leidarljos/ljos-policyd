@@ -227,7 +227,10 @@ still contributes its mailboxes.
 ``Disposition-Notification-To``, ``Return-Receipt-To``,
 ``Delivery-Receipt-To``, ``Mail-Followup-To`` and ``Mail-Reply-To``
 must stay clear of a deny-file identity (``address``, or a mailbox
-at a ``domain``) and of a domain named by the pack-law file. Any ``Resent-*`` header is a refusal, and so is
+at a ``domain``) and of a domain named by the pack-law file.
+``Sender``, ``Errors-To`` and ``Return-Path``, when present, must
+be the identity under the same rule as ``From``. An empty
+``Return-Path`` is not that address. Any ``Resent-*`` header is a refusal, and so is
 any ``Apparently-To``. ``To``, ``Cc`` and ``Bcc`` are refused
 when the mailbox is an ``address`` line in the deny file, and
 when the domain or a parent of it is named by the deny file or by
@@ -277,10 +280,13 @@ Code                                     When
 ``reply-to-unparsed``                    Reply-To does not parse
 ``sender-denied``                        Sender names a deny-file identity
 ``sender-unparsed``                      Sender does not parse
+``sender-not-identity``                  Sender is present and is not the identity
 ``return-path-denied``                   Return-Path names a deny-file identity
 ``return-path-unparsed``                 Return-Path does not parse
+``return-path-not-identity``             Return-Path is present and is not the identity
 ``errors-to-denied``                     Errors-To names a deny-file identity
 ``errors-to-unparsed``                   Errors-To does not parse
+``errors-to-not-identity``               Errors-To is present and is not the identity
 ``disposition-notification-to-denied``   Disposition-Notification-To names a deny-file identity
 ``disposition-notification-to-unparsed`` Disposition-Notification-To does not parse
 ``return-receipt-to-denied``             Return-Receipt-To names a deny-file identity

@@ -387,38 +387,66 @@ fn check_from(message: &Message, identity: &NormAddr, reasons: &mut Vec<MailReas
 }
 
 fn check_identity_headers(message: &Message, config: &Config, reasons: &mut Vec<MailReason>) {
-    for (name, unparsed, denied) in [
-        ("reply-to", "reply-to-unparsed", "reply-to-denied"),
-        ("sender", "sender-unparsed", "sender-denied"),
-        ("return-path", "return-path-unparsed", "return-path-denied"),
-        ("errors-to", "errors-to-unparsed", "errors-to-denied"),
+    for (name, unparsed, denied, not_identity) in [
+        ("reply-to", "reply-to-unparsed", "reply-to-denied", None),
+        (
+            "sender",
+            "sender-unparsed",
+            "sender-denied",
+            Some("sender-not-identity"),
+        ),
+        (
+            "return-path",
+            "return-path-unparsed",
+            "return-path-denied",
+            Some("return-path-not-identity"),
+        ),
+        (
+            "errors-to",
+            "errors-to-unparsed",
+            "errors-to-denied",
+            Some("errors-to-not-identity"),
+        ),
         (
             "disposition-notification-to",
             "disposition-notification-to-unparsed",
             "disposition-notification-to-denied",
+            None,
         ),
         (
             "return-receipt-to",
             "return-receipt-to-unparsed",
             "return-receipt-to-denied",
+            None,
         ),
         (
             "delivery-receipt-to",
             "delivery-receipt-to-unparsed",
             "delivery-receipt-to-denied",
+            None,
         ),
         (
             "mail-followup-to",
             "mail-followup-to-unparsed",
             "mail-followup-to-denied",
+            None,
         ),
         (
             "mail-reply-to",
             "mail-reply-to-unparsed",
             "mail-reply-to-denied",
+            None,
         ),
     ] {
-        check_named(message, name, unparsed, denied, config, reasons);
+        check_named(
+            message,
+            name,
+            unparsed,
+            denied,
+            not_identity,
+            config,
+            reasons,
+        );
     }
 }
 
@@ -427,17 +455,25 @@ fn check_named(
     name: &str,
     unparsed_code: &'static str,
     denied_code: &'static str,
+    not_identity: Option<&'static str>,
     config: &Config,
     reasons: &mut Vec<MailReason>,
 ) {
     let mut encoded = false;
     let mut unparsed = false;
+    let mut mismatch = false;
     let mut hits = Vec::new();
     for header in message.headers.iter().filter(|h| h.name == name) {
         match read_mailboxes(header) {
             Parsed::EncodedWord => encoded = true,
             Parsed::Unparsed => unparsed = true,
             Parsed::Mailboxes(list) => {
+                // Sender, Errors-To and Return-Path, when present, have to
+                // be the identity under the same rule as From. A group, an
+                // empty path, or a spelling NFKC would change is not it.
+                if not_identity.is_some() && !one_identity(header, &list, &config.identity) {
+                    mismatch = true;
+                }
                 for addr in list {
                     if let Some(shown) = mixed_script_domain(&addr.domain) {
                         hits.push((true, format!("{name} {shown}")));
@@ -457,6 +493,9 @@ fn check_named(
     }
     if unparsed {
         reasons.push(reason(unparsed_code, name));
+    }
+    if let Some(code) = not_identity.filter(|_| mismatch) {
+        reasons.push(reason(code, name));
     }
     for (mixed, hit) in hits {
         if mixed {
@@ -549,6 +588,12 @@ fn read_mailboxes(header: &Header) -> Parsed {
 /// `From` equals the identity after ASCII case folding only. A local
 /// part or domain that NFKC or ignorable-stripping would change is a
 /// different mailbox on the wire, so it does not match.
+fn one_identity(header: &Header, list: &[NormAddr], identity: &NormAddr) -> bool {
+    matches!(mail::contains_group(&header.raw), Ok(false))
+        && list.len() == 1
+        && same(&list[0], identity)
+}
+
 fn same(addr: &NormAddr, identity: &NormAddr) -> bool {
     if wire_rewritten(&addr.raw_local) || wire_rewritten(&addr.raw_domain) {
         return false;
@@ -981,7 +1026,10 @@ From: other@example.test\r\n";
         let raw = plain(&format!("Cc: a@{puny}\r\n"));
         assert_eq!(codes(&raw, "", ""), vec!["mixed-script"]);
         let raw = plain(&format!("Errors-To: a@{greek}\r\n"));
-        assert_eq!(codes(&raw, "", ""), vec!["mixed-script"]);
+        assert_eq!(
+            codes(&raw, "", ""),
+            vec!["errors-to-not-identity", "mixed-script"]
+        );
         // One script in the label is not this refusal. A Cyrillic label
         // beside a Latin label is two labels.
         let raw = plain("To: a@\u{043F}\u{0440}\u{0438}\u{043C}\u{0435}\u{0440}.test\r\n");
@@ -1229,14 +1277,53 @@ pair left right
         );
         assert_eq!(
             codes(&plain("Sender: person@blocked.test\r\n"), deny, ""),
-            vec!["sender-denied"]
+            vec!["sender-not-identity", "sender-denied"]
         );
         assert_eq!(
             codes(&plain("Return-Path: <other@example.test>\r\n"), deny, ""),
-            vec!["return-path-denied"]
+            vec!["return-path-not-identity", "return-path-denied"]
         );
         assert!(codes(&plain("Reply-To: mailseat@example.test\r\n"), deny, "").is_empty());
-        assert!(codes(&plain("Return-Path: <>\r\n"), deny, "").is_empty());
+        assert_eq!(
+            codes(&plain("Return-Path: <>\r\n"), deny, ""),
+            vec!["return-path-not-identity"]
+        );
+    }
+
+    /// Sender, Errors-To and Return-Path name the operator. When the
+    /// header is present it has to be the identity, ASCII case only.
+    #[test]
+    fn sender_errors_to_and_return_path_must_be_the_identity() {
+        assert_eq!(
+            codes(&plain("Sender: someone@else.test\r\n"), "", ""),
+            vec!["sender-not-identity"]
+        );
+        assert_eq!(
+            codes(&plain("Errors-To: someone@else.test\r\n"), "", ""),
+            vec!["errors-to-not-identity"]
+        );
+        assert_eq!(
+            codes(&plain("Return-Path: <someone@else.test>\r\n"), "", ""),
+            vec!["return-path-not-identity"]
+        );
+        assert_eq!(
+            codes(&plain("Return-Path: <>\r\n"), "", ""),
+            vec!["return-path-not-identity"]
+        );
+        assert!(codes(&plain("Sender: MailSeat@Example.Test\r\n"), "", "").is_empty());
+        assert!(codes(&plain("Errors-To: mailseat@example.test\r\n"), "", "").is_empty());
+        assert!(codes(&plain("Return-Path: <mailseat@example.test>\r\n"), "", "").is_empty());
+        let wide = "\u{FF4D}ailseat@example.test";
+        assert_eq!(
+            codes(&plain(&format!("Sender: {wide}\r\n")), "", ""),
+            vec!["sender-not-identity"]
+        );
+        assert_eq!(
+            codes(&plain("Sender: G: mailseat@example.test;\r\n"), "", ""),
+            vec!["sender-not-identity"]
+        );
+        assert!(codes(&plain("Reply-To: someone@else.test\r\n"), "", "").is_empty());
+        assert!(codes(&plain(""), "", "").is_empty());
     }
 
     /// An address entry is that mailbox. It does not deny every recipient
@@ -1301,7 +1388,7 @@ pair left right
         let deny = "address evil@example.test\ndomain blocked.test\n";
         assert_eq!(
             codes(&plain("Errors-To: evil@example.test\r\n"), deny, ""),
-            vec!["errors-to-denied"]
+            vec!["errors-to-not-identity", "errors-to-denied"]
         );
         assert_eq!(
             codes(
@@ -1492,10 +1579,18 @@ pair left right
             ("Mail-Followup-To", "mail-followup-to-denied"),
             ("Mail-Reply-To", "mail-reply-to-denied"),
         ] {
+            let mut expect = Vec::new();
+            match header {
+                "Sender" => expect.push("sender-not-identity".to_string()),
+                "Return-Path" => expect.push("return-path-not-identity".to_string()),
+                "Errors-To" => expect.push("errors-to-not-identity".to_string()),
+                _ => {}
+            }
+            expect.push(code.to_string());
             let raw = plain(&format!("{header}: a@packblocked.test\r\n"));
-            assert_eq!(codes(&raw, "", law), vec![code.to_string()], "{header}");
+            assert_eq!(codes(&raw, "", law), expect, "{header}");
             let sub = plain(&format!("{header}: a@sub.packblocked.test\r\n"));
-            assert_eq!(codes(&sub, "", law), vec![code.to_string()], "{header} sub");
+            assert_eq!(codes(&sub, "", law), expect, "{header} sub");
         }
     }
 
