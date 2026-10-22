@@ -295,6 +295,26 @@ impl LineFiles {
         }
     }
 
+    /// Put the writes from `from` on at `id`.
+    fn lower(&mut self, from: std::ops::RangeFrom<usize>, id: &[usize]) {
+        for w in &mut self.written[from] {
+            w.id = id.to_vec();
+        }
+    }
+
+    /// Put each write made in a loop under `base`, from its first command
+    /// to its last, just before the loop.
+    fn lower_loops(&mut self, base: &[usize], spans: &[(usize, usize)]) {
+        for w in &mut self.written {
+            let Some(&at) = w.id.strip_prefix(base).and_then(<[usize]>::first) else {
+                continue;
+            };
+            if let Some(&(start, _)) = spans.iter().find(|(a, b)| (*a..=*b).contains(&at)) {
+                w.id = [base, &[start - 1]].concat();
+            }
+        }
+    }
+
     fn wrote(&mut self, w: &str, dirs: &[std::path::PathBuf], home: Option<&str>, loose: bool) {
         for path in placed(w, dirs, home) {
             self.written.push(Written {
@@ -324,15 +344,16 @@ impl LineFiles {
 
     /// A script some command runs after another command on the line may
     /// have written it: the same path, one under a directory written, or
-    /// either one not shown. A write by the command that holds the run
-    /// in its script only opens the file before that script starts. A
-    /// loose write counts only for a script a shell runs from a path the
-    /// line shows.
+    /// either one not shown. A write by the command that runs it, or
+    /// holds the run in its script, counts too: `sh x.sh >> x.sh` adds
+    /// to the file while the shell reads it. A loose write counts only
+    /// for a script a shell runs from a path the line shows, and not
+    /// for one its own command runs.
     fn written_then_run(&self) -> Option<String> {
         self.ran.iter().find_map(|(r, rid, how)| {
             self.written
                 .iter()
-                .filter(|w| &w.id < rid && !rid.starts_with(&w.id))
+                .filter(|w| &w.id <= rid && !(w.loose && rid.starts_with(&w.id)))
                 .filter(|w| !w.loose || (*how == Ran::Shell && r.is_some()))
                 .find(|w| match (r, &w.path) {
                     (Some(r), Some(w)) => r.starts_with(w),
@@ -769,6 +790,11 @@ fn walk(
     // this walk, so a write can be put before or after a run.
     let base = shell.files.borrow().cmd.clone();
     let mut seq = 0;
+    // The outermost loops the line opens, from the command that starts
+    // one to its `done`. A later pass runs the body again, so a write
+    // anywhere in it counts as made before the loop.
+    let mut loops = Vec::new();
+    let mut spans = Vec::new();
     for (cmd, end) in ended_commands(&argv) {
         shell.aliases.extend(alias_defs(&cmd));
         if after == "&" {
@@ -815,12 +841,18 @@ fn walk(
         for w in wrappers.iter().filter(|w| is_assignment(w)) {
             set.assign(&with_pwd(w, pwd));
         }
-        seq += 1;
+        // Two apart, so a write lowered to `seq - 1` comes before this
+        // command and after the one before it.
+        seq += 2;
         let id = [base.as_slice(), &[seq]].concat();
+        if starts_loop(&cmd) {
+            loops.push(seq);
+        }
         shell.files.borrow_mut().cmd.clone_from(&id);
         ran_in.push((at.clone(), shell.old.clone(), set.clone(), id.clone()));
         // A subshell or substitution in the command runs where the
         // command does, and a `cd` inside it moves only itself.
+        let mark = shell.files.borrow().written.len();
         if depth < MAX_DEPTH {
             let dirs = shell.here.clone();
             let oldpwd = shell.old.clone();
@@ -848,6 +880,12 @@ fn walk(
                 }
             }
         }
+        // The substitutions run before the command, in an order that is
+        // not read here, so what one writes counts for all of it.
+        shell
+            .files
+            .borrow_mut()
+            .lower(mark.., &[base.as_slice(), &[seq - 1]].concat());
         // After the substitutions, which run before the command does.
         let walked = called_fn(&cmd, &shell.funcs).is_some();
         shell.files.borrow_mut().note(
@@ -859,6 +897,11 @@ fn walk(
             &id,
             walked,
         );
+        if cmd.first() == Some(&"done") {
+            if let Some(start) = loops.pop().filter(|_| loops.is_empty()) {
+                spans.push((start, seq));
+            }
+        }
         let shown: Vec<_> = cmd.iter().map(|w| with_pwd(w, pwd)).collect();
         let shown: Vec<&str> = shown.iter().map(|w| &**w).collect();
         if !piped {
@@ -1189,6 +1232,8 @@ fn walk(
         shell.restore(list.clone());
     }
     shell.files.borrow_mut().cmd.clone_from(&base);
+    spans.extend(loops.first().map(|&start| (start, seq)));
+    shell.files.borrow_mut().lower_loops(&base, &spans);
     if depth >= MAX_DEPTH {
         return;
     }
@@ -1216,6 +1261,20 @@ fn walk(
         }
     }
     shell.files.borrow_mut().cmd.clone_from(&base);
+    shell.files.borrow_mut().lower_loops(&base, &spans);
+}
+
+/// Whether `cmd` opens a loop: `for`, `while`, `until` or `select`, past
+/// the keywords that may stand before it.
+fn starts_loop(cmd: &[&str]) -> bool {
+    cmd.iter()
+        .find(|w| {
+            !matches!(
+                **w,
+                "!" | "{" | "if" | "then" | "else" | "elif" | "do" | "time"
+            )
+        })
+        .is_some_and(|w| matches!(*w, "for" | "while" | "until" | "select"))
 }
 
 /// The `CDPATH` and `HOME` a command on the line sees: `None` where one is
@@ -5946,7 +6005,8 @@ const NON_WRITERS: &str = "echo printf cat grep egrep fgrep rg ls test [ [[ true
     exit return break continue wait jobs umask ulimit getopts let kill \
     sleep wc head tail cut tr diff cmp stat file basename dirname \
     realpath readlink date id whoami uname printenv seq expr mkdir rm \
-    rmdir touch chmod { } ( ) ! then do else elif fi done esac trap";
+    rmdir touch chmod { } ( ) ! then do else elif fi done esac trap for \
+    select case";
 
 /// Commands whose writes [`program_writes`] names, or that the walk
 /// reads into: a shell's script, `source`, `eval`.
@@ -12336,5 +12396,38 @@ hash -r 2> /dev/null
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
         assert_everyday_allowed(&root);
+    }
+
+    #[test]
+    fn a_write_in_a_loop_substitution_or_enclosing_command_counts() {
+        let root = startup_root("looporder");
+        std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "for i in 1 2; do sh ok.sh; cp evil/force.sh ok.sh; done",
+            "while true; do source ok.sh; cat evil/force.sh > ok.sh; done",
+            "until false; do bash ok.sh; sh -c 'cp evil/force.sh ok.sh'; done",
+            "select x in a; do . ok.sh; for j in 1; do tee ok.sh < evil/force.sh; done; done",
+            "while sh ok.sh; do cp evil/force.sh ok.sh; done",
+            "sh ok.sh \"$(cp evil/force.sh ok.sh)\"",
+            "echo \"$(sh ok.sh)\" \"$(cp evil/force.sh ok.sh)\"",
+            "bash -c 'sh ok.sh' > ok.sh",
+            "sh ok.sh >> ok.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+        }
+        for line in [
+            "for i in 1 2; do sh ok.sh; done; cat ok.sh > out.txt",
+            "sh ok.sh; for i in 1 2; do cp evil/force.sh copy.sh; done",
+            "sh ok.sh; for i in 1; do echo x > ok.sh; done",
+            "for f in a b; do sh ok.sh \"$f\"; done",
+            "sh ok.sh > ok.log 2>&1",
+            "for i in 1 2; do sh ok.sh; done; for j in 1; do tar xf a.tar; done",
+            "while read -r l; do echo \"$l\"; done < ok.sh; sh ok.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
     }
 }
