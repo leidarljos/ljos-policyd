@@ -5201,6 +5201,16 @@ fn url_file_name(url: &str) -> Option<String> {
 /// own name for `curl -O` and for `wget` with no `-O`. Standard output
 /// (`-`) and `/dev/null` are no file.
 fn fetched_files(cmd: &[String]) -> Vec<String> {
+    fetched_paths(cmd)
+        .iter()
+        .map(|f| base_of(f).to_string())
+        .filter(|f| !f.is_empty())
+        .collect()
+}
+
+/// [`fetched_files`] as the words that name them, before the last path
+/// part is taken.
+fn fetched_paths(cmd: &[String]) -> Vec<String> {
     let cmd = peeled(cmd);
     let Some(at) = command_at(cmd) else {
         return Vec::new();
@@ -5280,12 +5290,8 @@ fn fetched_files(cmd: &[String]) -> Vec<String> {
                 .filter_map(|u| url_file_name(u)),
         );
     }
+    named.retain(|f| !matches!(f.as_str(), "" | "-" | "/dev/null" | "/dev/stdout"));
     named
-        .iter()
-        .filter(|f| !matches!(f.as_str(), "" | "-" | "/dev/null" | "/dev/stdout"))
-        .map(|f| base_of(f).to_string())
-        .filter(|f| !f.is_empty())
-        .collect()
 }
 
 /// A command that runs one of `saved` (files by last path part): a path
@@ -5293,14 +5299,23 @@ fn fetched_files(cmd: &[String]) -> Vec<String> {
 /// `source`, `.` or interpreter whose script operand is one (`sh i.sh`,
 /// `python3 /tmp/get.py`).
 fn runs_a_saved_file(cmd: &[String], saved: &[String]) -> bool {
+    ran_paths(cmd)
+        .iter()
+        .any(|p| saved.iter().any(|f| f == base_of(p)))
+}
+
+/// The files a command runs as a program, by the words that name them:
+/// a command word with a `/` in it, and the script operand of a shell,
+/// `source`, `.` or an interpreter.
+fn ran_paths(cmd: &[String]) -> Vec<&str> {
     let cmd = peeled(cmd);
     let Some(at) = command_at(cmd) else {
-        return false;
+        return Vec::new();
     };
-    let named = |p: &str| saved.iter().any(|f| f == base_of(p));
     let word = cmd[at].as_str();
-    if word.contains('/') && named(word) {
-        return true;
+    let mut out = Vec::new();
+    if word.contains('/') {
+        out.push(word);
     }
     let b = base_of(word);
     let (inline, valued) = if SHELLS.contains(&b) {
@@ -5310,9 +5325,12 @@ fn runs_a_saved_file(cmd: &[String], saved: &[String]) -> bool {
     } else if let Some((_, inline, valued)) = stdin_interpreter(b) {
         (inline, valued)
     } else {
-        return false;
+        return out;
     };
-    program_word(&cmd[at + 1..], inline, valued).is_some_and(|(w, inline)| !inline && named(w))
+    if let Some((w, false)) = program_word(&cmd[at + 1..], inline, valued) {
+        out.push(w);
+    }
+    out
 }
 
 /// A command that runs one of `saved`, including the text of a shell `-c`
@@ -5376,13 +5394,21 @@ fn output_target<'a>(word: &'a str, next: Option<&'a str>) -> Option<(&'a str, b
 
 /// Files a command's stdout redirections name, by last path part.
 fn redirection_files(argv: &[String]) -> Vec<String> {
+    redirection_targets(argv)
+        .into_iter()
+        .filter_map(saved_name)
+        .collect()
+}
+
+/// The words a command's output redirections name as the file.
+fn redirection_targets(argv: &[String]) -> Vec<&str> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < argv.len() {
         let next = argv.get(i + 1).map(String::as_str);
         if let Some((target, ate)) = output_target(&argv[i], next) {
-            if let Some(name) = saved_name(target) {
-                out.push(name);
+            if saved_name(target).is_some() {
+                out.push(target);
             }
             if ate {
                 i += 1;
@@ -5395,6 +5421,11 @@ fn redirection_files(argv: &[String]) -> Vec<String> {
 
 /// Files `tee` writes, by last path part. Flags are not files.
 fn tee_files(cmd: &[String]) -> Vec<String> {
+    tee_paths(cmd).into_iter().filter_map(saved_name).collect()
+}
+
+/// The words that name the files `tee` writes.
+fn tee_paths(cmd: &[String]) -> Vec<&str> {
     let Some(at) = command_at(cmd) else {
         return Vec::new();
     };
@@ -5405,14 +5436,11 @@ fn tee_files(cmd: &[String]) -> Vec<String> {
     let mut args = cmd[at + 1..].iter().map(String::as_str);
     while let Some(a) = args.next() {
         if a == "--" {
-            out.extend(args.filter_map(saved_name));
+            out.extend(args.filter(|a| saved_name(a).is_some()));
             break;
         }
-        if a.starts_with('-') {
-            continue;
-        }
-        if let Some(name) = saved_name(a) {
-            out.push(name);
+        if !a.starts_with('-') && saved_name(a).is_some() {
+            out.push(a);
         }
     }
     out
