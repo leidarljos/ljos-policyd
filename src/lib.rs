@@ -242,6 +242,7 @@ fn runner_commands(
         let gates = end == "&&" && after != "||";
         let before = std::mem::replace(&mut after, end);
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        let owned = split_env_strings(&owned).into_owned();
         let run = unwrap_wrappers(&owned).0.to_vec();
         // `env -C DIR` runs its own command, and any script it hands a
         // shell, in DIR, and moves nothing after it.
@@ -948,6 +949,12 @@ fn inner_commands_at(argv: &[String]) -> Vec<(usize, Vec<String>)> {
                 }
             }
         }
+        // GNU env runs no `$(...)` in a `-S` string, but one is still read
+        // as a script, so a substitution in it is judged as before.
+        if let Walk::Split(_, _, s) = wrapper_walk(&owned) {
+            out.extend(script_lines(s, 0).iter().map(|l| (i, shell_words(l))));
+        }
+        let owned = split_env_strings(&owned).into_owned();
         if owned.as_slice()
             != cmd
                 .iter()
@@ -1202,10 +1209,32 @@ const RUNNERS: &[(&str, &[&str])] = &[
 /// runner's flags (and their values) taken off. `timeout`, `flock`,
 /// `taskset` and `chrt` also take one positional word before the command.
 ///
-/// Some runners take the command as one string a shell splits: `env -S
-/// STRING`, `flock FILE -c STRING` and `watch STRING`. That string comes back
-/// as the second value, to be read as a script.
+/// Some runners take the command as one string a shell splits: `flock FILE
+/// -c STRING` and `watch STRING`. That string comes back as the second
+/// value, to be read as a script. An `env -S STRING` runs nothing here;
+/// [`split_env_strings`] puts the words of STRING in its place first.
 fn unwrap_wrappers(cmd: &[String]) -> (&[String], Option<&str>) {
+    match wrapper_walk(cmd) {
+        Walk::Run(i) => (&cmd[i..], None),
+        Walk::Script(s) => (&[], s),
+        Walk::Split(..) => (&[], None),
+    }
+}
+
+/// Where [`wrapper_walk`] stops in a command.
+enum Walk<'a> {
+    /// The command it runs starts at this word.
+    Run(usize),
+    /// A runner takes the command as one string a shell splits.
+    Script(Option<&'a str>),
+    /// The `env` option word at this index, with the number of words it
+    /// takes, holds this `-S` string.
+    Split(usize, usize, &'a str),
+}
+
+/// Walk `cmd` past its leading assignments and runner words, as
+/// [`unwrap_wrappers`] reads them.
+fn wrapper_walk(cmd: &[String]) -> Walk<'_> {
     let mut i = 0;
     while i < cmd.len() {
         let w = cmd[i].as_str();
@@ -1225,7 +1254,7 @@ fn unwrap_wrappers(cmd: &[String]) -> (&[String], Option<&str>) {
         i += 1;
         if *name == "flock" {
             if let Some(at) = cmd[i..].iter().position(|a| a == "-c" || a == "--command") {
-                return (&[], cmd.get(i + at + 1).map(String::as_str));
+                return Walk::Script(cmd.get(i + at + 1).map(String::as_str));
             }
         }
         while i < cmd.len() {
@@ -1237,7 +1266,7 @@ fn unwrap_wrappers(cmd: &[String]) -> (&[String], Option<&str>) {
             if *name == "env" && a.starts_with('-') {
                 let (taken, value) = env_flag(a, cmd.get(i + 1).map(String::as_str));
                 if let Some(('S', s)) = value {
-                    return (&[], Some(s));
+                    return Walk::Split(i, taken, s);
                 }
                 i += taken;
             } else if *name == "env" && is_assignment(a) {
@@ -1249,13 +1278,106 @@ fn unwrap_wrappers(cmd: &[String]) -> (&[String], Option<&str>) {
             }
         }
         if *name == "watch" && i + 1 == cmd.len() {
-            return (&[], Some(cmd[i].as_str()));
+            return Walk::Script(Some(cmd[i].as_str()));
         }
         if matches!(*name, "timeout" | "flock" | "taskset" | "chrt") && i < cmd.len() {
             i += 1;
         }
     }
-    (&cmd[i.min(cmd.len())..], None)
+    Walk::Run(i.min(cmd.len()))
+}
+
+/// `cmd` with each `env -S STRING` it runs replaced the way GNU env does
+/// it: the words of STRING take the option's place, after any options
+/// clustered in front of the `S`, and env reads its options again.
+fn split_env_strings(cmd: &[String]) -> Cow<'_, [String]> {
+    let mut cmd = Cow::Borrowed(cmd);
+    // Each round takes one `-S` off; a string may hold another.
+    for _ in 0..8 {
+        let Walk::Split(at, taken, s) = wrapper_walk(&cmd) else {
+            break;
+        };
+        let word = cmd[at].as_str();
+        let front = (!word.starts_with("--"))
+            .then(|| &word[..word.find('S').unwrap_or(0)])
+            .filter(|f| f.len() > 1);
+        let mut out: Vec<String> = cmd[..at].to_vec();
+        out.extend(front.map(str::to_string));
+        out.extend(env_split_words(s));
+        out.extend(cmd[at + taken..].iter().cloned());
+        cmd = Cow::Owned(out);
+    }
+    cmd
+}
+
+/// The words GNU env's `-S` splits `s` into. Blanks separate words and
+/// quotes group them; a backslash escapes outside single quotes, where
+/// `\_` is a separator outside double quotes and a space inside, and `\c`
+/// ends the string; a `#` that starts a word comments out the rest.
+/// `${NAME}` is kept as written, a value the line does not show.
+fn env_split_words(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut word = false;
+    let (mut single, mut double) = (false, false);
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' if !double => {
+                single = !single;
+                word = true;
+            }
+            '"' if !single => {
+                double = !double;
+                word = true;
+            }
+            '\\' if single => match chars.peek() {
+                Some(&n @ ('\\' | '\'')) => {
+                    chars.next();
+                    cur.push(n);
+                }
+                _ => cur.push('\\'),
+            },
+            '\\' => {
+                let Some(n) = chars.next() else {
+                    break;
+                };
+                match n {
+                    'c' => break,
+                    '_' if !double => {
+                        if word {
+                            out.push(std::mem::take(&mut cur));
+                            word = false;
+                        }
+                        continue;
+                    }
+                    '_' => cur.push(' '),
+                    'f' => cur.push('\u{000c}'),
+                    'n' => cur.push('\n'),
+                    'r' => cur.push('\r'),
+                    't' => cur.push('\t'),
+                    'v' => cur.push('\u{000b}'),
+                    n => cur.push(n),
+                }
+                word = true;
+            }
+            '#' if !single && !double && !word => break,
+            c if !single && !double && c.is_whitespace() => {
+                if word {
+                    out.push(std::mem::take(&mut cur));
+                    word = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                word = true;
+            }
+        }
+    }
+    if word {
+        out.push(cur);
+    }
+    out
 }
 
 /// How many words a function definition's head takes at the front of
@@ -3505,7 +3627,8 @@ fn setuid_mode(argv: &[String]) -> bool {
 fn interpreter_setuid(argv: &[String]) -> bool {
     commands(argv).iter().any(|cmd| {
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
-        let (run, _) = unwrap_wrappers(&owned);
+        let split = split_env_strings(&owned);
+        let (run, _) = unwrap_wrappers(&split);
         inline_program(run).is_some_and(chmod_expr_sets_id)
     })
 }

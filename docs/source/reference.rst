@@ -46,7 +46,9 @@ the one the runner's own ``-C``, ``--prefix`` or ``--cwd`` names.
 ``env`` reads its flags as GNU ``env`` does: short ones cluster
 (``-iC DIR``, ``-uVAR -C DIR``) and a long one may be cut to a prefix that
 names only it (``--ch DIR``), so these move the command as ``-C DIR``
-does, and ``-iS STRING`` is read as ``-S STRING``.
+does. ``-S STRING`` (or ``-iS STRING``) splits STRING into words that take
+its place, so options in it (``env -S '-C dir' make``) and the words
+after it are read too.
 Leading words that still run ``cd`` in this shell (``command``,
 ``builtin``, ``if``, ``while``, ``{`` and the other control keywords)
 are peeled before this check, as are assignments among them
