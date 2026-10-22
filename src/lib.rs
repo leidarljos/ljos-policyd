@@ -790,7 +790,7 @@ fn judge_body(words: &[String], shell: &Shell) -> Option<Checked> {
     }
     let moved =
         shell.left_tree || shell.here.iter().any(|d| is_untracked(d)) || leaves_tree(words, 0);
-    let c = host_argv_table_at(words, 0, moved);
+    let c = host_argv_table_at(words, 0, moved, &Scratch::default());
     (c.decision != Decision::Allow).then_some(c)
 }
 
@@ -3340,7 +3340,7 @@ fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
 }
 
 fn host_argv_table(argv: &[String]) -> Checked {
-    host_argv_table_at(argv, 0, leaves_tree(argv, 0))
+    host_argv_table_at(argv, 0, leaves_tree(argv, 0), &Scratch::default())
 }
 
 /// How deep `sh -c` scripts nest before the table stops reading them.
@@ -3351,8 +3351,10 @@ const MAX_DEPTH: usize = 4;
 /// -f` and `sh -c "git push -f"` meet the same rules as `git push -f`.
 /// `moved` is true when a `cd` or `pushd` anywhere on the line can leave the
 /// working tree, so a relative path no longer says where a delete lands.
-fn host_argv_table_at(argv: &[String], depth: usize, moved: bool) -> Checked {
-    let own = host_argv_rules(argv, moved);
+fn host_argv_table_at(argv: &[String], depth: usize, moved: bool, parent: &Scratch) -> Checked {
+    let mut bound = parent.clone();
+    bound.observe(argv);
+    let own = host_argv_rules(argv, moved, &bound);
     if own.decision != Decision::Allow {
         return own;
     }
@@ -3393,7 +3395,7 @@ fn host_argv_table_at(argv: &[String], depth: usize, moved: bool) -> Checked {
         if inner.as_slice() == argv {
             continue;
         }
-        let c = host_argv_table_at(&inner, depth + 1, moved);
+        let c = host_argv_table_at(&inner, depth + 1, moved, &bound);
         if c.decision != Decision::Allow {
             return c;
         }
@@ -5122,7 +5124,7 @@ fn closed_word(w: String) -> String {
     }
 }
 
-fn host_argv_rules(argv: &[String], moved: bool) -> Checked {
+fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
     if argv.is_empty() {
         return Checked {
             decision: Decision::Deny,
@@ -5173,7 +5175,7 @@ fn host_argv_rules(argv: &[String], moved: bool) -> Checked {
             token: Cow::Borrowed("recursive-chmod-chown"),
         };
     }
-    if recursive_delete_off_tmp(argv, moved) {
+    if recursive_delete_off_tmp(argv, moved, bound) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellDangerousRunner,
@@ -6870,7 +6872,7 @@ fn git_configs(argv: &[String]) -> Vec<(String, String)> {
 /// to pass there.
 fn git_shell_value(value: &str) -> Option<&'static str> {
     let argv = ["sh", "-c", value].map(String::from);
-    let c = host_argv_table_at(&argv, 1, true);
+    let c = host_argv_table_at(&argv, 1, true, &Scratch::default());
     // The table's tokens are all static; only phronesis writes its own.
     (c.decision != Decision::Allow).then_some(match c.token {
         Cow::Borrowed(t) => t,
@@ -7333,12 +7335,371 @@ fn leaves_tree(argv: &[String], depth: usize) -> bool {
             .any(|inner| inner.as_slice() != argv && leaves_tree(inner, depth + 1)))
 }
 
+/// What a variable holds, when every assignment the script shows is of
+/// that kind. A temp may be removed. A root is only a prefix
+/// (`${TMPDIR-/tmp}`), and removing it would clear the temp directory.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    Temp,
+    Root,
+}
+
+/// Variables a script assigns to scratch, so `rm -rf "$tmp"` is the
+/// directory `mktemp` just made and not a path the line does not show.
+/// One assignment that is not scratch poisons the name.
+#[derive(Clone, Default)]
+struct Scratch {
+    vars: std::collections::HashMap<String, Option<Hold>>,
+    /// True while every assignment is a suffix with no `/` and no `..`.
+    suffixes: std::collections::HashMap<String, bool>,
+    /// Set when the file's own text carries the autoconf header. A hint
+    /// for the temps a generated `configure` removes, not a pass.
+    autoconf: bool,
+}
+
+impl Scratch {
+    fn observe(&mut self, argv: &[String]) {
+        for w in argv {
+            self.observe_word(w);
+        }
+    }
+
+    fn observe_word(&mut self, w: &str) {
+        if let Some((name, value, append)) = assignment_of(w) {
+            if w[name.len()..].starts_with('[') {
+                self.vars.insert(name.to_string(), None);
+                self.suffixes.insert(name.to_string(), false);
+            } else {
+                self.note(name, value, append);
+            }
+        }
+        self.observe_defaults(w);
+    }
+
+    fn note(&mut self, name: &str, value: &str, append: bool) {
+        let hold = self.classify(value, name);
+        let next = match (self.vars.get(name).copied(), hold, append) {
+            (Some(None), _, _) => None,
+            (None, hold, false) => hold,
+            (Some(Some(Hold::Temp)), Some(Hold::Temp), _) => Some(Hold::Temp),
+            (Some(Some(Hold::Root)), Some(Hold::Root), false) => Some(Hold::Root),
+            _ => None,
+        };
+        self.vars.insert(name.to_string(), next);
+        let suffix = self.safe_suffix(value);
+        let kept = self.suffixes.get(name).copied().unwrap_or(true) && suffix;
+        self.suffixes.insert(name.to_string(), kept);
+    }
+
+    fn classify(&self, value: &str, self_name: &str) -> Option<Hold> {
+        if value.is_empty() {
+            return Some(Hold::Temp);
+        }
+        if let Some(body) = command_body(value) {
+            return self.cmdsub(body);
+        }
+        if let Some(name) = bare_var(value) {
+            return self.held(name, self_name);
+        }
+        if temp_root(value) {
+            return Some(Hold::Root);
+        }
+        if self.pid_temp(value) || self.literal_temp(value) {
+            return Some(Hold::Temp);
+        }
+        if value.contains(char::is_whitespace) {
+            return value
+                .split_whitespace()
+                .all(|part| self.classify(part, self_name) == Some(Hold::Temp))
+                .then_some(Hold::Temp);
+        }
+        None
+    }
+
+    /// The hold recorded for `name`. A reference to the variable being
+    /// assigned reads the hold from before this assignment, which is the
+    /// same map: this assignment is not recorded yet.
+    fn held(&self, name: &str, _self_name: &str) -> Option<Hold> {
+        self.vars.get(name).copied().flatten()
+    }
+
+    /// A command substitution that only makes a temp directory.
+    fn cmdsub(&self, body: &str) -> Option<Hold> {
+        let words = shell_words(body);
+        if !words
+            .iter()
+            .any(|w| matches!(base_of(w), "mktemp" | "tempfile"))
+        {
+            return None;
+        }
+        words
+            .iter()
+            .all(|w| !climbs(w) && (!w.starts_with('/') || under_tmp(w)) && self.expansion_safe(w))
+            .then_some(Hold::Temp)
+    }
+
+    fn literal_temp(&self, p: &str) -> bool {
+        under_tmp(p) || configure_scratch(p) || (self.autoconf && autoconf_operand(p, self))
+    }
+
+    fn pid_temp(&self, value: &str) -> bool {
+        if climbs(value) || !has_pid(value) {
+            return false;
+        }
+        if let Some(rest) = strip_temp_root(value) {
+            return !rest.is_empty() && self.expansion_safe(rest);
+        }
+        if value.strip_prefix("./conf$$").is_some() || value.strip_prefix("conf$$").is_some() {
+            return self.expansion_safe(value);
+        }
+        let Some((head, rest)) = value.split_once('/') else {
+            return false;
+        };
+        let Some(name) = bare_var(head) else {
+            return false;
+        };
+        !rest.is_empty() && self.held(name, "") == Some(Hold::Root) && self.expansion_safe(rest)
+    }
+
+    fn expansion_safe(&self, s: &str) -> bool {
+        let b = s.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] != b'$' {
+                i += 1;
+                continue;
+            }
+            if matches!(b.get(i + 1), Some(&b'$' | &b'!')) {
+                i += 2;
+                continue;
+            }
+            if b.get(i + 1) == Some(&b'{') {
+                let Some(end) = s[i + 2..].find('}') else {
+                    return false;
+                };
+                let body = &s[i + 2..i + 2 + end];
+                if !self.brace_safe(body) {
+                    return false;
+                }
+                i += end + 3;
+                continue;
+            }
+            let rest = &s[i + 1..];
+            let name: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if name.is_empty() || !self.name_in_temp(&name) {
+                return false;
+            }
+            i += 1 + name.len();
+        }
+        true
+    }
+
+    fn brace_safe(&self, body: &str) -> bool {
+        if matches!(body, "$" | "RANDOM" | "PPID" | "BASHPID") || temp_root(&format!("${{{body}}}"))
+        {
+            return true;
+        }
+        match body.split_once('=') {
+            Some((name, _)) if name.ends_with(':') || is_name(name) => {
+                self.name_in_temp(name.trim_end_matches(':'))
+            }
+            None => self.name_in_temp(body),
+            Some(_) => false,
+        }
+    }
+
+    fn name_in_temp(&self, name: &str) -> bool {
+        matches!(name, "RANDOM" | "PPID" | "BASHPID")
+            || self.suffixes.get(name) == Some(&true)
+            || self.vars.get(name).copied().flatten() == Some(Hold::Root)
+    }
+
+    fn safe_suffix(&self, value: &str) -> bool {
+        if value.is_empty() {
+            return true;
+        }
+        if let Some(body) = command_body(value) {
+            return !body.contains('/') && !climbs(body);
+        }
+        if let Some(name) = bare_var(value) {
+            return self.suffixes.get(name) == Some(&true);
+        }
+        !value.contains(['/', '$', '`']) && !climbs(value)
+    }
+
+    fn observe_defaults(&mut self, w: &str) {
+        let bytes = w.as_bytes();
+        let mut i = 0;
+        while i + 2 < bytes.len() {
+            if bytes[i] == b'$' && bytes[i + 1] == b'{' {
+                if let Some(end) = w[i + 2..].find('}') {
+                    let body = &w[i + 2..i + 2 + end];
+                    if let Some((name, value)) = default_assign(body) {
+                        if !self.vars.contains_key(name) {
+                            self.note(name, value, false);
+                        }
+                    }
+                    i += end + 3;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
+/// `NAME=value` or `NAME+=value`, the name without a subscript.
+fn assignment_of(w: &str) -> Option<(&str, &str, bool)> {
+    if !is_assignment(w) {
+        return None;
+    }
+    let end = w
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(w.len());
+    if end == 0 {
+        return None;
+    }
+    let mut rest = &w[end..];
+    if let Some(body) = rest.strip_prefix('[') {
+        let mut depth = 1;
+        let close = body.char_indices().find(|&(_, c)| {
+            match c {
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                _ => {}
+            }
+            depth == 0
+        })?;
+        rest = &body[close.0 + 1..];
+    }
+    if let Some(value) = rest.strip_prefix("+=") {
+        return Some((&w[..end], value, true));
+    }
+    rest.strip_prefix('=')
+        .map(|value| (&w[..end], value, false))
+}
+
+/// `${NAME=value}` or `${NAME:=value}` assigns when the name is unset.
+fn default_assign(body: &str) -> Option<(&str, &str)> {
+    let end = body
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(body.len());
+    if end == 0 || !is_name(&body[..end]) {
+        return None;
+    }
+    let rest = &body[end..];
+    let value = rest.strip_prefix(":=").or_else(|| rest.strip_prefix('='))?;
+    Some((&body[..end], value))
+}
+
+/// The whole value is `$(...)` or a backtick command.
+fn command_body(value: &str) -> Option<&str> {
+    if let Some(rest) = value.strip_prefix("$(") {
+        return rest.strip_suffix(')');
+    }
+    if value.starts_with('`') && value.ends_with('`') && value.len() >= 2 {
+        let body = &value[1..value.len() - 1];
+        return (!body.contains('`')).then_some(body);
+    }
+    None
+}
+
+/// `$name` or `${name}`, and not `${name:-default}`.
+fn bare_var(w: &str) -> Option<&str> {
+    let w = w.strip_prefix('$')?;
+    if let Some(name) = w.strip_prefix('{') {
+        let name = name.strip_suffix('}')?;
+        return is_name(name).then_some(name);
+    }
+    is_name(w).then_some(w)
+}
+
+fn temp_root(value: &str) -> bool {
+    matches!(
+        value,
+        "${TMPDIR-/tmp}"
+            | "${TMPDIR:-/tmp}"
+            | "${TMPDIR-/var/tmp}"
+            | "${TMPDIR:-/var/tmp}"
+            | "/tmp"
+            | "/var/tmp"
+            | "/tmp/"
+            | "/var/tmp/"
+    )
+}
+
+fn strip_temp_root(value: &str) -> Option<&str> {
+    const ROOTS: &[&str] = &[
+        "${TMPDIR:-/var/tmp}/",
+        "${TMPDIR-/var/tmp}/",
+        "${TMPDIR:-/tmp}/",
+        "${TMPDIR-/tmp}/",
+        "/var/tmp/",
+        "/tmp/",
+    ];
+    ROOTS.iter().find_map(|root| value.strip_prefix(root))
+}
+
+fn has_pid(s: &str) -> bool {
+    s.contains("$$")
+        || s.contains("$RANDOM")
+        || s.contains("${RANDOM}")
+        || s.contains("$!")
+        || s.contains("$PPID")
+}
+
+/// A name a generated `configure` removes. The header is required; the
+/// name alone is not a pass for `/` or a home directory.
+fn autoconf_operand(p: &str, bound: &Scratch) -> bool {
+    if climbs(p) || p.contains('~') {
+        return false;
+    }
+    if configure_scratch(p) {
+        return true;
+    }
+    let p = p.trim_end_matches('/');
+    let name = match p.rsplit_once('/') {
+        Some((".", name) | ("", name)) => name,
+        Some((dir, name)) if plain_relative(dir) => name,
+        Some(_) => return false,
+        None => p,
+    };
+    const NAMES: &[&str] = &[
+        "confdefs",
+        "confdefs.h",
+        "confdefs*",
+        ".tst",
+        "a.out",
+        "a.exe",
+        "b.out",
+        "a.out.dSYM",
+        "config.status",
+        "conf$$*",
+        "core",
+    ];
+    if NAMES.contains(&name) || name.starts_with("conf$$") {
+        return true;
+    }
+    let Some(rest) = name.strip_prefix("conftest") else {
+        return false;
+    };
+    if rest.is_empty() || !rest.contains('$') {
+        return !rest.contains('/') && !climbs(rest);
+    }
+    bare_var(rest).is_some_and(|n| bound.suffixes.get(n) == Some(&true))
+}
+
 /// True when any `rm` or `rtrash` on the line deletes recursively with an
 /// operand that is neither under `/tmp` or `/var/tmp`, nor a build output
 /// directory or a top-level scratch directory ([`SCRATCH_DIRS`]) named as a
-/// plain relative path. When the line can `cd` out of the working tree,
-/// only `/tmp` operands pass.
-fn recursive_delete_off_tmp(argv: &[String], moved: bool) -> bool {
+/// plain relative path, nor a variable the same script assigns only to
+/// scratch. When the line can `cd` out of the working tree, a relative
+/// path no longer passes; a scratch variable still does, because its value
+/// does not depend on the directory.
+fn recursive_delete_off_tmp(argv: &[String], moved: bool, bound: &Scratch) -> bool {
     commands(argv).iter().any(|cmd| {
         let b = base_of(cmd[0]);
         if b != "rm" && b != "rtrash" {
@@ -7356,10 +7717,18 @@ fn recursive_delete_off_tmp(argv: &[String], moved: bool) -> bool {
         !cmd.iter()
             .skip(1)
             .filter(|a| !a.starts_with('-') && !is_redirection(a))
-            .all(|p| {
-                under_tmp(p) || (!moved && (build_output(p) || scratch(p) || configure_scratch(p)))
-            })
+            .all(|p| delete_ok(p, moved, bound))
     })
+}
+
+fn delete_ok(p: &str, moved: bool, bound: &Scratch) -> bool {
+    if under_tmp(p) || (!moved && (build_output(p) || scratch(p) || configure_scratch(p))) {
+        return true;
+    }
+    if bound.autoconf && autoconf_operand(p, bound) {
+        return true;
+    }
+    bare_var(p).is_some_and(|name| bound.vars.get(name).copied().flatten() == Some(Hold::Temp))
 }
 
 /// A mode that sets the setuid or setgid bit: an octal mode of four or
@@ -12926,6 +13295,52 @@ hash -r 2> /dev/null
         for line in ["make ok", "make two"] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+    }
+
+    /// `rm -rf "$tmp"` is the directory the script just made when every
+    /// assignment of `tmp` is scratch: `mktemp`, a `/tmp` path, or a
+    /// `$$` name under `${TMPDIR-/tmp}`. One assignment to a real path
+    /// poisons the name. A variable the script never sets stays refused.
+    #[test]
+    fn a_scratch_variable_the_script_assigns_may_be_removed() {
+        let root = startup_root("scratchrm");
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "tmp=$(mktemp -d) && rm -rf \"$tmp\"",
+            "tmp=$(mktemp -d /tmp/x.XXXXXX) && rm -rf \"$tmp\"",
+            "tmp=$(mktemp -d); cd /tmp && rm -rf \"$tmp\"",
+            "tmp=$(mktemp -d); trap 'rm -rf \"$tmp\"' EXIT",
+            "ac_tmp=$(mktemp -d); rm -fr \"$ac_tmp\"",
+            "tmp=./conf$$-$RANDOM; rm -rf \"$tmp\"",
+            "tmp=\"${TMPDIR-/tmp}/xzdiff.$$\"; rm -rf \"$tmp\"",
+            "prog=xzdiff; tmp=\"${TMPDIR-/tmp}/$prog.$$\"; rm -rf \"$tmp\"",
+            "tmp=$(mktemp -d); ac_tmp=$tmp; rm -rf \"$ac_tmp\"",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        std::fs::write(
+            root.join("t.sh"),
+            "tmp=$(mktemp -d)\ntrap 'rm -rf \"$tmp\"' EXIT\n",
+        )
+        .unwrap();
+        let c = at("sh t.sh");
+        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
+        for line in [
+            "rm -rf \"$tmp\"",
+            "rm -rf \"$ac_tmp\"",
+            "tmp=/ && rm -rf \"$tmp\"",
+            "tmp=$(mktemp -d); tmp=/; rm -rf \"$tmp\"",
+            "tmp=$(mktemp -d /etc/XXXXXX) && rm -rf \"$tmp\"",
+            "tmp=$HOME; rm -rf \"$tmp\"",
+            "tmp=target && cd / && rm -rf \"$tmp\"",
+            "cd / && rm -rf conftest*",
+            "tmp=$(mktemp -d); tmp=$(echo $HOME); rm -rf \"$tmp\"",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert_eq!(c.token, "rm-rf-outside-tmp", "{line}: {}", c.token);
         }
     }
 
