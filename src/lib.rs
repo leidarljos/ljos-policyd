@@ -4881,6 +4881,37 @@ mod tests {
         }
     }
 
+    /// `line` checked from an empty directory beside an `evil` project
+    /// whose Makefile is `MAKEFILE` and a `safe` one whose `clean-all`
+    /// only echoes.
+    fn evil_and_safe(name: &str, line: &str) -> Decision {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(root.join("evil")).expect("dir");
+        std::fs::create_dir_all(root.join("safe")).expect("dir");
+        std::fs::write(root.join("evil/Makefile"), MAKEFILE).expect("write");
+        std::fs::write(root.join("safe/Makefile"), "clean-all:\n\techo clean\n").expect("write");
+        check_shell_in(&shell_words(line), &root, 0).decision
+    }
+
+    /// `popd` takes no option past `--`, so what follows it is not an
+    /// index and the bare form runs.
+    #[test]
+    fn popd_stops_reading_options_at_double_dash() {
+        for line in [
+            "pushd evil && pushd ../safe && popd -- +1 && make clean-all",
+            "pushd evil && pushd ../safe && popd -- -n && make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("popd-dash", line), Decision::Deny, "{line}");
+        }
+        assert_eq!(
+            evil_and_safe(
+                "popd-dash",
+                "pushd evil && pushd ../safe && popd -n -- && make clean-all"
+            ),
+            Decision::Allow
+        );
+    }
+
     /// Redirections before the `cd` target are not directory names.
     #[test]
     fn skips_redirections_before_a_cd_target() {
