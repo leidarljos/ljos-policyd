@@ -5440,6 +5440,18 @@ mod tests {
         );
     }
 
+    /// `NAME+=value` appends to what an earlier assignment named, so the
+    /// command word it builds is read whole.
+    #[test]
+    fn an_appended_command_word_does_not_hide_git() {
+        for script in [
+            "g=git; g+=\" push\"; $g --force origin main",
+            "g=git; g+=' push --force'; ${g} origin main",
+        ] {
+            assert_eq!(v(&["sh", "-c", script]), "deny\tgit-force-push", "{script}");
+        }
+    }
+
     /// A `#` that starts a word comments out the rest of its line.
     #[test]
     fn a_comment_runs_nothing() {
