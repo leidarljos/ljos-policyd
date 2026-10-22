@@ -218,7 +218,7 @@ the message. Pass the same recipients to ``--argv`` and this check
 refuses them as recipients. ``--config`` comes before ``--argv``.
 
 The config is lines of ``identity``, ``deny-file`` and ``pack-law``,
-and an optional ``subaddress`` line. A
+an optional ``subaddress`` line, and any number of ``alias`` lines. A
 relative path is read from the config file's directory. ``identity`` is
 the one address ``From`` must be, after ASCII case folding only. A
 local part or domain that NFKC or the removal of a skipped
@@ -260,7 +260,15 @@ with ``+``. On ``yahoo.com``, its country variants, ``ymail.com``
 and ``rocketmail.com``, ``-`` is a separator, and an address rule
 is also cut at its first separator, so a rule for one disposable
 address ``<base>-<keyword>`` covers ``<base>`` and every keyword.
-Domain rules and ``From`` are not matched this way. A domain literal (an
+An ``alias`` line adds a family to these:
+``alias <domain>[,<domain>...] <separators> [flag...]``. The
+separators are checked as on the ``subaddress`` line, and the flags
+are ``shared`` (the domains are one mailbox), ``dots`` (dots in
+the local part are ignored), ``subdomain`` (``<local>@<user>.<domain>``
+is ``<user>@<domain>``) and ``cut`` (the rule is also cut at its
+first separator). An ``alias`` line cannot remove a built-in
+family, and one that does not parse refuses the config. Domain
+rules and ``From`` are not matched this way. A domain literal (an
 address at ``@[ ... ]``) in a watched header is a refusal. An
 all-numeric domain is a refusal, judged after IDNA. That
 includes a dotted quad, a shorter form ``inet_aton`` accepts,

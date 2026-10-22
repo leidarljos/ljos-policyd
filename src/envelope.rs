@@ -201,12 +201,19 @@ fn load_config(path: &Path) -> Result<Config, MailReason> {
     let mut deny_file = None;
     let mut pack_law = None;
     let mut subaddress = None;
+    let mut aliases = builtin_families().ok_or_else(|| reason("config-invalid", "config"))?;
     for line in text.lines() {
         let Some((key, value)) =
             rule_line(line).map_err(|()| reason("config-invalid", "config"))?
         else {
             continue;
         };
+        // Repeatable, and added to the built-in families: a config line
+        // can widen an alias match and cannot remove one.
+        if key == "alias" {
+            aliases.push(alias_family(value).ok_or_else(|| reason("config-invalid", "config"))?);
+            continue;
+        }
         let slot = match key {
             "identity" => &mut identity,
             "deny-file" => &mut deny_file,
@@ -230,7 +237,6 @@ fn load_config(path: &Path) -> Result<Config, MailReason> {
         Some(_) => return Err(reason("config-invalid", "config")),
         None => "+-=".to_string(),
     };
-    let aliases = builtin_families().ok_or_else(|| reason("config-invalid", "config"))?;
     let identity =
         normalize_identity(&identity).ok_or_else(|| reason("identity-invalid", "identity"))?;
     let (deny_addresses, deny_domains) = load_deny(&resolve(path, &deny_file), &aliases)?;
@@ -704,7 +710,7 @@ fn is_subaddress(rule_local: &str, local: &str, seps: &str) -> bool {
 }
 
 /// Provider alias families, one per line in the form of a config `alias`
-/// value: `<domain>[,<domain>...] <separators> [flag...]`. The
+/// value, which adds a family to these: `<domain>[,<domain>...] <separators> [flag...]`. The
 /// separators are added to the `subaddress` line on those domains.
 /// `shared` makes the domains one mailbox, `dots` ignores dots in the
 /// local part, and `subdomain` reads `<anything>@<user>.<domain>` as
@@ -1776,6 +1782,40 @@ pair left right
         let fast = "address user@fastmail.com\n";
         assert!(denied("user+x@fastmail.com", fast));
         assert!(denied("x@user.fastmail.com", fast));
+    }
+
+    /// An `alias` line in the config adds a family. A line the parser
+    /// cannot read refuses the config instead of being skipped.
+    #[test]
+    fn a_config_alias_line_adds_a_family() {
+        let deny = "address bad@mail.test\n";
+        let to = |addr: &str| plain(&format!("To: {addr}\r\n"));
+        let extra = "alias mail.test,post.test ~ shared dots\n";
+        for addr in ["b.a.d@post.test", "bad~x@mail.test", "bad+x@post.test"] {
+            assert_eq!(
+                codes_with(&to(addr), deny, "", extra),
+                vec!["recipient-address-denied"],
+                "{addr}"
+            );
+        }
+        assert!(codes(&to("bad@post.test"), deny, "").is_empty());
+        let gmail = "address bad@gmail.com\n";
+        assert_eq!(
+            codes_with(&to("b.ad@googlemail.com"), gmail, "", "alias gmail.com -\n"),
+            vec!["recipient-address-denied"]
+        );
+        for bad in [
+            "alias mail.test\n",
+            "alias mail.test . shared\n",
+            "alias mail.test + always\n",
+            "alias mail.test,[1.2.3.4] +\n",
+        ] {
+            assert_eq!(
+                codes_with(&plain(""), "", "", bad),
+                vec!["config-invalid"],
+                "{bad}"
+            );
+        }
     }
 
     #[test]
