@@ -1845,9 +1845,14 @@ fn may_set(w: &str, name: &str) -> bool {
 /// A `source` or `.` of a literal path is not this: [`sourced`] reads the
 /// file and keeps the line when the text cannot move the shell.
 fn bare_unseen(cmd: &[&str]) -> bool {
-    head_word(cmd)
-        .is_some_and(|w| matches!(base_of(&w), "eval" | "source" | ".") || w.contains(['$', '`']))
-        || trap_moves(cmd)
+    // A `(...)` subshell and a substitution whose stdout is discarded run
+    // in their own shell. A backtick or `$` in that word is not a command
+    // of this one, and the body is walked on its own.
+    head_word(cmd).is_some_and(|w| {
+        !is_plain_subshell(&w)
+            && !injects_no_command(&w)
+            && (matches!(base_of(&w), "eval" | "source" | ".") || w.contains(['$', '`']))
+    }) || trap_moves(cmd)
 }
 
 /// Whether `cmd` is a `trap` whose action moves the shell or is
@@ -14394,6 +14399,29 @@ hash -r 2> /dev/null
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+        }
+    }
+
+    /// `(test "X\`print\`" = "X$x")` is one word. The backtick runs in
+    /// the subshell, so it was read as a command of this shell and the
+    /// directory was dropped. A `cd` in the subshell still moves only
+    /// that subshell.
+    #[test]
+    fn a_substitution_inside_a_subshell_does_not_drop_the_directory() {
+        for line in [
+            "(test \"X`print -r -- $as_echo`\" = \"X$as_echo\") 2>/dev/null; make -C safe clean-all",
+            "(command -v true >/dev/null); make -C safe clean-all",
+            "$(command -v true >/dev/null); make -C safe clean-all",
+            "(cd evil); make -C safe clean-all",
+        ] {
+            assert_eq!(evil_and_safe("sublose", line), Decision::Allow, "{line}");
+        }
+        for line in [
+            "(cd evil && make clean-all)",
+            "c=cd; $c evil; make clean-all",
+            "$(echo cd) evil; make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("sublose", line), Decision::Deny, "{line}");
         }
     }
 }
