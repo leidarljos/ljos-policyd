@@ -63,6 +63,13 @@ A =cd= or =pushd= to a relative path whose first part is not =.= or
 =..= may enter that path under any =CDPATH= entry, so the runner after
 it is also read in each entry that holds the path.
 
+=pushd= and =popd= follow the directory stack. =pushd -n= stacks its
+directory without entering it, =pushd +N= and =-N= enter the entry they
+bring to the top, and a bare =popd= enters the entry under the top,
+while =popd -n=, =popd +N= and =popd -N= drop an entry and stay. An
+index that counts past a =pushd= that may have failed may name any
+directory on the stack.
+
 The line goes on past a =cd= that may fail, so the runner after it is
 read in each directory the line may be in, up to sixteen. A =cd= into a
 directory without the search bit moves nothing. A runner that may run

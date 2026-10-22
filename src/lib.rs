@@ -256,12 +256,21 @@ fn runner_commands(
             continue;
         }
         if b == "popd" {
-            if let Some((back, sure)) = pushed.pop() {
-                let now = std::mem::replace(&mut here, back);
-                let was = std::mem::replace(&mut old, now.clone());
-                if !sure {
-                    add_dirs(&mut here, now);
-                    add_dirs(&mut old, was);
+            let args = operands(&words[1..]);
+            let index = args.iter().copied().find(|a| stack_index(a));
+            let stack: Vec<_> = std::iter::once((here.clone(), true))
+                .chain(pushed.iter().rev().cloned())
+                .collect();
+            if let Some((mut s, moved)) = popped(&stack, index, args.contains(&"-n")) {
+                let (back, sure) = s.remove(0);
+                pushed = s.into_iter().rev().collect();
+                if moved {
+                    let now = std::mem::replace(&mut here, back);
+                    let was = std::mem::replace(&mut old, now.clone());
+                    if !sure {
+                        add_dirs(&mut here, now);
+                        add_dirs(&mut old, was);
+                    }
                 }
             }
             continue;
@@ -472,6 +481,44 @@ fn rotated(stack: &Stack, index: Option<&str>) -> Option<Stack> {
         }
     }
     Some(s)
+}
+
+/// `stack` after `popd` drops entry `index`, `+N` from the top or `-N` from
+/// the bottom. Dropping the top, as a bare `popd` does, enters the entry
+/// under it, and says so; with `keep` (`-n`) that entry goes instead. None
+/// when the stack is too short. An entry the index counts past may be
+/// missing, so the one dropped may be another, and the line may then
+/// enter, and each entry hold, any directory on the stack.
+fn popped(stack: &Stack, index: Option<&str>, keep: bool) -> Option<(Stack, bool)> {
+    let n: usize = index.map_or(Some(0), |a| a[1..].parse().ok())?;
+    let from_top = !index.is_some_and(|a| a.starts_with('-'));
+    let i = if from_top {
+        n
+    } else {
+        stack.len().checked_sub(n + 1)?
+    };
+    if stack.len() < 2 || i >= stack.len() {
+        return None;
+    }
+    let moved = i == 0 && !keep;
+    let gone = if i == 0 && keep { 1 } else { i };
+    let counted = if from_top {
+        &stack[1..=gone.max(1)]
+    } else {
+        &stack[1..]
+    };
+    let mut s = stack.clone();
+    s.remove(gone);
+    if counted.iter().any(|(_, sure)| !sure) {
+        for (k, e) in s.iter_mut().enumerate() {
+            if k > 0 || moved {
+                e.0.clear();
+                add_dirs(&mut e.0, stack.iter().flat_map(|(d, _)| d.iter().cloned()));
+            }
+            e.1 = false;
+        }
+    }
+    Some((s, moved))
 }
 
 fn home_dir() -> Option<std::path::PathBuf> {
@@ -4507,6 +4554,32 @@ mod tests {
         ] {
             let c = entering("pushd-other", &files, line);
             assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+    }
+
+    /// `popd -n` drops the entry under the top and `popd +N` or `-N` the one
+    /// it names, all without moving; only the top going moves the line.
+    #[test]
+    fn follows_popd_through_its_stack() {
+        for line in [
+            "pushd safe && pushd .. && popd -n && make clean-all",
+            "pushd safe && pushd .. && popd +1 && make clean-all",
+            "pushd safe && pushd .. && popd +2 && make clean-all",
+            "pushd safe && pushd .. && popd -1 && make clean-all",
+            "pushd safe && pushd .. && popd -0 && make clean-all",
+            "pushd safe && pushd .. && popd 2>/dev/null +1 && make clean-all",
+            "pushd safe && pushd .. && popd +1 && popd && make clean-all",
+        ] {
+            assert_eq!(leaving("popd-stack", line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "pushd safe && popd -n && make clean-all",
+            "pushd safe && pushd .. && popd +2 && popd && make clean-all",
+            "pushd safe && pushd .. && popd -2 && make clean-all",
+            "pushd safe && pushd .. && popd +0 && make clean-all",
+            "pushd safe && pushd .. && popd +1 && cd - && make clean-all",
+        ] {
+            assert_eq!(leaving("popd-stack", line), Decision::Allow, "{line}");
         }
     }
 
