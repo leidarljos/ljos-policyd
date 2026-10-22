@@ -205,9 +205,11 @@ this check found nothing to refuse. A send still needs its own grant.
 
 The config is lines of =identity=, =deny-file= and =pack-law=. A
 relative path is read from the config file's directory. =identity= is
-the one address =From= must be, after folding, NFKC and IDNA. The
-mailbox is the address in angle brackets, read from the raw unfolded
-value. A display-name encoded-word is decoded for display only, and
+the one address =From= must be, after ASCII case folding only. A
+local part or domain that NFKC or the removal of a skipped
+character would change is a refusal, including a zero-width
+character or a fullwidth spelling. The mailbox is the address in
+angle brackets, read from the raw unfolded value. A display-name encoded-word is decoded for display only, and
 an encoded addr-spec is a refusal. A second =From= is a refusal.
 =Reply-To=, =Sender=, =Return-Path=, =Errors-To=,
 =Disposition-Notification-To=, =Return-Receipt-To=,
@@ -226,10 +228,10 @@ A recipient domain, or a domain on a header checked against the
 deny file, is refused when one label mixes Latin with Cyrillic or
 Greek after NFKC and IDNA.
 
-A fullwidth spelling and the punycode form compare as the same domain.
-A homoglyph that NFKC and IDNA leave alone does not. ASCII case is
-folded, and a character a reader skips is removed before the
-comparison. =handle=, =term= and =pair= may share the deny file and
+A deny-file domain compares a fullwidth spelling and the punycode
+form as the same domain. A homoglyph that NFKC and IDNA leave alone
+does not. ASCII case is folded, and a character a reader skips is
+removed before that comparison. =From= is not compared that way. =handle=, =term= and =pair= may share the deny file and
 are ignored here. A pack-law line that would allow a domain refuses
 the file. A message over 1 MiB, a control character in the header
 block, a header block that mixes CRLF and a bare LF, or a config

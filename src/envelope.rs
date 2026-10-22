@@ -123,8 +123,14 @@ pub fn check_mail_bytes(message: &[u8], config_path: &Path) -> MailVerdict {
 }
 
 struct NormAddr {
+    /// Deny-file form: NFKC, ignorables removed, local part lowercased,
+    /// domain in IDNA ASCII.
     local: String,
     domain: String,
+    /// The mailbox as written, before that folding. `From` is compared
+    /// in this form.
+    raw_local: String,
+    raw_domain: String,
 }
 
 impl NormAddr {
@@ -489,8 +495,24 @@ fn read_mailboxes(header: &Header) -> Parsed {
     }
 }
 
+/// `From` equals the identity after ASCII case folding only. A local
+/// part or domain that NFKC or ignorable-stripping would change is a
+/// different mailbox on the wire, so it does not match.
 fn same(addr: &NormAddr, identity: &NormAddr) -> bool {
-    addr.local == identity.local && addr.domain == identity.domain
+    if wire_rewritten(&addr.raw_local) || wire_rewritten(&addr.raw_domain) {
+        return false;
+    }
+    addr.raw_local.eq_ignore_ascii_case(&identity.raw_local)
+        && addr.raw_domain.eq_ignore_ascii_case(&identity.raw_domain)
+}
+
+fn wire_rewritten(raw: &str) -> bool {
+    let stripped: String = raw.chars().filter(|c| !is_ignorable(*c)).collect();
+    if stripped != raw {
+        return true;
+    }
+    let folded: String = raw.nfkc().collect();
+    folded != raw
 }
 
 fn domain_denied(domain: &str, denied: &BTreeSet<String>) -> bool {
@@ -502,7 +524,12 @@ fn domain_denied(domain: &str, denied: &BTreeSet<String>) -> bool {
 fn normalize_mailbox(mailbox: &Mailbox) -> Option<NormAddr> {
     let local = normalize_local(&mailbox.local)?;
     let domain = normalize_domain(&mailbox.domain)?;
-    Some(NormAddr { local, domain })
+    Some(NormAddr {
+        local,
+        domain,
+        raw_local: mailbox.local.clone(),
+        raw_domain: mailbox.domain.clone(),
+    })
 }
 
 fn normalize_local(raw: &str) -> Option<String> {
@@ -609,9 +636,9 @@ fn is_cyrillic_letter(c: char) -> bool {
         )
 }
 
-/// Characters a reader skips and a comparison must not treat as part of a
-/// different address. IDNA already rejects these in a domain; the local
-/// part has no such pass of its own.
+/// Characters a reader skips. A deny-file comparison removes them so
+/// they cannot hide an address. `From` does not: a mailbox these
+/// change is a different address on the wire and is refused.
 fn is_ignorable(c: char) -> bool {
     matches!(
         c,
@@ -767,12 +794,18 @@ From: other@example.test\r\n";
         );
     }
 
+    /// ASCII case is the same mailbox. A form NFKC or ignorable
+    /// stripping would change is a different mailbox on the wire.
     #[test]
-    fn from_case_and_fullwidth_local_still_match() {
+    fn from_matches_the_identity_in_ascii_case_only() {
         let raw = "From: MailSeat@Example.Test\r\n";
-        assert!(codes(raw, "", "").is_empty());
-        let raw = "From: \u{FF4D}\u{FF41}\u{FF49}\u{FF4C}\u{FF53}\u{FF45}\u{FF41}\u{FF54}@example.test\r\n";
         assert!(codes(raw, "", "").is_empty(), "{:?}", details(raw, "", ""));
+        let raw = "From: MAILSEAT@example.test\r\n";
+        assert!(codes(raw, "", "").is_empty(), "{:?}", details(raw, "", ""));
+        let raw = "From: \u{FF4D}\u{FF41}\u{FF49}\u{FF4C}\u{FF53}\u{FF45}\u{FF41}\u{FF54}@example.test\r\n";
+        assert_eq!(codes(raw, "", ""), vec!["from-not-identity"]);
+        let raw = "From: mail\u{200B}seat@example.test\r\n";
+        assert_eq!(codes(raw, "", ""), vec!["from-not-identity"]);
     }
 
     #[test]

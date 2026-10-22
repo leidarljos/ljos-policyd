@@ -145,10 +145,13 @@ deny-file deny.txt
 pack-law law.txt
 ```
 
-`From` has to be that one address. The mailbox is the address in
-angle brackets, read from the raw header after a folded line is
-joined. An encoded-word in a display name is decoded for display
-only, and an encoded addr-spec is a refusal. A second `From`, a
+`From` has to be that one address after ASCII case folding only.
+The mailbox is the address in angle brackets, read from the raw
+header after a folded line is joined. A local part or domain that
+NFKC or the removal of a skipped character would change is a
+refusal, including a zero-width character or a fullwidth spelling.
+An encoded-word in a display name is decoded for display only,
+and an encoded addr-spec is a refusal. A second `From`, a
 `From` that does not parse, or any other address is a refusal.
 `Reply-To`, `Sender`, `Return-Path`, `Errors-To`,
 `Disposition-Notification-To`, `Return-Receipt-To`,
@@ -166,11 +169,13 @@ A recipient domain, or a domain on a header checked against the
 deny file, is refused when one of its labels mixes Latin with
 Cyrillic or Greek after NFKC and IDNA.
 
-A domain is compared after NFKC and IDNA, so a fullwidth spelling and
-the punycode form are the same domain. ASCII case is folded. A
-character a reader skips, such as a zero-width space, is removed
-before the comparison. A homoglyph that those two passes leave alone
-stays a different domain, so it is not the configured identity.
+A deny-file domain is compared after NFKC and IDNA, so a fullwidth
+spelling and the punycode form are the same domain. ASCII case is
+folded. A character a reader skips, such as a zero-width space, is
+removed before that comparison. A homoglyph that those two passes
+leave alone stays a different domain. `From` is not compared that
+way: only ASCII case folding, and a spelling those passes would
+change is refused.
 
 The deny file's lines are `address`, `domain`, `handle`, `term` and
 `pair`. This check uses `address` and `domain`. The other three can
