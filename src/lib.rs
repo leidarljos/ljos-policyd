@@ -12894,4 +12894,50 @@ hash -r 2> /dev/null
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
         }
     }
+
+    /// The lines people run every day that the script checks must leave
+    /// alone, with a benign `configure`, a built binary and a venv.
+    #[test]
+    fn the_everyday_table_stays_allowed() {
+        let root = startup_root("everyday");
+        for d in ["x", "build", "repo", "target/debug"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(
+            root.join("configure"),
+            "#!/bin/sh\necho checking\nCC=cc\necho \"CC=$CC\" > config.out\nrm -rf conftest*\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("Makefile"), "all:\n\techo built\n").unwrap();
+        std::fs::write(root.join("x/Makefile"), "test:\n\techo ok\n").unwrap();
+        std::fs::write(root.join("config.mk"), "CC = cc\n").unwrap();
+        std::fs::copy("/bin/true", root.join("target/debug/app")).unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "./configure && make",
+            "sh ./configure",
+            "make -C x test > \"$LOG\"",
+            "npm run build",
+            "cargo xtask",
+            "cargo build && ./target/debug/app",
+            "xargs -I{} echo {}",
+            "find . -name '*.pyc' -exec rm -f {} +",
+            "source .venv/bin/activate",
+            "conda activate",
+            "nvm use",
+            "direnv allow",
+            "pyenv init -",
+            "git -C repo status",
+            "tee build.log",
+            "read -r name; git checkout \"$name\"",
+            "cp config.mk . && sh ./configure",
+            "echo 'echo ok' > build/run.sh && sh build/run.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        let c = at("echo start > \"$LOG\"; sh ./configure");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(c.token.contains("write to a literal path"), "{}", c.token);
+    }
 }
