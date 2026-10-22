@@ -1,0 +1,1 @@
+The pack's pass had no directory, so a relative scratch name was treated as a symlink and left unchanged. `rm -rf conftest*` was then refused after the host had allowed it. That pass uses the directory the host checked.

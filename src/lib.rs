@@ -98,7 +98,7 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
     let table = host_argv_table_at(argv, 0, leaves_tree(argv, 0), &parent);
     #[cfg(has_phronesis)]
     let table = if table.decision == Decision::Allow {
-        check_shell_phronesis(argv)
+        check_shell_phronesis(argv, cwd)
     } else {
         table
     };
@@ -8384,12 +8384,18 @@ impl Seat {
 }
 
 #[cfg(has_phronesis)]
-type Job = (Vec<String>, std::sync::mpsc::Sender<Checked>);
+type Job = (
+    Vec<String>,
+    std::path::PathBuf,
+    std::sync::mpsc::Sender<Checked>,
+);
 
 /// phronesis keeps its Janet VM in the thread that first loaded the pack,
-/// so every check in the process runs on one worker thread.
+/// so every check in the process runs on one worker thread. The directory
+/// is the one the host already checked: a relative scratch name is a
+/// symlink only when that directory says so.
 #[cfg(has_phronesis)]
-fn check_shell_phronesis(argv: &[String]) -> Checked {
+fn check_shell_phronesis(argv: &[String], cwd: &std::path::Path) -> Checked {
     static WORKER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<Job>>> =
         std::sync::OnceLock::new();
     let worker = WORKER.get_or_init(|| {
@@ -8397,11 +8403,13 @@ fn check_shell_phronesis(argv: &[String]) -> Checked {
         std::thread::Builder::new()
             .name("phronesis".into())
             .spawn(move || {
-                for (argv, reply) in rx {
+                for (argv, cwd, reply) in rx {
+                    let parent = Scratch {
+                        root: Some(cwd),
+                        ..Scratch::default()
+                    };
                     let c = match Seat::open() {
-                        Ok(seat) => {
-                            seat.check_at(&argv, 0, &Scratch::default(), leaves_tree(&argv, 0))
-                        }
+                        Ok(seat) => seat.check_at(&argv, 0, &parent, leaves_tree(&argv, 0)),
                         Err(c) => c,
                     };
                     let _ = reply.send(c);
@@ -8414,7 +8422,7 @@ fn check_shell_phronesis(argv: &[String]) -> Checked {
         return refused("phronesis: no worker thread");
     };
     let (reply, answer) = std::sync::mpsc::channel();
-    if tx.send((argv.to_vec(), reply)).is_err() {
+    if tx.send((argv.to_vec(), cwd.to_path_buf(), reply)).is_err() {
         return refused("phronesis: worker thread gone");
     }
     answer
