@@ -3661,8 +3661,10 @@ fn parallel_command_unshown(argv: &[String]) -> bool {
 /// input comes from stdin or an argument list, so the script is unknown.
 /// It lands there through a replace string (`xargs -I{} sh -c '{}'`), or
 /// as the words xargs appends when the command ends where the script
-/// would be (`xargs sh -c`, `xargs bash`, `xargs python3 -c`). A
-/// `mapfile -C` callback takes the lines it reads the same way.
+/// would be (`xargs sh -c`, `xargs bash`, `xargs python3 -c`), or as
+/// the positional parameters a shown script runs (`xargs sh -c 'eval
+/// "$1"' _`). A `mapfile -C` callback takes the lines it reads the same
+/// way.
 fn xargs_script_unshown(argv: &[String]) -> bool {
     commands(argv).into_iter().any(|cmd| {
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
@@ -3761,7 +3763,13 @@ fn script_takes_input(run: &[String], fed: &dyn Fn(&str) -> bool, appended: bool
     let b = base_of(head);
     if SHELLS.contains(&b) {
         if let Some(s) = shell_script(run) {
-            return fed(s);
+            // The words after the script are its positional parameters.
+            let params = run
+                .iter()
+                .position(|w| std::ptr::eq(w.as_ptr(), s.as_ptr()))
+                .map_or(&run[..0], |i| &run[i + 1..]);
+            return fed(s)
+                || ((appended || params.iter().any(|a| fed(a))) && script_runs_positional(s));
         }
         let short =
             |a: &&String, f: char| a.starts_with('-') && !a.starts_with("--") && a[1..].contains(f);
@@ -3784,6 +3792,45 @@ fn script_takes_input(run: &[String], fed: &dyn Fn(&str) -> bool, appended: bool
         Some(at) => run.get(at + 1).map_or(appended, |code| fed(code)),
         None => false,
     }
+}
+
+/// Whether the shell script `script` runs one of its positional
+/// parameters as code: `eval "$1"`, `. "$1"`, `sh -c "$*"`, or `"$@"`
+/// as the command word. A variable set from one, or a `for` over them,
+/// holds one too.
+fn script_runs_positional(script: &str) -> bool {
+    let words = shell_words(script);
+    let mut names: Vec<String> = Vec::new();
+    commands(&words).into_iter().any(|cmd| {
+        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        let fed = |w: &str| positional(w) || names.iter().any(|n| expands(w, n));
+        let run = unwrap_wrappers(&owned).0;
+        if run.first().is_some_and(|w| fed(w)) || script_takes_input(run, &fed, false) {
+            return true;
+        }
+        let set: Vec<String> = match run {
+            [f, name] if f == "for" => vec![name.clone()],
+            [f, name, i, list @ ..] if f == "for" && i == "in" && list.iter().any(|w| fed(w)) => {
+                vec![name.clone()]
+            }
+            _ => owned
+                .iter()
+                .filter_map(|w| w.split_once('=').filter(|(n, v)| is_name(n) && fed(v)))
+                .map(|(n, _)| n.to_string())
+                .collect(),
+        };
+        names.extend(set);
+        false
+    })
+}
+
+/// Whether `w` expands a positional parameter: `$1`, `${2}`, `$@`, `$*`.
+fn positional(w: &str) -> bool {
+    let param = |r: &str| r.starts_with(|c: char| c.is_ascii_digit() || c == '@' || c == '*');
+    w.match_indices('$').any(|(i, _)| {
+        let rest = &w[i + 1..];
+        param(rest) || rest.strip_prefix('{').is_some_and(param)
+    })
 }
 
 /// The command string a `mapfile` or `readarray` call runs with `-C`,
@@ -12731,6 +12778,34 @@ hash -r 2> /dev/null
         for line in [
             "mapfile -t lines < list.txt",
             "mapfile -C 'echo got' -c 1 arr < list.txt",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+    }
+
+    #[test]
+    fn a_script_running_positional_input_is_refused() {
+        let root = startup_root("posargs");
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "xargs sh -c 'eval \"$1\"' _",
+            "xargs -n1 bash -c '. \"$1\"' sh",
+            "xargs sh -c 'exec \"$@\"' _",
+            "find . -name '*.sh' | xargs sh -c 'for f; do sh -c \"$f\"; done' _",
+            "xargs sh -c 'c=$1; eval \"$c\"' _",
+            "xargs -I{} sh -c 'eval \"$1\"' _ {}",
+            "parallel sh -c 'eval \"$*\"' _ ::: a",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert_eq!(c.token, "xargs-script-unshown", "{line}");
+        }
+        for line in [
+            "xargs sh -c 'echo \"$1\"' _",
+            "xargs -I{} echo {}",
+            "find . -print0 | xargs -0 sh -c 'for f; do wc -l \"$f\"; done' _",
+            "sh -c 'eval \"$1\"' _ 'echo hi'",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
