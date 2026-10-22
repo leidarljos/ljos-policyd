@@ -560,6 +560,10 @@ fn set_vars(cmd: &[&str], vars: &mut Vars) {
     for name in cmd.iter().filter_map(|w| fd_variable(w)) {
         vars.lose_target(name);
     }
+    // `((...))` and `$((...))` evaluate here and may assign what they name.
+    for w in cmd.iter().filter(|w| w.contains("((")) {
+        vars.lose(w);
+    }
     let words = operands(cmd);
     let front = (0..words.len())
         .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
