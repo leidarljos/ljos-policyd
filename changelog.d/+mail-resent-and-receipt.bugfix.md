@@ -1,1 +1,0 @@
-A Resent-* header replaces the envelope after the check. Errors-To, Disposition-Notification-To and Return-Receipt-To name a mailbox the same way Reply-To does, so a deny-file identity on those headers is a refusal too.

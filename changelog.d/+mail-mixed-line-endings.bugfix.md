@@ -1,1 +1,0 @@
-A header block that mixes CRLF and a bare LF has two places a reader can split off the body. The earlier split drops the headers between them, including a recipient the other reader still sends. That block is refused.

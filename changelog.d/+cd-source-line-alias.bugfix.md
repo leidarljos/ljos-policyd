@@ -1,1 +1,0 @@
-A file that a `source` or `.` reads is scanned with the aliases the line defined before it expanded, so `alias go='cd evil'; source ./env.sh && make clean-all` with `env.sh` calling `go` leaves the line untracked and the runner is refused.

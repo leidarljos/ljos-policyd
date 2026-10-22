@@ -1,1 +1,0 @@
-`time` after `command` or `builtin` is read as the time program rather than the keyword, as bash reads it, so the `cd` in `command time cd evil; make clean-all` moves only the program's child and the `make` after it is read where the line was.

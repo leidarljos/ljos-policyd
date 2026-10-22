@@ -1,1 +1,0 @@
-A header line over 998 octets was accepted. A hop that wraps the line without folding turns the tail into a new header, so a Bcc past column 998 was never judged. A header line over that limit is a refusal.

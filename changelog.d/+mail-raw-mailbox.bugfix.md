@@ -1,1 +1,0 @@
-An encoded-word was decoded before the address was read, so a decoded parenthesis became a comment and the mailbox inside it was never compared. The mailbox is the raw unfolded address. A display name may still be decoded, and only for display. An encoded addr-spec is a refusal.

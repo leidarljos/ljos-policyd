@@ -1,1 +1,0 @@
-`>|`, the redirection that overwrites a file under `noclobber`, stays one word instead of a `>` and a pipe, so `cd >| /dev/null evil && make clean-all` follows the `cd` and refuses the `rm -rf ~` in `evil/Makefile`. The split made the `cd` a pipeline stage, which moves nothing.

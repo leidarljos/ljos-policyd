@@ -1,1 +1,0 @@
-A `BASH_ENV` file that starts another `bash` is read only a bounded number of times and then refused as `startup-script-unshown`. `export BASH_ENV=loop.sh; bash -c 'echo ok'`, with a `bash -c` in `loop.sh`, overflowed the guard's stack, since each bash the file starts sources it again.

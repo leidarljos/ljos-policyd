@@ -1,1 +1,0 @@
-The all-numeric check ran before IDNA, so a dotted quad written with U+3002 or U+FF61 was read as an address and still allowed. Hex labels, leading-zero labels, and the shorter forms inet_aton accepts were names too. The check reads the IDNA form and refuses those shapes.

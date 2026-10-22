@@ -1,1 +1,0 @@
-Folded headers, encoded-words and a repeated From are read as one message. A fold stays the same header and keeps the space where the line broke, an encoded-word is the text it names, and a second From stays a second header so a later check can refuse it instead of picking one copy.

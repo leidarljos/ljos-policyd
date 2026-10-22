@@ -1,1 +1,0 @@
-From was compared after NFKC, ignorable stripping and case folding, so a zero-width character or a fullwidth spelling matched the identity while the header that was sent named a different mailbox. From now has to equal the identity after ASCII case folding only, and a spelling those passes would change is a refusal.

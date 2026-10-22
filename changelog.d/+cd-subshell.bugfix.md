@@ -1,1 +1,0 @@
-A subshell or command substitution reads a task runner's file where the command holding it runs, so `cd project && (make clean-all)` and `cd project && echo $(make clean-all)` read `project/Makefile`. Inside a `sh -c` script both were read where the line started, and allowed. `cd project && (make test)` stays allowed.

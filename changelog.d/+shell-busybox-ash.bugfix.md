@@ -1,1 +1,0 @@
-`ash`, `hush` and `mksh` are shells, so `busybox ash evil.sh`, `busybox hush -c 'git push -f'` and `toybox sh -c ...` are judged by the script they run. busybox ran its applet, but only `sh` among its shells was known, and `busybox ash -c 'git push -f'` was allowed.

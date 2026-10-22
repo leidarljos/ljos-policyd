@@ -1,1 +1,0 @@
-A quoted or escaped `;`, `&&`, `||`, `|` or `&` in a script (`echo ';'`, `find ... \;`) is an argument, not a separator, so `echo ';' cd safe && make clean-all` no longer follows a `cd` that never runs and reads `make` where the shell is.

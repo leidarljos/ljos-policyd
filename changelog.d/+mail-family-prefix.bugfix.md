@@ -1,1 +1,0 @@
-A short address rule stays on its own domain. ed@outlook.com denies that mailbox and a subaddress, and not ed@hotmail.com. A longer rule still crosses the family: john@outlook.com denies john@hotmail.com, john@live.com, john@msn.com and john@outlook.de. Those domains are not one mailbox. The skeleton prefix is what crosses.

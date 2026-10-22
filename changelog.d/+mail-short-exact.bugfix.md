@@ -1,1 +1,0 @@
-An address rule whose skeleton is shorter than three characters no longer refuses the deny file. It still matches that mailbox, a subaddress and the same skeleton, including a Fastmail tag of one character. The prefix match, which would treat jo as john, is not used for it. An empty skeleton still refuses the file, and the error still names the line.

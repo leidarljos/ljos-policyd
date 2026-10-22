@@ -1,1 +1,0 @@
-A stage before a `|` in a sourced file runs in a subshell and no longer makes the file look like it moves the shell, so the `case "$(uname)" in CYGWIN*|MSYS*|MINGW*)` block in a Python 3.13 venv's `activate` keeps `source .venv/bin/activate && make test` allowed.

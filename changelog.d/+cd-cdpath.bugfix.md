@@ -1,1 +1,0 @@
-A `cd` or `pushd` to a relative path whose first part is not `.` or `..` also enters each `CDPATH` entry that holds the path, as the shell may: with `CDPATH=~/lib`, `cd proj && make clean-all` read only `./proj/Makefile` and allowed the `rm -rf ~` in `~/lib/proj/Makefile`, where the shell runs it.

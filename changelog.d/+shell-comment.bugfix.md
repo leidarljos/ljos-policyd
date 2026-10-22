@@ -1,1 +1,0 @@
-A `#` that starts a word in a script comments out the rest of its line, so `true # ; cd safe` followed by `make clean-all` on the next line no longer follows the commented-out `cd` and reads `make` where the shell is.
