@@ -5141,6 +5141,23 @@ mod tests {
         assert_eq!(c.decision, Decision::Deny);
     }
 
+    /// A subscript may hold `=`, so `a[b=c]=1` is one assignment, split
+    /// at the `=` after its closing `]`.
+    #[test]
+    fn a_subscript_holding_an_equals_is_an_assignment() {
+        assert!(v(&["a[b=c]=1", "git", "push", "--force", "origin", "main"]).starts_with("deny\t"));
+        for line in [
+            "a[b=c]=1 cd evil && make clean-all",
+            "a[x[0]=1]+=2 pushd evil && make clean-all",
+        ] {
+            assert_eq!(
+                evil_and_safe("subscript-eq", line),
+                Decision::Deny,
+                "{line}"
+            );
+        }
+    }
+
     /// The `time` keyword, with or without `-p`, runs `cd` in this shell.
     #[test]
     fn follows_a_cd_behind_time() {
