@@ -148,6 +148,7 @@ fn reads_a_runner_where_a_cdpath_set_earlier_enters() {
         ": ${CDPATH:=../lib}; cd proj && make clean-all",
         "for CDPATH in ../lib; do cd proj && make clean-all; done",
         "HOME=..; CDPATH=$HOME/lib; HOME=/nowhere; cd proj && make clean-all",
+        "HOME=proj; CDPATH=../lib; cd $HOME && make clean-all",
     ] {
         let v = check(&work, None, line);
         assert!(v.starts_with("deny\t"), "{line}: {v}");

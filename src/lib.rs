@@ -1293,9 +1293,15 @@ fn entered(
         return vec![UNTRACKED.into()];
     };
     let mut dirs = Vec::new();
+    // The shell searches with the word as it expands it, so `$HOME/x` is
+    // searched only when HOME is relative.
+    let to = match to.split_once('/').unwrap_or((to, "")) {
+        ("$HOME" | "${HOME}", rest) => format!("{}/{rest}", home.unwrap_or_default()),
+        _ => to.to_string(),
+    };
     let searched = !to.starts_with('~')
         && matches!(
-            std::path::Path::new(to).components().next(),
+            std::path::Path::new(&to).components().next(),
             Some(std::path::Component::Normal(_))
         );
     if let Some(cdpath) = set.cdpath.as_deref().filter(|_| searched) {
@@ -1310,7 +1316,7 @@ fn entered(
                 .filter(|e| !e.contains('$'))
                 .and_then(|e| path_from(e, dir, home))
                 .unwrap_or_else(|| UNTRACKED.into())
-                .join(to);
+                .join(&to);
             if is_untracked(&d) {
                 dirs.push(d);
                 continue;
