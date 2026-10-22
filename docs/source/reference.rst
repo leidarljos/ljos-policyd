@@ -74,8 +74,10 @@ Raw newlines and carriage returns split script commands, and ``$'...'``
 ANSI-C quoted words are decoded before the line is judged.
 
 A ``cd`` or ``pushd`` to a relative path whose first part is not ``.`` or
-``..`` may enter that path under any ``CDPATH`` entry, so the runner after
-it is also read in each entry that holds the path. A ``CDPATH`` set in
+``..`` enters that path under the first ``CDPATH`` entry that holds it, an
+empty or ``.`` entry being the working directory, so the runner after it
+is read there, and in any entry before it the line does not show. A
+``CDPATH`` set in
 front of the ``cd`` (``CDPATH=dir cd x``), or of the shell that runs it, is
 the one searched, as is one the line sets before it, alone or with
 ``export``, ``declare`` and the like (``export CDPATH=dir; cd x``), unless a

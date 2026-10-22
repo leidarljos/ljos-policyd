@@ -662,24 +662,29 @@ fn entered(
     let Some(path) = path_from(to, dir, home) else {
         return Vec::new();
     };
-    let mut dirs = vec![path];
+    let mut dirs = Vec::new();
     let searched = !to.starts_with('~')
         && matches!(
             std::path::Path::new(to).components().next(),
             Some(std::path::Component::Normal(_))
         );
     if let Some(cdpath) = set.cdpath.as_deref().filter(|_| searched) {
-        // The shell takes the first entry it can enter, or else `dir`; an
-        // entry that names no directory the line shows may be any.
+        // The shell takes the first entry it can enter, an empty one being
+        // `dir`, or else `dir`; an entry that names no directory the line
+        // shows may be any, and the walk goes on past it.
         for entry in cdpath.split(':') {
             let d = path_from(entry, dir, home)
                 .unwrap_or_else(|| UNTRACKED.into())
                 .join(to);
-            if is_untracked(&d) || d.join(".").is_dir() {
+            if is_untracked(&d) {
                 dirs.push(d);
+            } else if d.join(".").is_dir() {
+                dirs.push(d);
+                return dirs;
             }
         }
     }
+    dirs.push(path);
     dirs
 }
 
