@@ -1273,9 +1273,14 @@ fn entered(
         .filter(|a| a.starts_with('-'))
         .flat_map(|a| a.chars())
         .rfind(|c| matches!(c, 'L' | 'P'));
+    // Where the path by name is no directory, bash tries it as written,
+    // through the links, so the line may be there instead.
     let forms = |p: std::path::PathBuf| {
         let by_name = (flag != Some('P')).then(|| logical(&p));
-        let resolved = (flag == Some('P') || flag.is_none() && set.physical)
+        let missed = by_name
+            .as_ref()
+            .is_some_and(|d| !is_untracked(d) && !d.join(".").is_dir());
+        let resolved = (flag == Some('P') || flag.is_none() && set.physical || missed)
             .then(|| p.canonicalize().unwrap_or(p));
         by_name.into_iter().chain(resolved)
     };
@@ -1349,7 +1354,7 @@ fn popd_args<'a>(args: &[&'a str]) -> Option<(Option<&'a str>, bool)> {
 
 /// `path` with each `.` and `..` taken off by name, as a logical `cd`
 /// takes them. dash does so past a part that is not there, where bash
-/// fails the `cd`. An untracked path stays one.
+/// tries the path as written. An untracked path stays one.
 fn logical(path: &std::path::Path) -> std::path::PathBuf {
     if is_untracked(path) {
         return path.to_path_buf();
