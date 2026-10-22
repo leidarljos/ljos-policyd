@@ -1,0 +1,1 @@
+A bare dotted-quad domain was accepted as a name, so it never met a domain rule, and a resolver connects to that address. An all-numeric domain, including one written with fullwidth digits, is a refusal.

@@ -944,6 +944,31 @@ From: other@example.test\r\n";
     }
 
     #[test]
+    fn an_all_numeric_domain_is_refused() {
+        let raw = "From: mailseat@example.test\r\nTo: a@192.0.2.1\r\n\r\n";
+        assert_eq!(codes(raw, "", ""), vec!["recipient-unparsed"]);
+        assert_eq!(
+            codes(&plain("Cc: a@192.0.2\r\n"), "", ""),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("Bcc: a@192.000.002.001\r\n"), "", ""),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("To: a@10.0.0.1.2\r\n"), "", ""),
+            vec!["recipient-unparsed"]
+        );
+        let full = "\u{FF11}\u{FF19}\u{FF12}.\u{FF10}.\u{FF12}.\u{FF11}";
+        assert_eq!(
+            codes(&plain(&format!("To: a@{full}\r\n")), "", ""),
+            vec!["recipient-unparsed"]
+        );
+        assert!(codes(&plain("To: a@mx1.example.test\r\n"), "", "").is_empty());
+        assert!(codes(&plain("To: a@192.0.2.example.test\r\n"), "", "").is_empty());
+    }
+
+    #[test]
     fn a_domain_literal_is_refused() {
         let deny = "domain blocked.test\n";
         assert_eq!(

@@ -163,7 +163,8 @@ file, and when that domain, or a parent of it, is named by the
 deny file or by the pack-law file. An `address` line is that
 mailbox, not the whole domain. It also covers a `local+tag`
 subaddress of that mailbox. An address at `@[ ... ]` is a
-domain literal and is a refusal. A source route
+domain literal and is a refusal. An all-numeric domain, such as
+a dotted quad, is a refusal. A source route
 (`<@host:mailbox>`) is a refusal. `%` or `!` in an unquoted local
 part is a refusal. A quoted local part may hold either character.
 A recipient domain, or a domain on a header checked against the

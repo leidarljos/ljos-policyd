@@ -7,6 +7,8 @@
 //! check refuses from what this read; it does not decide the address by
 //! which copy of `From` a later reader might keep.
 
+use unicode_normalization::UnicodeNormalization;
+
 /// A header whose value is unfolded. The name is lower case.
 #[derive(Debug)]
 pub(crate) struct Header {
@@ -899,7 +901,22 @@ fn parse_domain(s: &str) -> Result<String, AddressFault> {
     if !any || prev_dot {
         return Err(AddressFault);
     }
+    // A dotted quad, or any domain whose labels are all digits, is an
+    // address a resolver will connect to. Fullwidth digits fold to the
+    // same shape. It is not a name this check can compare.
+    if numeric_domain(bare) {
+        return Err(AddressFault);
+    }
     Ok(bare.to_string())
+}
+
+fn numeric_domain(bare: &str) -> bool {
+    let folded: String = bare.nfkc().collect();
+    let folded = folded.trim_end_matches('.');
+    !folded.is_empty()
+        && folded
+            .split('.')
+            .all(|label| !label.is_empty() && label.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn is_atext(c: char) -> bool {
@@ -1074,6 +1091,18 @@ From: other@example.test\r\n\
     #[test]
     fn an_empty_return_path_has_no_mailbox() {
         assert!(mailboxes("<>").unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_all_numeric_domain_is_not_a_mailbox() {
+        assert!(mailboxes("a@192.0.2.1").is_err());
+        assert!(mailboxes("a@192.0.2").is_err());
+        assert!(mailboxes("a@10.0.0.1.2").is_err());
+        assert!(mailboxes("<a@192.000.002.001>").is_err());
+        let full = "\u{FF11}\u{FF19}\u{FF12}.\u{FF10}.\u{FF12}.\u{FF11}";
+        assert!(mailboxes(&format!("a@{full}")).is_err());
+        assert!(mailboxes("a@mx1.example.test").is_ok());
+        assert!(mailboxes("a@192.0.2.example.test").is_ok());
     }
 
     #[test]
