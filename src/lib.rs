@@ -6971,6 +6971,35 @@ mod tests {
         }
     }
 
+    /// An alias runs its body where its name is the command word. A body
+    /// the line does not show may be `cd`, so the line is not followed
+    /// past it.
+    #[test]
+    fn an_alias_runs_its_body() {
+        for line in [
+            "cd safe && shopt -s expand_aliases; alias m=\"make clean-all\"; cd ../evil; m",
+            "alias m=\"make clean-all\"; cd evil && m",
+            "alias m='cd evil'; m; make clean-all",
+            "alias m=\"$X\"; m; make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("alias", line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "alias m=\"make clean-all\"; cd safe && m",
+            "alias ll='ls -la'; ll; cd safe && make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("alias", line), Decision::Allow, "{line}");
+        }
+        for script in ["alias p='git push -f'; p", "alias g=git; g push --force"] {
+            assert_eq!(
+                v(&["bash", "-c", script]),
+                "deny\tgit-force-push",
+                "{script}"
+            );
+        }
+        assert_eq!(v(&["bash", "-c", "alias ll='ls -la'; ll"]), "allow");
+    }
+
     #[test]
     fn a_shell_script_does_not_hide_a_recursive_delete() {
         assert!(v(&["sh", "-c", "rm -rf /home/u/x"]).starts_with("deny"));
