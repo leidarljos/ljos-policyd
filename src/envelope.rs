@@ -2154,6 +2154,31 @@ pair left right
         assert!(!denied("bad@pm\u{FF0E}me\u{FF0E}test", proton));
     }
 
+    /// Case, a fullwidth stop, dots and a tag in one address, and the
+    /// same address quoted, still meet the gmail rule. A fullwidth stop
+    /// in the local part is refused before any rule is read.
+    #[test]
+    fn folds_combine_in_one_address() {
+        let gmail = "address bad@gmail.com\n";
+        let to = |addr: &str| plain(&format!("To: {addr}\r\n"));
+        for addr in [
+            "bad+t.ag@gmail.com",
+            "\"b.ad+x\"@googlemail.com",
+            "B.a.D+T.aG@GoogleMail\u{FF0E}COM",
+            "\"B.a.D+T.aG\"@GMail\u{FF0E}com",
+        ] {
+            assert_eq!(
+                codes(&to(addr), gmail, ""),
+                vec!["recipient-address-denied"],
+                "{addr}"
+            );
+        }
+        let wide = to("b\u{FF0E}ad+x@gmail.com");
+        assert!(!codes(&wide, gmail, "").is_empty());
+        assert!(!codes(&wide, "", "").is_empty());
+        assert!(codes(&to("b.a+x@gmail.com"), gmail, "").is_empty());
+    }
+
     #[test]
     fn a_zero_width_character_does_not_hide_a_denied_address() {
         let deny = "address other@example.test\n";
