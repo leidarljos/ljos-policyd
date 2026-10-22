@@ -7404,6 +7404,118 @@ fn here_string(cmd: &[String]) -> Option<String> {
     None
 }
 
+/// Replace marks of an `xargs` or `parallel` whose shown inputs are all
+/// under `/tmp`. The mark is the word the pack would refuse.
+fn temp_fed_marks(argv: &[String]) -> Vec<String> {
+    let ended = ended_owned(argv);
+    let mut out = Vec::new();
+    for (i, (cmd, _)) in ended.iter().enumerate() {
+        let owned = split_env_strings(cmd).into_owned();
+        let run_all = unwrap_wrappers(&owned).0;
+        if run_all.is_empty() {
+            continue;
+        }
+        let wrappers = &owned[..owned.len() - run_all.len()];
+        let Some(at) = wrappers
+            .iter()
+            .rposition(|w| matches!(base_of(w), "xargs" | "parallel"))
+        else {
+            continue;
+        };
+        let parallel = base_of(&wrappers[at]) == "parallel";
+        let parsed = parse_feed_flags(&wrappers[at + 1..]);
+        let opaque = parsed.is_none();
+        let end = run_all
+            .iter()
+            .position(|w| w == ":::" || w == "::::")
+            .unwrap_or(run_all.len());
+        let template = &run_all[..end];
+        let mut spec = parsed.unwrap_or(FeedSplit {
+            nul: false,
+            delim: None,
+            lines: false,
+            group: None,
+            replace: None,
+            argfile: false,
+        });
+        if parallel {
+            spec.group = spec.group.or(Some(1));
+            if spec.replace.is_none() {
+                spec.replace = parallel_mark(template, None);
+            }
+            if spec.replace.is_some() {
+                spec.lines = !spec.nul && spec.delim.is_none();
+            }
+        }
+        let Some(mark) = spec.replace.clone() else {
+            continue;
+        };
+        if mark.is_empty() || spec.argfile {
+            continue;
+        }
+        let colon = parallel_inputs(run_all);
+        let producer = i.checked_sub(1).filter(|&p| ended[p].1 == "|");
+        let inputs = if let Some(found) = colon {
+            found.ok()
+        } else if opaque {
+            None
+        } else {
+            producer.and_then(|p| producer_text(&ended[p].0).map(|t| split_feed(&t, &spec)))
+        };
+        let Some(inputs) = inputs else {
+            continue;
+        };
+        if !inputs.is_empty() && inputs.iter().all(|p| under_tmp(p)) {
+            out.push(mark);
+        }
+    }
+    out
+}
+
+/// Names a `read` takes from a `printf` or `echo` of paths under `/tmp`.
+/// A name that also has an unshown read is not one of them.
+fn shown_temp_reads(argv: &[String]) -> Vec<String> {
+    let ended = ended_owned(argv);
+    let mut good = Vec::new();
+    let mut bad = Vec::new();
+    for (i, (cmd, _)) in ended.iter().enumerate() {
+        let owned = split_env_strings(cmd).into_owned();
+        let run = unwrap_wrappers(&owned).0;
+        let refs: Vec<&str> = run.iter().map(String::as_str).collect();
+        let tail: Vec<String> = command_after_keywords(&refs)
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        if !tail
+            .first()
+            .is_some_and(|w| matches!(base_of(w), "read" | "mapfile" | "readarray"))
+        {
+            continue;
+        }
+        let names = read_var_names(&tail);
+        let text = if let Some(p) = i.checked_sub(1).filter(|&p| ended[p].1 == "|") {
+            producer_text(&ended[p].0)
+        } else {
+            here_string(cmd)
+        };
+        let temp = text.is_some_and(|t| {
+            let lines: Vec<&str> = t
+                .split('\n')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            !lines.is_empty() && lines.iter().copied().all(under_tmp)
+        });
+        if temp {
+            good.extend(names);
+        } else {
+            bad.extend(names);
+        }
+    }
+    good.retain(|n| !bad.iter().any(|b| b == n));
+    good
+}
+
 fn read_var_names(run: &[String]) -> Vec<String> {
     let all = read_names(run);
     let named: Vec<String> = all
@@ -11724,6 +11836,9 @@ struct Scratch {
     root: Option<std::path::PathBuf>,
     /// `IFS` was assigned or `eval` ran. A variable suffix can split.
     ifs_assigned: bool,
+    /// An `xargs -I` mark whose shown inputs are all under `/tmp`. The
+    /// pack still sees the mark, and its older rule refuses that word.
+    fed_marks: Vec<String>,
 }
 
 impl Scratch {
@@ -11740,6 +11855,18 @@ impl Scratch {
             }
             if command_parts(&cmd).1 == "eval" {
                 self.poison_all();
+            }
+        }
+        // `read x` from a `printf` of `/tmp/...` holds that path. The pack
+        // still sees `$x`, and its older rule refuses the name.
+        for name in shown_temp_reads(argv) {
+            // `read` poisons the name: stdin is not an assignment. The
+            // producer on this line is the value, so the poison is wrong.
+            self.vars.insert(name, Some(Hold::Temp));
+        }
+        for mark in temp_fed_marks(argv) {
+            if !self.fed_marks.iter().any(|m| m == &mark) {
+                self.fed_marks.push(mark);
             }
         }
     }
@@ -12522,6 +12649,17 @@ fn rm_recursive(cmd: &[&str]) -> bool {
 #[cfg(has_phronesis)]
 fn argv_for_pack(argv: &[String], bound: &Scratch, moved: bool) -> Vec<String> {
     let mut out = argv.to_vec();
+    for w in &mut out {
+        let bare = w.trim_end_matches(';');
+        if bound.fed_marks.iter().any(|m| m == bare) && !pack_delete_ok(bare, moved) {
+            let semi = w.ends_with(';');
+            *w = if semi {
+                "/tmp/policyd-scratch;".into()
+            } else {
+                "/tmp/policyd-scratch".into()
+            };
+        }
+    }
     let mut place = Place::new(bound.root.clone());
     let mut prev = "";
     for (idx, end) in ended_indices(argv) {
@@ -12532,7 +12670,7 @@ fn argv_for_pack(argv: &[String], bound: &Scratch, moved: bool) -> Vec<String> {
             .filter(|w| !w.is_empty())
             .collect();
         let refs: Vec<&str> = words.iter().map(String::as_str).collect();
-        if rm_recursive(&refs) {
+        if rm_recursive(command_after_keywords(&refs)) {
             for &i in &idx {
                 let w = out[i].trim_end_matches(';').to_string();
                 if w.is_empty() || w.starts_with('-') || is_redirection(&w) {
@@ -12552,6 +12690,38 @@ fn argv_for_pack(argv: &[String], bound: &Scratch, moved: bool) -> Vec<String> {
         prev = end;
     }
     out
+}
+
+/// Shell words in front of the command `do` and `then` introduce.
+/// `do rm -rf "$x"` is that `rm`.
+fn command_after_keywords<'a>(words: &'a [&'a str]) -> &'a [&'a str] {
+    let mut w = words;
+    while w.first().is_some_and(|s| {
+        matches!(
+            *s,
+            "while"
+                | "until"
+                | "for"
+                | "do"
+                | "then"
+                | "else"
+                | "elif"
+                | "if"
+                | "in"
+                | "{"
+                | "}"
+                | "("
+                | ")"
+                | "!"
+                | "time"
+                | "done"
+                | "fi"
+                | "esac"
+        )
+    }) {
+        w = &w[1..];
+    }
+    w
 }
 
 /// [`ended_commands`], each as the indexes of its words in `argv`.
