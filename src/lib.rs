@@ -1832,11 +1832,46 @@ fn trap_moves(cmd: &[&str]) -> bool {
     let front = (0..words.len())
         .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
         .count();
-    trap_action(peel_cd_command_word(&words[front..])).is_some_and(|a| {
+    let run = peel_cd_command_word(&words[front..]);
+    // An EXIT trap runs when the shell exits. It does not move the
+    // commands that follow it. A DEBUG, ERR or signal trap can.
+    if trap_exit_only(run) {
+        return false;
+    }
+    trap_action(run).is_some_and(|a| {
         commands(&shell_words(a))
             .iter()
             .any(|c| bare_unseen(c) || moves_shell(c))
     })
+}
+
+/// `trap ACTION 0` or `trap ACTION EXIT`, and no other signal.
+fn trap_exit_only(run: &[&str]) -> bool {
+    let Some((first, args)) = run.split_first() else {
+        return false;
+    };
+    if base_of(first) != "trap" {
+        return false;
+    }
+    let mut sigs = Vec::new();
+    let mut action = false;
+    for a in args {
+        if *a == "--" {
+            continue;
+        }
+        if a.starts_with('-') && a.len() > 1 {
+            continue;
+        }
+        if !action {
+            action = true;
+            continue;
+        }
+        sigs.push(*a);
+    }
+    !sigs.is_empty()
+        && sigs
+            .iter()
+            .all(|s| *s == "0" || s.eq_ignore_ascii_case("EXIT"))
 }
 
 /// What [`sourced`] found for a `source` or `.`.
@@ -14086,6 +14121,36 @@ hash -r 2> /dev/null
             let c = at(line);
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
             assert_eq!(c.token, token, "{line}");
+        }
+    }
+
+    /// An EXIT trap runs as the shell exits. It does not move the
+    /// commands after it. The action is still judged, and a trap on
+    /// any other signal still moves the shell.
+    #[test]
+    fn an_exit_trap_does_not_move_the_commands_after_it() {
+        let root = startup_root("exittrap");
+        std::fs::create_dir_all(root.join("safe")).unwrap();
+        std::fs::write(root.join("safe/Makefile"), "all:\n\techo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "trap 'cd /' EXIT; make -C safe",
+            "trap 'cd /' 0; make -C safe",
+            "trap -- 'cd evil' EXIT; make -C safe",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for (line, token) in [
+            ("trap 'cd /' DEBUG; make -C safe", "untracked directory"),
+            ("trap 'cd /' ERR; make -C safe", "untracked directory"),
+            ("trap 'git push -f' EXIT", "git-force-push"),
+            ("trap 'rm -rf /' EXIT", "rm-rf-outside-tmp"),
+            ("trap 'cd /' EXIT INT; make -C safe", "untracked directory"),
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains(token), "{line}: {}", c.token);
         }
     }
 }
