@@ -286,7 +286,7 @@ fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
                     }
                 }
             }
-            "!" | "if" | "then" | "else" | "elif" | "while" | "until" | "do" => {
+            "!" | "{" | "if" | "then" | "else" | "elif" | "while" | "until" | "do" => {
                 words = rest;
             }
             _ => return words,
@@ -3793,6 +3793,14 @@ mod tests {
             let c = entering("control-cd", &files, line);
             assert_eq!(c.decision, Decision::Deny, "{line}");
         }
+    }
+
+    /// An opening `{` before `cd` does not hide it.
+    #[test]
+    fn follows_a_cd_behind_a_brace_group() {
+        let files = [("Makefile", MAKEFILE)];
+        let c = entering("brace-cd", &files, "{ cd project && make clean-all; }");
+        assert_eq!(c.decision, Decision::Deny);
     }
 
     /// A script the line hands a shell, `eval` or a named command word runs
