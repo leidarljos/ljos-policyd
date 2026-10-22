@@ -282,7 +282,8 @@ one mailbox), ``dots`` (dots in the local part are ignored),
 ``<user><sep><local>@<domain>``, ``<sep>`` being the line's first
 separator, folded again so ``dots`` also reaches the user) and ``cut`` (the rule is also cut at its
 first separator). An ``alias`` line cannot remove a built-in
-family, and one that does not parse refuses the config. A
+family, and one that does not parse, or names one domain or flag
+twice, refuses the config. A
 ``domain`` rule on a domain of a ``shared`` family covers every
 domain of that family and their subdomains, so ``domain gmail.com``
 also refuses ``googlemail.com``, ``domain pm.me`` the other Proton

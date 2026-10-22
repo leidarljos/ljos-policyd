@@ -797,7 +797,8 @@ fn builtin_families() -> Option<Vec<AliasFamily>> {
 }
 
 /// `None` for a line that names no domain, a separator `subaddress`
-/// would refuse, or an unknown flag.
+/// would refuse, or an unknown flag, and for a domain or a flag named
+/// twice, which is a typo for something else.
 fn alias_family(value: &str) -> Option<AliasFamily> {
     let mut parts = value.split_whitespace();
     let domains = parts
@@ -805,6 +806,9 @@ fn alias_family(value: &str) -> Option<AliasFamily> {
         .split(',')
         .map(alias_domain)
         .collect::<Option<Vec<_>>>()?;
+    if domains.iter().collect::<BTreeSet<_>>().len() != domains.len() {
+        return None;
+    }
     let separators = parts.next()?.to_string();
     if !valid_separators(&separators) {
         return None;
@@ -825,6 +829,9 @@ fn alias_family(value: &str) -> Option<AliasFamily> {
             "cut" => &mut family.cut,
             _ => return None,
         };
+        if *slot {
+            return None;
+        }
         *slot = true;
     }
     Some(family)
@@ -2103,6 +2110,11 @@ pair left right
             "alias mail.test . shared\n",
             "alias mail.test + always\n",
             "alias mail.test,[1.2.3.4] +\n",
+            "alias mail.test + shared shared\n",
+            "alias mail.test + dots subdomain dots\n",
+            "alias mail.test,mail.test +\n",
+            "alias mail.test,MAIL\u{FF0E}test +\n",
+            "alias yahoo.*,Yahoo.* -\n",
         ] {
             assert_eq!(
                 codes_with(&plain(""), "", "", bad),

@@ -3,3 +3,4 @@ The Yahoo and Microsoft families are patterns (`yahoo.*`, `ymail.*`, `outlook.*`
 A `domain` or `deny-domain` rule on a domain of a shared family covers the whole family: `domain gmail.com` refuses `googlemail.com`, `domain pm.me` refuses the other Proton domains, and `domain icloud.com` refuses `me.com` and `mac.com`.
 `shop@user.fastmail.com` is `user+shop@fastmail.com`, as Fastmail delivers it, instead of `user@fastmail.com`: a rule for either spelling covers the other, and a subdomain rule no longer denies every tag on the user. The subdomain fold also runs on the domains a `shared` family adds and is folded again, so `dots` reaches a dotted user label.
 A punycode subdomain label is decoded to Unicode before it becomes the local part, so `x@bücher.fastmail.com` matches a rule for `bücher@fastmail.com`.
+An `alias` line that names one domain or one flag twice refuses the config.
