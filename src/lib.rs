@@ -6682,9 +6682,9 @@ const NON_WRITERS: &str = "echo printf cat grep egrep fgrep rg ls test [ [[ true
     unset set shopt shift local declare typeset readonly alias unalias \
     exit return break continue wait jobs umask ulimit getopts let kill \
     sleep wc head tail cut tr diff cmp stat file basename dirname \
-    realpath readlink date id whoami uname printenv seq expr mkdir rm \
+    realpath readlink date id whoami uname hostname printenv seq expr mkdir rm \
     rmdir touch chmod { } ( ) ! then do else elif fi done esac trap for \
-    select case";
+    select case emulate setopt print";
 
 /// Commands whose writes [`program_writes`] names, or that the walk
 /// reads into: a shell's script, `source`, `eval`.
@@ -14200,6 +14200,27 @@ hash -r 2> /dev/null
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
         let c = at("mysterybin; sh ./ok.sh");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(c.token.contains("may write any file"), "{}", c.token);
+    }
+
+    /// `hostname`, `print`, `emulate` and `setopt` write no file. A
+    /// command the guard does not know, named the same way, still may.
+    #[test]
+    fn hostname_print_emulate_and_setopt_write_nothing() {
+        let root = startup_root("nowrite");
+        std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "hostname; sh ./ok.sh",
+            "print -r -- hi; sh ./ok.sh",
+            "emulate sh; sh ./ok.sh",
+            "setopt extendedglob; sh ./ok.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        let c = at("not-a-builtin; sh ./ok.sh");
         assert_eq!(c.decision, Decision::Deny, "{}", c.token);
         assert!(c.token.contains("may write any file"), "{}", c.token);
     }
