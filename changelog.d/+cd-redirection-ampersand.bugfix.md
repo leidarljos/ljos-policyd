@@ -1,0 +1,1 @@
+The `&` of a redirection (`2>&1`, `>&2`, `<&3`, `&>log`) inside a `-c` script stays in its word instead of reading as a list sent to the background, so `sh -c 'pushd project >/dev/null 2>&1 && make clean-all'` reads `project/Makefile` again and is refused for its `rm -rf ~`; it was read where the line started and allowed. A lone `&` still sends its list to the background.

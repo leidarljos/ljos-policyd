@@ -39,11 +39,12 @@ Task runners
 A line that runs a task runner is also judged on what the target runs.
 The recipe comes from the file the runner reads, in the directory it
 runs in: the working directory, the one a ``cd`` or ``pushd`` earlier on
-the line enters, or the one ``-C``, ``--prefix`` or ``--cwd`` names.
+the line enters, the one ``env -C`` names for the command it runs, or
+the one the runner's own ``-C``, ``--prefix`` or ``--cwd`` names.
 Leading words that still run ``cd`` in this shell (``command``,
 ``builtin``, ``if``, ``while``, ``{`` and the other control keywords)
-are peeled before this check, and redirections before a ``cd`` target do
-not name the directory.
+are peeled before this check, and a redirection among the words of a
+``cd`` or ``pushd`` names neither the directory nor a ``pushd`` stack index.
 
 ============================================ ==============================================================================================
 Runner                                       File read
@@ -57,10 +58,28 @@ Runner                                       File read
 Each recipe line is judged as a ``sh -c`` script, and a refusal names the
 target and the line: :literal:`make clean-all runs \`rm -rf ~\`: rm-rf-outside-tmp`.
 Nothing is spawned. A missing or unreadable file, or a directory the
-line does not name (a variable, ``cd -``), leaves the line judged as
-written.
+line does not name (a variable), leaves the line judged as written.
 Raw newlines and carriage returns split script commands, and ``$'...'``
 ANSI-C quoted words are decoded before the line is judged.
+
+A ``cd`` or ``pushd`` to a relative path whose first part is not ``.`` or
+``..`` may enter that path under any ``CDPATH`` entry, so the runner after
+it is also read in each entry that holds the path.
+
+The line goes on past a ``cd`` that may fail, so the runner after it is
+read in each directory the line may be in, up to sixteen. A ``cd`` into a
+directory without the search bit moves nothing. A runner that may run
+in a directory past those sixteen is refused, as
+``make clean-all may run in an untracked directory``.
+
+A ``cd -`` or ``pushd -`` enters ``OLDPWD``, which each ``cd``, ``pushd`` and
+``popd`` on the line moves, and a script the line runs starts with the
+one its command has. Without ``OLDPWD`` in the environment, and in a
+recipe's line, where it is not followed, a runner after ``cd -`` is
+refused the same way.
+
+The words ``xargs`` adds from stdin can name any target, so a runner that
+``xargs`` runs is refused, as ``xargs make may take a target from stdin``.
 
 Argument limits
 ===============

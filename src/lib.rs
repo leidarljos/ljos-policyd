@@ -97,9 +97,37 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
     if table.decision != Decision::Allow || depth >= SCRIPT_DEPTH {
         return table;
     }
+    // A recipe's shell has the OLDPWD of wherever the line ran its runner,
+    // which is not followed, and without OLDPWD the line's own `cd -`
+    // may be in another shell's.
+    let oldpwd = std::env::var_os("OLDPWD")
+        .filter(|p| depth == 0 && !p.is_empty())
+        .map_or_else(|| UNTRACKED.into(), |p| cwd.join(p));
     let mut runs = Vec::new();
-    runner_commands(argv, cwd, 0, &mut runs);
-    for (run, dir) in runs {
+    runner_commands(argv, cwd, &[oldpwd], 0, &mut runs);
+    for (run, dir, stdin) in runs {
+        if is_untracked(&dir) && scripts::runner(&run) {
+            return Checked {
+                decision: Decision::Deny,
+                code: PolicyReason::ShellDangerousRunner,
+                token: Cow::Owned(format!(
+                    "{} may run in an untracked directory",
+                    run.join(" ")
+                )),
+            };
+        }
+        // The words `xargs` adds can name any target, so the ones the line
+        // shows say nothing of what runs.
+        if stdin && scripts::runner(&run) {
+            return Checked {
+                decision: Decision::Deny,
+                code: PolicyReason::ShellDangerousRunner,
+                token: Cow::Owned(format!(
+                    "xargs {} may take a target from stdin",
+                    run.join(" ")
+                )),
+            };
+        }
         for line in scripts::resolved(&run, &dir) {
             let sh = ["sh".to_string(), "-c".to_string(), line.clone()];
             let c = check_shell_in(&sh, &dir, depth + 1);
@@ -116,15 +144,37 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
 }
 
 /// How many directories the commands after a `cd` that may have failed
-/// are read in. Past this, a further `cd` drops the ones it leaves.
+/// are read in. Past this, a further `cd` leaves the ones it drops
+/// untracked.
 const MAX_DIRS: usize = 16;
 
+/// Stands for a directory the line may be in that is not followed. No
+/// real directory holds a NUL byte, and every path joined onto it keeps
+/// it, so nothing is read there; a task runner that may run there is
+/// refused instead.
+const UNTRACKED: &str = "/\0";
+
+fn is_untracked(d: &std::path::Path) -> bool {
+    d.as_os_str().as_encoded_bytes().contains(&0)
+}
+
 /// Add each of `dirs` that `set` lacks, while it holds fewer than
-/// [`MAX_DIRS`].
+/// [`MAX_DIRS`]. One past that is dropped, and [`UNTRACKED`] goes in once
+/// in its place.
 fn add_dirs(set: &mut Vec<std::path::PathBuf>, dirs: impl IntoIterator<Item = std::path::PathBuf>) {
     for d in dirs {
-        if set.len() < MAX_DIRS && !set.contains(&d) {
+        let d = if is_untracked(&d) {
+            UNTRACKED.into()
+        } else {
+            d
+        };
+        if set.contains(&d) {
+            continue;
+        }
+        if set.len() < MAX_DIRS {
             set.push(d);
+        } else if !set.iter().any(|s| is_untracked(s)) {
+            set.push(UNTRACKED.into());
         }
     }
 }
@@ -136,44 +186,67 @@ fn add_dirs(set: &mut Vec<std::path::PathBuf>, dirs: impl IntoIterator<Item = st
 /// in a subshell: a stage of a pipeline, or a list sent to the background
 /// with `&`. The line goes on past a `cd` that fails at a `;` or `||`, so
 /// the commands there are read both where it went and where it was. A
-/// script nested in the line starts where the command that runs it does.
+/// script nested in the line starts where the command that runs it does,
+/// and with its `cd -`, which goes to one of `oldpwd` at the start.
+/// Each command also says whether `xargs` adds words to it from stdin.
 fn runner_commands(
     argv: &[String],
     cwd: &std::path::Path,
+    oldpwd: &[std::path::PathBuf],
     depth: usize,
-    out: &mut Vec<(Vec<String>, std::path::PathBuf)>,
+    out: &mut Vec<(Vec<String>, std::path::PathBuf, bool)>,
 ) {
-    // Every directory the next command may run in. A `cd` before `&&`
-    // holds for the commands after it, and the directories it left wait
-    // in `failed` for the next `;` or `||`.
+    // Every directory the next command may run in, and every one its
+    // `cd -` may enter. A `cd` before `&&` holds for the commands after
+    // it, and the directories it left wait in `failed` and `old_failed`
+    // for the next `;` or `||`.
     let mut here = vec![cwd.to_path_buf()];
+    let mut old = oldpwd.to_vec();
     let mut failed = Vec::new();
+    let mut old_failed = Vec::new();
     // Each `pushd`'s directories, and whether it surely ran.
     let mut pushed: Vec<(Vec<std::path::PathBuf>, bool)> = Vec::new();
     // Where the list now running started, for a `&` to put back.
-    let mut list = (here.clone(), pushed.clone());
+    let mut list = (here.clone(), old.clone(), pushed.clone());
     let mut after = ";";
     let mut ran_in = Vec::new();
     for (cmd, end) in ended_commands(argv) {
         if after == "&" {
-            (here, pushed) = list.clone();
+            (here, old, pushed) = list.clone();
             failed.clear();
+            old_failed.clear();
         }
         if matches!(after, ";" | "||") {
             add_dirs(&mut here, failed.drain(..));
+            add_dirs(&mut old, old_failed.drain(..));
             for p in &mut pushed {
                 p.1 = false;
             }
         }
         if matches!(after, ";" | "&") {
-            list = (here.clone(), pushed.clone());
+            list = (here.clone(), old.clone(), pushed.clone());
         }
         let piped = after == "|" || end == "|";
         // A `cd` before `&&` holds for what runs after it, unless a `||`
         // before it may have skipped it.
         let gates = end == "&&" && after != "||";
         after = end;
-        ran_in.push(here.clone());
+        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        let run = unwrap_wrappers(&owned).0.to_vec();
+        // `env -C DIR` runs its own command, and any script it hands a
+        // shell, in DIR, and moves nothing after it.
+        let wrappers = &owned[..owned.len() - run.len()];
+        let at: Vec<_> = here.iter().map(|d| env_dir(wrappers, d)).collect();
+        ran_in.push((at.clone(), old.clone()));
+        // A subshell or substitution in the command runs where the
+        // command does, and a `cd` inside it moves only itself.
+        if depth < MAX_DEPTH {
+            for body in cmd.iter().flat_map(|w| substitutions(w)) {
+                for dir in &here {
+                    runner_commands(&shell_words(&body), dir, &old, depth + 1, out);
+                }
+            }
+        }
         // An assignment in front of a builtin is set for that command
         // alone: `FOO=1 cd dir` still moves the shell.
         let words = &cmd[cmd.iter().take_while(|w| is_assignment(w)).count()..];
@@ -185,39 +258,96 @@ fn runner_commands(
         if b == "popd" {
             if let Some((back, sure)) = pushed.pop() {
                 let now = std::mem::replace(&mut here, back);
+                let was = std::mem::replace(&mut old, now.clone());
                 if !sure {
                     add_dirs(&mut here, now);
+                    add_dirs(&mut old, was);
                 }
             }
             continue;
         }
         if b == "cd" || b == "pushd" {
+            let pushd = b == "pushd";
+            let args = operands(&words[1..]);
+            // `pushd -n` changes the stack and leaves the directory.
+            let keep = pushd && args.contains(&"-n");
+            let args: Vec<&str> = args.into_iter().filter(|a| !keep || *a != "-n").collect();
+            if pushd && args.first().is_none_or(|a| stack_index(a)) {
+                let stack: Vec<_> = std::iter::once((here.clone(), true))
+                    .chain(pushed.iter().rev().cloned())
+                    .collect();
+                if let Some(mut s) = rotated(&stack, args.first().copied()) {
+                    let top = s.remove(0).0;
+                    pushed = s
+                        .into_iter()
+                        .rev()
+                        .map(|(d, sure)| (d, sure && gates))
+                        .collect();
+                    if !keep {
+                        let from = std::mem::replace(&mut here, top);
+                        let was = std::mem::replace(&mut old, from.clone());
+                        add_dirs(if gates { &mut old_failed } else { &mut old }, was);
+                        add_dirs(if gates { &mut failed } else { &mut here }, from);
+                    }
+                }
+                continue;
+            }
+            let named: Vec<_> = here
+                .iter()
+                .flat_map(|d| entered(&args, d, pushd, &old))
+                .collect();
+            if pushd && (keep || named.is_empty()) {
+                // A directory the line does not name still takes its place
+                // on the stack, and is read as the one the line is in.
+                if !keep {
+                    add_dirs(&mut old, here.clone());
+                }
+                let mut dirs = Vec::new();
+                add_dirs(
+                    &mut dirs,
+                    if named.is_empty() {
+                        here.clone()
+                    } else {
+                        named
+                    },
+                );
+                pushed.push((dirs, gates));
+                continue;
+            }
             // A `cd` that may have failed keeps the directories it left,
-            // and one into a directory that is not there moves nothing.
+            // and one into a directory that is not there, or that lacks
+            // the search bit, moves nothing. One the line does not name
+            // is read as staying, and a `cd -` after it may come back.
             let mut to = Vec::new();
             add_dirs(
                 &mut to,
-                here.iter()
-                    .filter_map(|d| entered(&words[1..], d, b == "pushd"))
-                    .filter(|d| gates || d.is_dir()),
+                named
+                    .into_iter()
+                    .filter(|d| gates || is_untracked(d) || d.join(".").is_dir()),
             );
-            if !to.is_empty() {
+            if to.is_empty() {
+                add_dirs(&mut old, here.clone());
+            } else {
                 let from = std::mem::replace(&mut here, to);
                 if b == "pushd" {
                     pushed.push((from.clone(), gates));
                 }
+                let was = std::mem::replace(&mut old, from.clone());
+                add_dirs(if gates { &mut old_failed } else { &mut old }, was);
                 add_dirs(if gates { &mut failed } else { &mut here }, from);
             }
             continue;
         }
-        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
-        let run = unwrap_wrappers(&owned).0.to_vec();
         if run.is_empty() {
             continue;
         }
-        for dir in &here {
-            if !out.iter().any(|(r, d)| *r == run && d == dir) {
-                out.push((run.clone(), dir.clone()));
+        let stdin = wrappers.iter().any(|w| base_of(w) == "xargs");
+        for dir in &at {
+            if !out
+                .iter()
+                .any(|(r, d, s)| *r == run && d == dir && *s == stdin)
+            {
+                out.push((run.clone(), dir.clone(), stdin));
             }
         }
     }
@@ -226,50 +356,178 @@ fn runner_commands(
     }
     for (i, inner) in inner_commands_at(argv) {
         if inner.as_slice() != argv {
-            for dir in &ran_in[i] {
-                runner_commands(&inner, dir, depth + 1, out);
+            let (dirs, old) = &ran_in[i];
+            for dir in dirs {
+                runner_commands(&inner, dir, old, depth + 1, out);
             }
         }
     }
 }
 
-/// The directory `cd` or `pushd` with `args` enters from `dir`: a path,
-/// `~` or `~/path`, or home for a bare `cd`. A bare `pushd`, `-`, a
-/// stack index, a variable or a substitution names no directory the line
-/// shows, so the caller keeps the one it has.
-fn entered(args: &[&str], dir: &std::path::Path, pushd: bool) -> Option<std::path::PathBuf> {
-    let home = || std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let mut to = None;
-    let mut i = 0;
-    while i < args.len() {
-        let a = args[i];
-        if is_redirection(a) {
-            i += 1;
-            let rest = a.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
-            if rest.chars().all(|c| matches!(c, '>' | '<' | '&' | '-')) && i < args.len() {
-                i += 1;
-            }
+/// The words after `cd` or `pushd` that are not redirections, nor the file
+/// a redirection names in the word after it.
+fn operands<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut words = args.iter();
+    while let Some(&a) = words.next() {
+        if !is_redirection(a) {
+            out.push(a);
             continue;
         }
-        if !a.starts_with(['-', '+']) || a == "-" {
-            to = Some(a);
-            break;
+        let rest = a.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+        if rest.chars().all(|c| matches!(c, '>' | '<' | '&' | '-')) {
+            words.next();
         }
-        i += 1;
     }
-    let Some(to) = to else {
-        return if pushd { None } else { home() };
+    out
+}
+
+/// The directories `cd` or `pushd` with `args` may enter from `dir`: a
+/// path, `~` or `~/path`, home for a bare `cd`, `old` for `-`, and for a
+/// relative path whose first part is not `.` or `..`, each `CDPATH`
+/// entry that holds it. A bare `pushd`, a stack index, a variable or a
+/// substitution names no directory the line shows, so the caller keeps
+/// the one it has.
+fn entered(
+    args: &[&str],
+    dir: &std::path::Path,
+    pushd: bool,
+    old: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let Some(&to) = args
+        .iter()
+        .find(|a| !a.starts_with(['-', '+']) || **a == "-")
+    else {
+        return if pushd { None } else { home_dir() }.into_iter().collect();
     };
-    if to == "-" || to.contains(['$', '`']) {
+    if to == "-" {
+        return old.to_vec();
+    }
+    let Some(path) = path_from(to, dir) else {
+        return Vec::new();
+    };
+    let mut dirs = vec![path];
+    let searched = !to.starts_with('~')
+        && matches!(
+            std::path::Path::new(to).components().next(),
+            Some(std::path::Component::Normal(_))
+        );
+    if let Some(cdpath) = std::env::var_os("CDPATH").filter(|_| searched) {
+        // The shell takes the first entry it can enter, or else `dir`; an
+        // entry that names no directory the line shows may be any.
+        for entry in cdpath.to_string_lossy().split(':') {
+            let d = path_from(entry, dir)
+                .unwrap_or_else(|| UNTRACKED.into())
+                .join(to);
+            if is_untracked(&d) || d.join(".").is_dir() {
+                dirs.push(d);
+            }
+        }
+    }
+    dirs
+}
+
+/// Whether `a` is a `pushd` stack index, `+N` or `-N`.
+fn stack_index(a: &str) -> bool {
+    a.len() > 1 && a.starts_with(['+', '-']) && a[1..].bytes().all(|c| c.is_ascii_digit())
+}
+
+/// A directory stack, top first: each entry's directories, and whether the
+/// `pushd` that left it surely ran.
+type Stack = Vec<(Vec<std::path::PathBuf>, bool)>;
+
+/// `stack` after `pushd` brings entry `index` to the top: `+N` counts from
+/// the top and `-N` from the bottom, and a bare `pushd` swaps the top two.
+/// None when the stack is too short. An entry the index counts past may
+/// be missing, so the one it names may be another and the top may then be
+/// any directory on the stack.
+fn rotated(stack: &Stack, index: Option<&str>) -> Option<Stack> {
+    let n: usize = index.map_or(Some(1), |a| a[1..].parse().ok())?;
+    let from_top = !index.is_some_and(|a| a.starts_with('-'));
+    let i = if from_top {
+        n
+    } else {
+        stack.len().checked_sub(n + 1)?
+    };
+    if i >= stack.len() {
+        return None;
+    }
+    let counted = if from_top { &stack[1..=i] } else { &stack[1..] };
+    let mut s = stack.clone();
+    if index.is_none() {
+        s.swap(0, 1);
+    } else {
+        s.rotate_left(i);
+    }
+    if counted.iter().any(|(_, sure)| !sure) {
+        s[0].0.clear();
+        add_dirs(
+            &mut s[0].0,
+            stack.iter().flat_map(|(d, _)| d.iter().cloned()),
+        );
+        for e in &mut s {
+            e.1 = false;
+        }
+    }
+    Some(s)
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+/// Where the path word `to` lands from `dir`: `~` and `~/path` from home,
+/// anything else joined onto `dir`. A variable, a substitution or `~user`
+/// names no directory the line shows.
+fn path_from(to: &str, dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    if to.contains(['$', '`']) {
         return None;
     }
     if to == "~" {
-        return home();
+        return home_dir();
     }
     if let Some(rest) = to.strip_prefix("~/") {
-        return home().map(|h| h.join(rest));
+        return home_dir().map(|h| h.join(rest));
     }
     (!to.starts_with('~')).then(|| dir.join(to))
+}
+
+/// The directory a command runs in from `dir` after the runner words
+/// `wrappers` in front of it: the one `env -C DIR`, `-CDIR`, `--chdir DIR`
+/// or `--chdir=DIR` names, or `dir`. The last of an `env`'s flags wins,
+/// from where that `env` starts.
+fn env_dir(wrappers: &[String], dir: &std::path::Path) -> std::path::PathBuf {
+    let mut at = dir.to_path_buf();
+    // Where the `env` whose flags are being read starts.
+    let mut from = None;
+    let mut words = wrappers.iter().map(String::as_str);
+    while let Some(w) = words.next() {
+        if base_of(w) == "env" {
+            from = Some(at.clone());
+            continue;
+        }
+        let Some(start) = &from else {
+            continue;
+        };
+        let to = if w == "-C" || w == "--chdir" {
+            words.next()
+        } else if let Some(to) = w.strip_prefix("--chdir=") {
+            Some(to)
+        } else if let Some(to) = w.strip_prefix("-C").filter(|t| !t.is_empty()) {
+            Some(to)
+        } else {
+            if matches!(w, "-u" | "--unset" | "-S" | "--split-string") {
+                words.next();
+            } else if !w.starts_with('-') && !is_assignment(w) {
+                from = None;
+            }
+            continue;
+        };
+        if let Some(d) = to.and_then(|t| path_from(t, start)) {
+            at = d;
+        }
+    }
+    at
 }
 
 /// Words that keep `cd` in this shell when they run before it.
@@ -3811,6 +4069,46 @@ mod tests {
         }
     }
 
+    /// The lines an agent runs every day stay allowed beside a project
+    /// whose `clean-all` deletes home, whether the line enters it or
+    /// starts there.
+    #[test]
+    fn allows_everyday_lines_beside_a_refused_target() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "cd project && make test",
+            "cd project; make test",
+            "cd project && make clean",
+            "FOO=1 cd project && make test",
+            "pushd project && make test && popd",
+            "pushd project; make test; popd",
+            "cd project && bash -lc 'make test'",
+            "cd project && rm -rf target",
+            "make test 2>&1",
+            "bash -lc 'make test'",
+            "cargo test",
+            "git status",
+        ] {
+            let c = entering("everyday", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+        let project = std::env::temp_dir()
+            .join(format!("policyd-lib-{}-everyday", std::process::id()))
+            .join("project");
+        for line in [
+            "make test",
+            "make test 2>&1",
+            "make clean",
+            "bash -lc 'make test'",
+            "cargo test",
+            "git status",
+            "rm -rf target",
+        ] {
+            let c = check_shell_in(&shell_words(line), &project, 0);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+    }
+
     /// Safe lines from the rereview stay allowed.
     #[test]
     fn keeps_rereview_safe_lines_allowed() {
@@ -4002,6 +4300,211 @@ mod tests {
             "cd safe && pushd .. && popd && make clean-all",
         ] {
             assert_eq!(leaving("fail-cd", line), Decision::Allow, "{line}");
+        }
+    }
+
+    /// Sixteen directories fit: after fifteen `cd`s that may fail, a runner
+    /// is read in each directory they enter and in the one the line starts
+    /// in, which went in first.
+    #[test]
+    fn reads_a_runner_in_sixteen_directories() {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-sixteen", std::process::id()));
+        let mut line = String::new();
+        for i in 0..MAX_DIRS {
+            let d = root.join(format!("d{i}"));
+            std::fs::create_dir_all(&d).expect("dir");
+            std::fs::write(d.join("Makefile"), "clean-all:\n\techo clean\n").expect("write");
+            if i > 0 {
+                line.push_str(&format!("cd {} ; ", d.display()));
+            }
+        }
+        line.push_str("make clean-all");
+        std::fs::write(root.join("Makefile"), MAKEFILE).expect("write");
+        let argv = shell_words(&line);
+        assert_eq!(check_shell_in(&argv, &root, 0).decision, Decision::Deny);
+        assert_eq!(
+            check_shell_in(&argv, &root.join("d0"), 0).decision,
+            Decision::Allow
+        );
+    }
+
+    /// Past sixteen directories the one dropped is not followed, so a
+    /// runner after it is refused. A directory without the search bit is
+    /// not entered, and fills no place.
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_runner_past_sixteen_directories() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("policyd-lib-{}-seventeen", std::process::id()));
+        let mut line = String::new();
+        for i in 0..=MAX_DIRS {
+            let d = root.join(format!("d{i}"));
+            std::fs::create_dir_all(&d).expect("dir");
+            std::fs::write(d.join("Makefile"), "clean-all:\n\techo clean\n").expect("write");
+            if i > 0 {
+                line.push_str(&format!("cd {} ; ", d.display()));
+            }
+        }
+        line.push_str("make clean-all");
+        std::fs::write(root.join("Makefile"), MAKEFILE).expect("write");
+        let argv = shell_words(&line);
+        let c = check_shell_in(&argv, &root, 0);
+        assert_eq!(c.decision, Decision::Deny);
+        assert_eq!(c.token, "make clean-all may run in an untracked directory");
+        let c = check_shell_in(&argv, &root.join("d0"), 0);
+        assert_eq!(c.decision, Decision::Deny);
+
+        let shut: Vec<_> = (0..18).map(|i| root.join(format!("shut{i}"))).collect();
+        for d in &shut {
+            std::fs::create_dir_all(d).expect("dir");
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        }
+        let cds: String = shut
+            .iter()
+            .map(|d| format!("cd {} ; ", d.display()))
+            .collect();
+        let files = [("Makefile", MAKEFILE)];
+        let line = format!("cd project && {cds}make clean-all");
+        assert_eq!(entering("shut-cd", &files, &line).decision, Decision::Deny);
+        // Root may enter a directory with no mode bits, and the shell then
+        // does too.
+        let searchable = shut[0].join(".").is_dir();
+        let line = format!("{cds}make clean-all");
+        let c = check_shell_in(&shell_words(&line), &root.join("d0"), 0);
+        let want = if searchable {
+            Decision::Deny
+        } else {
+            Decision::Allow
+        };
+        assert_eq!(c.decision, want);
+        for d in &shut {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+    }
+
+    /// `xargs` adds words from stdin to the runner it runs, and they can
+    /// name any target, so the runner is refused.
+    #[test]
+    fn refuses_a_runner_xargs_feeds() {
+        let files = [("Makefile", MAKEFILE), ("package.json", PACKAGE)];
+        for line in [
+            "cd project && printf '%s\\n' clean-all | xargs make",
+            "cd project && echo clean-all | xargs make test",
+            "cd project && echo clean-all | xargs -n 1 nice make",
+            "cd project && echo nuke | xargs npm run",
+            "echo clean-all | xargs make -C project",
+        ] {
+            let c = entering("xargs-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        let c = entering("xargs-cd", &files, "cd project && echo x | xargs make");
+        assert_eq!(c.token, "xargs make may take a target from stdin");
+        for line in [
+            "cd project && ls | xargs wc -l",
+            "cd project && make test && echo x | xargs echo",
+        ] {
+            let c = entering("xargs-cd", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+    }
+
+    /// A subshell or substitution runs where the command holding it runs,
+    /// after any `cd` before it on the line.
+    #[test]
+    fn reads_a_subshell_where_the_line_enters() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "sh -c 'cd project && (make clean-all)'",
+            "sh -c 'cd project && echo $(make clean-all)'",
+            "cd project && (make clean-all)",
+            "cd project && echo \"$(make clean-all)\"",
+            "cd project && echo `make clean-all`",
+        ] {
+            let c = entering("sub-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        for line in [
+            "cd project && (make test)",
+            "cd project && echo $(make test)",
+        ] {
+            let c = entering("sub-cd", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+        for line in [
+            "cd safe && (make clean-all)",
+            "cd safe && echo $(make clean-all)",
+        ] {
+            assert_eq!(leaving("sub-cd", line), Decision::Allow, "{line}");
+        }
+    }
+
+    /// `env -C DIR` runs its own command in DIR, and only that command.
+    #[test]
+    fn reads_a_runner_where_env_chdir_runs_it() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "env -C project make clean-all",
+            "env -Cproject make clean-all",
+            "env --chdir project make clean-all",
+            "env --chdir=project make clean-all",
+            "env -i -u HOME -C {dir} make clean-all",
+            "env -C /tmp -C project make clean-all",
+            "nice env -C project sh -c 'make clean-all'",
+        ] {
+            let c = entering("env-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        let c = entering("env-cd", &files, "env -C project true && make clean-all");
+        assert_eq!(c.decision, Decision::Allow);
+        assert_eq!(
+            leaving("env-cd", "env -C safe true && make clean-all"),
+            Decision::Deny
+        );
+        assert_eq!(
+            leaving("env-cd", "env -C safe make clean-all"),
+            Decision::Allow
+        );
+    }
+
+    /// `pushd -n` stacks a directory without entering it, and `pushd +N`,
+    /// `-N` or a bare `pushd` enters the one it brings to the top.
+    #[test]
+    fn follows_pushd_through_its_stack() {
+        for line in [
+            "pushd -n safe && make clean-all",
+            "pushd safe && pushd +1 && make clean-all",
+            "pushd safe && pushd -0 && make clean-all",
+            "pushd safe && pushd && make clean-all",
+            "pushd safe && pushd \"$PWD\" && pushd +2 && make clean-all",
+            "pushd safe ; pushd +1 && make clean-all",
+            "pushd safe >/dev/null && pushd >/dev/null && make clean-all",
+            "pushd safe && pushd 2>/dev/null +1 && make clean-all",
+            "pushd safe && pushd > /dev/null -0 && make clean-all",
+        ] {
+            assert_eq!(leaving("pushd-stack", line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "pushd -n safe && popd && make clean-all",
+            "cd safe && pushd -n .. && make clean-all",
+            "pushd safe && pushd +0 && make clean-all",
+            "pushd safe && pushd -1 && make clean-all",
+            "pushd safe >/dev/null && pushd >/dev/null +0 && make clean-all",
+        ] {
+            assert_eq!(leaving("pushd-stack", line), Decision::Allow, "{line}");
+        }
+        let other = std::env::temp_dir()
+            .join(format!("policyd-lib-{}-pushd-other", std::process::id()))
+            .join("project/other");
+        std::fs::create_dir_all(&other).expect("dir");
+        std::fs::write(other.join("Makefile"), "clean-all:\n\techo clean\n").expect("write");
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "pushd project && pushd other && pushd +1 && make clean-all",
+            "pushd project && pushd \"$PWD/other\" && pushd +1 && make clean-all",
+        ] {
+            let c = entering("pushd-other", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
         }
     }
 

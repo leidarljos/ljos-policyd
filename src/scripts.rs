@@ -39,6 +39,21 @@ pub(crate) fn resolved(run: &[String], cwd: &Path) -> Vec<String> {
     }
 }
 
+/// Whether `run` names one of the runners [`resolved`] reads a file for,
+/// whatever its target.
+pub(crate) fn runner(run: &[String]) -> bool {
+    let Some(first) = run.first() else {
+        return false;
+    };
+    match first.rsplit('/').next().unwrap_or(first) {
+        "make" | "gmake" | "npm" | "pnpm" | "yarn" | "bun" | "just" | "cargo-make" | "makers" => {
+            true
+        }
+        "cargo" => run.get(1).is_some_and(|a| a == "make"),
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------- cache
 
 enum Parsed {
