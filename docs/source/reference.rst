@@ -262,15 +262,17 @@ mailbox at ``<local>@<user>.fastmail.com`` (one label, then
 label is part of the user name. ``proton.me``,
 ``protonmail.com``, ``protonmail.ch`` and ``pm.me`` are one
 domain, and so are ``icloud.com``, ``me.com`` and ``mac.com``,
-each with ``+``. ``outlook.com``, ``hotmail.com``, ``live.com``,
-``msn.com`` and their country variants are separate domains, each
-with ``+``. On ``yahoo.com``, its country variants, ``ymail.com``
-and ``rocketmail.com``, ``-`` is a separator, and an address rule
+each with ``+``. ``outlook.*``, ``hotmail.*``, ``live.*`` and
+``msn.*`` (every domain with that first label, whatever the
+country suffix) are separate domains, each with ``+``. On
+``yahoo.*``, ``ymail.*`` and ``rocketmail.com``, ``-`` is a
+separator, and an address rule
 is also cut at its first separator, so a rule for one disposable
 address ``<base>-<keyword>`` covers ``<base>`` and every keyword.
 An ``alias`` line adds a family to these:
-``alias <domain>[,<domain>...] <separators> [flag...]``. The
-separators are checked as on the ``subaddress`` line, and the flags
+``alias <domain>[,<domain>...] <separators> [flag...]``. A
+domain may be ``<label>.*``, every domain whose first label is
+``<label>``. The separators are checked as on the ``subaddress`` line, and the flags
 are ``shared`` (the domains are one mailbox), ``dots`` (dots in
 the local part are ignored), ``subdomain`` (``<local>@<user>.<domain>``
 is ``<user>@<domain>``) and ``cut`` (the rule is also cut at its

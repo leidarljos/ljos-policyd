@@ -721,7 +721,7 @@ fn skeleton(local: &str) -> String {
 }
 
 fn same_family(domain: &str, other: &str, families: &[AliasFamily]) -> bool {
-    domain == other || families_of(domain, families).any(|f| f.domains.iter().any(|d| d == other))
+    domain == other || families_of(domain, families).any(|f| f.has(other))
 }
 
 fn separators(domain: &str, config: &Config) -> String {
@@ -742,6 +742,9 @@ fn is_subaddress(rule_local: &str, local: &str, seps: &str) -> bool {
 /// Provider alias families, one per line in the form of a config `alias`
 /// value, which adds a family to these: `<domain>[,<domain>...] <separators> [flag...]`. The
 /// separators are added to the `subaddress` line on those domains.
+/// `<label>.*` is every domain whose first label is `<label>`, so
+/// `yahoo.*` covers `yahoo.com.br` and any other country suffix. It
+/// also covers `yahoo.example.test`, which can only over-block.
 /// `shared` makes the domains one mailbox, `dots` ignores dots in the
 /// local part, and `subdomain` reads `<anything>@<user>.<domain>` as
 /// `<user>@<domain>`. `cut` also cuts the rule's own local part at the
@@ -759,10 +762,7 @@ const ALIAS_FAMILIES: &[&str] = &[
     // Plus addressing only. The domains and their country variants are
     // separate mailboxes, so none of them is shared:
     // https://support.microsoft.com/en-us/outlook/send-email-from-a-different-address-in-outlook-com
-    "outlook.com,hotmail.com,live.com,msn.com +",
-    "outlook.fr,outlook.de,outlook.es,outlook.it,outlook.jp +",
-    "hotmail.co.uk,hotmail.fr,hotmail.de,hotmail.es,hotmail.it +",
-    "live.co.uk,live.fr,live.de,live.it,live.nl,live.ca +",
+    "outlook.*,hotmail.*,live.*,msn.* +",
     // One account across the four Proton domains, with plus aliases:
     // https://proton.me/support/mail
     // https://proton.me/support/addresses-and-aliases
@@ -775,8 +775,8 @@ const ALIAS_FAMILIES: &[&str] = &[
     // Disposable addresses are `<base>-<keyword>`, so a denied
     // disposable address denies its base and every keyword on it:
     // https://help.yahoo.com/kb/SLN36718.html
-    "yahoo.com,yahoo.co.uk,yahoo.fr,yahoo.de,yahoo.es,yahoo.it,yahoo.ca,yahoo.com.au - cut",
-    "ymail.com,rocketmail.com - cut",
+    "yahoo.* - cut",
+    "ymail.*,rocketmail.com - cut",
 ];
 
 struct AliasFamily {
@@ -802,7 +802,7 @@ fn alias_family(value: &str) -> Option<AliasFamily> {
     let domains = parts
         .next()?
         .split(',')
-        .map(normalize_domain)
+        .map(alias_domain)
         .collect::<Option<Vec<_>>>()?;
     let separators = parts.next()?.to_string();
     if !valid_separators(&separators) {
@@ -829,13 +829,45 @@ fn alias_family(value: &str) -> Option<AliasFamily> {
     Some(family)
 }
 
+/// A domain, or `<label>.*` with one label before the `.*`.
+fn alias_domain(value: &str) -> Option<String> {
+    let (name, pattern) = match value.strip_suffix(".*") {
+        Some(label) => (label, true),
+        None => (value, false),
+    };
+    let name = normalize_domain(name).filter(|n| !n.contains('*'))?;
+    match pattern {
+        true if name.contains('.') => None,
+        true => Some(format!("{name}.*")),
+        false => Some(name),
+    }
+}
+
+fn member_matches(member: &str, domain: &str) -> bool {
+    match member.strip_suffix(".*") {
+        Some(label) => domain
+            .split_once('.')
+            .is_some_and(|(first, rest)| first == label && !rest.is_empty()),
+        None => member == domain,
+    }
+}
+
+impl AliasFamily {
+    fn has(&self, domain: &str) -> bool {
+        self.domains.iter().any(|d| member_matches(d, domain))
+    }
+
+    /// The domains a fold can name, which leaves out the patterns.
+    fn literal_domains(&self) -> impl Iterator<Item = &String> {
+        self.domains.iter().filter(|d| !d.ends_with(".*"))
+    }
+}
+
 fn families_of<'a>(
     domain: &'a str,
     families: &'a [AliasFamily],
 ) -> impl Iterator<Item = &'a AliasFamily> {
-    families
-        .iter()
-        .filter(move |f| f.domains.iter().any(|d| d == domain))
+    families.iter().filter(move |f| f.has(domain))
 }
 
 /// Every `(local, domain)` the families make of one mailbox, itself
@@ -845,7 +877,7 @@ fn families_of<'a>(
 fn alias_forms(local: &str, domain: &str, families: &[AliasFamily]) -> Vec<(String, String)> {
     let mut forms = vec![(local.to_string(), domain.to_string())];
     for family in families.iter().filter(|f| f.subdomain) {
-        for base in &family.domains {
+        for base in family.literal_domains() {
             let user = domain
                 .strip_suffix(base.as_str())
                 .and_then(|rest| rest.strip_suffix('.'));
@@ -863,7 +895,7 @@ fn alias_forms(local: &str, domain: &str, families: &[AliasFamily]) -> Vec<(Stri
                 push_form(&mut forms, bare, domain.clone());
             }
             if family.shared {
-                for other in &family.domains {
+                for other in family.literal_domains() {
                     push_form(&mut forms, local.clone(), other.clone());
                 }
             }
@@ -1843,6 +1875,56 @@ pair left right
         let fast = "address user@fastmail.com\n";
         assert!(denied("user+x@fastmail.com", fast));
         assert!(denied("x@user.fastmail.com", fast));
+    }
+
+    /// `yahoo.*` and the Microsoft patterns name every country suffix,
+    /// so a domain the table never listed still gets the family, even
+    /// when `subaddress` leaves the family separator out.
+    #[test]
+    fn a_family_pattern_covers_every_country_suffix() {
+        let denied = |to: &str, deny: &str, extra: &str| {
+            codes_with(&plain(&format!("To: {to}\r\n")), deny, "", extra)
+                == vec!["recipient-address-denied"]
+        };
+        for suffix in ["com.br", "co.in", "com.sg", "com.hk", "com.mx", "co.nz"] {
+            let deny = format!("address base-shop@yahoo.{suffix}\n");
+            for local in ["base", "base-other", "base-shop"] {
+                let to = format!("{local}@yahoo.{suffix}");
+                assert!(denied(&to, &deny, "subaddress +\n"), "{to}");
+            }
+            assert!(!denied(&format!("based-x@yahoo.{suffix}"), &deny, ""));
+        }
+        for domain in [
+            "outlook.co.uk",
+            "outlook.com.au",
+            "hotmail.com.br",
+            "live.co.za",
+        ] {
+            let deny = format!("address bad@{domain}\n");
+            let to = format!("bad+x@{domain}");
+            assert!(denied(&to, &deny, "subaddress -\n"), "{to}");
+        }
+        let extra = "alias mailhost.* ~ cut\n";
+        let deny = "address base~shop@mailhost.test\n";
+        assert!(denied("base~other@mailhost.test", deny, extra));
+        assert!(!denied("base~other@mailhost.test", deny, ""));
+        assert!(denied(
+            "bad@mailhost.example",
+            "address bad@mailhost.test\n",
+            extra
+        ));
+        for bad in [
+            "alias *.test +\n",
+            "alias a.b.* +\n",
+            "alias * +\n",
+            "alias .* +\n",
+        ] {
+            assert_eq!(
+                codes_with(&plain(""), "", "", bad),
+                vec!["config-invalid"],
+                "{bad}"
+            );
+        }
     }
 
     /// An `alias` line in the config adds a family. A line the parser
