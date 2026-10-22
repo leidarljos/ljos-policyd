@@ -5423,6 +5423,24 @@ mod tests {
         );
     }
 
+    /// A quoted or escaped `;`, `&&` or `|` is an argument, not a separator.
+    #[test]
+    fn a_quoted_separator_is_an_argument() {
+        for line in [
+            "echo ';' cd safe && make clean-all",
+            "echo 'a;' cd safe && make clean-all",
+            "echo \\; cd safe && make clean-all",
+            "echo \"&&\" cd safe && make clean-all",
+            "find . -exec true {} \\; cd safe && make clean-all",
+        ] {
+            assert_eq!(leaving("quoted-sep", line), Decision::Deny, "{line}");
+        }
+        assert_eq!(
+            leaving("quoted-sep", "echo x; cd safe && make clean-all"),
+            Decision::Allow
+        );
+    }
+
     /// A redirection that names its descriptor by a variable, `{fd}>file`,
     /// is not the `cd` target, and it sets that variable in this shell.
     #[test]
