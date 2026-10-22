@@ -120,7 +120,8 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
 /// `eval` and wrapper inside it, down to [`MAX_DEPTH`]. A `cd`, `pushd`
 /// or `popd` moves the commands after it on the same line, unless it runs
 /// in a subshell: a stage of a pipeline, or a list sent to the background
-/// with `&`. A script nested in the line starts from `cwd`.
+/// with `&`. A script nested in the line starts where the command that
+/// runs it does.
 fn runner_commands(
     argv: &[String],
     cwd: &std::path::Path,
@@ -129,10 +130,10 @@ fn runner_commands(
 ) {
     let mut dir = cwd.to_path_buf();
     let mut pushed = Vec::new();
-    let mut own = Vec::new();
     // Where the list now running started, for a `&` to put back.
     let mut list = (dir.clone(), pushed.clone());
     let mut after = ";";
+    let mut ran_in = Vec::new();
     for (cmd, end) in ended_commands(argv) {
         if after == "&" {
             (dir, pushed) = list.clone();
@@ -142,6 +143,7 @@ fn runner_commands(
         }
         let piped = after == "|" || end == "|";
         after = end;
+        ran_in.push(dir.clone());
         // An assignment in front of a builtin is set for that command
         // alone: `FOO=1 cd dir` still moves the shell.
         let words = &cmd[cmd.iter().take_while(|w| is_assignment(w)).count()..];
@@ -168,18 +170,15 @@ fn runner_commands(
             continue;
         }
         if !out.iter().any(|(r, d)| *r == run && *d == dir) {
-            out.push((run.clone(), dir.clone()));
+            out.push((run, dir.clone()));
         }
-        own.push(run);
     }
     if depth >= MAX_DEPTH {
         return;
     }
-    // This line's own commands are already in `out` with their directory;
-    // read again from `cwd`, they would be judged in the wrong one.
-    for inner in inner_commands(argv) {
-        if inner.as_slice() != argv && !own.contains(&inner) {
-            runner_commands(&inner, cwd, depth + 1, out);
+    for (i, inner) in inner_commands_at(argv) {
+        if inner.as_slice() != argv {
+            runner_commands(&inner, &ran_in[i], depth + 1, out);
         }
     }
 }
@@ -240,11 +239,20 @@ fn host_argv_table_at(argv: &[String], depth: usize, moved: bool) -> Checked {
 /// The commands a line runs once separators are split, wrapper words are
 /// taken off, and a shell's `-c` script is read as its own line.
 fn inner_commands(argv: &[String]) -> Vec<Vec<String>> {
+    inner_commands_at(argv)
+        .into_iter()
+        .map(|(_, c)| c)
+        .collect()
+}
+
+/// [`inner_commands`], each with the index in [`commands`] of the command
+/// it comes from.
+fn inner_commands_at(argv: &[String]) -> Vec<(usize, Vec<String>)> {
     let mut out = Vec::new();
     // `g=git; $g push -f`: a bare assignment earlier on the line names what
     // a later `$g` or `${g}` command word runs.
     let mut names: Vec<(String, String)> = Vec::new();
-    for cmd in commands(argv) {
+    for (i, cmd) in commands(argv).into_iter().enumerate() {
         if cmd.iter().all(|w| is_assignment(w)) {
             for w in &cmd {
                 if let Some((k, v)) = w.split_once('=') {
@@ -276,35 +284,35 @@ fn inner_commands(argv: &[String]) -> Vec<Vec<String>> {
                 .collect::<Vec<_>>()
                 .as_slice()
         {
-            out.push(owned.clone());
+            out.push((i, owned.clone()));
         }
         let (run, handed) = unwrap_wrappers(&owned);
         if let Some(code) = inline_program(run) {
             for s in program_shell_strings(code) {
-                out.extend(script_lines(&s, 0).iter().map(|l| shell_words(l)));
+                out.extend(script_lines(&s, 0).iter().map(|l| (i, shell_words(l))));
             }
         }
         if let Some(script) = handed {
-            out.extend(script_lines(script, 0).iter().map(|l| shell_words(l)));
+            out.extend(script_lines(script, 0).iter().map(|l| (i, shell_words(l))));
             continue;
         }
         if run.is_empty() {
             continue;
         }
         if let Some(inside) = container_command(run) {
-            out.push(inside);
+            out.push((i, inside));
         }
         if let Some(script) = shell_script(run) {
-            out.extend(script_lines(script, 0).iter().map(|l| shell_words(l)));
+            out.extend(script_lines(script, 0).iter().map(|l| (i, shell_words(l))));
         } else if base_of(&run[0]) == "eval" {
             // eval joins its words with spaces and runs that as a script.
             out.extend(
                 script_lines(&run[1..].join(" "), 0)
                     .iter()
-                    .map(|l| shell_words(l)),
+                    .map(|l| (i, shell_words(l))),
             );
         } else {
-            out.push(run.to_vec());
+            out.push((i, run.to_vec()));
         }
     }
     out
@@ -3658,6 +3666,28 @@ mod tests {
             "assign-cd",
             &files,
             "pushd project && FOO=1 popd && make clean-all",
+        );
+        assert_eq!(c.decision, Decision::Allow);
+    }
+
+    /// A script the line hands a shell, `eval` or a named command word runs
+    /// where the line has moved to by then.
+    #[test]
+    fn reads_a_nested_script_where_the_line_enters() {
+        let files = [("Makefile", MAKEFILE), ("package.json", PACKAGE)];
+        for line in [
+            "cd project && bash -lc 'make clean-all'",
+            "cd project && env FOO=1 sh -c 'true; npm run nuke'",
+            "pushd project && eval make clean-all",
+            "m=make; cd project && $m clean-all",
+        ] {
+            let c = entering("nested-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+        let c = entering(
+            "nested-cd",
+            &files,
+            "bash -lc 'make clean-all' && cd project",
         );
         assert_eq!(c.decision, Decision::Allow);
     }
