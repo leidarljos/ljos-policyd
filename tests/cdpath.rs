@@ -1,0 +1,61 @@
+//! A `cd` or `pushd` to a relative name finds it through `CDPATH` as the
+//! shell does, so a task runner after it is read in each directory the
+//! shell may enter.
+
+fn check(dir: &std::path::Path, cdpath: Option<&str>, line: &str) -> String {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_ljos-policyd"));
+    cmd.args(["check", "--", "sh", "-c", line])
+        .current_dir(dir)
+        .env("PHRONESIS_STATE_DIR", dir.join("state"))
+        .env_remove("PHRONESIS_WORKSPACE")
+        .env_remove("PHRONESIS_JANET_PACK")
+        .env_remove("PHRONESIS_PREFIX")
+        .env_remove("PHRONESIS_PACK_ROOT");
+    match cdpath {
+        Some(p) => cmd.env("CDPATH", p),
+        None => cmd.env_remove("CDPATH"),
+    };
+    let out = cmd.output().expect("spawn check");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// `work/proj` is harmless and `lib/proj` runs `rm -rf ~/`, so a line
+/// from `work` that enters `proj` through `CDPATH=lib` is refused.
+#[test]
+fn reads_a_runner_where_cdpath_enters() {
+    let base = std::env::temp_dir().join(format!("ljos-policyd-cdpath-{}", std::process::id()));
+    let work = base.join("work");
+    let lib = base.join("lib");
+    for d in [work.join("proj"), lib.join("proj"), lib.join(".hid")] {
+        std::fs::create_dir_all(&d).unwrap();
+    }
+    let harmless = "test:\n\tcargo test\nclean-all:\n\techo clean\n";
+    let wipe = "test:\n\tcargo test\nclean-all:\n\trm -rf ~/\n";
+    std::fs::write(work.join("proj/Makefile"), harmless).unwrap();
+    std::fs::write(lib.join("proj/Makefile"), wipe).unwrap();
+    std::fs::write(lib.join(".hid/Makefile"), wipe).unwrap();
+    let abs = lib.to_string_lossy().into_owned();
+    for (cdpath, line) in [
+        (abs.as_str(), "cd proj && make clean-all"),
+        (abs.as_str(), "pushd proj && make clean-all"),
+        (abs.as_str(), "cd .hid && make clean-all"),
+        (abs.as_str(), "true ; cd proj ; make clean-all"),
+        ("/nowhere:../lib", "cd proj && make clean-all"),
+    ] {
+        let v = check(&work, Some(cdpath), line);
+        assert!(v.starts_with("deny\t"), "CDPATH={cdpath} {line}: {v}");
+    }
+    for (cdpath, line) in [
+        (Some(abs.as_str()), "cd ./proj && make clean-all"),
+        (Some(abs.as_str()), "cd proj && make test"),
+        (Some(abs.as_str()), "env -C proj make clean-all"),
+        (None, "cd proj && make clean-all"),
+    ] {
+        assert_eq!(
+            check(&work, cdpath, line),
+            "allow",
+            "CDPATH={cdpath:?} {line}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}

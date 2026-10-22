@@ -277,10 +277,7 @@ fn runner_commands(
                 }
                 continue;
             }
-            let named: Vec<_> = here
-                .iter()
-                .filter_map(|d| entered(&args, d, pushd))
-                .collect();
+            let named: Vec<_> = here.iter().flat_map(|d| entered(&args, d, pushd)).collect();
             if pushd && (keep || named.is_empty()) {
                 // A directory the line does not name still takes its place
                 // on the stack, and is read as the one the line is in.
@@ -338,21 +335,44 @@ fn runner_commands(
     }
 }
 
-/// The directory `cd` or `pushd` with `args` enters from `dir`: a path,
-/// `~` or `~/path`, or home for a bare `cd`. A bare `pushd`, `-`, a
-/// stack index, a variable or a substitution names no directory the line
-/// shows, so the caller keeps the one it has.
-fn entered(args: &[&str], dir: &std::path::Path, pushd: bool) -> Option<std::path::PathBuf> {
+/// The directories `cd` or `pushd` with `args` may enter from `dir`: a
+/// path, `~` or `~/path`, or home for a bare `cd`, and for a relative
+/// path whose first part is not `.` or `..`, each `CDPATH` entry that
+/// holds it. A bare `pushd`, `-`, a stack index, a variable or a
+/// substitution names no directory the line shows, so the caller keeps
+/// the one it has.
+fn entered(args: &[&str], dir: &std::path::Path, pushd: bool) -> Vec<std::path::PathBuf> {
     let Some(to) = args
         .iter()
         .find(|a| !a.starts_with(['-', '+']) || **a == "-")
     else {
-        return if pushd { None } else { home_dir() };
+        return if pushd { None } else { home_dir() }.into_iter().collect();
     };
     if *to == "-" {
-        return None;
+        return Vec::new();
     }
-    path_from(to, dir)
+    let Some(path) = path_from(to, dir) else {
+        return Vec::new();
+    };
+    let mut dirs = vec![path];
+    let searched = !to.starts_with('~')
+        && matches!(
+            std::path::Path::new(to).components().next(),
+            Some(std::path::Component::Normal(_))
+        );
+    if let Some(cdpath) = std::env::var_os("CDPATH").filter(|_| searched) {
+        // The shell takes the first entry it can enter, or else `dir`; an
+        // entry that names no directory the line shows may be any.
+        for entry in cdpath.to_string_lossy().split(':') {
+            let d = path_from(entry, dir)
+                .unwrap_or_else(|| UNTRACKED.into())
+                .join(to);
+            if is_untracked(&d) || d.join(".").is_dir() {
+                dirs.push(d);
+            }
+        }
+    }
+    dirs
 }
 
 /// Whether `a` is a `pushd` stack index, `+N` or `-N`.

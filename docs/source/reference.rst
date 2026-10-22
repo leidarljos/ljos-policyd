@@ -57,6 +57,10 @@ Nothing is spawned. A missing or unreadable file, or a directory the
 line does not name (a variable, ``cd -``), leaves the line judged as
 written.
 
+A ``cd`` or ``pushd`` to a relative path whose first part is not ``.`` or
+``..`` may enter that path under any ``CDPATH`` entry, so the runner after
+it is also read in each entry that holds the path.
+
 The line goes on past a ``cd`` that may fail, so the runner after it is
 read in each directory the line may be in, up to sixteen. A ``cd`` into a
 directory without the search bit moves nothing. A runner that may run
