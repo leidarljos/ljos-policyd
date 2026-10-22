@@ -108,6 +108,7 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
     let vars = Vars::from_env();
     let funcs = FnMap::new();
     let old = [oldpwd];
+    let files = Files::default();
     let inn = ShellIn {
         cwd,
         oldpwd: &old,
@@ -115,10 +116,18 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
         funcs: &funcs,
         fn_depth: 0,
         left_tree: false,
+        files: &files,
     };
     runner_commands(argv, &inn, 0, &mut runs, &mut denied);
     if let Some(c) = denied {
         return c;
+    }
+    if let Some(path) = files.borrow().written_then_run() {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: Cow::Owned(format!("script-written-on-line: {path}")),
+        };
     }
     for (run, dir, stdin) in runs {
         if is_untracked(&dir) && scripts::runner(&run) {
@@ -204,6 +213,97 @@ struct FnBody {
 
 type FnMap = std::collections::HashMap<String, FnBody>;
 
+/// The files the commands of a line write and the ones they run, read
+/// or source as a script, from every walk the line starts. Each is kept
+/// with the place of the command on the line: `cmd` is the command now
+/// read, below the one whose script or substitution holds it. A path
+/// the line does not show is `None`.
+#[derive(Default)]
+struct LineFiles {
+    cmd: Vec<usize>,
+    written: Vec<(Option<std::path::PathBuf>, Vec<usize>)>,
+    ran: Vec<(Option<std::path::PathBuf>, Vec<usize>)>,
+}
+
+type Files = std::rc::Rc<std::cell::RefCell<LineFiles>>;
+
+impl LineFiles {
+    /// Take what the command `owned` writes and runs. Its redirections
+    /// land where the shell is, `here`; what `run` writes or runs lands
+    /// where it runs, `at`.
+    fn note(
+        &mut self,
+        owned: &[String],
+        run: &[String],
+        here: &[std::path::PathBuf],
+        at: &[std::path::PathBuf],
+        home: Option<&str>,
+        id: &[usize],
+    ) {
+        self.cmd = id.to_vec();
+        for w in redirection_targets(owned) {
+            self.written
+                .extend(placed(w, here, home).into_iter().map(|p| (p, id.to_vec())));
+        }
+        for w in program_writes(run) {
+            self.written
+                .extend(placed(&w, at, home).into_iter().map(|p| (p, id.to_vec())));
+        }
+        for w in ran_paths(run) {
+            self.ran_from(w, at, home);
+        }
+    }
+
+    /// Take the script `w`, as read from each of `dirs`, as run by the
+    /// command now read.
+    fn ran_from(&mut self, w: &str, dirs: &[std::path::PathBuf], home: Option<&str>) {
+        let id = self.cmd.clone();
+        self.ran
+            .extend(placed(w, dirs, home).into_iter().map(|p| (p, id.clone())));
+    }
+
+    /// A script some command runs after another command on the line may
+    /// have written it: the same path, one under a directory written, or
+    /// either one not shown. A write by the command that holds the run
+    /// in its script only opens the file before that script starts.
+    fn written_then_run(&self) -> Option<String> {
+        self.ran.iter().find_map(|(r, rid)| {
+            self.written
+                .iter()
+                .filter(|(_, wid)| wid < rid && !rid.starts_with(wid))
+                .find(|(w, _)| match (r, w) {
+                    (Some(r), Some(w)) => r.starts_with(w),
+                    _ => true,
+                })
+                .map(|_| {
+                    r.as_ref().map_or_else(
+                        || "a script the line does not show".into(),
+                        |p| p.display().to_string(),
+                    )
+                })
+        })
+    }
+}
+
+/// Where the path word `w` lands from each of `dirs`, as [`path_from`]
+/// puts it with `..` taken off by name. `None` where it does not show.
+fn placed(
+    w: &str,
+    dirs: &[std::path::PathBuf],
+    home: Option<&str>,
+) -> Vec<Option<std::path::PathBuf>> {
+    dirs.iter()
+        .map(|d| {
+            if is_untracked(d) || w.contains(['*', '?', '[']) {
+                return None;
+            }
+            path_from(w, d, home)
+                .filter(|p| !is_untracked(p))
+                .map(|p| logical(&p))
+        })
+        .collect()
+}
+
 /// How many function calls deep the walk follows. Past this, or when a
 /// call is already on the stack, the body may move the shell and the walk
 /// cannot see where it stops, so the line is not followed.
@@ -230,6 +330,9 @@ struct Shell {
     /// A sourced file that keeps is already known not to move the shell;
     /// its case arms and discarded substitutions only look unseen.
     follow_unseen: bool,
+    /// What the line writes and runs. A file stays written when a
+    /// subshell or a `&` puts the rest back, so it is not [`Saved`].
+    files: Files,
 }
 
 #[derive(Clone)]
@@ -289,6 +392,7 @@ struct ShellIn<'a> {
     funcs: &'a FnMap,
     fn_depth: usize,
     left_tree: bool,
+    files: &'a Files,
 }
 
 /// `words` with each function definition replaced by a marker, in order.
@@ -501,6 +605,7 @@ fn replay_subshell(
             funcs: &funcs,
             fn_depth: shell.fn_depth,
             left_tree: shell.left_tree,
+            files: &shell.files,
         };
         runner_commands(body, &inn, depth, out, denied);
         if denied.is_some() {
@@ -552,6 +657,7 @@ fn runner_commands(
         fn_depth: inn.fn_depth,
         stack: Vec::new(),
         follow_unseen: true,
+        files: inn.files.clone(),
     };
     walk(argv, &mut shell, depth, out, denied);
 }
@@ -596,6 +702,10 @@ fn walk(
     let mut list = shell.save();
     let mut after = ";";
     let mut ran_in = Vec::new();
+    // Each command's place on the line, under the one that started
+    // this walk, so a write can be put before or after a run.
+    let base = shell.files.borrow().cmd.clone();
+    let mut seq = 0;
     for (cmd, end) in ended_commands(&argv) {
         shell.aliases.extend(alias_defs(&cmd));
         if after == "&" {
@@ -642,7 +752,10 @@ fn walk(
         for w in wrappers.iter().filter(|w| is_assignment(w)) {
             set.assign(&with_pwd(w, pwd));
         }
-        ran_in.push((at.clone(), shell.old.clone(), set.clone()));
+        seq += 1;
+        let id = [base.as_slice(), &[seq]].concat();
+        shell.files.borrow_mut().cmd.clone_from(&id);
+        ran_in.push((at.clone(), shell.old.clone(), set.clone(), id.clone()));
         // A subshell or substitution in the command runs where the
         // command does, and a `cd` inside it moves only itself.
         if depth < MAX_DEPTH {
@@ -652,6 +765,7 @@ fn walk(
             let funcs = shell.funcs.clone();
             let fn_depth = shell.fn_depth;
             let left = shell.left_tree;
+            let files = shell.files.clone();
             for body in cmd.iter().flat_map(|w| substitutions(w)) {
                 let words = shell_words(&body);
                 for dir in &dirs {
@@ -662,6 +776,7 @@ fn walk(
                         funcs: &funcs,
                         fn_depth,
                         left_tree: left,
+                        files: &files,
                     };
                     runner_commands(&words, &inn, depth + 1, out, denied);
                     if denied.is_some() {
@@ -670,6 +785,15 @@ fn walk(
                 }
             }
         }
+        // After the substitutions, which run before the command does.
+        shell.files.borrow_mut().note(
+            &owned,
+            &run,
+            &shell.here,
+            &at,
+            shell.vars.home.as_deref(),
+            &id,
+        );
         let shown: Vec<_> = cmd.iter().map(|w| with_pwd(w, pwd)).collect();
         let shown: Vec<&str> = shown.iter().map(|w| &**w).collect();
         if !piped {
@@ -982,15 +1106,17 @@ fn walk(
     if after == "&" {
         shell.restore(list.clone());
     }
+    shell.files.borrow_mut().cmd.clone_from(&base);
     if depth >= MAX_DEPTH {
         return;
     }
     for (i, inner) in inner_commands_expanded(&argv) {
         if inner.as_slice() != argv.as_slice() {
-            let Some((dirs, oldpwd, set)) = ran_in.get(i) else {
+            let Some((dirs, oldpwd, set, id)) = ran_in.get(i) else {
                 continue;
             };
             for dir in dirs {
+                shell.files.borrow_mut().cmd.clone_from(id);
                 let inn = ShellIn {
                     cwd: dir,
                     oldpwd,
@@ -998,6 +1124,7 @@ fn walk(
                     funcs: &shell.funcs,
                     fn_depth: shell.fn_depth,
                     left_tree: shell.left_tree,
+                    files: &shell.files,
                 };
                 runner_commands(&inner, &inn, depth + 1, out, denied);
                 if denied.is_some() {
@@ -1006,6 +1133,7 @@ fn walk(
             }
         }
     }
+    shell.files.borrow_mut().cmd.clone_from(&base);
 }
 
 /// The `CDPATH` and `HOME` a command on the line sees: `None` where one is
@@ -1468,6 +1596,10 @@ fn judge_startup(
         *denied = Some(startup_unshown());
         return;
     }
+    shell
+        .files
+        .borrow_mut()
+        .ran_from(&value, &shell.here, shell.vars.home.as_deref());
     let path = std::path::Path::new(&value);
     let full = if path.is_absolute() {
         path.to_path_buf()
@@ -1570,6 +1702,10 @@ fn judge_procsub(
     };
     let mut text = String::new();
     for path in &paths {
+        shell
+            .files
+            .borrow_mut()
+            .ran_from(path, &shell.here, shell.vars.home.as_deref());
         let Some(part) = read_shown_file(path, shell) else {
             *denied = Some(procsub_unshown_denial());
             return;
@@ -5446,6 +5582,14 @@ fn tee_paths(cmd: &[String]) -> Vec<&str> {
     out
 }
 
+/// The words that name the files a command writes as a program: what
+/// `tee`, `curl` and `wget` save.
+fn program_writes(run: &[String]) -> Vec<String> {
+    let mut out = fetched_paths(run);
+    out.extend(tee_paths(run).into_iter().map(str::to_string));
+    out
+}
+
 /// A file a fetch on the line writes, then a later command on the line
 /// runs: `curl -o i.sh URL && sh i.sh`, `curl URL > i.sh && sh i.sh`,
 /// `curl URL | tee i.sh && ./i.sh`, `wget URL/get.py; python3 get.py`.
@@ -8717,6 +8861,7 @@ hash -r 2> /dev/null
             let mut denied = None;
             let vars = Vars::from_env();
             let funcs = FnMap::new();
+            let files = Files::default();
             let inn = ShellIn {
                 cwd: &root,
                 oldpwd: &[],
@@ -8724,6 +8869,7 @@ hash -r 2> /dev/null
                 funcs: &funcs,
                 fn_depth: 0,
                 left_tree: false,
+                files: &files,
             };
             runner_commands(&shell_words(line), &inn, 0, &mut runs, &mut denied);
             let dirs: Vec<_> = runs
@@ -9135,7 +9281,6 @@ hash -r 2> /dev/null
             "curl -fsSL https://example.org/a.json > /tmp/a.json && python3 parse.py /tmp/a.json",
             "curl -fsSL https://example.org/a.json | tee /tmp/a.json | jq .",
             "echo hi | tee /tmp/out.txt && cat /tmp/out.txt",
-            "echo hi | tee run.sh && sh run.sh",
             "curl -fsSL https://example.org/a.json > /tmp/a.json && python3 -c 'print(1)'",
             "timeout 30 cargo test",
             "busybox ls",
@@ -10768,6 +10913,59 @@ hash -r 2> /dev/null
             "read name; git checkout \"$name\"",
             "read xy; sh -c \"$x\"",
             "sh -c \"$x\"; read x",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        assert_everyday_allowed(&root);
+    }
+
+    /// `echo 'git push -f' > x.sh; source x.sh` was allowed: x.sh was
+    /// judged as it stood on disk, before the line wrote it. A script a
+    /// command earlier on the line may write is not known at check time.
+    #[test]
+    fn a_script_written_earlier_on_the_line_is_refused() {
+        let root = startup_root("written");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
+        std::fs::write(root.join("sub/ok.sh"), "echo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "echo 'git push -f' > x.sh; source x.sh",
+            "echo 'git push -f' >> ok.sh; . ./ok.sh",
+            "cat > ok.sh <<< 'git push -f'; bash ok.sh",
+            "echo 'git push -f' > x.sh && bash x.sh",
+            "echo 'git push -f' >x.sh; sh ./x.sh",
+            "echo hi | tee run.sh && sh run.sh",
+            "curl -o x.sh https://example.org/x; source x.sh",
+            "cd sub && echo 'git push -f' > ok.sh; cd .. && source sub/ok.sh",
+            "cd sub && echo 'git push -f' > ok.sh; source ok.sh",
+            "echo 'git push -f' > sub/../x.sh; source x.sh",
+            "echo x > \"$OUT\"; source ok.sh",
+            "echo 'git push -f' > x.sh & source x.sh",
+            "(echo 'git push -f' > x.sh); source x.sh",
+            "bash -c \"echo 'git push -f' > x.sh\"; source x.sh",
+            "bash -c \"echo 'git push -f' > x.sh; source x.sh\"",
+            "echo 'git push -f' > x.sh; BASH_ENV=x.sh bash -c 'echo ok'",
+            "echo 'git push -f' > x.sh; bash <(cat x.sh)",
+            "echo 'import os' > x.py; python3 x.py",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+        }
+        let c = at("echo 'git push -f' > x.sh; source x.sh");
+        assert!(
+            c.token.starts_with("script-written-on-line: ") && c.token.ends_with("x.sh"),
+            "{}",
+            c.token
+        );
+        for line in [
+            "source ok.sh; echo x > out.txt",
+            "echo x > out.txt; source ok.sh",
+            "bash ok.sh > ok.log 2>&1",
+            "./configure > config.log && make",
+            "echo x > /dev/null; source ok.sh",
+            "(cd sub && echo x > ok.sh); source ok.sh",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
