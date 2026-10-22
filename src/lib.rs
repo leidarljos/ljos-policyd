@@ -5795,6 +5795,24 @@ mod tests {
         );
     }
 
+    /// `dirs` takes no option past `--`, so `dirs -- -c` leaves the stack.
+    #[test]
+    fn dirs_stops_reading_options_at_double_dash() {
+        assert_eq!(
+            evil_and_safe(
+                "dirs-dash",
+                "pushd safe && dirs -- -c && popd && make clean-all"
+            ),
+            Decision::Allow
+        );
+        for line in [
+            "pushd safe && dirs -c && popd && make clean-all",
+            "pushd safe && dirs -lc -- && popd && make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("dirs-dash", line), Decision::Deny, "{line}");
+        }
+    }
+
     /// A `popd` that fails, on a word it does not take or a stack it
     /// cannot pop, leaves the line in a directory it does not follow.
     #[test]
