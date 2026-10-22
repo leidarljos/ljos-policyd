@@ -1381,19 +1381,42 @@ fn note_startup(cmd: &[&str], vars: &mut Vars) {
     }
 }
 
-/// The `NAME=value` for `var` written before the shell word `shell` on
-/// `cmd`: a prefix assignment or one `env` puts in the child's environment.
-fn prefix_startup<'a>(cmd: &[&'a str], shell: &str, var: &str) -> Option<&'a str> {
+/// What the words before the shell word `shell` on `cmd` do to `var` in
+/// the child's environment: `Some(Some(value))` for a prefix assignment
+/// or one `env` makes, `Some(None)` where an `env -u var` or `env -i`
+/// takes it out, `None` where they leave the shell's own.
+fn prefix_startup<'a>(cmd: &[&'a str], shell: &str, var: &str) -> Option<Option<&'a str>> {
     let mut found = None;
-    for w in cmd {
+    let mut env = false;
+    let mut words = cmd.iter().copied().peekable();
+    while let Some(w) = words.next() {
         if let Some((n, v)) = startup_pair(w) {
             if n == var {
-                found = Some(v);
+                found = Some(Some(v));
             }
             continue;
         }
         if base_of(w) == shell {
             break;
+        }
+        if base_of(w) == "env" {
+            env = true;
+            continue;
+        }
+        if !env || !w.starts_with('-') {
+            env = false;
+            continue;
+        }
+        let short = w.strip_prefix('-').filter(|f| !f.starts_with('-'));
+        let ignores = w == "-"
+            || w == "--ignore-environment"
+            || short.is_some_and(|f| f.split(['u', 'C', 'S']).next().unwrap_or("").contains('i'));
+        let (taken, value) = env_flag(w, words.peek().copied());
+        if taken == 2 {
+            words.next();
+        }
+        if ignores || value == Some(('u', var)) {
+            found = Some(None);
         }
     }
     found
@@ -1432,17 +1455,12 @@ fn judge_startup(
         "sh" => ("ENV", shell.vars.sh_env_exported),
         _ => return,
     };
-    let value = prefix_startup(cmd, base_of(first), var)
-        .map(shown_startup)
-        .or_else(|| {
-            if !exported {
-                return None;
-            }
-            match var {
-                "BASH_ENV" => shell.vars.bash_env.clone(),
-                _ => shell.vars.sh_env.clone(),
-            }
-        });
+    let value = match prefix_startup(cmd, base_of(first), var) {
+        Some(v) => v.map(shown_startup),
+        None if exported && var == "BASH_ENV" => shell.vars.bash_env.clone(),
+        None if exported => shell.vars.sh_env.clone(),
+        None => None,
+    };
     let Some(value) = value.filter(|v| !v.is_empty()) else {
         return;
     };
@@ -10389,6 +10407,34 @@ hash -r 2> /dev/null
         for line in [
             "export BASH_ENV=evil/force.sh; unset BASH_ENV; bash -c 'echo ok'",
             "export BASH_ENV=evil/force.sh; unset -v BASH_ENV; bash -c 'echo ok'",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        assert_everyday_allowed(&root);
+    }
+
+    /// `env -u BASH_ENV bash` and `env -i bash` start a bash without the
+    /// exported startup file, yet it was still judged for that bash.
+    #[test]
+    fn env_without_the_startup_variable_starts_bash_without_it() {
+        let root = startup_root("stenvu");
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "export BASH_ENV=evil/force.sh; env -u ENV bash -c 'echo ok'",
+            "export BASH_ENV=evil/force.sh; env -i BASH_ENV=evil/force.sh bash -c 'echo ok'",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
+        }
+        for line in [
+            "export BASH_ENV=evil/force.sh; env -u BASH_ENV bash -c 'echo ok'",
+            "export BASH_ENV=evil/force.sh; env -uBASH_ENV bash -c 'echo ok'",
+            "export BASH_ENV=evil/force.sh; env --unset=BASH_ENV bash -c 'echo ok'",
+            "export BASH_ENV=evil/force.sh; env -i bash -c 'echo ok'",
+            "export ENV=evil/force.sh; env -u ENV sh -c 'echo ok'",
+            "BASH_ENV=evil/force.sh env -i bash -c 'echo ok'",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);

@@ -1,0 +1,1 @@
+An `env -u BASH_ENV`, `env --unset=BASH_ENV` or `env -i` in front of a shell starts it without the exported startup file, so that shell is no longer refused for the file's text: `export BASH_ENV=evil.sh; env -u BASH_ENV bash -c 'echo ok'` is allowed. An assignment `env -i` makes after it is still read.
