@@ -3210,7 +3210,6 @@ const RUNNERS: &[(&str, &[&str])] = &[
         "xargs",
         &[
             "-I",
-            "-i",
             "-n",
             "-P",
             "-L",
@@ -10440,6 +10439,31 @@ hash -r 2> /dev/null
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
         assert_everyday_allowed(&root);
+    }
+
+    /// GNU xargs takes the replace string of `-i` only in the same word,
+    /// so the word after `-i` is the command. It was read as the value,
+    /// and `xargs -i git push -f` was judged as `push -f`.
+    #[test]
+    fn xargs_dash_i_takes_no_separate_value() {
+        for line in [
+            "xargs -i git push -f",
+            "printf x | xargs -i git push --force origin",
+            "xargs -0 -i git push -f",
+        ] {
+            assert_eq!(
+                verdict(&shell_words(line)),
+                "deny\tgit-force-push",
+                "{line}"
+            );
+        }
+        for line in [
+            "xargs -i echo {}",
+            "xargs -i{} echo {}",
+            "xargs -I {} echo {}",
+        ] {
+            assert_eq!(verdict(&shell_words(line)), "allow", "{line}");
+        }
     }
 
     /// `bash evil.sh` was allowed whatever evil.sh held: only a `-c`

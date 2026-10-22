@@ -1,0 +1,1 @@
+The word after an `xargs -i` is the command it runs: GNU xargs takes the replace string of `-i` only in the same word (`-i{}`). It was read as the value, so `xargs -i git push -f` was judged as `push -f` and allowed.
