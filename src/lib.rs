@@ -250,6 +250,7 @@ fn runner_commands(
         // An assignment in front of a builtin is set for that command
         // alone: `FOO=1 cd dir` still moves the shell.
         let words = &cmd[cmd.iter().take_while(|w| is_assignment(w)).count()..];
+        let words = peel_cd_command_word(words);
         let b = words.first().map_or("", |w| base_of(w));
         if piped && matches!(b, "cd" | "pushd" | "popd") {
             continue;
@@ -378,13 +379,28 @@ fn entered(
     pushd: bool,
     old: &[std::path::PathBuf],
 ) -> Vec<std::path::PathBuf> {
-    let Some(to) = args
-        .iter()
-        .find(|a| !a.starts_with(['-', '+']) || **a == "-")
-    else {
+    let mut to = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i];
+        if is_redirection(a) {
+            i += 1;
+            let rest = a.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+            if rest.chars().all(|c| matches!(c, '>' | '<' | '&' | '-')) && i < args.len() {
+                i += 1;
+            }
+            continue;
+        }
+        if !a.starts_with(['-', '+']) || a == "-" {
+            to = Some(a);
+            break;
+        }
+        i += 1;
+    }
+    let Some(to) = to else {
         return if pushd { None } else { home_dir() }.into_iter().collect();
     };
-    if *to == "-" {
+    if to == "-" {
         return old.to_vec();
     }
     let Some(path) = path_from(to, dir) else {
@@ -512,6 +528,43 @@ fn env_dir(wrappers: &[String], dir: &std::path::Path) -> std::path::PathBuf {
         }
     }
     at
+}
+
+/// Words that keep `cd` in this shell when they run before it.
+fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
+    loop {
+        let Some((w, rest)) = words.split_first() else {
+            return words;
+        };
+        match base_of(w) {
+            "command" => {
+                words = rest;
+                while let Some((a, tail)) = words.split_first() {
+                    if *a == "--" {
+                        words = tail;
+                        break;
+                    }
+                    if *a == "-p" {
+                        words = tail;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            "builtin" => {
+                words = rest;
+                if let Some((a, tail)) = words.split_first() {
+                    if *a == "--" {
+                        words = tail;
+                    }
+                }
+            }
+            "!" | "{" | "if" | "then" | "else" | "elif" | "while" | "until" | "do" => {
+                words = rest;
+            }
+            _ => return words,
+        }
+    }
 }
 
 fn host_argv_table(argv: &[String]) -> Checked {
@@ -969,6 +1022,93 @@ fn shell_script(run: &[String]) -> Option<&str> {
     None
 }
 
+fn decode_ansi_c_quoted(chars: &[char], i: &mut usize, out: &mut String) {
+    while *i < chars.len() {
+        let c = chars[*i];
+        *i += 1;
+        if c == '\'' {
+            return;
+        }
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(esc) = chars.get(*i).copied() else {
+            out.push('\\');
+            return;
+        };
+        *i += 1;
+        match esc {
+            'a' => out.push('\u{0007}'),
+            'b' => out.push('\u{0008}'),
+            'e' | 'E' => out.push('\u{001b}'),
+            'f' => out.push('\u{000c}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'v' => out.push('\u{000b}'),
+            '\\' => out.push('\\'),
+            '\'' => out.push('\''),
+            '"' => out.push('"'),
+            '?' => out.push('?'),
+            'x' => {
+                let mut value = 0u32;
+                let mut n = 0;
+                while *i < chars.len() && n < 2 {
+                    if let Some(d) = chars[*i].to_digit(16) {
+                        value = value * 16 + d;
+                        *i += 1;
+                        n += 1;
+                        continue;
+                    }
+                    break;
+                }
+                if n == 0 {
+                    out.push('x');
+                } else if let Some(c) = char::from_u32(value) {
+                    out.push(c);
+                }
+            }
+            'u' | 'U' => {
+                let max = if esc == 'u' { 4 } else { 8 };
+                let mut value = 0u32;
+                let mut n = 0;
+                while *i < chars.len() && n < max {
+                    if let Some(d) = chars[*i].to_digit(16) {
+                        value = value * 16 + d;
+                        *i += 1;
+                        n += 1;
+                        continue;
+                    }
+                    break;
+                }
+                if n == 0 {
+                    out.push(esc);
+                } else if let Some(c) = char::from_u32(value) {
+                    out.push(c);
+                }
+            }
+            c if matches!(c, '0'..='7') => {
+                let mut value = c.to_digit(8).expect("octal digit");
+                let mut n = 1;
+                while *i < chars.len() && n < 3 {
+                    if let Some(d) = chars[*i].to_digit(8) {
+                        value = value * 8 + d;
+                        *i += 1;
+                        n += 1;
+                        continue;
+                    }
+                    break;
+                }
+                if let Some(c) = char::from_u32(value) {
+                    out.push(c);
+                }
+            }
+            c => out.push(c),
+        }
+    }
+}
+
 /// A script split into words the way a shell would: quotes group, a
 /// backslash escapes the next character outside single quotes, and `;`,
 /// `&&`, `||`, `|` and `&` stand as words of their own. The `&` of a
@@ -991,6 +1131,11 @@ fn shell_words(script: &str) -> Vec<String> {
                 cur.extend(&chars[i - 1..end]);
                 word = true;
                 i = end;
+            }
+            '$' if !single && !double && chars.get(i) == Some(&'\'') => {
+                i += 1;
+                decode_ansi_c_quoted(&chars, &mut i, &mut cur);
+                word = true;
             }
             '\\' if !single => {
                 if let Some(n) = chars.get(i) {
@@ -1019,6 +1164,10 @@ fn shell_words(script: &str) -> Vec<String> {
                 if word {
                     out.push(std::mem::take(&mut cur));
                     word = false;
+                }
+                if matches!(c, '\n' | '\r') {
+                    out.push(";".to_string());
+                    continue;
                 }
                 if matches!(c, ';' | '|' | '&') {
                     let mut sep = c.to_string();
@@ -3960,6 +4109,35 @@ mod tests {
         }
     }
 
+    /// Safe lines from the rereview stay allowed.
+    #[test]
+    fn keeps_rereview_safe_lines_allowed() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "cd project && make test",
+            "cd project; make test",
+            "cd project && make clean",
+            "FOO=1 cd project && make test",
+            "pushd project && make test && popd",
+            "bash -lc 'make test'",
+            "cd project && rm -rf target",
+        ] {
+            let c = entering("safe-lines", &files, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}");
+        }
+        assert_eq!(
+            in_dir(
+                "safe-lines-redir",
+                "Makefile",
+                MAKEFILE,
+                &["make", "test", "2>&1"]
+            ),
+            Decision::Allow
+        );
+        assert_eq!(v(&["cargo", "test"]), "allow");
+        assert_eq!(v(&["git", "status"]), "allow");
+    }
+
     /// A directory the line does not show, or one it leaves again, is not
     /// read, and the runner is judged as before.
     #[test]
@@ -4024,6 +4202,56 @@ mod tests {
             "pushd project && FOO=1 popd && make clean-all",
         );
         assert_eq!(c.decision, Decision::Allow);
+    }
+
+    /// `command`, `command -p` and `builtin` do not hide `cd`.
+    #[test]
+    fn follows_a_cd_behind_command_or_builtin() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "command cd project && make clean-all",
+            "command -p cd project && make clean-all",
+            "builtin cd project && make clean-all",
+        ] {
+            let c = entering("command-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+    }
+
+    /// A control keyword before `cd` does not hide it.
+    #[test]
+    fn follows_a_cd_behind_control_keywords() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "if cd project; then make clean-all; fi",
+            "while cd project; do make clean-all; done",
+            "until cd project; do make clean-all; done",
+            "! cd project; make clean-all",
+        ] {
+            let c = entering("control-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+    }
+
+    /// An opening `{` before `cd` does not hide it.
+    #[test]
+    fn follows_a_cd_behind_a_brace_group() {
+        let files = [("Makefile", MAKEFILE)];
+        let c = entering("brace-cd", &files, "{ cd project && make clean-all; }");
+        assert_eq!(c.decision, Decision::Deny);
+    }
+
+    /// ANSI-C quoted words decode before `cd` chooses its target.
+    #[test]
+    fn follows_a_cd_with_an_ansi_c_quoted_target() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "cd $'project' && make clean-all",
+            "cd $'pro\\x6aect' && make clean-all",
+        ] {
+            let c = entering("ansi-c-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
     }
 
     /// A script the line hands a shell, `eval` or a named command word runs
@@ -4276,6 +4504,20 @@ mod tests {
         }
     }
 
+    /// Redirections before the `cd` target are not directory names.
+    #[test]
+    fn skips_redirections_before_a_cd_target() {
+        let files = [("Makefile", MAKEFILE)];
+        for line in [
+            "cd 2>/dev/null project && make clean-all",
+            "cd > /dev/null project && make clean-all",
+            "cd </dev/null project && make clean-all",
+        ] {
+            let c = entering("redir-target-cd", &files, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
+    }
+
     /// The `&` of a redirection does not send the `cd` before it to the
     /// background.
     #[test]
@@ -4292,6 +4534,18 @@ mod tests {
             let c = entering("redir-cd", &files, line);
             assert_eq!(c.decision, Decision::Deny, "{line}");
         }
+    }
+
+    #[test]
+    fn a_newline_or_carriage_return_splits_a_script_command() {
+        assert_eq!(
+            v(&["bash", "-lc", "true\nrm -rf ~"]),
+            "deny\trm-rf-outside-tmp"
+        );
+        assert_eq!(
+            v(&["bash", "-lc", "true\rrm -rf ~"]),
+            "deny\trm-rf-outside-tmp"
+        );
     }
 
     #[test]
