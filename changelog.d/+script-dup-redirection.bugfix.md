@@ -1,0 +1,1 @@
+A `>&file`, `>& file` or `1>&file` redirection counts as a write of that file, so `echo 'git push -f' >&x.sh; sh x.sh` is refused as `script-written-on-line`. `>&` was read only as a copy of a descriptor; it is one only when the word after it is a number or `-` (`2>&1`, `>&-`).

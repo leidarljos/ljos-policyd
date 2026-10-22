@@ -5795,12 +5795,18 @@ fn saved_name(path: &str) -> Option<String> {
 }
 
 /// The file a stdout redirection writes: `> i.sh`, `>i.sh`, `>>i.sh`,
-/// `2> i.sh`, `>|i.sh`. `>&1` and `2>&1` duplicate a descriptor.
+/// `2> i.sh`, `>|i.sh`, and `>&i.sh`, which writes stdout and stderr
+/// there. `>&1`, `2>&1` and `>&-` duplicate or close a descriptor.
 fn output_target<'a>(word: &'a str, next: Option<&'a str>) -> Option<(&'a str, bool)> {
+    let fd = |t: &str| t == "-" || (!t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()));
     let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
     let rest = rest.strip_prefix("&>").or_else(|| rest.strip_prefix('>'))?;
-    if rest.starts_with('&') {
-        return None;
+    if let Some(dup) = rest.strip_prefix('&') {
+        if dup.is_empty() {
+            let target = next.filter(|t| !fd(t) && !matches!(*t, "|" | ">" | ">>"))?;
+            return Some((target, true));
+        }
+        return (!fd(dup)).then_some((dup, false));
     }
     let rest = rest.trim_start_matches(['>', '|']);
     if rest.is_empty() {
@@ -11944,6 +11950,39 @@ hash -r 2> /dev/null
             "exec ./app",
             "cd \"$X\" && /bin/true",
             "( : <>/dev/null ) && echo ok",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        assert_everyday_allowed(&root);
+    }
+
+    /// `echo 'git push -f' >&x.sh; sh x.sh` was allowed: `>&` was read
+    /// only as a copy of a descriptor, but bash writes stdout and stderr
+    /// to a file when the word after it is not a descriptor number or `-`.
+    #[test]
+    fn a_redirection_ampersand_to_a_file_writes_it() {
+        let root = startup_root("dupwrite");
+        std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "echo 'git push -f' >&x.sh; sh x.sh",
+            "echo 'git push -f' >& ok.sh; source ok.sh",
+            "echo 'git push -f' 1>&ok.sh && bash ok.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(
+                c.token.starts_with("script-written-on-line: "),
+                "{line}: {}",
+                c.token
+            );
+        }
+        for line in [
+            "bash ok.sh >ok.log 2>&1",
+            "echo x >&2; source ok.sh",
+            "echo x 1>&- ; sh ok.sh",
+            "echo x >& 2; sh ok.sh",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
