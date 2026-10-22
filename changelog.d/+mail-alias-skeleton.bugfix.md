@@ -1,0 +1,1 @@
+An address rule also denies by skeleton: the local part after NFKC and case folding, with `.`, `_`, `-`, `+` and `=` removed. A recipient whose skeleton starts with the rule's, at that domain or one in its family, is refused, so `johndoe@proton.me` now covers `john.doe@pm.me`, `john_doe@protonmail.com` and `john-doe@proton.me`. This over-blocks on purpose.

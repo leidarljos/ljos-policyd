@@ -671,14 +671,22 @@ fn wire_rewritten(raw: &str) -> bool {
 ///
 /// Alias families fold both the rule and the recipient, and only here.
 /// A domain rule and `From` do not use them.
+///
+/// The skeleton match is checked beside that, and either one denies.
 fn address_denied(addr: &NormAddr, config: &Config) -> bool {
     for (local, domain) in alias_forms(&addr.local, &addr.domain, &config.aliases) {
         let seps = separators(&domain, config);
         let cut = families_of(&domain, &config.aliases).any(|f| f.cut);
+        let local_skeleton = skeleton(&local);
         for rule in &config.deny_addresses {
             let Some((rule_local, rule_domain)) = rule.split_once('@') else {
                 continue;
             };
+            if same_family(&domain, rule_domain, &config.aliases)
+                && local_skeleton.starts_with(&skeleton(rule_local))
+            {
+                return true;
+            }
             if domain != rule_domain {
                 continue;
             }
@@ -692,6 +700,28 @@ fn address_denied(addr: &NormAddr, config: &Config) -> bool {
         }
     }
     false
+}
+
+/// Characters a provider may ignore or cut on in a local part.
+const TRANSPARENT: &[char] = &['.', '_', '-', '+', '='];
+
+/// NFKC, case folded, with every `TRANSPARENT` character removed and
+/// nothing cut. A recipient whose skeleton starts with a rule's
+/// skeleton, at that domain or one in the same family, is denied. This
+/// over-blocks on purpose: `john` also denies `johnny` and `jo.hn-x`,
+/// so a provider that ignores a character no family lists cannot
+/// deliver a denied mailbox.
+fn skeleton(local: &str) -> String {
+    let folded: String = local
+        .nfkc()
+        .flat_map(char::to_uppercase)
+        .flat_map(char::to_lowercase)
+        .collect();
+    folded.nfkc().filter(|c| !TRANSPARENT.contains(c)).collect()
+}
+
+fn same_family(domain: &str, other: &str, families: &[AliasFamily]) -> bool {
+    domain == other || families_of(domain, families).any(|f| f.domains.iter().any(|d| d == other))
 }
 
 fn separators(domain: &str, config: &Config) -> String {
@@ -1667,8 +1697,45 @@ pair left right
             codes(&plain("Bcc: Evil+Tag@Example.test\r\n"), deny, ""),
             vec!["recipient-address-denied"]
         );
-        assert!(codes(&plain("Reply-To: evilx@example.test\r\n"), deny, "").is_empty());
         assert!(codes(&plain("To: notevil+x@example.test\r\n"), deny, "").is_empty());
+    }
+
+    /// The skeleton drops `. _ - + =` and compares a prefix, so it
+    /// over-blocks a longer name that starts with the rule.
+    #[test]
+    fn the_skeleton_covers_every_transparent_spelling() {
+        let denied = |to: &str, deny: &str, extra: &str| {
+            codes_with(&plain(&format!("To: {to}\r\n")), deny, "", extra)
+                == vec!["recipient-address-denied"]
+        };
+        let proton = "address johndoe@proton.me\n";
+        for to in [
+            "john.doe@pm.me",
+            "john_doe@protonmail.com",
+            "john-doe@proton.me",
+            "john.doe+tag@protonmail.ch",
+            "john_doe@pm.me",
+            "john-doe@protonmail.ch",
+            "John.Doe+Tag@PM.ME",
+        ] {
+            assert!(denied(to, proton, ""), "{to}");
+            assert!(denied(to, proton, "subaddress =\n"), "{to}");
+        }
+        assert!(denied("jo-hn@proton.me", "address john@proton.me\n", ""));
+        assert!(!denied("jane.doe@pm.me", proton, ""));
+        assert!(!denied("johndoe@gmail.com", proton, ""));
+        let custom = "address hannah.martin@example.test\n";
+        assert!(denied("hannah_martin@example.test", custom, ""));
+        assert!(denied(
+            "evilx@example.test",
+            "address evil@example.test\n",
+            ""
+        ));
+        assert!(denied(
+            "stra\u{DF}e@example.test",
+            "address strasse@example.test\n",
+            ""
+        ));
     }
 
     /// The default separators are `+-=`. Gmail and Googlemail are one
@@ -1689,13 +1756,6 @@ pair left right
             codes(&plain("To: \"evil-x\"@example.test\r\n"), deny, ""),
             vec!["recipient-address-denied"]
         );
-        assert!(codes_with(
-            &plain("To: evil-x@example.test\r\n"),
-            deny,
-            "",
-            "subaddress +\n"
-        )
-        .is_empty());
         assert_eq!(
             codes_with(
                 &plain("To: evil+x@example.test\r\n"),
@@ -1722,7 +1782,7 @@ pair left right
             codes(&plain("To: b.a.d+x@googlemail.com\r\n"), gmail, ""),
             vec!["recipient-address-denied"]
         );
-        assert!(codes(&plain("To: badx@gmail.com\r\n"), gmail, "").is_empty());
+        assert!(codes(&plain("To: bax@gmail.com\r\n"), gmail, "").is_empty());
         assert_eq!(
             codes_with(
                 &plain("To: bad+x@gmail.com\r\n"),
@@ -1746,8 +1806,8 @@ pair left right
     }
 
     /// Proton and Apple domains are one mailbox each. Microsoft domains
-    /// are not, and only cut on `+`. A Yahoo rule covers every
-    /// disposable address on its base.
+    /// are not, and the skeleton still covers the whole family. A Yahoo
+    /// rule covers every disposable address on its base.
     #[test]
     fn provider_alias_families_cover_their_aliases() {
         let denied = |to: &str, deny: &str| {
@@ -1765,8 +1825,9 @@ pair left right
         }
         let outlook = "address bad@outlook.com\n";
         assert!(denied("bad+x@outlook.com", outlook));
-        assert!(!denied("bad@hotmail.com", outlook));
-        assert!(!denied("bad-x@outlook.com", outlook));
+        assert!(denied("bad-x@outlook.com", outlook));
+        assert!(denied("bad@hotmail.com", outlook));
+        assert!(!denied("bad@gmail.com", outlook));
         assert!(denied("bad+x@hotmail.co.uk", "address bad@hotmail.co.uk\n"));
         let yahoo = "address base-shop@yahoo.com\n";
         for to in [

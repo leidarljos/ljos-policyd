@@ -244,7 +244,15 @@ is that mailbox, not the whole domain. It also covers that local
 part, one ``subaddress`` separator, and anything after the
 separator. The separators are the ``subaddress`` line, or ``+-=``
 when the line is omitted. ``.``, ``@``, ``%`` and ``!`` are not
-separators. A provider alias family folds both the rule and the
+separators. An ``address`` rule is also compared by skeleton:
+NFKC, case folded, with every ``.``, ``_``, ``-``, ``+`` and ``=``
+removed and nothing cut. A recipient whose skeleton starts with
+the rule's skeleton, at the rule's domain or one in the same
+alias family, is refused, and so is one the folding below
+refuses. This over-blocks on purpose: a rule for ``john`` also
+refuses ``johnny`` and ``jo.hn-x``, so a provider that ignores a
+character no family lists cannot deliver a denied mailbox.
+A provider alias family folds both the rule and the
 recipient, and adds its separators to the ``subaddress`` line on
 its domains. ``gmail.com`` and ``googlemail.com`` are one
 domain, dots in the local part are ignored, and ``+`` is a
