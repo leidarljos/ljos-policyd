@@ -1139,6 +1139,28 @@ From: other@example.test\r\n";
             codes(&plain(&format!("To: a@{full}\r\n")), "", ""),
             vec!["recipient-unparsed"]
         );
+        let ideographic = "192\u{3002}0\u{3002}2\u{3002}1";
+        assert_eq!(
+            codes(&plain(&format!("To: a@{ideographic}\r\n")), "", ""),
+            vec!["recipient-unparsed"]
+        );
+        let halfwidth = "192\u{FF61}0\u{FF61}2\u{FF61}1";
+        assert_eq!(
+            codes(&plain(&format!("To: a@{halfwidth}\r\n")), "", ""),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("To: a@0x7f.1\r\n"), "", ""),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("To: a@0x7f.example.test\r\n"), "", ""),
+            vec!["recipient-unparsed"]
+        );
+        assert_eq!(
+            codes(&plain("Cc: a@0177.example.test\r\n"), "", ""),
+            vec!["recipient-unparsed"]
+        );
         assert!(codes(&plain("To: a@mx1.example.test\r\n"), "", "").is_empty());
         assert!(codes(&plain("To: a@192.0.2.example.test\r\n"), "", "").is_empty());
     }

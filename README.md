@@ -176,8 +176,11 @@ On an address rule for `fastmail.com`, a mailbox at
 is `<user>@fastmail.com`. A hyphen in that label is part of the
 user name. Domain rules and `From` are not matched this way.
 An address at `@[ ... ]` is a
-domain literal and is a refusal. An all-numeric domain, such as
-a dotted quad, is a refusal. A source route
+domain literal and is a refusal. An all-numeric domain is a
+refusal, judged after IDNA. That includes a dotted quad, a
+shorter form `inet_aton` accepts, a hex label (`0x`) and a
+label with a leading zero. U+3002 or U+FF61 between the
+numbers is still that address. A source route
 (`<@host:mailbox>`) is a refusal. `@`, `%` or `!` in a local
 part is a refusal, quoted or not, including a backslash escape
 inside the quotes.
