@@ -32,6 +32,9 @@ pub(crate) enum MessageFault {
     Control,
     /// The block is not a header list, so there is no envelope to read.
     Structure,
+    /// CRLF and a bare LF in the same header block. One reader splits the
+    /// body at the earlier blank line and drops the headers between them.
+    LineEnding,
 }
 
 #[derive(Debug)]
@@ -53,7 +56,7 @@ pub(crate) struct AddressFault;
 /// Headers of `input`, split from the body at the first blank line.
 /// A message with no blank line is all headers.
 pub(crate) fn parse_message(input: &str) -> Result<Message, MessageFault> {
-    let block = header_block(input);
+    let block = header_block(input)?;
     if has_bad_control(block) {
         return Err(MessageFault::Control);
     }
@@ -85,15 +88,54 @@ pub(crate) fn mailboxes(value: &str) -> Result<Vec<Mailbox>, AddressFault> {
     Ok(out)
 }
 
-fn header_block(message: &str) -> &str {
+fn header_block(message: &str) -> Result<&str, MessageFault> {
     let crlf = message.find("\r\n\r\n");
     let lf = message.find("\n\n");
     match (crlf, lf) {
-        (Some(i), Some(j)) => &message[..i.min(j)],
-        (Some(i), None) => &message[..i],
-        (None, Some(j)) => &message[..j],
-        (None, None) => message.trim_end_matches(['\r', '\n']),
+        // A bare LF blank before the CRLF blank hides every header between
+        // them from the reader that stops at the earlier one.
+        (Some(i), Some(j)) if j < i => Err(MessageFault::LineEnding),
+        (Some(i), _) => {
+            let block = &message[..i];
+            if has_bare_lf(block) {
+                Err(MessageFault::LineEnding)
+            } else {
+                Ok(block)
+            }
+        }
+        (None, Some(j)) => {
+            let block = &message[..j];
+            if has_crlf(block) || block.ends_with('\r') {
+                Err(MessageFault::LineEnding)
+            } else {
+                Ok(block)
+            }
+        }
+        (None, None) => {
+            let end = message.trim_end_matches(['\r', '\n']).len();
+            let block = &message[..end];
+            let tail = &message[end..];
+            if (has_bare_lf(block) || has_bare_lf(tail))
+                && (has_crlf(block) || tail.contains("\r\n"))
+            {
+                Err(MessageFault::LineEnding)
+            } else {
+                Ok(block)
+            }
+        }
     }
+}
+
+fn has_crlf(s: &str) -> bool {
+    s.contains("\r\n")
+}
+
+fn has_bare_lf(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes
+        .iter()
+        .enumerate()
+        .any(|(i, c)| *c == b'\n' && (i == 0 || bytes[i - 1] != b'\r'))
 }
 
 fn has_bad_control(block: &str) -> bool {
@@ -1033,6 +1075,14 @@ From: other@example.test\r\n\
     fn a_broken_encoded_word_is_not_read_as_text() {
         let raw = "From: =?utf-8?q?unterminated <mailseat@example.test>\r\n\r\n";
         assert_eq!(froms(raw), vec![Err(HeaderFault::EncodedWord)]);
+    }
+
+    #[test]
+    fn mixed_line_endings_are_refused() {
+        let raw = "From: mailseat@example.test\n\nBcc: hidden@example.test\r\n\r\n";
+        assert_eq!(parse_message(raw).unwrap_err(), MessageFault::LineEnding);
+        let raw = "From: mailseat@example.test\r\nTo: a@example.test\n";
+        assert_eq!(parse_message(raw).unwrap_err(), MessageFault::LineEnding);
     }
 
     #[test]

@@ -231,7 +231,8 @@ folded, and a character a reader skips is removed before the
 comparison. ``handle``, ``term`` and ``pair`` may share the deny file
 and are ignored here. A pack-law line that would allow a domain refuses
 the file. A message over 1 MiB, a control character in the header
-block, or a config that cannot be read is a refusal.
+block, a header block that mixes CRLF and a bare LF, or a config
+that cannot be read is a refusal.
 
 =========================== =========================================================
 Code                        When
@@ -246,6 +247,7 @@ Code                        When
 ``return-path-denied``      Return-Path names a deny-file identity
 ``recipient-domain-denied`` To, Cc or Bcc is at a denied domain
 ``header-control``          a control character in the header block
+``header-line-ending``      the header block mixes CRLF and a bare LF
 ``message-too-large``       the message is over 1 MiB
 ``message-invalid``         the bytes are not a header block
 ``config-unreadable``       the config path cannot be read

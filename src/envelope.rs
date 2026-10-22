@@ -106,6 +106,9 @@ pub fn check_mail_bytes(message: &[u8], config_path: &Path) -> MailVerdict {
         Err(MessageFault::Control) => {
             return MailVerdict::refusal("header-control", "header block");
         }
+        Err(MessageFault::LineEnding) => {
+            return MailVerdict::refusal("header-line-ending", "header block");
+        }
         Err(MessageFault::Structure) => {
             return MailVerdict::refusal("message-invalid", "header block");
         }
@@ -803,6 +806,23 @@ pair left right
         let v = check_mail_bytes(b"From: mailseat@example.test\r\n", &dir.join("mail.conf"));
         assert_eq!(v.reasons[0].code, "deny-file-unreadable");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mixed_header_line_endings_are_refused() {
+        let hidden = "From: mailseat@example.test\n\nBcc: a@blocked.test\r\n\r\n";
+        assert_eq!(
+            codes(hidden, "domain blocked.test\n", ""),
+            vec!["header-line-ending"]
+        );
+        let mixed = "From: mailseat@example.test\r\nTo: a@example.test\n";
+        assert_eq!(codes(mixed, "", ""), vec!["header-line-ending"]);
+        let bare_blank = "From: mailseat@example.test\r\nTo: a@example.test\n\n";
+        assert_eq!(codes(bare_blank, "", ""), vec!["header-line-ending"]);
+        let crlf_then_body = "From: mailseat@example.test\r\n\r\npara\n\nmore\r\n";
+        assert!(codes(crlf_then_body, "", "").is_empty());
+        assert!(codes("From: mailseat@example.test\r\n", "", "").is_empty());
+        assert!(codes("From: mailseat@example.test\n", "", "").is_empty());
     }
 
     #[test]
