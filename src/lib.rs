@@ -675,6 +675,7 @@ fn walk(
         if !piped {
             let was = shell.vars.clone();
             set_vars(&shown, &mut shell.vars);
+            note_startup(&shown, &mut shell.vars);
             match before {
                 "||" => shell.vars.merge(was),
                 "&&" => match &mut vars_failed {
@@ -693,25 +694,45 @@ fn walk(
                 shell.vars.home = Some("$".into());
             }
         }
+        // A non-interactive bash or sh sources BASH_ENV or ENV in the
+        // child, before the -c script. That text is judged here.
+        judge_startup(&shown, shell, depth, out, denied);
+        if denied.is_some() {
+            return;
+        }
+        // `bash <(cat file)` runs the file in the child. The directory
+        // the path is relative to is known only here.
+        judge_procsub(&shown, shell, depth, out, denied);
+        if denied.is_some() {
+            return;
+        }
         let words = peel_cd_command_word(&shown);
         let b = words.first().map_or("", |w| base_of(w));
         // A pipeline stage runs in a subshell, so it cannot move this
         // shell. The last stage can, once `lastpipe` is on.
         let in_shell = !piped || (shell.lastpipe && end != "|");
-        if in_shell {
-            let read = {
-                let dir = match shell.here.as_slice() {
-                    [d] if !is_untracked(d) => Some(d.as_path()),
-                    _ => None,
-                };
-                sourced(&cmd, dir, &shell.aliases)
+        // `source` runs the file. The deny rules see that text here, in
+        // the same walk that tracks the directory, whether or not the
+        // file can move this shell. A pipeline stage's source moves only
+        // its own subshell.
+        let read = {
+            let dir = match shell.here.as_slice() {
+                [d] if !is_untracked(d) => Some(d.as_path()),
+                _ => None,
             };
-            match read {
-                Sourced::Keeps(words) => {
-                    // The scan already accepted this file. Case arms and a
-                    // discarded substitution look like commands the walk
-                    // cannot see, and that would drop the directory and
-                    // turn `lastpipe` on for whatever the line runs next.
+            sourced(&cmd, dir, &shell.aliases)
+        };
+        match read {
+            Sourced::Read { keeps, words } => {
+                if let Some(c) = judge_body(&words, shell) {
+                    *denied = Some(c);
+                    return;
+                }
+                if in_shell && keeps {
+                    // Case arms and a discarded substitution look like
+                    // commands the walk cannot see, and that would drop
+                    // the directory and turn `lastpipe` on for the rest
+                    // of the line. The scan already accepted the file.
                     let lastpipe = shell.lastpipe;
                     let pwd_set = shell.pwd_set;
                     let follow = shell.follow_unseen;
@@ -723,12 +744,24 @@ fn walk(
                     shell.lastpipe = lastpipe;
                     shell.pwd_set = pwd_set;
                     shell.follow_unseen = follow;
-                }
-                Sourced::Loses => shell.lose(),
-                Sourced::No => {
-                    if shell.follow_unseen && (bare_unseen(&cmd) || blinds_functions(&cmd)) {
-                        shell.lose();
+                } else if in_shell {
+                    shell.lose();
+                } else if keeps {
+                    replay_subshell(&words, shell, depth, out, denied);
+                    if denied.is_some() {
+                        return;
                     }
+                }
+            }
+            Sourced::Loses => {
+                if in_shell {
+                    shell.lose();
+                }
+            }
+            Sourced::No => {
+                if in_shell && shell.follow_unseen && (bare_unseen(&cmd) || blinds_functions(&cmd))
+                {
+                    shell.lose();
                 }
             }
         }
@@ -985,6 +1018,14 @@ struct Vars {
     pwd: Option<String>,
     lastpipe: bool,
     physical: bool,
+    /// The shell's `BASH_ENV`. `Some("$")` is a value the line does not
+    /// show. `bash_env_exported` is set once `export` or `declare -x`
+    /// has put it in the environment a later `bash` inherits.
+    bash_env: Option<String>,
+    bash_env_exported: bool,
+    /// The shell's `ENV`, same as [`Vars::bash_env`] for `sh`.
+    sh_env: Option<String>,
+    sh_env_exported: bool,
 }
 
 /// The variables [`Vars`] holds.
@@ -999,6 +1040,10 @@ impl Vars {
             pwd: None,
             lastpipe: false,
             physical: false,
+            bash_env: None,
+            bash_env_exported: false,
+            sh_env: None,
+            sh_env_exported: false,
         }
     }
 
@@ -1080,6 +1125,15 @@ impl Vars {
         }
         self.lastpipe |= other.lastpipe;
         self.physical |= other.physical;
+        // A startup file one side set and the other did not is not known.
+        if self.bash_env != other.bash_env || self.bash_env_exported != other.bash_env_exported {
+            self.bash_env = Some("$".into());
+            self.bash_env_exported = true;
+        }
+        if self.sh_env != other.sh_env || self.sh_env_exported != other.sh_env_exported {
+            self.sh_env = Some("$".into());
+            self.sh_env_exported = true;
+        }
     }
 }
 
@@ -1106,6 +1160,10 @@ fn writes_pwd(argv: &[String], cwd: &std::path::Path) -> bool {
                 pwd: Some(UNTRACKED.into()),
                 lastpipe: false,
                 physical: false,
+                bash_env: None,
+                bash_env_exported: false,
+                sh_env: None,
+                sh_env_exported: false,
             };
             set_vars(&cmd, &mut probe);
             if probe.pwd.as_deref() != Some(UNTRACKED) {
@@ -1183,12 +1241,12 @@ fn trap_moves(cmd: &[&str]) -> bool {
 enum Sourced {
     /// The command is not a `source` or `.` of a literal path.
     No,
-    /// The file can be read and its text leaves the shell where it was.
-    /// The words are the file, aliases expanded, so a function it defines
-    /// or calls is judged with the line.
-    Keeps(Vec<String>),
-    /// The file cannot be read, or its text may move the shell or set
-    /// `HOME`, `CDPATH` or `PWD`.
+    /// The file was read. `keeps` when its text leaves the shell where it
+    /// was. `words` is the file, aliases expanded, so a function it
+    /// defines or calls is judged with the line, and the deny rules see
+    /// the same words.
+    Read { keeps: bool, words: Vec<String> },
+    /// The file cannot be read, or the path is not one literal file.
     Loses,
 }
 
@@ -1207,10 +1265,265 @@ fn sourced(cmd: &[&str], cwd: Option<&std::path::Path>, aliases: &[(String, Stri
         return Sourced::Loses;
     };
     let scan = scan_script(&text, aliases);
-    if scan.keeps {
-        Sourced::Keeps(scan.words)
+    Sourced::Read {
+        keeps: scan.keeps,
+        words: scan.words,
+    }
+}
+
+/// A startup-file value the line shows as a path, or `"$"` when it does
+/// not. Empty is empty: bash sources nothing when `BASH_ENV` is empty.
+fn shown_startup(v: &str) -> String {
+    if v.is_empty() {
+        String::new()
+    } else if v.contains(['$', '`', '*', '?', '[', '~', '\n']) {
+        "$".into()
     } else {
-        Sourced::Loses
+        v.to_string()
+    }
+}
+
+fn startup_pair(w: &str) -> Option<(&str, &str)> {
+    let (n, v) = w.split_once('=')?;
+    let n = n.strip_suffix('+').unwrap_or(n);
+    matches!(n, "BASH_ENV" | "ENV").then_some((n, v))
+}
+
+fn store_startup(vars: &mut Vars, name: &str, value: String, export: bool) {
+    let (slot, flag) = match name {
+        "BASH_ENV" => (&mut vars.bash_env, &mut vars.bash_env_exported),
+        "ENV" => (&mut vars.sh_env, &mut vars.sh_env_exported),
+        _ => return,
+    };
+    *slot = Some(value);
+    if export {
+        *flag = true;
+    }
+}
+
+/// Record `BASH_ENV` and `ENV` when `cmd` sets them in this shell.
+/// A prefix assignment (`BASH_ENV=file bash`) belongs to that command
+/// alone and is not recorded here.
+fn note_startup(cmd: &[&str], vars: &mut Vars) {
+    let words = operands(cmd);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    let rest = peel_cd_command_word(&words[front..]);
+    let name = rest.first().map_or("", |w| base_of(w));
+    if name.is_empty() {
+        for w in &words[..front] {
+            if let Some((n, v)) = startup_pair(w) {
+                store_startup(vars, n, shown_startup(v), false);
+            }
+        }
+        return;
+    }
+    if name == "unset" {
+        for a in rest.iter().skip(1) {
+            match *a {
+                "BASH_ENV" => {
+                    vars.bash_env = None;
+                    vars.bash_env_exported = false;
+                }
+                "ENV" => {
+                    vars.sh_env = None;
+                    vars.sh_env_exported = false;
+                }
+                _ if a.contains(['$', '`']) => {
+                    vars.bash_env = Some("$".into());
+                    vars.bash_env_exported = true;
+                    vars.sh_env = Some("$".into());
+                    vars.sh_env_exported = true;
+                }
+                _ => {}
+            }
+        }
+        return;
+    }
+    let exporting = name == "export"
+        || (matches!(name, "declare" | "typeset")
+            && rest
+                .iter()
+                .skip(1)
+                .any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('x')));
+    if !exporting {
+        return;
+    }
+    for a in rest.iter().skip(1) {
+        if *a == "BASH_ENV" {
+            vars.bash_env_exported = true;
+            if vars.bash_env.is_none() {
+                vars.bash_env = Some("$".into());
+            }
+        } else if *a == "ENV" {
+            vars.sh_env_exported = true;
+            if vars.sh_env.is_none() {
+                vars.sh_env = Some("$".into());
+            }
+        } else if let Some((n, v)) = startup_pair(a) {
+            store_startup(vars, n, shown_startup(v), true);
+        }
+    }
+}
+
+/// The `NAME=value` for `var` written before the shell word `shell` on
+/// `cmd`: a prefix assignment or one `env` puts in the child's environment.
+fn prefix_startup<'a>(cmd: &[&'a str], shell: &str, var: &str) -> Option<&'a str> {
+    let mut found = None;
+    for w in cmd {
+        if let Some((n, v)) = startup_pair(w) {
+            if n == var {
+                found = Some(v);
+            }
+            continue;
+        }
+        if base_of(w) == shell {
+            break;
+        }
+    }
+    found
+}
+
+fn startup_unshown() -> Checked {
+    Checked {
+        decision: Decision::Deny,
+        code: PolicyReason::ShellDangerousRunner,
+        token: Cow::Borrowed("startup-script-unshown"),
+    }
+}
+
+/// Judge the `BASH_ENV` or `ENV` file a non-interactive `bash` or `sh`
+/// sources before its `-c` script. The file runs in the child, so a `cd`
+/// in it does not move this shell; the commands are still recorded there.
+fn judge_startup(
+    cmd: &[&str],
+    shell: &Shell,
+    depth: usize,
+    out: &mut Vec<(Vec<String>, std::path::PathBuf, bool)>,
+    denied: &mut Option<Checked>,
+) {
+    if denied.is_some() {
+        return;
+    }
+    let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+    let owned = split_env_strings(&owned).into_owned();
+    let (run, _) = unwrap_wrappers(&owned);
+    let Some(first) = run.first() else {
+        return;
+    };
+    let (var, exported) = match base_of(first) {
+        "bash" => ("BASH_ENV", shell.vars.bash_env_exported),
+        "sh" => ("ENV", shell.vars.sh_env_exported),
+        _ => return,
+    };
+    if shell_script(run).is_none() {
+        return;
+    }
+    let value = prefix_startup(cmd, base_of(first), var)
+        .map(shown_startup)
+        .or_else(|| {
+            if !exported {
+                return None;
+            }
+            match var {
+                "BASH_ENV" => shell.vars.bash_env.clone(),
+                _ => shell.vars.sh_env.clone(),
+            }
+        });
+    let Some(value) = value.filter(|v| !v.is_empty()) else {
+        return;
+    };
+    if value == "$" {
+        *denied = Some(startup_unshown());
+        return;
+    }
+    let path = std::path::Path::new(&value);
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match shell.here.as_slice() {
+            [d] if !is_untracked(d) => d.join(path),
+            _ => {
+                *denied = Some(startup_unshown());
+                return;
+            }
+        }
+    };
+    let Some(text) = read_regular_nofollow(&full) else {
+        *denied = Some(startup_unshown());
+        return;
+    };
+    let mut aliases = shell.aliases.clone();
+    let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
+    if let Some(c) = judge_body(&words, shell) {
+        *denied = Some(c);
+        return;
+    }
+    replay_subshell(&words, shell, depth, out, denied);
+}
+
+/// A `bash <(cat file)` runs `file` as its script, in the child. A `cd`
+/// in the file does not move this shell. `echo` text is judged with the
+/// other commands of the line; only a `cat` of a literal path is read
+/// here, where the directory is known.
+fn judge_procsub(
+    cmd: &[&str],
+    shell: &Shell,
+    depth: usize,
+    out: &mut Vec<(Vec<String>, std::path::PathBuf, bool)>,
+    denied: &mut Option<Checked>,
+) {
+    if denied.is_some() {
+        return;
+    }
+    let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+    let owned = split_env_strings(&owned).into_owned();
+    let (run, _) = unwrap_wrappers(&owned);
+    let ProcKind::Paths(paths) = procsub_of(run) else {
+        return;
+    };
+    let mut text = String::new();
+    for path in &paths {
+        let Some(part) = read_shown_file(path, shell) else {
+            *denied = Some(procsub_unshown_denial());
+            return;
+        };
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&part);
+    }
+    let mut aliases = shell.aliases.clone();
+    let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
+    if let Some(c) = judge_body(&words, shell) {
+        *denied = Some(c);
+        return;
+    }
+    replay_subshell(&words, shell, depth, out, denied);
+}
+
+/// The text of a literal path, read from the one directory the shell is
+/// in. `None` when the path is relative and that directory is not known,
+/// or the file cannot be read.
+fn read_shown_file(path: &str, shell: &Shell) -> Option<String> {
+    let path = std::path::Path::new(path);
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match shell.here.as_slice() {
+            [d] if !is_untracked(d) => d.join(path),
+            _ => return None,
+        }
+    };
+    read_regular_nofollow(&full)
+}
+
+fn procsub_unshown_denial() -> Checked {
+    Checked {
+        decision: Decision::Deny,
+        code: PolicyReason::ShellDangerousRunner,
+        token: Cow::Borrowed("procsub-script-unshown"),
     }
 }
 
@@ -1452,6 +1765,10 @@ fn writes_tracked(cmd: &[&str]) -> bool {
         pwd: Some(mark.into()),
         lastpipe: false,
         physical: false,
+        bash_env: None,
+        bash_env_exported: false,
+        sh_env: None,
+        sh_env_exported: false,
     };
     set_vars(cmd, &mut vars);
     vars.cdpath.as_deref() != Some(mark)
@@ -2189,6 +2506,22 @@ fn host_argv_table_at(argv: &[String], depth: usize, moved: bool) -> Checked {
     if own.decision != Decision::Allow {
         return own;
     }
+    // A find payload or a parallel command the line does not show can be
+    // any program. Refuse it before the commands the line does show.
+    if find_exec_unshown(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: Cow::Borrowed("find-exec-unshown"),
+        };
+    }
+    if parallel_command_unshown(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: Cow::Borrowed("parallel-command-unshown"),
+        };
+    }
     for inner in inner_commands(argv)
         .into_iter()
         .filter(|_| depth < MAX_DEPTH)
@@ -2215,6 +2548,15 @@ fn host_argv_table_at(argv: &[String], depth: usize, moved: bool) -> Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellDangerousRunner,
             token: Cow::Borrowed("shell-stdin-unshown"),
+        };
+    }
+    // `bash <(echo "$cmd")`: the substitution runs, and its output is the
+    // script. An output the line does not show may be any script.
+    if procsub_script_unshown(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: Cow::Borrowed("procsub-script-unshown"),
         };
     }
     own
@@ -2393,14 +2735,148 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
                     .iter()
                     .map(|l| (i, shell_words(l))),
             );
-        } else {
+        } else if base_of(&run[0]) == ":::" {
+            // `parallel ::: 'git push -f'`: with no command in front, each
+            // argument is a shell command.
+            for a in &run[1..] {
+                if a == ":::" || a == "::::" {
+                    break;
+                }
+                out.extend(script_lines(a, 0).iter().map(|l| (i, shell_words(l))));
+            }
+        } else if base_of(&run[0]) != "::::" {
             if let Some(action) = trap_action(run) {
                 out.extend(script_lines(action, 0).iter().map(|l| (i, shell_words(l))));
+            }
+            for payload in find_payloads(run) {
+                if !payload_unshown(&payload) {
+                    out.push((i, subst_find_braces(&payload)));
+                }
+            }
+            // `bash <(echo git push -f)` runs echo, and bash then runs
+            // echo's output as its script. A `cat` of a path is read in
+            // the walk, which knows the directory.
+            match procsub_of(run) {
+                ProcKind::Not => {}
+                kind => {
+                    if let Some(body) = procsub_body(run) {
+                        out.extend(script_lines(body, 0).iter().map(|l| (i, shell_words(l))));
+                    }
+                    if let ProcKind::Text(text) = kind {
+                        out.extend(script_lines(&text, 0).iter().map(|l| (i, shell_words(l))));
+                    }
+                }
             }
             out.push((i, run.to_vec()));
         }
     }
     out
+}
+
+/// Whether `w` ends a `find -exec` payload. A quoted or escaped `;` is
+/// still the terminator find reads, and `shell_words` keeps it as `';'`.
+fn find_terminator(w: &str) -> bool {
+    matches!(w, ";" | "';'" | "\";" | "\\;" | "+" | "'+'" | "\"+\"")
+}
+
+/// The commands `find -exec`, `-execdir`, `-ok` and `-okdir` run. The
+/// words after the predicate, up to `;` or `+`, are the command. With no
+/// terminator the rest of the line is that command.
+fn find_payloads(cmd: &[String]) -> Vec<Vec<String>> {
+    if cmd.first().is_none_or(|w| base_of(w) != "find") {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut i = 1;
+    while i < cmd.len() {
+        if matches!(cmd[i].as_str(), "-exec" | "-execdir" | "-ok" | "-okdir") {
+            i += 1;
+            let start = i;
+            while i < cmd.len() && !find_terminator(&cmd[i]) {
+                i += 1;
+            }
+            out.push(cmd[start..i].to_vec());
+            if i < cmd.len() {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// A find payload whose command word the line does not show: empty,
+/// `{}` (the path find fills in), `$cmd`, or a glob. The program find
+/// runs could be anything.
+fn payload_unshown(payload: &[String]) -> bool {
+    let Some(head) = payload.first() else {
+        return true;
+    };
+    let head = base_of(head);
+    head.is_empty() || head.contains(['$', '`', '*', '?', '[', '~', '\n', '{'])
+}
+
+/// `{}` and the GNU find braces in an argument are the path find
+/// substitutes. The line does not name it, so the path rules read a file
+/// under `/tmp` while the command itself is still judged.
+fn subst_find_braces(payload: &[String]) -> Vec<String> {
+    payload
+        .iter()
+        .enumerate()
+        .map(|(n, w)| if n == 0 { w.clone() } else { subst_find_arg(w) })
+        .collect()
+}
+
+fn subst_find_arg(w: &str) -> String {
+    const MARK: &str = "/tmp/find-arg";
+    let mut w = w.replace("{}", MARK);
+    for tok in ["{//}", "{.}", "{/}", "{%}", "{#}"] {
+        w = w.replace(tok, MARK);
+    }
+    w
+}
+
+/// A `find` on the line whose `-exec` payload does not show its command.
+fn find_exec_unshown(argv: &[String]) -> bool {
+    each_unwrapped(argv)
+        .iter()
+        .any(|run| find_payloads(run).iter().any(|p| payload_unshown(p)))
+}
+
+/// `parallel ::: TEXT` runs TEXT, and `parallel :::: FILE` runs the lines
+/// of FILE. A value the line does not show, or a file of commands, is
+/// unknown. A command in front of `:::` is the wrapper's own command.
+fn parallel_command_unshown(argv: &[String]) -> bool {
+    each_unwrapped(argv).iter().any(|run| {
+        let Some(head) = run.first() else {
+            return false;
+        };
+        match base_of(head) {
+            ":::" => run[1..].iter().any(|a| a == "::::" || !shown_script(a)),
+            "::::" => true,
+            _ => false,
+        }
+    })
+}
+
+/// A script written out in the line: no parameter, glob or `~`.
+fn shown_script(s: &str) -> bool {
+    !s.is_empty() && !s.contains(['$', '`', '*', '?', '[', '~', '\n'])
+}
+
+/// Each command of `argv` past its wrappers, as [`unwrap_wrappers`]
+/// leaves it.
+fn each_unwrapped(argv: &[String]) -> Vec<Vec<String>> {
+    commands(argv)
+        .into_iter()
+        .filter_map(|cmd| {
+            let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+            let owned = split_env_strings(&owned).into_owned();
+            let (run, _) = unwrap_wrappers(&owned);
+            (!run.is_empty()).then(|| run.to_vec())
+        })
+        .collect()
 }
 
 /// The script `trap` runs on each signal it names: its first operand,
@@ -2661,6 +3137,34 @@ const RUNNERS: &[(&str, &[&str])] = &[
             "--max-args",
             "--max-procs",
             "--arg-file",
+        ],
+    ),
+    (
+        "parallel",
+        &[
+            "-j",
+            "--jobs",
+            "-S",
+            "--sshlogin",
+            "--sshloginfile",
+            "-a",
+            "--arg-file",
+            "--argsep",
+            "-d",
+            "--delimiter",
+            "--colsep",
+            "-C",
+            "-I",
+            "--replace",
+            "-n",
+            "-N",
+            "--max-args",
+            "--timeout",
+            "--delay",
+            "--joblog",
+            "--halt",
+            "--workdir",
+            "--wd",
         ],
     ),
     ("watch", &["-n", "--interval", "-d"]),
@@ -2952,6 +3456,253 @@ fn shell_script(run: &[String]) -> Option<&str> {
         }
     }
     None
+}
+
+/// What a process substitution handed to a shell as its script produces.
+enum ProcKind {
+    /// Literal output of `echo` or `printf`, the script the shell runs.
+    Text(String),
+    /// Literal paths `cat` reads. The walk opens them.
+    Paths(Vec<String>),
+    /// The output is not shown: the script could be anything.
+    Unshown,
+    /// This command is not a shell fed a process substitution.
+    Not,
+}
+
+/// The first script operand of a shell that has no `-c` script: the word
+/// bash would open as the program. A redirection is not that operand,
+/// except a `<(...)` or `>(...)` passed as the script path.
+fn shell_file_operand(run: &[String]) -> Option<&str> {
+    if run.first().is_none_or(|w| !SHELLS.contains(&base_of(w))) || shell_script(run).is_some() {
+        return None;
+    }
+    let mut it = run[1..].iter().map(String::as_str);
+    while let Some(a) = it.next() {
+        if is_redirection(a) && !a.starts_with("<(") && !a.starts_with(">(") {
+            let rest = redirection_body(a);
+            if rest == "<<-" || rest.chars().all(|c| matches!(c, '>' | '<' | '&' | '|')) {
+                it.next();
+            }
+            continue;
+        }
+        if a == "--" {
+            return it.next();
+        }
+        if (a.starts_with('-') || a.starts_with('+')) && a.len() >= 2 {
+            if a.starts_with('-') && !a.starts_with("--") && a[1..].contains('s') {
+                return None;
+            }
+            if matches!(a, "--rcfile" | "--init-file")
+                || (!a.starts_with("--") && a.ends_with(['o', 'O']))
+            {
+                it.next();
+            }
+            continue;
+        }
+        return Some(a);
+    }
+    None
+}
+
+/// The body of `<(...)` when that is the shell's script operand.
+fn procsub_body(run: &[String]) -> Option<&str> {
+    let op = shell_file_operand(run)?;
+    let body = op.strip_prefix("<(")?.strip_suffix(')')?;
+    (!body.trim().is_empty()).then_some(body)
+}
+
+/// How a shell reads a process substitution it was given as its script.
+fn procsub_of(run: &[String]) -> ProcKind {
+    let Some(op) = shell_file_operand(run) else {
+        return ProcKind::Not;
+    };
+    if op.starts_with(">(") {
+        return ProcKind::Unshown;
+    }
+    let Some(body) = procsub_body(run) else {
+        return if op.starts_with("<(") {
+            ProcKind::Unshown
+        } else {
+            ProcKind::Not
+        };
+    };
+    let words = shell_words(body);
+    let cmds = commands(&words);
+    if cmds.len() != 1 {
+        return ProcKind::Unshown;
+    }
+    let owned: Vec<String> = cmds[0].iter().map(|s| (*s).to_string()).collect();
+    let owned = split_env_strings(&owned).into_owned();
+    let (inner, handed) = unwrap_wrappers(&owned);
+    if handed.is_some() {
+        return ProcKind::Unshown;
+    }
+    let Some(head) = inner.first() else {
+        return ProcKind::Unshown;
+    };
+    match base_of(head) {
+        "echo" => echo_text(&inner[1..])
+            .map(ProcKind::Text)
+            .unwrap_or(ProcKind::Unshown),
+        "printf" => printf_text(&inner[1..])
+            .map(ProcKind::Text)
+            .unwrap_or(ProcKind::Unshown),
+        "cat" => cat_paths(&inner[1..])
+            .map(ProcKind::Paths)
+            .unwrap_or(ProcKind::Unshown),
+        _ => ProcKind::Unshown,
+    }
+}
+
+/// A shell on the line whose script is a process substitution whose
+/// output is not a literal `echo`, `printf` or `cat` of a path.
+fn procsub_script_unshown(argv: &[String]) -> bool {
+    each_unwrapped(argv)
+        .iter()
+        .any(|run| matches!(procsub_of(run), ProcKind::Unshown))
+}
+
+/// Text with no parameter, command substitution, glob or `~`.
+fn literal_text(s: &str) -> bool {
+    !s.contains(['$', '`', '*', '?', '[', '~', '\n'])
+}
+
+/// The text `echo` writes, when every argument is literal. `-e` escapes
+/// the line does not spell out are unknown.
+fn echo_text(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    let mut escapes = false;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            i += 1;
+            break;
+        }
+        if let Some(flags) = a
+            .strip_prefix('-')
+            .filter(|f| !f.is_empty() && f.chars().all(|c| matches!(c, 'n' | 'e' | 'E')))
+        {
+            if flags.contains('e') {
+                escapes = true;
+            }
+            if flags.contains('E') {
+                escapes = false;
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    let rest = &args[i..];
+    if rest.iter().any(|a| !literal_text(a)) {
+        return None;
+    }
+    let mut parts = Vec::new();
+    for a in rest {
+        if escapes {
+            parts.push(echo_unescape(a)?);
+        } else {
+            parts.push(a.clone());
+        }
+    }
+    Some(parts.join(" "))
+}
+
+fn echo_unescape(s: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            Some('a') => out.push('\u{7}'),
+            Some('b') => out.push('\u{8}'),
+            Some('e' | 'E') => out.push('\u{1b}'),
+            Some('f') => out.push('\u{c}'),
+            Some('v') => out.push('\u{b}'),
+            Some('c') => return Some(out),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// The text `printf` writes for a literal format of `%s`, `%%` and
+/// simple escapes. Any other conversion, or an argument left over, is
+/// unknown: printf would read the leftover as another format.
+fn printf_text(args: &[String]) -> Option<String> {
+    let args = if args.first().is_some_and(|a| a == "--") {
+        &args[1..]
+    } else {
+        args
+    };
+    if args.first().is_some_and(|a| a.starts_with('-')) {
+        return None;
+    }
+    let (fmt, rest) = args.split_first()?;
+    if !literal_text(fmt) || rest.iter().any(|a| !literal_text(a)) {
+        return None;
+    }
+    render_printf(fmt, rest)
+}
+
+fn render_printf(fmt: &str, args: &[String]) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = fmt.chars();
+    let mut ai = 0;
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('\\') => out.push('\\'),
+                _ => return None,
+            }
+            continue;
+        }
+        if c == '%' {
+            match chars.next() {
+                Some('%') => out.push('%'),
+                Some('s') => {
+                    out.push_str(args.get(ai)?);
+                    ai += 1;
+                }
+                _ => return None,
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    (ai == args.len()).then_some(out)
+}
+
+/// The paths a literal `cat` reads. A flag or a path the line does not
+/// show changes the bytes, so the script is unknown.
+fn cat_paths(args: &[String]) -> Option<Vec<String>> {
+    let mut paths = Vec::new();
+    let mut end = false;
+    for a in args {
+        if !end && a == "--" {
+            end = true;
+            continue;
+        }
+        if !end && a.starts_with('-') {
+            return None;
+        }
+        if a.is_empty() || !literal_text(a) {
+            return None;
+        }
+        paths.push(a.clone());
+    }
+    (!paths.is_empty()).then_some(paths)
 }
 
 /// What the line feeds a shell on stdin.
@@ -9320,6 +10071,269 @@ hash -r 2> /dev/null
             "source .venv/bin/activate && true | cd evil && make clean-all",
         ] {
             let c = check(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+    }
+
+    /// A sourced file runs in this shell, so its text is judged by the
+    /// same rules as the line. `source ../evil/force.sh` was allowed when
+    /// the file's only command was `git push -f` or `make -C ../evil
+    /// clean-all`, because the deny rules never saw the file.
+    #[test]
+    fn a_sourced_file_is_judged_as_the_line_is() {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-srcbody", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sub = root.join("sub");
+        for d in ["sub", "evil", "safe", "repo", ".venv/bin"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("evil/Makefile"), MAKEFILE).unwrap();
+        std::fs::write(root.join("evil/force.sh"), "git push -f origin\n").unwrap();
+        std::fs::write(root.join("evil/make.sh"), "make -C ../evil clean-all\n").unwrap();
+        std::fs::write(root.join("safe/Makefile"), "test:\n\techo ok\n").unwrap();
+        std::fs::write(
+            root.join("safe/package.json"),
+            r#"{"scripts":{"build":"echo build"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(".venv/bin/activate"),
+            include_str!("../tests/fixtures/pyvenv-activate.sh"),
+        )
+        .unwrap();
+        let at = |dir: &std::path::Path, line: &str| check_shell_in(&shell_words(line), dir, 0);
+        for line in [
+            "source ../evil/force.sh",
+            ". ../evil/force.sh",
+            "source ../evil/force.sh && echo ok",
+            "bash -c 'source ../evil/force.sh'",
+        ] {
+            let c = at(&sub, line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
+        }
+        let c = at(&sub, "source ../evil/make.sh");
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(
+            c.token
+                .starts_with("make -C ../evil clean-all runs `rm -rf "),
+            "{}",
+            c.token
+        );
+        assert!(c.token.ends_with(": rm-rf-outside-tmp"), "{}", c.token);
+        for line in [
+            "source .venv/bin/activate && make -C safe test",
+            "conda activate",
+            "nvm use",
+            "direnv allow",
+            "pyenv init -",
+            "make -C safe test",
+            "git -C repo status",
+            "npm run build",
+            "cargo xtask",
+            "f() { echo hi; }; f",
+        ] {
+            let c = at(&root, line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+    }
+
+    /// A non-interactive `bash` reads `BASH_ENV` and a non-interactive
+    /// `sh` reads `ENV` before its `-c` script. A literal file is judged
+    /// as a sourced script; a value the line does not show is unknown.
+    #[test]
+    fn a_startup_file_is_judged_as_a_sourced_script() {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-stenv", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sub = root.join("sub");
+        for d in ["sub", "evil", "safe"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("evil/force.sh"), "git push -f origin\n").unwrap();
+        std::fs::write(root.join("safe/hi.sh"), "echo hi\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &sub, 0);
+        for line in [
+            "BASH_ENV=../evil/force.sh bash -c 'echo ok'",
+            "ENV=../evil/force.sh sh -c 'echo ok'",
+            "export BASH_ENV=../evil/force.sh; bash -c 'echo ok'",
+            "BASH_ENV=../evil/force.sh; export BASH_ENV; bash -c 'echo ok'",
+            "export ENV=../evil/force.sh; sh -c 'echo ok'",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
+        }
+        for line in [
+            "BASH_ENV=\"$F\" bash -c 'echo ok'",
+            "export BASH_ENV=\"$F\"; bash -c 'echo ok'",
+            "ENV=\"$F\" sh -c 'echo ok'",
+            "BASH_ENV=../evil/missing.sh bash -c 'echo ok'",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(
+                c.token.contains("startup-script-unshown"),
+                "{line}: {}",
+                c.token
+            );
+        }
+        for line in [
+            "bash -c 'echo ok'",
+            "sh -c 'echo ok'",
+            "BASH_ENV=../safe/hi.sh bash -c 'echo ok'",
+            "ENV=../evil/force.sh bash -c 'echo ok'",
+            "BASH_ENV=../evil/force.sh sh -c 'echo ok'",
+            "conda activate",
+            "nvm use",
+            "direnv allow",
+            "pyenv init -",
+            "f() { echo hi; }; f",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+    }
+
+    /// `find -exec` runs its payload, and so does a wrapper in front of a
+    /// command. `find . -exec git push -f ';'` was allowed: only an `-exec`
+    /// of `rm`, `shred` or `unlink` was judged. A payload whose command
+    /// word the line does not show is unknown.
+    #[test]
+    fn a_find_exec_payload_is_judged_as_a_command() {
+        let line = |s: &str| verdict(&shell_words(s));
+        for s in [
+            "find . -exec git push -f ';'",
+            "find . -exec git push -f \\;",
+            "find . -exec git push --force {} +",
+            "find . -exec sh -c 'git push -f' ';'",
+            "find . -execdir git push -f \\;",
+            "find . -ok git push -f {} \\;",
+            "find . -okdir sh -c 'git push --force' {} +",
+            "find . \\( -name x -exec git push -f \\; \\)",
+            "bash -c \"find . -exec git push -f ';'\"",
+            "parallel git push -f",
+            "parallel -j 4 git push -f",
+            "parallel --jobs 2 git push --force",
+            "parallel -j4 git push -f",
+            "parallel ::: 'git push -f'",
+            "xargs git push -f",
+            "xargs -n 1 git push -f",
+            "env git push -f",
+            "nohup git push -f",
+            "timeout 5 git push -f",
+            "nice -n 10 git push -f",
+            "stdbuf -oL git push -f",
+            "stdbuf -o L git push -f",
+            "setsid git push -f",
+            "command git push -f",
+            "command -p git push -f",
+            "builtin git push -f",
+            "exec git push -f",
+            "exec -a git git push -f",
+        ] {
+            assert_eq!(line(s), "deny\tgit-force-push", "{s}");
+        }
+        for s in ["sudo git push -f", "doas git push -f"] {
+            assert_eq!(line(s), "deny\tsudo", "{s}");
+        }
+        for s in [
+            "find . -exec {} \\;",
+            "find . -exec \"$cmd\" \\;",
+            "find . -execdir {} +",
+            "parallel ::: \"$cmd\"",
+            "parallel :::: cmds.txt",
+        ] {
+            let got = line(s);
+            assert!(got.starts_with("deny\t"), "{s}: {got}");
+        }
+        for s in [
+            "find . -exec echo {} \\;",
+            "find . -exec grep x {} +",
+            "find . -name '*.pyc' -exec rm -rf {} +",
+            "find /tmp/build -exec rm {} +",
+            "parallel echo hi",
+            "parallel -j 4 echo hi ::: a b",
+            "xargs echo hi",
+            "stdbuf -oL echo hi",
+            "setsid echo hi",
+            "conda activate",
+            "nvm use",
+            "direnv allow",
+            "pyenv init -",
+            "make -C safe test",
+            "git -C repo status",
+            "npm run build",
+            "cargo xtask",
+            "f() { echo hi; }; f",
+        ] {
+            assert_eq!(line(s), "allow", "{s}");
+        }
+    }
+
+    /// A shell whose script operand is a process substitution runs the
+    /// substitution's output. `bash <(echo git push -f)` was allowed: the
+    /// substitution was judged only when it downloaded. A literal `echo`
+    /// or `cat` of a file is that script. Anything else is unknown.
+    #[test]
+    fn a_process_substitution_fed_to_a_shell_is_the_script() {
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-procsub", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sub = root.join("sub");
+        for d in ["sub", "evil", "safe"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        std::fs::write(root.join("evil/force.sh"), "git push -f origin\n").unwrap();
+        std::fs::write(root.join("safe/hi.sh"), "echo hi\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &sub, 0);
+        for line in [
+            "bash <(echo git push -f)",
+            "bash <(echo 'git push -f')",
+            "sh <(echo git push --force)",
+            "bash <(echo -n git push -f)",
+            "bash <(printf '%s\\n' 'git push -f')",
+            "bash -- <(echo git push -f)",
+            "env bash <(echo git push -f)",
+            "bash <(cat ../evil/force.sh)",
+            "bash <(cat ../evil/force.sh) extra",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.contains("git-force-push"), "{line}: {}", c.token);
+        }
+        for line in [
+            "bash <(echo \"$cmd\")",
+            "bash <(echo git push -f \"$x\")",
+            "bash <(cat \"$F\")",
+            "bash <(cat ../evil/missing.sh)",
+            "bash <(date)",
+            "bash <(printf '%s' \"$x\")",
+            "bash <(echo git push -f | cat)",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(
+                c.token.contains("procsub-script-unshown"),
+                "{line}: {}",
+                c.token
+            );
+        }
+        for line in [
+            "bash <(echo echo ok)",
+            "bash <(cat ../safe/hi.sh)",
+            "sh <(echo echo ok)",
+            "cat <(echo git push -f)",
+            "echo $(echo git push -f)",
+            "conda activate",
+            "nvm use",
+            "direnv allow",
+            "pyenv init -",
+            "make -C safe test",
+            "git -C repo status",
+            "npm run build",
+            "cargo xtask",
+            "f() { echo hi; }; f",
+        ] {
+            let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
     }
