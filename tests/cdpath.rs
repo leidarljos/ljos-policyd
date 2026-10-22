@@ -97,6 +97,7 @@ fn reads_a_runner_where_a_cdpath_set_on_the_cd_enters() {
         "CDPATH=../lib cd ./proj && make clean-all",
         "CDPATH=$LIB cd ./proj && make clean-all",
         "CDPATH=../lib true; cd proj && make clean-all",
+        "HOME=/nowhere; CDPATH=$LIB cd $HOME/proj && make clean-all",
     ] {
         assert_eq!(check(&work, None, line), "allow", "{line}");
     }
