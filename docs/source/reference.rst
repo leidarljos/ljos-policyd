@@ -19,7 +19,15 @@ Built-in denials
 
 First match wins. The head is the last path component of argv[0].
 Leading assignments, ``NAME=value`` or ``NAME+=value``, and runner words
-such as ``env``, ``nice`` and ``timeout`` come off first.
+such as ``env``, ``nice`` and ``timeout`` come off first, as does the head
+of a ``case`` arm (``case $x in a)``, or ``b)`` after ``;;``). A ``trap``
+action is judged as a script of its own. A shell with no ``-c`` script
+and no file runs what it reads on stdin: the text of a here-string or
+heredoc is judged as that script, and a pipe, a ``-s`` shell fed
+neither, or a here-string holding an expansion is refused as
+``shell-stdin-unshown``. A command word that an ``alias`` earlier on the
+line names is read as the alias's body, since dash and zsh expand
+aliases in a script and the line does not say which shell reads it.
 
 ===================== ======================== ============================
 Token                 Cap'n PolicyReason       When
@@ -54,7 +62,8 @@ other way, is read as that value. A string that still holds a ``$`` after
 that may run any command, so it is refused as
 ``env-split-string-unshown``.
 Leading words that still run ``cd`` in this shell (``command``,
-``builtin``, ``if``, ``while``, ``{`` and the other control keywords, and
+``builtin``, ``if``, ``while``, ``{`` and the other control keywords, a
+``case`` arm's head, and
 the ``time`` keyword with its ``-p``, which is a program after ``command``
 or ``builtin``, where no word is a keyword)
 are peeled before this check, as are assignments among them
@@ -79,11 +88,13 @@ judged as written. A ``cd`` or ``pushd`` to a path the line does not show
 (``cd "$X"``) leaves it in a directory it does not follow, so a runner
 after it is refused. So does an ``eval``, a ``source`` or ``.`` whose file
 the guard cannot read or whose text may move the shell or set one of
-those, and a command word the line does not show (``$c dir``), which may
-be ``cd``; after one ``HOME``, ``CDPATH`` and ``PWD`` are not followed
-either. A ``source`` or ``.`` of a literal path to a regular file the
-guard can read, whose text does none of that, leaves the line where it
-was.
+those, a command word the line does not show (``$c dir``), which may be
+``cd``, as may an alias whose body the line does not show, and a ``trap``
+whose action is one of those or a ``cd``, ``pushd`` or ``popd``, since a
+``DEBUG`` trap runs before each command; after one ``HOME``, ``CDPATH`` and
+``PWD`` are not followed either. A ``source`` or ``.`` of a literal path to
+a regular file the guard can read, whose text does none of that, leaves
+the line where it was.
 Raw newlines and carriage returns split script commands, and ``$'...'``
 ANSI-C quoted words are decoded before the line is judged.
 
@@ -123,7 +134,9 @@ directory on the stack. A ``popd`` that fails, on a word it does not take
 (``popd x``) or with nothing left to pop (after ``dirs -c``), leaves the
 line in a directory it does not follow. Under ``shopt -s lastpipe`` or
 ``set -o lastpipe``, alone or in an ``eval``, or a ``shopt`` with a word
-the line does not show (``shopt -s $opt``), a
+the line does not show (``shopt -s $opt``), and in a shell the line
+starts after setting ``BASHOPTS`` or ``SHELLOPTS`` to a value that names
+``lastpipe`` or that it does not show, a
 ``cd``, ``pushd`` or ``popd`` in the last stage of a pipeline does the same,
 and a ``dirs`` there leaves the stack not followed.
 

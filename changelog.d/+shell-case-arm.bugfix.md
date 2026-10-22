@@ -1,0 +1,1 @@
+A `case` arm is judged on the command after its pattern, so `case "$x" in a) git push --force ;; esac` is refused as `git-force-push`, and a `cd` in an arm moves the runner after `esac` as any other `cd` that may not run.

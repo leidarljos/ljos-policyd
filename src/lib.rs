@@ -198,6 +198,7 @@ fn runner_commands(
     depth: usize,
     out: &mut Vec<(Vec<String>, std::path::PathBuf, bool)>,
 ) {
+    let argv = &*expand_aliases(argv);
     // Every directory the next command may run in, and every one its
     // `cd -` may enter. A `cd` before `&&` holds for the commands after
     // it, and the directories it left wait in `failed` and `old_failed`
@@ -218,9 +219,10 @@ fn runner_commands(
     let mut ran_in = Vec::new();
     // `$PWD` follows the line's directory unless the line sets it.
     let pwd_set = writes_pwd(argv, cwd);
-    // With `shopt -s lastpipe` anywhere on the line, the last stage of a
-    // pipeline may run in this shell.
-    let lastpipe = commands(argv).iter().any(|c| may_set_lastpipe(c));
+    // With `shopt -s lastpipe` anywhere on the line, or a `BASHOPTS` the
+    // shell running it started with, the last stage of a pipeline may
+    // run in this shell.
+    let lastpipe = vars.lastpipe || commands(argv).iter().any(|c| may_set_lastpipe(c));
     // Functions a sourced file defined whose bodies may move this shell.
     // A later call of one leaves the line untracked; a definition the
     // line never calls does not.
@@ -463,7 +465,7 @@ fn runner_commands(
     if depth >= MAX_DEPTH {
         return;
     }
-    for (i, inner) in inner_commands_at(argv) {
+    for (i, inner) in inner_commands_expanded(argv) {
         if inner.as_slice() != argv {
             let (dirs, old, set) = &ran_in[i];
             for dir in dirs {
@@ -476,12 +478,15 @@ fn runner_commands(
 /// The `CDPATH` and `HOME` a command on the line sees: `None` where one is
 /// unset, and a value with `$` in it, which names no directory, where the
 /// line does not show it. `pwd` is read only by [`writes_pwd`], to see
-/// whether a command writes `PWD`.
+/// whether a command writes `PWD`. `lastpipe` is set once a `BASHOPTS` or
+/// `SHELLOPTS` that may name `lastpipe` is set, which a bash the line
+/// starts reads at startup.
 #[derive(Clone)]
 struct Vars {
     cdpath: Option<String>,
     home: Option<String>,
     pwd: Option<String>,
+    lastpipe: bool,
 }
 
 /// The variables [`Vars`] holds.
@@ -494,6 +499,7 @@ impl Vars {
             cdpath: var("CDPATH"),
             home: var("HOME"),
             pwd: None,
+            lastpipe: false,
         }
     }
 
@@ -514,6 +520,11 @@ impl Vars {
             return;
         };
         let (name, add) = name.strip_suffix('+').map_or((name, false), |n| (n, true));
+        if matches!(name, "BASHOPTS" | "SHELLOPTS")
+            && (v.contains("lastpipe") || v.contains(['$', '`', '*', '?', '[']))
+        {
+            self.lastpipe = true;
+        }
         if name.contains('[') {
             self.lose_target(name);
             return;
@@ -564,6 +575,7 @@ impl Vars {
         if self.home != other.home {
             self.home = Some("$".into());
         }
+        self.lastpipe |= other.lastpipe;
     }
 }
 
@@ -586,6 +598,7 @@ fn writes_pwd(argv: &[String], cwd: &std::path::Path) -> bool {
                 cdpath: None,
                 home: None,
                 pwd: Some(UNTRACKED.into()),
+                lastpipe: false,
             };
             set_vars(&cmd, &mut probe);
             if probe.pwd.as_deref() != Some(UNTRACKED) {
@@ -629,13 +642,29 @@ fn may_set(w: &str, name: &str) -> bool {
 
 /// Whether the command `cmd` runs, in the shell that runs it, what the
 /// walk does not follow: `eval`, `source` or `.`, or a command word the
-/// line does not show (`$c dir`), which may be `cd`. After one nothing is
-/// known of where the line is or what `CDPATH`, `HOME` and `PWD` hold.
+/// line does not show (`$c dir`), which may be `cd`, or a `trap` whose
+/// action [`trap_moves`]. After one nothing is known of where the line is
+/// or what `CDPATH`, `HOME` and `PWD` hold.
 /// A `source` or `.` of a literal path is not this: [`sourced`] reads the
 /// file and keeps the line when the text cannot move the shell.
 fn bare_unseen(cmd: &[&str]) -> bool {
     head_word(cmd)
         .is_some_and(|w| matches!(base_of(&w), "eval" | "source" | ".") || w.contains(['$', '`']))
+        || trap_moves(cmd)
+}
+
+/// Whether `cmd` is a `trap` whose action moves the shell or is
+/// [`bare_unseen`]. A DEBUG trap runs its action before each command.
+fn trap_moves(cmd: &[&str]) -> bool {
+    let words = operands(cmd);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    trap_action(peel_cd_command_word(&words[front..])).is_some_and(|a| {
+        commands(&shell_words(a))
+            .iter()
+            .any(|c| bare_unseen(c) || moves_shell(c))
+    })
 }
 
 /// What [`sourced`] found for a `source` or `.`.
@@ -880,9 +909,11 @@ fn body_keeps(
     memo: &mut std::collections::HashMap<String, bool>,
     stack: &mut std::collections::HashSet<String>,
 ) -> bool {
+    // A stage before a `|` runs in a subshell even under lastpipe. A case
+    // arm's alternatives (`CYGWIN*|MSYS*)`) read as such stages.
     ended_commands(words)
         .iter()
-        .all(|(cmd, _)| command_keeps(cmd, funcs, memo, stack))
+        .all(|(cmd, end)| *end == "|" || command_keeps(cmd, funcs, memo, stack))
 }
 
 /// Whether `cmd`, run in this shell, leaves the directory, the stack,
@@ -895,7 +926,7 @@ fn command_keeps(
     memo: &mut std::collections::HashMap<String, bool>,
     stack: &mut std::collections::HashSet<String>,
 ) -> bool {
-    if writes_tracked(cmd) || moves_shell(cmd) {
+    if writes_tracked(cmd) || moves_shell(cmd) || trap_moves(cmd) {
         return false;
     }
     let Some(owned) = head_word(cmd) else {
@@ -906,10 +937,12 @@ fn command_keeps(
         return true;
     }
     // `[` is the test builtin. Its name is the glob character
-    // [`may_set_lastpipe`] treats as a word the line does not show.
+    // [`may_set_lastpipe`] treats as a word the line does not show. An
+    // alias it defines may run anything as a later command word.
     if (w != "[" && w != "[[" && may_set_lastpipe(cmd))
         || matches!(base_of(w), "eval" | "source" | ".")
         || w.contains(['$', '`'])
+        || (base_of(w) == "alias" && cmd.iter().any(|a| a.contains('=')))
     {
         return false;
     }
@@ -921,18 +954,21 @@ fn moves_shell(cmd: &[&str]) -> bool {
     head_word(cmd).is_some_and(|w| matches!(base_of(&w), "cd" | "pushd" | "popd" | "dirs"))
 }
 
-/// Whether `cmd` writes `HOME`, `CDPATH` or `PWD` in this shell.
+/// Whether `cmd` writes `HOME`, `CDPATH` or `PWD` in this shell, or a
+/// `BASHOPTS` that may turn on `lastpipe` in a shell it starts.
 fn writes_tracked(cmd: &[&str]) -> bool {
     let mark = "\0";
     let mut vars = Vars {
         cdpath: Some(mark.into()),
         home: Some(mark.into()),
         pwd: Some(mark.into()),
+        lastpipe: false,
     };
     set_vars(cmd, &mut vars);
     vars.cdpath.as_deref() != Some(mark)
         || vars.home.as_deref() != Some(mark)
         || vars.pwd.as_deref() != Some(mark)
+        || vars.lastpipe
 }
 
 fn is_plain_subshell(w: &str) -> bool {
@@ -1483,6 +1519,11 @@ fn peel_cd_command_word<'a>(mut words: &'a [&'a str]) -> &'a [&'a str] {
         let Some((w, rest)) = words.split_first() else {
             return words;
         };
+        let head = case_head(words);
+        if head > 0 && !looked_up {
+            words = &words[head..];
+            continue;
+        }
         if is_assignment(w) {
             words = rest;
             continue;
@@ -1563,6 +1604,13 @@ fn host_argv_table_at(argv: &[String], depth: usize, moved: bool) -> Checked {
             token: Cow::Borrowed("env-split-string-unshown"),
         };
     }
+    if unshown_stdin_script(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::ShellDangerousRunner,
+            token: Cow::Borrowed("shell-stdin-unshown"),
+        };
+    }
     own
 }
 
@@ -1576,8 +1624,65 @@ fn inner_commands(argv: &[String]) -> Vec<Vec<String>> {
 }
 
 /// [`inner_commands`], each with the index in [`commands`] of the command
-/// it comes from.
+/// it comes from, once the line's aliases are expanded.
 fn inner_commands_at(argv: &[String]) -> Vec<(usize, Vec<String>)> {
+    inner_commands_expanded(&expand_aliases(argv))
+}
+
+/// `argv` with each command word that an `alias` before it on the line
+/// names replaced by the alias's body. dash and zsh expand aliases in a
+/// script, as bash does under `shopt -s expand_aliases`, and the line
+/// does not say which shell reads it, so expansion may always be on. A
+/// body the line does not show (`$`, a backquote) becomes a command word
+/// it does not show.
+fn expand_aliases(argv: &[String]) -> Cow<'_, [String]> {
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    let mut out = Vec::new();
+    let mut changed = false;
+    for (cmd, end) in ended_commands(argv) {
+        let front = (0..cmd.len())
+            .take_while(|&i| is_assignment(cmd[i]) || keyword_at(&cmd, i))
+            .count();
+        let front = front + case_head(&cmd[front..]);
+        let mut rest: Vec<String> = cmd[front..].iter().map(|s| (*s).to_string()).collect();
+        let mut used: Vec<&String> = Vec::new();
+        while let Some((name, body)) = rest
+            .first()
+            .and_then(|w| aliases.iter().rev().find(|(n, _)| n == w))
+            .filter(|(n, _)| !used.contains(&n))
+        {
+            used.push(name);
+            changed = true;
+            if body.contains(['$', '`']) {
+                rest[0] = format!("${{alias {name}}}");
+                break;
+            }
+            let mut words = shell_words(body);
+            words.extend(rest.drain(1..));
+            rest = words;
+        }
+        if let Some((w, defs)) = peel_cd_command_word(&cmd[front..]).split_first() {
+            if base_of(w) == "alias" {
+                aliases.extend(
+                    defs.iter()
+                        .filter_map(|d| d.split_once('='))
+                        .map(|(n, b)| (n.to_string(), b.to_string())),
+                );
+            }
+        }
+        out.extend(cmd[..front].iter().map(|s| (*s).to_string()));
+        out.extend(rest);
+        out.extend((!end.is_empty()).then(|| end.to_string()));
+    }
+    if changed {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(argv)
+    }
+}
+
+/// [`inner_commands_at`] on a line whose aliases are already expanded.
+fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
     let mut out = Vec::new();
     // `g=git; $g push -f`: a bare assignment earlier on the line names what
     // a later `$g` or `${g}` command word runs.
@@ -1654,6 +1759,9 @@ fn inner_commands_at(argv: &[String]) -> Vec<(usize, Vec<String>)> {
         if let Some(inside) = container_command(run) {
             out.push((i, inside));
         }
+        if let Some((Fed::Text(script), _)) = shell_stdin(run) {
+            out.extend(script_lines(script, 0).iter().map(|l| (i, shell_words(l))));
+        }
         if let Some(script) = shell_script(run) {
             out.extend(script_lines(script, 0).iter().map(|l| (i, shell_words(l))));
         } else if base_of(&run[0]) == "eval" {
@@ -1664,10 +1772,25 @@ fn inner_commands_at(argv: &[String]) -> Vec<(usize, Vec<String>)> {
                     .map(|l| (i, shell_words(l))),
             );
         } else {
+            if let Some(action) = trap_action(run) {
+                out.extend(script_lines(action, 0).iter().map(|l| (i, shell_words(l))));
+            }
             out.push((i, run.to_vec()));
         }
     }
     out
+}
+
+/// The script `trap` runs on each signal it names: its first operand,
+/// past `-l`, `-p` and `--`.
+fn trap_action<S: AsRef<str>>(run: &[S]) -> Option<&str> {
+    let (first, args) = run.split_first()?;
+    if base_of(first.as_ref()) != "trap" {
+        return None;
+    }
+    args.iter()
+        .map(AsRef::as_ref)
+        .find(|a| !(a.starts_with('-') && a.len() > 1))
 }
 
 /// `w` with each `$NAME` and `${NAME}` whose value the line shows read as
@@ -1974,6 +2097,11 @@ fn wrapper_walk(cmd: &[String]) -> Walk<'_> {
             i += 1;
             continue;
         }
+        let head = case_head(&cmd[i..]);
+        if head > 0 {
+            i += head;
+            continue;
+        }
         if let Some(head) = function_head(&cmd[i..]) {
             // `f() { git push -f; }`: the body is what runs when `f` is
             // called, so it is judged as written.
@@ -2112,6 +2240,24 @@ fn env_split_words(s: &str) -> Vec<String> {
     out
 }
 
+/// How many words at the front of `words` open a `case` arm: `case WORD
+/// in` with the first arm's pattern (`a)`, `(a)`), or the pattern alone
+/// that opens each later arm after `;;`. The command after them is the
+/// one the arm runs. A pattern is a word with a `)` no `(` in it opens.
+fn case_head<S: AsRef<str>>(words: &[S]) -> usize {
+    let word = |i: usize| words.get(i).map(AsRef::as_ref);
+    let pattern = |p: &str| p.ends_with(')') && p.matches(')').count() > p.matches('(').count();
+    let n = if word(0) == Some("case") && word(2) == Some("in") {
+        3
+    } else {
+        0
+    };
+    match word(n) {
+        Some(p) if pattern(p) || (n == 3 && p.starts_with('(') && p.ends_with(')')) => n + 1,
+        _ => n,
+    }
+}
+
 /// How many words a function definition's head takes at the front of
 /// `words`: `f(){`, `f() {`, `function f {` and `function f() {`. None
 /// when the words do not open one.
@@ -2184,6 +2330,80 @@ fn shell_script(run: &[String]) -> Option<&str> {
         }
     }
     None
+}
+
+/// What the line feeds a shell on stdin.
+enum Fed<'a> {
+    /// A here-string's text.
+    Text(&'a str),
+    /// A heredoc, whose lines are already commands of the line.
+    Heredoc,
+    /// Nothing the line shows: a pipe, or the stdin it inherits.
+    Unshown,
+}
+
+/// For a shell that reads its script from stdin, having no `-c` script
+/// and no file operand (or `-s`, after which operands are arguments),
+/// what the line feeds it there and whether `-s` asks for it. `None` for
+/// a call that is not such a shell.
+fn shell_stdin(run: &[String]) -> Option<(Fed<'_>, bool)> {
+    let (first, args) = run.split_first()?;
+    if !SHELLS.contains(&base_of(first)) || shell_script(run).is_some() {
+        return None;
+    }
+    let mut fed = Fed::Unshown;
+    let mut it = args.iter().map(String::as_str);
+    while let Some(a) = it.next() {
+        let body = redirection_body(a);
+        if let Some(text) = body.strip_prefix("<<<") {
+            fed = Fed::Text(if text.is_empty() {
+                it.next().unwrap_or_default()
+            } else {
+                text
+            });
+        } else if body.starts_with("<<") {
+            fed = Fed::Heredoc;
+        }
+    }
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut stdin = false;
+    let mut it = operands(&words).into_iter();
+    while let Some(a) = it.next() {
+        if a == "--" || a == "-" {
+            break;
+        }
+        if !(a.starts_with('-') || a.starts_with('+')) {
+            if !stdin {
+                return None;
+            }
+            break;
+        }
+        if a.starts_with('-') && !a.starts_with("--") && a[1..].contains('s') {
+            stdin = true;
+        }
+        if matches!(a, "--rcfile" | "--init-file")
+            || (!a.starts_with("--") && a.ends_with(['o', 'O']))
+        {
+            it.next();
+        }
+    }
+    Some((fed, stdin))
+}
+
+/// Whether a shell on the line runs a script from stdin that the line
+/// does not show: one after a `|`, or one called with `-s`, that no
+/// here-string or heredoc feeds, or a here-string holding an expansion.
+fn unshown_stdin_script(argv: &[String]) -> bool {
+    let mut piped = false;
+    ended_commands(argv).into_iter().any(|(cmd, end)| {
+        let after_pipe = std::mem::replace(&mut piped, end == "|");
+        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        match shell_stdin(unwrap_wrappers(&owned).0) {
+            Some((Fed::Text(text), _)) => text.contains(['$', '`']),
+            Some((Fed::Unshown, dash_s)) => after_pipe || dash_s,
+            _ => false,
+        }
+    })
 }
 
 fn decode_ansi_c_quoted(chars: &[char], i: &mut usize, out: &mut String) {
@@ -5588,6 +5808,29 @@ mod tests {
         );
     }
 
+    /// bash takes its shopt options from `BASHOPTS` in its environment, so
+    /// a value naming `lastpipe`, or one the line does not show, may turn
+    /// it on in a shell the line starts. The first stage of a pipeline
+    /// runs in a subshell even then.
+    #[test]
+    fn bashopts_may_turn_lastpipe_on_in_a_nested_shell() {
+        for line in [
+            "BASHOPTS=lastpipe bash -c \"true | cd evil; make clean-all\"",
+            "export BASHOPTS=lastpipe; bash -c 'true | cd evil; make clean-all'",
+            "env SHELLOPTS=$opts bash -c 'true | cd evil; make clean-all'",
+            "BASHOPTS=\"$O\" bash -c 'true | cd evil; make clean-all'",
+        ] {
+            assert_eq!(evil_and_safe("bashopts", line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "BASHOPTS=lastpipe bash -c \"cd evil | cat; make clean-all\"",
+            "BASHOPTS=extglob bash -c 'true | cd evil; make clean-all'",
+            "bash -c 'true | cd evil; make clean-all'",
+        ] {
+            assert_eq!(evil_and_safe("bashopts", line), Decision::Allow, "{line}");
+        }
+    }
+
     /// Arithmetic runs in this shell, so `((HOME=5))` or `$((HOME=5))`
     /// leaves `HOME` untracked.
     #[test]
@@ -5845,6 +6088,97 @@ mod tests {
         let c = check(&root.join("sub"), "eval cd ../evil; make clean-all");
         assert_eq!(c.decision, Decision::Deny);
         assert_eq!(c.token, "make clean-all may run in an untracked directory");
+    }
+
+    /// The lines an agent runs every day stay allowed beside the rules for
+    /// case arms, traps, stdin scripts, aliases and lastpipe. A sourced
+    /// script that does not move the shell, such as a virtualenv's
+    /// `activate`, leaves the line followed; one that may, or one the
+    /// line cannot read, does not.
+    #[test]
+    fn everyday_lines_stay_allowed() {
+        const ACTIVATE: &str = r#"deactivate () {
+    if [ -n "${_OLD_VIRTUAL_PATH:-}" ] ; then
+        PATH="${_OLD_VIRTUAL_PATH:-}"
+        export PATH
+        unset _OLD_VIRTUAL_PATH
+    fi
+    hash -r 2> /dev/null
+    unset VIRTUAL_ENV
+    if [ ! "${1:-}" = "nondestructive" ] ; then
+        unset -f deactivate
+    fi
+}
+deactivate nondestructive
+case "$(uname)" in
+    CYGWIN*|MSYS*|MINGW*)
+        VIRTUAL_ENV=$(cygpath /srv/proj/.venv)
+        ;;
+    *)
+        VIRTUAL_ENV=/srv/proj/.venv
+        ;;
+esac
+export VIRTUAL_ENV
+_OLD_VIRTUAL_PATH="$PATH"
+PATH="$VIRTUAL_ENV/"bin":$PATH"
+export PATH
+if [ -z "${VIRTUAL_ENV_DISABLE_PROMPT:-}" ] ; then
+    _OLD_VIRTUAL_PS1="${PS1:-}"
+    PS1="(.venv) ${PS1:-}"
+    export PS1
+fi
+hash -r 2> /dev/null
+"#;
+        evil_and_safe("daily", "true");
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-daily", std::process::id()));
+        let safe = root.join("safe");
+        for d in ["sub", "x", ".venv/bin", "bad/bin"] {
+            std::fs::create_dir_all(safe.join(d)).expect("dir");
+        }
+        std::fs::write(safe.join("sub/Makefile"), "all:\n\techo sub\n").expect("write");
+        std::fs::write(safe.join(".venv/bin/activate"), ACTIVATE).expect("write");
+        std::fs::write(safe.join("bad/bin/activate"), "cd ../../evil\n").expect("write");
+        let check = |line: &str| check_shell_in(&shell_words(line), &safe, 0).decision;
+        for line in [
+            "cargo --version",
+            "make clean-all",
+            "npm --version",
+            "pytest --version",
+            "git status",
+            "git diff --stat",
+            "git log --oneline -1",
+            "cd sub && make",
+            "cd -",
+            "pushd x && popd",
+            "source .venv/bin/activate && make test",
+            ". .venv/bin/activate && make clean-all",
+            "trap 'rm -f /tmp/x' EXIT",
+            "case $1 in a) echo a;; esac",
+        ] {
+            assert_eq!(check(line), Decision::Allow, "{line}");
+            assert_eq!(
+                check(&format!("bash -c \"{line}\"")),
+                Decision::Allow,
+                "bash -c {line}"
+            );
+        }
+        for (name, body) in [
+            ("trap.sh", "trap 'cd ../evil' DEBUG\n"),
+            ("alias.sh", "alias make='cd ../evil && make'\n"),
+            ("bashopts.sh", "export BASHOPTS=lastpipe\n"),
+        ] {
+            std::fs::write(safe.join(name), body).expect("write");
+            let line = format!("source ./{name} && make clean-all");
+            assert_eq!(check(&line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "source bad/bin/activate && make clean-all",
+            "source missing/activate && make clean-all",
+            "source activate && make clean-all",
+            "source \"$VENV/bin/activate\" && make clean-all",
+        ] {
+            assert_eq!(check(line), Decision::Deny, "{line}");
+        }
     }
 
     /// `command`, `command -p` and `builtin` do not hide `cd`.
@@ -7229,6 +7563,131 @@ mod tests {
         ] {
             assert_eq!(v(&["sh", "-c", script]), "allow", "{script}");
         }
+    }
+
+    /// A `case` arm runs the command after its pattern.
+    #[test]
+    fn a_case_arm_does_not_hide_a_force_push() {
+        for script in [
+            "x=a; case \"$x\" in a) git push --force ;; esac",
+            "case $1 in a) echo a;; b|c) git push -f;; esac",
+            "case $1 in (a) git push -f;; esac",
+            "case $1 in\n  a | b) git push -f\n  ;;\nesac",
+        ] {
+            assert_eq!(
+                v(&["bash", "-c", script]),
+                "deny\tgit-force-push",
+                "{script}"
+            );
+        }
+        assert_eq!(v(&["bash", "-c", "case $1 in a) echo a;; esac"]), "allow");
+        assert_eq!(
+            evil_and_safe("case-cd", "case $1 in a) cd evil;; esac; make clean-all"),
+            Decision::Deny
+        );
+    }
+
+    /// `trap` runs its action as a script on each signal it names, in
+    /// this shell.
+    #[test]
+    fn a_trap_action_does_not_hide_a_force_push() {
+        for script in [
+            "trap \"git push -f\" EXIT; :",
+            "trap -- 'git push --force' INT TERM",
+        ] {
+            assert_eq!(
+                v(&["bash", "-c", script]),
+                "deny\tgit-force-push",
+                "{script}"
+            );
+        }
+        for script in ["trap 'rm -f /tmp/x' EXIT", "trap - EXIT", "trap -p"] {
+            assert_eq!(v(&["bash", "-c", script]), "allow", "{script}");
+        }
+        for line in [
+            "trap 'cd evil' DEBUG; make clean-all",
+            "trap \"$X\" DEBUG; make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("trap", line), Decision::Deny, "{line}");
+        }
+        assert_eq!(
+            evil_and_safe(
+                "trap",
+                "cd safe && trap 'rm -f /tmp/x' EXIT && make clean-all"
+            ),
+            Decision::Allow
+        );
+    }
+
+    /// A shell with no script of its own runs what it reads on stdin. The
+    /// text of a here-string or heredoc is judged as that script; stdin
+    /// from a pipe, or a `-s` shell fed no such text, is not shown.
+    #[test]
+    fn a_script_fed_to_a_shell_on_stdin_is_judged() {
+        for script in [
+            "bash <<< \"git push -f\"",
+            "sh <<<'git push --force'",
+            "bash -s -- a <<< 'git push -f'",
+            "zsh 0<<< 'git push -f'",
+            "bash <<EOF\ngit push -f\nEOF",
+        ] {
+            assert_eq!(
+                v(&["bash", "-c", script]),
+                "deny\tgit-force-push",
+                "{script}"
+            );
+        }
+        for script in [
+            "echo \"git push -f\" | bash",
+            "printf '%s\\n' \"$X\" | sh -",
+            "cat cmds.txt | zsh",
+            "bash -s",
+            "bash <<< \"$cmd\"",
+        ] {
+            assert_eq!(
+                v(&["bash", "-c", script]),
+                "deny\tshell-stdin-unshown",
+                "{script}"
+            );
+        }
+        for script in [
+            "bash <<< 'echo hi'",
+            "echo hi | cat",
+            "bash script.sh < input.txt",
+            "echo hi | bash -c 'cat'",
+            "cat <<< 'git status'",
+        ] {
+            assert_eq!(v(&["bash", "-c", script]), "allow", "{script}");
+        }
+    }
+
+    /// An alias runs its body where its name is the command word. A body
+    /// the line does not show may be `cd`, so the line is not followed
+    /// past it.
+    #[test]
+    fn an_alias_runs_its_body() {
+        for line in [
+            "cd safe && shopt -s expand_aliases; alias m=\"make clean-all\"; cd ../evil; m",
+            "alias m=\"make clean-all\"; cd evil && m",
+            "alias m='cd evil'; m; make clean-all",
+            "alias m=\"$X\"; m; make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("alias", line), Decision::Deny, "{line}");
+        }
+        for line in [
+            "alias m=\"make clean-all\"; cd safe && m",
+            "alias ll='ls -la'; ll; cd safe && make clean-all",
+        ] {
+            assert_eq!(evil_and_safe("alias", line), Decision::Allow, "{line}");
+        }
+        for script in ["alias p='git push -f'; p", "alias g=git; g push --force"] {
+            assert_eq!(
+                v(&["bash", "-c", script]),
+                "deny\tgit-force-push",
+                "{script}"
+            );
+        }
+        assert_eq!(v(&["bash", "-c", "alias ll='ls -la'; ll"]), "allow");
     }
 
     #[test]
