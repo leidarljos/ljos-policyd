@@ -1027,7 +1027,16 @@ fn inner_commands_at(argv: &[String]) -> Vec<(usize, Vec<String>)> {
         if cmd.iter().all(|w| is_assignment(w)) {
             for w in &cmd {
                 if let Some((k, v)) = w.split_once('=') {
-                    names.push((k.to_string(), v.trim_matches(['"', '\'']).to_string()));
+                    let v = v.trim_matches(['"', '\'']);
+                    let v = match k.strip_suffix('+') {
+                        Some(k) => names
+                            .iter()
+                            .rev()
+                            .find(|(n, _)| n == k)
+                            .map_or(v.to_string(), |(_, was)| format!("{was}{v}")),
+                        None => v.to_string(),
+                    };
+                    names.push((k.trim_end_matches('+').to_string(), v));
                 }
             }
             continue;
