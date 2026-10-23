@@ -7943,6 +7943,8 @@ struct PipeTrack<'a> {
     in_body: Vec<bool>,
     defs: Vec<FnDef>,
     shells: Vec<u32>,
+    /// Functions this command's shell can call, before the command runs.
+    seen: Vec<std::collections::HashMap<String, usize>>,
     opts: Vec<PipeOpt>,
     visible: Vec<std::collections::HashMap<String, usize>>,
     next: u32,
@@ -8001,6 +8003,7 @@ impl<'a> PipeTrack<'a> {
             in_body,
             defs,
             shells: vec![0; n],
+            seen: vec![std::collections::HashMap::new(); n],
             opts: vec![opt],
             visible: vec![funcs],
             next: 1,
@@ -8020,7 +8023,13 @@ impl<'a> PipeTrack<'a> {
     fn walk(&mut self, lo: usize, hi: usize, shell: u32, ctx: &mut PipeCtx<'_>) {
         let mut i = lo;
         while i < hi {
-            let end = compound_end(self.ended, i, hi).min(hi.saturating_sub(1));
+            // `coproc [NAME] { ... }` runs the group asynchronously. The
+            // `}` closes that group, not whatever compound contains it.
+            let grouped = coproc_group_end(self.ended, i, hi);
+            let end = match grouped {
+                Some(c) => c,
+                None => compound_end(self.ended, i, hi).min(hi.saturating_sub(1)),
+            };
             // The first command of a compound body still has a separator.
             // The opener is the command before it (`{ printf`, `if printf`,
             // `while printf`, `case … printf`), and a trailing `|` is the
@@ -8040,7 +8049,10 @@ impl<'a> PipeTrack<'a> {
             let in_pipe = sep_before == "|" || sep_after == "|";
             let last = in_pipe && sep_after != "|";
             let effect = pipe_effect(self.opts[shell as usize]);
-            let fresh = paren || sep_after == "&" || (in_pipe && !(last && effect));
+            // `coproc` is asynchronous even when it is a simple command
+            // (`coproc read x`). The read does not assign here.
+            let coproc = grouped.is_some() || starts_coproc(&self.ended[i].0);
+            let fresh = coproc || paren || sep_after == "&" || (in_pipe && !(last && effect));
             let stage = if fresh { self.fork(shell) } else { shell };
             // `{ read <<< /tmp/a | cat; }` keeps `read` in the opener.
             // That `|` is the pipeline, so the opener is a subshell.
@@ -8048,6 +8060,7 @@ impl<'a> PipeTrack<'a> {
             let opener_pipe = end > i && matches!(own.as_str(), "|" | "|&") && !opener_pat;
             let opener_shell = if opener_pipe { self.fork(stage) } else { stage };
             self.shells[i] = opener_shell;
+            self.seen[i] = self.visible[opener_shell as usize].clone();
             // The opener runs before its body, so a `shopt` glued to
             // `{` or `then` is already in effect for the body.
             self.note(i, opener_shell, ctx);
@@ -8262,6 +8275,18 @@ fn run_pipe(
     (opt, funcs)
 }
 
+/// Shells, and the functions each command can call. A body index in
+/// `seen` refers to `bodies`.
+struct CommandShells {
+    shells: Vec<u32>,
+    seen: Vec<std::collections::HashMap<String, usize>>,
+    bodies: Vec<Vec<String>>,
+    /// The command is inside a function body. It does not run at the
+    /// definition, so a `read` there assigns only when the function is
+    /// called.
+    in_body: Vec<bool>,
+}
+
 /// The shell each command writes. A pipeline stage is its own shell.
 /// The last stage is this shell only while `lastpipe` is on in this
 /// shell and monitor is off. A `(...)` group and a command ended by `&`
@@ -8271,8 +8296,9 @@ fn run_pipe(
 /// (`{ read | cat`) is that stage too. A `|` that only splits `case`
 /// patterns is not a pipeline. `shopt` in a pipeline, a background, a
 /// dead branch or a function that is not called does not change this
-/// shell. `shopt -u` and `set -m` turn the effect off.
-fn command_shells(argv: &[String], ended: &[(Vec<String>, String)]) -> Vec<u32> {
+/// shell. `shopt -u` and `set -m` turn the effect off. `coproc` runs in
+/// its own shell.
+fn command_shells(argv: &[String], ended: &[(Vec<String>, String)]) -> CommandShells {
     let mut arena = FnBodies { words: Vec::new() };
     let mut stack = std::collections::HashSet::new();
     let mut track = PipeTrack::prepare(
@@ -8292,7 +8318,92 @@ fn command_shells(argv: &[String], ended: &[(Vec<String>, String)]) -> Vec<u32> 
         depth: 0,
     };
     track.walk(0, n, 0, &mut ctx);
-    track.shells
+    CommandShells {
+        shells: track.shells,
+        seen: track.seen,
+        bodies: arena.words,
+        in_body: track.in_body,
+    }
+}
+
+/// `coproc`, after assignments and keywords. It runs in another shell.
+fn starts_coproc(cmd: &[String]) -> bool {
+    let mut i = 0;
+    while i < cmd.len() && is_assignment(&cmd[i]) {
+        i += 1;
+    }
+    while i < cmd.len() && KEYWORDS.contains(&cmd[i].as_str()) {
+        let time = cmd[i] == "time";
+        i += 1;
+        if time && cmd.get(i).map(String::as_str) == Some("-p") {
+            i += 1;
+        }
+    }
+    cmd.get(i).is_some_and(|w| base_of(w) == "coproc")
+}
+
+/// The command that closes `coproc [NAME] { ... }`, when `ended[i]`
+/// opens one. The `{` is not the first word, so [`compound_end`] does
+/// not see the group.
+fn coproc_group_end(ended: &[(Vec<String>, String)], i: usize, hi: usize) -> Option<usize> {
+    let cmd = &ended.get(i)?.0;
+    let mut k = 0;
+    while k < cmd.len() && is_assignment(&cmd[k]) {
+        k += 1;
+    }
+    while k < cmd.len() && KEYWORDS.contains(&cmd[k].as_str()) {
+        let time = cmd[k] == "time";
+        k += 1;
+        if time && cmd.get(k).map(String::as_str) == Some("-p") {
+            k += 1;
+        }
+    }
+    if cmd.get(k).map(|w| base_of(w.as_str())) != Some("coproc") {
+        return None;
+    }
+    k += 1;
+    if cmd.get(k).is_some_and(|w| w != "{" && is_name(w)) {
+        k += 1;
+    }
+    if cmd.get(k).map(String::as_str) != Some("{") {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (j, (words, _)) in ended.iter().enumerate().take(hi).skip(i) {
+        let start = if j == i { k } else { 0 };
+        for w in words.iter().skip(start) {
+            if w == "{" {
+                depth += 1;
+            } else if w == "}" {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The function `cmd` calls, when it is a bare name and not a definition.
+fn called_name(cmd: &[String]) -> Option<String> {
+    let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    if hides_function(&refs) {
+        return None;
+    }
+    let mut i = 0;
+    while i < cmd.len() && is_assignment(&cmd[i]) {
+        i += 1;
+    }
+    if function_head(&cmd[i..]).is_some() {
+        return None;
+    }
+    let head = *peel_cd_command_word(&refs).first()?;
+    let name = base_of(head);
+    if !is_name(name) || name != head || matches!(name, "shopt" | "set" | "eval" | "coproc") {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// A `read` at `set_at` is the value a later command sees. It has to
@@ -9368,41 +9479,95 @@ fn read_fields(line: &str, nvars: usize, ifs: &str) -> Vec<String> {
 }
 
 fn read_hits(argv: &[String], ended: &[(Vec<String>, String)]) -> Vec<ReadHit> {
-    let shells = command_shells(argv, ended);
+    let inherited = std::collections::HashMap::new();
+    let mut stack = std::collections::HashSet::new();
+    read_hits_in(argv, ended, 0, &mut stack, &inherited)
+}
+
+/// `inherited` holds functions defined outside this text, by name and
+/// body. A body index from [`command_shells`] is only valid for this
+/// text, so a call copies the words before it recurses.
+fn read_hits_in(
+    argv: &[String],
+    ended: &[(Vec<String>, String)],
+    depth: usize,
+    stack: &mut std::collections::HashSet<String>,
+    inherited: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<ReadHit> {
+    if depth > PIPE_DEPTH {
+        return Vec::new();
+    }
+    let map = command_shells(argv, ended);
     let runs = commands_reached(argv, ended);
     let mut out = Vec::new();
     for (i, (cmd, _)) in ended.iter().enumerate() {
         // A branch that never runs, or that this walk cannot prove,
-        // does not assign. The name keeps the earlier value.
-        if runs.get(i) != Some(&true) {
+        // does not assign. The name keeps the earlier value. A read in
+        // a function body does not run at the definition.
+        if runs.get(i) != Some(&true) || map.in_body.get(i) == Some(&true) {
             continue;
         }
-        let Some(tail) = read_command(cmd) else {
-            continue;
-        };
-        let names = read_var_names(&tail);
-        if names.is_empty() {
-            continue;
-        }
-        let cols = read_text(ended, i, cmd).map(|t| {
-            let ifs = read_input_ifs(ended, &shells, i, cmd);
-            let mut cols = vec![Vec::new(); names.len()];
-            for line in read_lines(&t) {
-                let fields = read_fields(&line, names.len(), &ifs);
-                for (k, field) in fields.into_iter().enumerate() {
-                    if let Some(col) = cols.get_mut(k) {
-                        col.push(field);
+        if let Some(tail) = read_command(cmd) {
+            let names = read_var_names(&tail);
+            if !names.is_empty() {
+                let cols = read_text(ended, i, cmd).map(|t| {
+                    let ifs = read_input_ifs(ended, &map.shells, i, cmd);
+                    let mut cols = vec![Vec::new(); names.len()];
+                    for line in read_lines(&t) {
+                        let fields = read_fields(&line, names.len(), &ifs);
+                        for (k, field) in fields.into_iter().enumerate() {
+                            if let Some(col) = cols.get_mut(k) {
+                                col.push(field);
+                            }
+                        }
                     }
+                    cols
+                });
+                for (k, name) in names.into_iter().enumerate() {
+                    out.push(ReadHit {
+                        name,
+                        values: cols.as_ref().map(|c| c.get(k).cloned().unwrap_or_default()),
+                        at: i,
+                    });
                 }
             }
-            cols
-        });
-        for (k, name) in names.into_iter().enumerate() {
-            out.push(ReadHit {
-                name,
-                values: cols.as_ref().map(|c| c.get(k).cloned().unwrap_or_default()),
-                at: i,
-            });
+        }
+        // A call runs the body in this shell. A read in the body's own
+        // shell assigns here; one in a pipeline or a `coproc` does not.
+        let Some(name) = called_name(cmd) else {
+            continue;
+        };
+        if !stack.insert(name.clone()) {
+            continue;
+        }
+        let local = map.seen.get(i).and_then(|m| m.get(&name)).copied();
+        let words = local
+            .and_then(|id| map.bodies.get(id).cloned())
+            .or_else(|| inherited.get(&name).cloned());
+        let Some(words) = words else {
+            stack.remove(&name);
+            continue;
+        };
+        let mut child = inherited.clone();
+        if let Some(seen) = map.seen.get(i) {
+            for (n, id) in seen {
+                if let Some(body) = map.bodies.get(*id) {
+                    child.insert(n.clone(), body.clone());
+                }
+            }
+        }
+        let body_ended = ended_owned(&words);
+        let inner = read_hits_in(&words, &body_ended, depth + 1, stack, &child);
+        let body_shells = command_shells(&words, &body_ended).shells;
+        stack.remove(&name);
+        for hit in inner {
+            if body_shells.get(hit.at) == Some(&0) {
+                out.push(ReadHit {
+                    name: hit.name,
+                    values: hit.values,
+                    at: i,
+                });
+            }
         }
     }
     out
@@ -9414,7 +9579,7 @@ fn read_hits(argv: &[String], ended: &[(Vec<String>, String)]) -> Vec<ReadHit> {
 /// command still holds from an earlier assignment is in neither.
 fn shown_temp_reads(argv: &[String]) -> (Vec<String>, Vec<String>) {
     let ended = ended_owned(argv);
-    let shells = command_shells(argv, &ended);
+    let shells = command_shells(argv, &ended).shells;
     let hits = read_hits(argv, &ended);
     let mut good = Vec::new();
     let mut bad = Vec::new();
@@ -9543,7 +9708,7 @@ fn split_unquoted(value: &str, ifs: &str) -> Vec<String> {
 /// command that expands the name.
 fn read_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Option<Checked> {
     let ended = ended_owned(argv);
-    let shells = command_shells(argv, &ended);
+    let shells = command_shells(argv, &ended).shells;
     let fed = read_hits(argv, &ended);
     if fed.is_empty() {
         return None;
@@ -14114,6 +14279,7 @@ impl Scratch {
     fn observe(&mut self, argv: &[String]) {
         let ended = ended_owned(argv);
         let runs = commands_reached(argv, &ended);
+        let shells = command_shells(argv, &ended);
         for (i, cmd) in commands(argv).into_iter().enumerate() {
             for w in &cmd {
                 self.observe_word(w);
@@ -14122,13 +14288,17 @@ impl Scratch {
                 self.ifs_assigned = true;
             }
             // A `read` poisons the name because stdin is not an assignment.
-            // One that does not run leaves the value already stored.
+            // One that does not run, or that runs in another shell or only
+            // inside a function that is not being called, leaves the value
+            // already stored.
             let dead = runs.get(i) == Some(&false);
             let read = matches!(
                 command_parts(&cmd).1.as_str(),
                 "read" | "mapfile" | "readarray"
             );
-            if dead && read {
+            let elsewhere = shells.in_body.get(i) == Some(&true)
+                || shells.shells.get(i).is_some_and(|s| *s != 0);
+            if read && (dead || elsewhere) {
                 continue;
             }
             for name in opaque_bound(&cmd) {
@@ -20197,6 +20367,50 @@ hash -r 2> /dev/null
             "for n in a; do shopt -s lastpipe; done; ",
         ] {
             both(&line(head), "allow");
+        }
+    }
+
+    /// `coproc` runs in another shell. A `read` in a function body assigns
+    /// only when a call in this shell runs it. A call in a pipeline, a
+    /// subshell or the background does not, and neither does a function
+    /// that is not called.
+    #[test]
+    fn a_coproc_or_a_function_read_stays_in_that_shell() {
+        let both = |s: &str, want: &str| {
+            assert_eq!(verdict(&shell_words(s)), want, "{s}");
+            let bash = vec!["bash".into(), "-c".into(), s.to_string()];
+            assert_eq!(verdict(&bash), want, "bash -c {s}");
+        };
+        let deny = "deny\trm-rf-outside-tmp";
+        for line in [
+            "x=/; coproc read x <<< /tmp/a; rm -rf \"$x\"",
+            "x=/; coproc { read x <<< /tmp/a; }; rm -rf \"$x\"",
+            "x=/; coproc NAME { read x <<< /tmp/a; }; rm -rf \"$x\"",
+            "x=/; f() { read x <<< /tmp/a; }; rm -rf \"$x\"",
+            "x=/; f()\n{\nread x <<< /tmp/a\n}\nrm -rf \"$x\"",
+            "x=/; f() { read x <<< /tmp/a; }; f | cat; rm -rf \"$x\"",
+            "x=/; f() { read x <<< /tmp/a; }; ( f ); rm -rf \"$x\"",
+            "x=/; f() { read x <<< /tmp/a; }; f & rm -rf \"$x\"",
+            "x=/; f() { printf '/tmp/a\\n' | read x; }; f; rm -rf \"$x\"",
+            "x=/; if false; then f() { read x <<< /tmp/a; }; fi; f; rm -rf \"$x\"",
+            "x=/; ( f() { read x <<< /tmp/a; } ); f; rm -rf \"$x\"",
+            "x=/; f() { read x <<< /tmp/a; }; f() { read x <<< /; }; f; rm -rf \"$x\"",
+            "x=/tmp/a; f() { read x <<< /; }; f; rm -rf \"$x\"",
+        ] {
+            both(line, deny);
+        }
+        for line in [
+            "x=/; f() { read x <<< /tmp/a; }; f; rm -rf \"$x\"",
+            "x=/; f()\n{\nread x <<< /tmp/a\n}\nf\nrm -rf \"$x\"",
+            "x=/; f() { shopt -s lastpipe; printf '/tmp/a\\n' | read x; }; f; rm -rf \"$x\"",
+            "x=/; f() { read x <<< /; }; f() { read x <<< /tmp/a; }; f; rm -rf \"$x\"",
+            "x=/; g() { read x <<< /tmp/a; }; f() { g; }; f; rm -rf \"$x\"",
+            "x=/tmp/a; coproc read x <<< /; rm -rf \"$x\"",
+            "x=/tmp/a; f() { read x <<< /; }; rm -rf \"$x\"",
+            "coproc { read x <<< /tmp/a; rm -rf \"$x\"; }",
+            "( f() { read x <<< /tmp/a; }; f; rm -rf \"$x\" )",
+        ] {
+            both(line, "allow");
         }
     }
 
