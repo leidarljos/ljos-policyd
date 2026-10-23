@@ -5262,9 +5262,11 @@ fn is_name(w: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// A function at `words[i]`: `(name, body, index after the definition)`.
-/// `name () { ... }`, `name() { ... }` and `function name { ... }`.
-fn function_at(words: &[String], i: usize) -> Option<(String, Vec<String>, usize)> {
+/// A function at `words[i]`: `(name, body start, body end, index after)`.
+/// The body is `[start, end)`. A `(...)` body is empty: it runs in a
+/// subshell, so it does not change the caller. The definition does not
+/// run the body.
+fn function_bounds(words: &[String], i: usize) -> Option<(String, usize, usize, usize)> {
     let w0 = words.get(i)?.as_str();
     let (raw, mut k, keyword) = if w0 == "function" {
         (words.get(i + 1)?.as_str(), i + 2, true)
@@ -5282,8 +5284,7 @@ fn function_at(words: &[String], i: usize) -> Option<(String, Vec<String>, usize
         return None;
     }
     let mut paren = raw.ends_with("()") || raw.ends_with("(){");
-    // A newline between the name and `()` or `{` is a separator. The
-    // definition does not run the body.
+    // A newline between the name and `()` or `{` is a separator.
     while words.get(k).map(String::as_str) == Some(";") {
         k += 1;
     }
@@ -5300,7 +5301,7 @@ fn function_at(words: &[String], i: usize) -> Option<(String, Vec<String>, usize
     if !opened {
         let opener = words.get(k)?.as_str();
         if opener.starts_with('(') && !opener.starts_with("((") {
-            return Some((name.to_string(), Vec::new(), k + 1));
+            return Some((name.to_string(), k, k, k + 1));
         }
         if opener != "{" {
             return None;
@@ -5314,11 +5315,18 @@ fn function_at(words: &[String], i: usize) -> Option<(String, Vec<String>, usize
         } else if w == "}" {
             depth -= 1;
             if depth == 0 {
-                return Some((name.to_string(), words[k..n].to_vec(), n + 1));
+                return Some((name.to_string(), k, n, n + 1));
             }
         }
     }
     None
+}
+
+/// A function at `words[i]`: `(name, body, index after the definition)`.
+/// `name () { ... }`, `name() { ... }` and `function name { ... }`.
+fn function_at(words: &[String], i: usize) -> Option<(String, Vec<String>, usize)> {
+    let (name, lo, hi, next) = function_bounds(words, i)?;
+    Some((name, words[lo..hi].to_vec(), next))
 }
 
 fn function_risks(
@@ -7837,91 +7845,454 @@ fn compound_end(ended: &[(Vec<String>, String)], i: usize, hi: usize) -> usize {
     hi.saturating_sub(1)
 }
 
-/// The shell each command writes. A pipeline stage is its own shell.
-/// The last stage is this shell only after `lastpipe` may be on. A
-/// `(...)` group and a command ended by `&` are their own shell too.
-/// The body of `while` stays in the shell that runs the `while`.
-/// A compound opener is the first stage when its separator is `|`
-/// (`{ printf | read`), so that stage's successor stays in its own shell.
-/// The opener's own trailing `|` (`{ read | cat`) is that stage too, so
-/// the opener is not this shell. The body is still walked here, and a
-/// `|` that only splits `case` patterns is not a pipeline.
-fn command_shells(ended: &[(Vec<String>, String)]) -> Vec<u32> {
-    let n = ended.len();
-    let mut shells = vec![0u32; n];
-    let mut lastpipe = vec![false; n];
-    let mut on = false;
-    for (i, (cmd, _)) in ended.iter().enumerate() {
-        lastpipe[i] = on;
-        let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
-        if may_set_lastpipe(&refs) {
-            on = true;
-        }
-    }
-    let mut next = 1u32;
-    walk_shells(ended, 0, n, 0, &mut shells, &mut next, &lastpipe);
-    shells
+/// `lastpipe` and monitor as this shell has them. The effect is on only
+/// when `lastpipe` is on and monitor is off: job control disables it.
+/// A fresh shell copies both. Nothing here turns the effect on because
+/// a word might name it; [`may_set_lastpipe`] stays that way for `cd`.
+#[derive(Clone, Copy)]
+struct PipeOpt {
+    lastpipe: bool,
+    monitor: bool,
 }
 
-fn walk_shells(
-    ended: &[(Vec<String>, String)],
-    lo: usize,
-    hi: usize,
-    shell: u32,
-    shells: &mut [u32],
-    next: &mut u32,
-    lastpipe: &[bool],
-) {
-    let mut i = lo;
-    while i < hi {
-        let end = compound_end(ended, i, hi).min(hi.saturating_sub(1));
-        // The first command of a compound body still has a separator.
-        // The opener is the command before it (`{ printf`, `if printf`,
-        // `while printf`, `case … printf`), and a trailing `|` is the
-        // pipeline that command started. Dropping it put `read` back in
-        // the shell that follows the group. A `|` that only splits `case`
-        // patterns is not a pipeline. The top of the line has nothing
-        // before it. `!`, `time` and `&&` / `||` do not open a body, so
-        // their `|` is already the separator of the command it follows.
-        let sep_before = if i > lo || (lo > 0 && i == lo && !pure_case_pattern(&ended[i - 1].0)) {
-            ended[i - 1].1.as_str()
-        } else {
-            ""
-        };
-        let sep_after = ended[end].1.as_str();
-        let in_pipe = sep_before == "|" || sep_after == "|";
-        let last = in_pipe && sep_after != "|";
-        let paren = nest_event(&ended[i].0).is_some_and(|(open, k)| open && k == Nest::Paren);
-        let fresh = paren || sep_after == "&" || (in_pipe && !(last && lastpipe[i]));
-        let stage = if fresh {
-            let id = *next;
-            *next += 1;
-            id
-        } else {
-            shell
-        };
-        // `{ read <<< /tmp/a | cat; }` keeps `read` in the opener. That
-        // `|` is the pipeline, so the opener is a subshell. The body
-        // stays in `stage`: `lastpipe` still runs the last stage here.
-        // `case z in a | b)` is a pattern list, not a pipe.
-        let own = ended[i].1.as_str();
-        let opener_pipe = end > i && matches!(own, "|" | "|&") && !pure_case_pattern(&ended[i].0);
-        let opener_shell = if opener_pipe {
-            let id = *next;
-            *next += 1;
-            id
-        } else {
-            stage
-        };
-        shells[i] = opener_shell;
-        if end > i {
-            shells[end] = stage;
-            if i + 1 < end {
-                walk_shells(ended, i + 1, end, stage, shells, next, lastpipe);
+fn pipe_effect(opt: PipeOpt) -> bool {
+    opt.lastpipe && !opt.monitor
+}
+
+/// A word the line does not show. It is not proof of an option name.
+fn opt_unshown(w: &str) -> bool {
+    w.contains(['$', '`', '*', '?', '[', '{'])
+}
+
+fn minus_flag(a: &str, c: char) -> bool {
+    let Some(rest) = a.strip_prefix('-') else {
+        return false;
+    };
+    !rest.is_empty() && !rest.starts_with('-') && rest.contains(c)
+}
+
+/// `command` or `builtin` in front of the word skips a function.
+fn hides_function(words: &[&str]) -> bool {
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i];
+        if is_assignment(w) {
+            i += 1;
+            continue;
+        }
+        if KEYWORDS.contains(&w) {
+            i += 1;
+            if w == "time" && words.get(i) == Some(&"-p") {
+                i += 1;
+            }
+            continue;
+        }
+        return matches!(base_of(w), "command" | "builtin");
+    }
+    false
+}
+
+/// Argv spans of [`ended_commands`], in that order.
+fn command_argv_spans(argv: &[String]) -> Vec<(usize, usize)> {
+    let mut raw = Vec::new();
+    let mut lo: Option<usize> = None;
+    let mut hi = 0usize;
+    for (i, a) in argv.iter().enumerate() {
+        let a = a.as_str();
+        if matches!(a, ";" | "&&" | "||" | "|" | "&") {
+            push_span(&mut raw, &mut lo, hi);
+            continue;
+        }
+        let closes = a.ends_with(';');
+        let tok = a.trim_end_matches(';');
+        if !tok.is_empty() {
+            if lo.is_none() {
+                lo = Some(i);
+            }
+            hi = i + 1;
+        }
+        if closes {
+            push_span(&mut raw, &mut lo, hi);
+        }
+    }
+    push_span(&mut raw, &mut lo, hi);
+    raw
+}
+
+fn push_span(raw: &mut Vec<(usize, usize)>, lo: &mut Option<usize>, hi: usize) {
+    if let Some(s) = lo.take() {
+        if hi > s {
+            raw.push((s, hi));
+        }
+    }
+}
+
+struct FnDef {
+    name: String,
+    def_cmd: usize,
+    body_id: usize,
+}
+
+struct FnBodies {
+    words: Vec<Vec<String>>,
+}
+
+struct PipeTrack<'a> {
+    ended: &'a [(Vec<String>, String)],
+    runs: Vec<bool>,
+    in_body: Vec<bool>,
+    defs: Vec<FnDef>,
+    shells: Vec<u32>,
+    opts: Vec<PipeOpt>,
+    visible: Vec<std::collections::HashMap<String, usize>>,
+    next: u32,
+}
+
+struct PipeCtx<'a> {
+    arena: &'a mut FnBodies,
+    stack: &'a mut std::collections::HashSet<usize>,
+    depth: usize,
+}
+
+const PIPE_DEPTH: usize = 4;
+
+impl<'a> PipeTrack<'a> {
+    fn prepare(
+        argv: &'a [String],
+        ended: &'a [(Vec<String>, String)],
+        opt: PipeOpt,
+        funcs: std::collections::HashMap<String, usize>,
+        arena: &mut FnBodies,
+    ) -> Self {
+        let n = ended.len();
+        let runs = commands_reached(argv, ended);
+        let spans = command_argv_spans(argv);
+        let mut in_body = vec![false; n];
+        let mut defs = Vec::new();
+        debug_assert_eq!(spans.len(), n);
+        if spans.len() == n {
+            let mut i = 0usize;
+            while i < argv.len() {
+                let Some((name, blo, bhi, next)) = function_bounds(argv, i) else {
+                    i += 1;
+                    continue;
+                };
+                let def_cmd = spans.iter().position(|(lo, hi)| i >= *lo && i < *hi);
+                if let Some(def_cmd) = def_cmd {
+                    let body_id = arena.words.len();
+                    arena.words.push(argv[blo..bhi].to_vec());
+                    for (ci, (lo, hi)) in spans.iter().enumerate() {
+                        if *lo < bhi && *hi > blo {
+                            in_body[ci] = true;
+                        }
+                    }
+                    defs.push(FnDef {
+                        name,
+                        def_cmd,
+                        body_id,
+                    });
+                }
+                i = if next > i { next } else { i + 1 };
             }
         }
-        i = end + 1;
+        Self {
+            ended,
+            runs,
+            in_body,
+            defs,
+            shells: vec![0; n],
+            opts: vec![opt],
+            visible: vec![funcs],
+            next: 1,
+        }
     }
+
+    fn fork(&mut self, parent: u32) -> u32 {
+        let id = self.next;
+        self.next += 1;
+        let opt = self.opts[parent as usize];
+        let funcs = self.visible[parent as usize].clone();
+        self.opts.push(opt);
+        self.visible.push(funcs);
+        id
+    }
+
+    fn walk(&mut self, lo: usize, hi: usize, shell: u32, ctx: &mut PipeCtx<'_>) {
+        let mut i = lo;
+        while i < hi {
+            let end = compound_end(self.ended, i, hi).min(hi.saturating_sub(1));
+            // The first command of a compound body still has a separator.
+            // The opener is the command before it (`{ printf`, `if printf`,
+            // `while printf`, `case … printf`), and a trailing `|` is the
+            // pipeline that command started. A `|` that only splits `case`
+            // patterns is not a pipeline.
+            let prev_case = i > 0 && pure_case_pattern(&self.ended[i - 1].0);
+            let sep_before = if i > lo || (lo > 0 && i == lo && !prev_case) {
+                self.ended[i - 1].1.clone()
+            } else {
+                String::new()
+            };
+            let sep_after = self.ended[end].1.clone();
+            let own = self.ended[i].1.clone();
+            let opener_pat = pure_case_pattern(&self.ended[i].0);
+            let paren =
+                nest_event(&self.ended[i].0).is_some_and(|(open, k)| open && k == Nest::Paren);
+            let in_pipe = sep_before == "|" || sep_after == "|";
+            let last = in_pipe && sep_after != "|";
+            let effect = pipe_effect(self.opts[shell as usize]);
+            let fresh = paren || sep_after == "&" || (in_pipe && !(last && effect));
+            let stage = if fresh { self.fork(shell) } else { shell };
+            // `{ read <<< /tmp/a | cat; }` keeps `read` in the opener.
+            // That `|` is the pipeline, so the opener is a subshell.
+            // The body stays in `stage`.
+            let opener_pipe = end > i && matches!(own.as_str(), "|" | "|&") && !opener_pat;
+            let opener_shell = if opener_pipe { self.fork(stage) } else { stage };
+            self.shells[i] = opener_shell;
+            // The opener runs before its body, so a `shopt` glued to
+            // `{` or `then` is already in effect for the body.
+            self.note(i, opener_shell, ctx);
+            if end > i {
+                self.shells[end] = stage;
+                if i + 1 < end {
+                    self.walk(i + 1, end, stage, ctx);
+                }
+            }
+            i = end + 1;
+        }
+    }
+
+    fn note(&mut self, i: usize, shell: u32, ctx: &mut PipeCtx<'_>) {
+        if self.runs.get(i) != Some(&true) {
+            return;
+        }
+        if let Some(pos) = self.defs.iter().position(|d| d.def_cmd == i) {
+            let name = self.defs[pos].name.clone();
+            let id = self.defs[pos].body_id;
+            self.visible[shell as usize].insert(name, id);
+            return;
+        }
+        // The body does not run at the definition. A call replays it.
+        if self.in_body.get(i) == Some(&true) {
+            return;
+        }
+        let cmd = self.ended[i].0.clone();
+        self.apply_cmd(&cmd, shell, ctx);
+    }
+
+    fn apply_cmd(&mut self, cmd: &[String], shell: u32, ctx: &mut PipeCtx<'_>) {
+        let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        let bypass = hides_function(&refs);
+        let peeled = peel_cd_command_word(&refs);
+        let Some(head) = peeled.first().copied() else {
+            return;
+        };
+        let base = base_of(head).to_string();
+        match base.as_str() {
+            "shopt" => self.apply_shopt(shell, &peeled[1..]),
+            "set" => self.apply_set(shell, &peeled[1..]),
+            "eval" => {
+                let args: Vec<String> = peeled[1..].iter().map(|s| (*s).to_string()).collect();
+                self.apply_eval(shell, &args, ctx);
+            }
+            other if !bypass => {
+                let id = self
+                    .visible
+                    .get(shell as usize)
+                    .and_then(|m| m.get(other))
+                    .copied();
+                if let Some(id) = id {
+                    self.replay_into(shell, id, ctx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Literal `-s lastpipe` turns it on. Literal `-u lastpipe` turns it
+    /// off. A hidden name or flag is not proof it ends on: `shopt -s $o`
+    /// may be `extglob`, and `shopt -u $o` may name `lastpipe`.
+    fn apply_shopt(&mut self, shell: u32, args: &[&str]) {
+        let hidden = args.iter().any(|a| opt_unshown(a));
+        let sets = args.iter().any(|a| minus_flag(a, 's'));
+        let unsets = args.iter().any(|a| minus_flag(a, 'u'));
+        let name = args.contains(&"lastpipe");
+        let o = &mut self.opts[shell as usize];
+        if hidden {
+            if sets && !unsets && name {
+                o.lastpipe = true;
+            } else if unsets || !sets {
+                o.lastpipe = false;
+            }
+            return;
+        }
+        if sets && unsets {
+            o.lastpipe = false;
+        } else if sets && name {
+            o.lastpipe = true;
+        } else if unsets && name {
+            o.lastpipe = false;
+        }
+    }
+
+    /// Monitor disables the effect. `set -m` and `set -o monitor` turn
+    /// it on; `set +m` and `set +o monitor` turn it off. `lastpipe` is
+    /// not a `set -o` name. A word the line does not show may be `-m`.
+    fn apply_set(&mut self, shell: u32, args: &[&str]) {
+        let opts: Vec<&str> = args.iter().copied().take_while(|a| *a != "--").collect();
+        if opts.iter().any(|a| opt_unshown(a)) {
+            let o = &mut self.opts[shell as usize];
+            o.lastpipe = false;
+            o.monitor = true;
+            return;
+        }
+        let mut i = 0;
+        while i < opts.len() {
+            let a = opts[i];
+            i += 1;
+            let (plus, body) = if let Some(b) = a.strip_prefix('+') {
+                if b.is_empty() || b.starts_with('+') {
+                    continue;
+                }
+                (true, b)
+            } else if let Some(b) = a.strip_prefix('-') {
+                if b.is_empty() || b.starts_with('-') {
+                    continue;
+                }
+                (false, b)
+            } else {
+                continue;
+            };
+            for c in body.chars() {
+                if c == 'o' {
+                    let name = opts.get(i).copied();
+                    i += 1;
+                    if name == Some("monitor") {
+                        self.opts[shell as usize].monitor = !plus;
+                    }
+                } else if c == 'm' {
+                    self.opts[shell as usize].monitor = !plus;
+                }
+            }
+        }
+    }
+
+    fn apply_eval(&mut self, shell: u32, args: &[String], ctx: &mut PipeCtx<'_>) {
+        let o = &mut self.opts[shell as usize];
+        if args.is_empty() || args.iter().any(|a| opt_unshown(a)) || ctx.depth + 1 > PIPE_DEPTH {
+            o.lastpipe = false;
+            o.monitor = true;
+            return;
+        }
+        let script = args.join(" ");
+        let words = shell_words(&script);
+        let ended = ended_owned(&words);
+        let opt = self.opts[shell as usize];
+        let funcs = self.visible[shell as usize].clone();
+        let (opt, funcs) = run_pipe(
+            &words,
+            &ended,
+            opt,
+            funcs,
+            ctx.arena,
+            ctx.stack,
+            ctx.depth + 1,
+        );
+        self.opts[shell as usize] = opt;
+        self.visible[shell as usize] = funcs;
+    }
+
+    fn replay_into(&mut self, shell: u32, id: usize, ctx: &mut PipeCtx<'_>) {
+        if ctx.depth + 1 > PIPE_DEPTH || !ctx.stack.insert(id) {
+            self.opts[shell as usize] = PipeOpt {
+                lastpipe: false,
+                monitor: true,
+            };
+            return;
+        }
+        let words = ctx.arena.words.get(id).cloned().unwrap_or_default();
+        let ended = ended_owned(&words);
+        let opt = self.opts[shell as usize];
+        let funcs = self.visible[shell as usize].clone();
+        let (opt, funcs) = run_pipe(
+            &words,
+            &ended,
+            opt,
+            funcs,
+            ctx.arena,
+            ctx.stack,
+            ctx.depth + 1,
+        );
+        ctx.stack.remove(&id);
+        self.opts[shell as usize] = opt;
+        self.visible[shell as usize] = funcs;
+    }
+}
+
+fn run_pipe(
+    argv: &[String],
+    ended: &[(Vec<String>, String)],
+    opt: PipeOpt,
+    funcs: std::collections::HashMap<String, usize>,
+    arena: &mut FnBodies,
+    stack: &mut std::collections::HashSet<usize>,
+    depth: usize,
+) -> (PipeOpt, std::collections::HashMap<String, usize>) {
+    if depth > PIPE_DEPTH {
+        return (
+            PipeOpt {
+                lastpipe: false,
+                monitor: true,
+            },
+            funcs,
+        );
+    }
+    let mut track = PipeTrack::prepare(argv, ended, opt, funcs, arena);
+    let n = ended.len();
+    let mut ctx = PipeCtx {
+        arena,
+        stack,
+        depth,
+    };
+    track.walk(0, n, 0, &mut ctx);
+    let opt = track.opts.first().copied().unwrap_or(PipeOpt {
+        lastpipe: false,
+        monitor: false,
+    });
+    let funcs = track.visible.first().cloned().unwrap_or_default();
+    (opt, funcs)
+}
+
+/// The shell each command writes. A pipeline stage is its own shell.
+/// The last stage is this shell only while `lastpipe` is on in this
+/// shell and monitor is off. A `(...)` group and a command ended by `&`
+/// are their own shell too. The body of `while` stays in the shell that
+/// runs the `while`. A compound opener is the first stage when its
+/// separator is `|` (`{ printf | read`). The opener's own trailing `|`
+/// (`{ read | cat`) is that stage too. A `|` that only splits `case`
+/// patterns is not a pipeline. `shopt` in a pipeline, a background, a
+/// dead branch or a function that is not called does not change this
+/// shell. `shopt -u` and `set -m` turn the effect off.
+fn command_shells(argv: &[String], ended: &[(Vec<String>, String)]) -> Vec<u32> {
+    let mut arena = FnBodies { words: Vec::new() };
+    let mut stack = std::collections::HashSet::new();
+    let mut track = PipeTrack::prepare(
+        argv,
+        ended,
+        PipeOpt {
+            lastpipe: false,
+            monitor: false,
+        },
+        std::collections::HashMap::new(),
+        &mut arena,
+    );
+    let n = ended.len();
+    let mut ctx = PipeCtx {
+        arena: &mut arena,
+        stack: &mut stack,
+        depth: 0,
+    };
+    track.walk(0, n, 0, &mut ctx);
+    track.shells
 }
 
 /// A `read` at `set_at` is the value a later command sees. It has to
@@ -8997,7 +9368,7 @@ fn read_fields(line: &str, nvars: usize, ifs: &str) -> Vec<String> {
 }
 
 fn read_hits(argv: &[String], ended: &[(Vec<String>, String)]) -> Vec<ReadHit> {
-    let shells = command_shells(ended);
+    let shells = command_shells(argv, ended);
     let runs = commands_reached(argv, ended);
     let mut out = Vec::new();
     for (i, (cmd, _)) in ended.iter().enumerate() {
@@ -9043,7 +9414,7 @@ fn read_hits(argv: &[String], ended: &[(Vec<String>, String)]) -> Vec<ReadHit> {
 /// command still holds from an earlier assignment is in neither.
 fn shown_temp_reads(argv: &[String]) -> (Vec<String>, Vec<String>) {
     let ended = ended_owned(argv);
-    let shells = command_shells(&ended);
+    let shells = command_shells(argv, &ended);
     let hits = read_hits(argv, &ended);
     let mut good = Vec::new();
     let mut bad = Vec::new();
@@ -9172,7 +9543,7 @@ fn split_unquoted(value: &str, ifs: &str) -> Vec<String> {
 /// command that expands the name.
 fn read_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Option<Checked> {
     let ended = ended_owned(argv);
-    let shells = command_shells(&ended);
+    let shells = command_shells(argv, &ended);
     let fed = read_hits(argv, &ended);
     if fed.is_empty() {
         return None;
@@ -19756,6 +20127,77 @@ hash -r 2> /dev/null
             "x=/; case z in a|b) read x <<< /tmp/a;; esac; rm -rf \"$x\"",
             "deny\trm-rf-outside-tmp",
         );
+    }
+
+    /// `lastpipe` follows the shell that runs `shopt`, in order. A
+    /// pipeline stage, a background command, a branch that does not run
+    /// and a function that is not called do not turn it on here. `shopt
+    /// -u` and `set -m` turn the effect off. A word the line does not
+    /// show is not proof the `read` assigns.
+    #[test]
+    fn lastpipe_tracks_the_shell_that_sets_it() {
+        let both = |s: &str, want: &str| {
+            assert_eq!(verdict(&shell_words(s)), want, "{s}");
+            let bash = vec!["bash".into(), "-c".into(), s.to_string()];
+            assert_eq!(verdict(&bash), want, "bash -c {s}");
+        };
+        let deny = "deny\trm-rf-outside-tmp";
+        let tail = "x=/; printf '/tmp/a\\n' | read x; rm -rf \"$x\"";
+        let line = |head: &str| format!("{head}{tail}");
+        for head in [
+            "shopt -s lastpipe | true; ",
+            "{ shopt -s lastpipe; } | cat; ",
+            "shopt -s lastpipe & ",
+            "shopt -s lastpipe; shopt -u lastpipe; ",
+            "if false; then shopt -s lastpipe; fi; ",
+            "f()\n{\nshopt -s lastpipe\n}\n",
+            "o=extglob; shopt -s $o; ",
+            "shopt -s lastpipe; set -m; ",
+            "f() { shopt -s lastpipe; }; ",
+            "true | shopt -s lastpipe; ",
+            "false && shopt -s lastpipe; ",
+            "set -o lastpipe; ",
+            "o=lastpipe; shopt -s $o; ",
+            "shopt -s lastpipe; shopt -u $o; ",
+            "shopt -s lastpipe; set $opts; ",
+            "shopt -s lastpipe; true | shopt -u lastpipe; ",
+            "f()\n{\nshopt -s lastpipe\n}\nf | cat\n",
+            "f()\n{\nshopt -s lastpipe\n}\nf &\n",
+            "outer()\n{\ninner()\n{\nshopt -s lastpipe\n}\n}\nouter\n",
+            "if false; then\nf()\n{\nshopt -s lastpipe\n}\nfi\nf\n",
+            "( f() { shopt -s lastpipe; }; ); f; ",
+            "shopt -s lastpipe; f() { shopt -u lastpipe; }; f; ",
+            "set -m; shopt -s lastpipe; ",
+            "shopt -s lastpipe; set -o monitor; ",
+        ] {
+            both(&line(head), deny);
+        }
+        for head in [
+            "shopt -s lastpipe; ",
+            "builtin shopt -s lastpipe; ",
+            "command shopt -s lastpipe; ",
+            "eval 'shopt -s lastpipe'; ",
+            "{ shopt -s lastpipe; }; ",
+            "if true; then shopt -s lastpipe; fi; ",
+            "true && shopt -s lastpipe; ",
+            "false || shopt -s lastpipe; ",
+            "shopt -s lastpipe; if false; then shopt -u lastpipe; fi; ",
+            "shopt -s lastpipe; set -e; ",
+            "shopt -s lastpipe; set -euo pipefail; ",
+            "shopt -s lastpipe; set -m; set +m; ",
+            "shopt -s lastpipe; set -o monitor; set +o monitor; ",
+            "shopt -s lastpipe; ( shopt -u lastpipe ); ",
+            "shopt -s lastpipe; f() { shopt -s lastpipe; }; f; ",
+            "f() { shopt -s lastpipe; }; f; ",
+            "f()\n{\nshopt -s lastpipe\n}\nf\n",
+            "shopt -s lastpipe; o=extglob; shopt -s $o; ",
+            "g()\n{\nshopt -s lastpipe\n}\nf()\n{\ng\n}\nf\n",
+            "outer()\n{\ninner()\n{\nshopt -s lastpipe\n}\ninner\n}\nouter\n",
+            "if true; then\nf()\n{\nshopt -s lastpipe\n}\nfi\nf\n",
+            "for n in a; do shopt -s lastpipe; done; ",
+        ] {
+            both(&line(head), "allow");
+        }
     }
 
     /// Each name takes one field. The last keeps the rest of the line.

@@ -1,0 +1,1 @@
+A `shopt` in a pipeline, a background command, a dead branch or an uncalled function does not turn `lastpipe` on. `shopt -u` and `set -m` turn the effect off. A word the line does not show is not proof the `read` assigns.
