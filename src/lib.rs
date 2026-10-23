@@ -9290,6 +9290,8 @@ fn read_command(cmd: &[String]) -> Option<Vec<String>> {
         .iter()
         .map(|s| (*s).to_string())
         .collect();
+    // `3<<< / read` is still `read`. The redirection is not the command.
+    skip_leading_redirs(&mut tail);
     // `z) read` keeps the pattern on the command. `z)read` glues it.
     if let Some(first) = tail.first().cloned() {
         if let Some(at) = pattern_close_at(&first) {
@@ -9300,28 +9302,357 @@ fn read_command(cmd: &[String]) -> Option<Vec<String>> {
             }
         }
     }
+    skip_leading_redirs(&mut tail);
     tail.first()
         .is_some_and(|w| matches!(base_of(w), "read" | "mapfile" | "readarray"))
         .then_some(tail)
 }
 
-fn read_text(ended: &[(Vec<String>, String)], i: usize, cmd: &[String]) -> Option<String> {
-    // A `|` between `case` patterns is not the producer. `a|z)` still
-    // has the here-string. A `)` glued to the command (`z)printf`) is a
-    // real pipeline, and that command is what `read` is fed.
-    let pipe = i
-        .checked_sub(1)
-        .filter(|&p| ended[p].1 == "|" && !pure_case_pattern(&ended[p].0));
-    if let Some(p) = pipe {
-        let prev = &ended[p].0;
-        if let Some(glued) = case_glued_producer(prev) {
-            producer_text(&glued)
-        } else {
-            producer_text(prev)
+fn skip_leading_redirs(tail: &mut Vec<String>) {
+    while tail.first().is_some_and(|w| is_redirection(w)) {
+        let eat = eats_redir_operand(&tail[0]);
+        tail.remove(0);
+        if eat && !tail.is_empty() {
+            tail.remove(0);
         }
+    }
+}
+
+/// `<<<` and `<` take the next word when the operator is the whole target.
+fn eats_redir_operand(a: &str) -> bool {
+    let rest = redirection_body(a);
+    rest == "<<-" || rest.chars().all(|c| matches!(c, '>' | '<' | '&' | '|'))
+}
+
+/// What `read` assigns. `Skip` assigns nothing, so the name keeps the
+/// value it already holds. `Unknown` assigns bytes the line does not
+/// show. `Text` is the literal input.
+enum ReadSrc {
+    Skip,
+    Unknown,
+    Text(String),
+}
+
+/// A timeout `read -t` accepts: an optional sign, digits, and one dot.
+/// `0`, `0.0`, `+0` and `.0` read nothing. `0e0` is not a timeout.
+enum TimeSpec {
+    Zero,
+    Reads,
+    Bad,
+    Hidden,
+}
+
+fn time_spec(s: &str) -> TimeSpec {
+    if !literal_text(s) {
+        return TimeSpec::Hidden;
+    }
+    let b = s.as_bytes();
+    if b.is_empty() {
+        return TimeSpec::Bad;
+    }
+    let neg = b[0] == b'-';
+    let mut i = usize::from(b[0] == b'+' || neg);
+    if i == b.len() {
+        return TimeSpec::Bad;
+    }
+    let mut digit = false;
+    let mut dot = false;
+    let mut nonzero = false;
+    while i < b.len() {
+        match b[i] {
+            b'0' => digit = true,
+            b'1'..=b'9' => {
+                digit = true;
+                nonzero = true;
+            }
+            b'.' if !dot => dot = true,
+            _ => return TimeSpec::Bad,
+        }
+        i += 1;
+    }
+    if !digit {
+        TimeSpec::Bad
+    } else if nonzero && neg {
+        // `-1` is not a timeout. `-0` is zero and reads nothing.
+        TimeSpec::Bad
+    } else if nonzero {
+        TimeSpec::Reads
+    } else {
+        TimeSpec::Zero
+    }
+}
+
+/// The descriptor `read -u` names. `Hidden` is a word the line does not
+/// show. `Bad` is a literal bash rejects.
+enum FdSpec {
+    N(u32),
+    Bad,
+    Hidden,
+}
+
+fn fd_spec(s: &str) -> FdSpec {
+    if !literal_text(s) {
+        return FdSpec::Hidden;
+    }
+    if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
+        return FdSpec::Bad;
+    }
+    match s.parse() {
+        Ok(n) => FdSpec::N(n),
+        Err(_) => FdSpec::Bad,
+    }
+}
+
+/// `Skip` when bash rejects the options or the timeout is zero. A hidden
+/// descriptor may be any fd, so the value is not the one already held.
+fn read_control(tail: &[String]) -> Result<u32, ReadSrc> {
+    let words = without_redirs(tail);
+    let mut i = 1usize;
+    let mut bad = false;
+    let mut last_zero = false;
+    let mut hidden_t = false;
+    let mut hidden_fd = false;
+    let mut fd = 0u32;
+    while i < words.len() {
+        let a = words[i];
+        if a == "--" {
+            break;
+        }
+        if !a.starts_with('-') || a.len() < 2 {
+            break;
+        }
+        let mut rest = &a[1..];
+        i += 1;
+        while !rest.is_empty() {
+            let c = rest.as_bytes()[0] as char;
+            rest = &rest[1..];
+            let valued = matches!(c, 'a' | 'd' | 'i' | 'n' | 'N' | 'p' | 't' | 'u');
+            if !valued && !matches!(c, 'e' | 'r' | 's') {
+                bad = true;
+                break;
+            }
+            if !valued {
+                continue;
+            }
+            let val = if rest.is_empty() {
+                if i < words.len() {
+                    i += 1;
+                    words[i - 1]
+                } else {
+                    ""
+                }
+            } else {
+                rest
+            };
+            match c {
+                't' => match time_spec(val) {
+                    // A later literal zero reads nothing even if an earlier
+                    // timeout was a word the line does not show.
+                    TimeSpec::Zero => {
+                        last_zero = true;
+                        hidden_t = false;
+                    }
+                    TimeSpec::Reads => last_zero = false,
+                    TimeSpec::Hidden => {
+                        last_zero = false;
+                        hidden_t = true;
+                    }
+                    TimeSpec::Bad => bad = true,
+                },
+                'u' => match fd_spec(val) {
+                    FdSpec::N(n) => {
+                        fd = n;
+                        hidden_fd = false;
+                    }
+                    FdSpec::Hidden => hidden_fd = true,
+                    FdSpec::Bad => bad = true,
+                },
+                _ => {}
+            }
+            break;
+        }
+    }
+    if bad || last_zero {
+        Err(ReadSrc::Skip)
+    } else if hidden_t || hidden_fd {
+        Err(ReadSrc::Unknown)
+    } else {
+        Ok(fd)
+    }
+}
+
+fn without_redirs(words: &[String]) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        if is_redirection(&words[i]) {
+            let eat = eats_redir_operand(&words[i]) && i + 1 < words.len();
+            i += 1 + usize::from(eat);
+            continue;
+        }
+        out.push(words[i].as_str());
+        i += 1;
+    }
+    out
+}
+
+/// The last input opened on `fd`. A here-string's text is the word after
+/// `<<<`, not a path. A plain `<` or a heredoc replaces that text, and
+/// the bytes are not the filename.
+enum InKind {
+    Here(String),
+    Doc,
+    Other,
+}
+
+fn input_for(cmd: &[String], fd: u32) -> (Option<InKind>, usize) {
+    let mut last = None;
+    let mut docs = 0usize;
+    let mut i = 0;
+    while i < cmd.len() {
+        let Some((kind, span)) = redir_span(cmd, i) else {
+            i += 1;
+            continue;
+        };
+        i += span;
+        let Some((n, kind)) = kind else {
+            continue;
+        };
+        if matches!(kind, InKind::Doc) {
+            docs += 1;
+        }
+        if n == fd {
+            last = Some(kind);
+        }
+    }
+    (last, docs)
+}
+
+/// One redirection at `cmd[i]`: the input it opens, and how many words
+/// it uses. Output redirections and `{name}` opens are `None`.
+fn redir_span(cmd: &[String], i: usize) -> Option<(Option<(u32, InKind)>, usize)> {
+    let w = cmd.get(i)?;
+    if !is_redirection(w) {
+        return None;
+    }
+    let eat = eats_redir_operand(w) && i + 1 < cmd.len();
+    let span = 1 + usize::from(eat);
+    if fd_variable(w).is_some() {
+        return Some((None, span));
+    }
+    let digits = w.chars().take_while(|c| c.is_ascii_digit()).count();
+    let body = &w[digits..];
+    if !body.starts_with('<') {
+        return Some((None, span));
+    }
+    let fd = if digits == 0 {
+        0
+    } else {
+        let Ok(n) = w[..digits].parse::<u32>() else {
+            return Some((None, span));
+        };
+        n
+    };
+    let kind = if let Some(rest) = body.strip_prefix("<<<") {
+        let text = if rest.is_empty() {
+            cmd.get(i + 1).cloned().unwrap_or_default()
+        } else {
+            rest.to_string()
+        };
+        InKind::Here(text)
+    } else if body.starts_with("<<") {
+        InKind::Doc
+    } else {
+        InKind::Other
+    };
+    Some((Some((fd, kind)), span))
+}
+
+/// The text `read` assigns from. The last input for its descriptor wins
+/// over the pipe. `read -u N` with no `N` redirection assigns nothing,
+/// and so does `read -t 0`.
+fn read_source(
+    ended: &[(Vec<String>, String)],
+    i: usize,
+    cmd: &[String],
+    tail: &[String],
+) -> ReadSrc {
+    if tail.first().is_none_or(|w| base_of(w) != "read") {
+        return match read_text(ended, i, cmd) {
+            Some(t) => ReadSrc::Text(t),
+            None => ReadSrc::Unknown,
+        };
+    }
+    let fd = match read_control(tail) {
+        Ok(n) => n,
+        Err(src) => return src,
+    };
+    let (last, docs) = input_for(cmd, fd);
+    match last {
+        Some(InKind::Here(text)) => {
+            if literal_text(&text) {
+                ReadSrc::Text(text)
+            } else {
+                ReadSrc::Unknown
+            }
+        }
+        Some(InKind::Doc) if docs == 1 => match heredoc_at(ended, i) {
+            Some(t) => ReadSrc::Text(t),
+            None => ReadSrc::Unknown,
+        },
+        Some(InKind::Doc | InKind::Other) => ReadSrc::Unknown,
+        None if fd == 0 => match pipe_producer_text(ended, i) {
+            Some(t) => ReadSrc::Text(t),
+            None => ReadSrc::Unknown,
+        },
+        None => ReadSrc::Skip,
+    }
+}
+
+fn heredoc_at(ended: &[(Vec<String>, String)], i: usize) -> Option<String> {
+    let pairs: Vec<(Vec<&str>, &str)> = ended
+        .iter()
+        .map(|(c, s)| (c.iter().map(String::as_str).collect(), s.as_str()))
+        .collect();
+    let (texts, _) = heredoc_bodies(&pairs);
+    texts.get(i).and_then(Clone::clone)
+}
+
+/// A `|` between `case` patterns is not the producer. `a|z)` still has
+/// the here-string. A `)` glued to the command (`z)printf`) is a real
+/// pipeline, and that command is what `read` is fed.
+fn pipe_producer_text(ended: &[(Vec<String>, String)], i: usize) -> Option<String> {
+    let p = i
+        .checked_sub(1)
+        .filter(|&p| ended[p].1 == "|" && !pure_case_pattern(&ended[p].0))?;
+    let prev = &ended[p].0;
+    if let Some(glued) = case_glued_producer(prev) {
+        producer_text(&glued)
+    } else {
+        producer_text(prev)
+    }
+}
+
+fn read_text(ended: &[(Vec<String>, String)], i: usize, cmd: &[String]) -> Option<String> {
+    if i.checked_sub(1)
+        .is_some_and(|p| ended[p].1 == "|" && !pure_case_pattern(&ended[p].0))
+    {
+        pipe_producer_text(ended, i)
     } else {
         here_string(cmd)
     }
+}
+
+/// `true` when this `read` assigns nothing, so it must not poison the
+/// name the way an unshown stdin would.
+fn read_assigns_nothing(ended: &[(Vec<String>, String)], i: usize) -> bool {
+    let Some(cmd) = ended.get(i).map(|(c, _)| c) else {
+        return false;
+    };
+    let Some(tail) = read_command(cmd) else {
+        return false;
+    };
+    matches!(read_source(ended, i, cmd, &tail), ReadSrc::Skip)
 }
 
 /// The command glued onto a `case` pattern (`z)printf '/tmp/a\n'`).
@@ -9510,25 +9841,33 @@ fn read_hits_in(
         if let Some(tail) = read_command(cmd) {
             let names = read_var_names(&tail);
             if !names.is_empty() {
-                let cols = read_text(ended, i, cmd).map(|t| {
-                    let ifs = read_input_ifs(ended, &map.shells, i, cmd);
-                    let mut cols = vec![Vec::new(); names.len()];
-                    for line in read_lines(&t) {
-                        let fields = read_fields(&line, names.len(), &ifs);
-                        for (k, field) in fields.into_iter().enumerate() {
-                            if let Some(col) = cols.get_mut(k) {
-                                col.push(field);
+                let cols = match read_source(ended, i, cmd, &tail) {
+                    // Nothing was assigned. A hit here would poison a
+                    // value this shell already holds.
+                    ReadSrc::Skip => None,
+                    ReadSrc::Unknown => Some(None),
+                    ReadSrc::Text(t) => {
+                        let ifs = read_input_ifs(ended, &map.shells, i, cmd);
+                        let mut cols = vec![Vec::new(); names.len()];
+                        for line in read_lines(&t) {
+                            let fields = read_fields(&line, names.len(), &ifs);
+                            for (k, field) in fields.into_iter().enumerate() {
+                                if let Some(col) = cols.get_mut(k) {
+                                    col.push(field);
+                                }
                             }
                         }
+                        Some(Some(cols))
                     }
-                    cols
-                });
-                for (k, name) in names.into_iter().enumerate() {
-                    out.push(ReadHit {
-                        name,
-                        values: cols.as_ref().map(|c| c.get(k).cloned().unwrap_or_default()),
-                        at: i,
-                    });
+                };
+                if let Some(cols) = cols {
+                    for (k, name) in names.into_iter().enumerate() {
+                        out.push(ReadHit {
+                            name,
+                            values: cols.as_ref().map(|c| c.get(k).cloned().unwrap_or_default()),
+                            at: i,
+                        });
+                    }
                 }
             }
         }
@@ -14290,7 +14629,8 @@ impl Scratch {
             // A `read` poisons the name because stdin is not an assignment.
             // One that does not run, or that runs in another shell or only
             // inside a function that is not being called, leaves the value
-            // already stored.
+            // already stored. So does one that assigns nothing (`read -t 0`,
+            // or `read -u N` when this command never opens N).
             let dead = runs.get(i) == Some(&false);
             let read = matches!(
                 command_parts(&cmd).1.as_str(),
@@ -14298,7 +14638,8 @@ impl Scratch {
             );
             let elsewhere = shells.in_body.get(i) == Some(&true)
                 || shells.shells.get(i).is_some_and(|s| *s != 0);
-            if read && (dead || elsewhere) {
+            let idle = read && read_assigns_nothing(&ended, i);
+            if read && (dead || elsewhere || idle) {
                 continue;
             }
             for name in opaque_bound(&cmd) {
@@ -20409,6 +20750,55 @@ hash -r 2> /dev/null
             "x=/tmp/a; f() { read x <<< /; }; rm -rf \"$x\"",
             "coproc { read x <<< /tmp/a; rm -rf \"$x\"; }",
             "( f() { read x <<< /tmp/a; }; f; rm -rf \"$x\" )",
+        ] {
+            both(line, "allow");
+        }
+    }
+
+    /// The last input for `read`'s descriptor wins over the pipe. `read -u N`
+    /// reads that descriptor, and `read -t 0` assigns nothing.
+    #[test]
+    fn a_read_takes_the_last_input_for_its_fd() {
+        let both = |s: &str, want: &str| {
+            assert_eq!(verdict(&shell_words(s)), want, "{s}");
+            let bash = vec!["bash".into(), "-c".into(), s.to_string()];
+            assert_eq!(verdict(&bash), want, "bash -c {s}");
+        };
+        let deny = "deny\trm-rf-outside-tmp";
+        for line in [
+            "shopt -s lastpipe; printf '/tmp/a\\n' | read x <<< /; rm -rf \"$x\"",
+            "x=/; read x <<< /tmp/a <<< /; rm -rf \"$x\"",
+            "x=/; read -u 3 x <<< /tmp/a 3<<< /; rm -rf \"$x\"",
+            "x=/; read -t 0 x <<< /tmp/a; rm -rf \"$x\"",
+            "x=/; read -u3 x 3<<< /; rm -rf \"$x\"",
+            "x=/; read -t0 x <<< /tmp/a; rm -rf \"$x\"",
+            "x=/; read -t 0.0 x <<< /tmp/a; rm -rf \"$x\"",
+            "x=/; read -t0.0 x <<< /tmp/a; rm -rf \"$x\"",
+            "x=/; read -u 3 -t 0 x 3<<< /tmp/a; rm -rf \"$x\"",
+            "shopt -s lastpipe; x=/; printf '/tmp/a\\n' | read x < /etc/hostname; rm -rf \"$x\"",
+            "x=/; read x <<< /tmp/a < /etc/hostname; rm -rf \"$x\"",
+            "shopt -s lastpipe; x=/; printf '/tmp/a\\n' | read x <<EOF\n/\nEOF\nrm -rf \"$x\"",
+        ] {
+            both(line, deny);
+        }
+        for line in [
+            "x=/tmp/a; read -t 0 x <<< /; rm -rf \"$x\"",
+            "x=/tmp/a; read -t0 x <<< /; rm -rf \"$x\"",
+            "x=/tmp/a; read -t 0.0 x <<< /; rm -rf \"$x\"",
+            "x=/tmp/a; read x <<< / <<< /tmp/a; rm -rf \"$x\"",
+            "x=/tmp/a; read x <<< /tmp/b <<< /tmp/a; rm -rf \"$x\"",
+            "x=/; read -u 3 x 3<<< /tmp/a; rm -rf \"$x\"",
+            "x=/tmp/a; read -u 3 x <<< /; rm -rf \"$x\"",
+            "x=/tmp/a; read -u 3 x <<< /tmp/b; rm -rf \"$x\"",
+            "x=/tmp/a; read -u 3 -t 0 x 3<<< /; rm -rf \"$x\"",
+            "shopt -s lastpipe; x=/; printf '/\\n' | read x <<< /tmp/a; rm -rf \"$x\"",
+            "x=/; read x 3<<< / <<< /tmp/a; rm -rf \"$x\"",
+            "x=/; read -u 3 x <<< / 3<<< /tmp/a; rm -rf \"$x\"",
+            "x=/tmp/a; read -u foo x <<< /; rm -rf \"$x\"",
+            "x=/tmp/a; read -t 0e0 x <<< /; rm -rf \"$x\"",
+            "x=/; case z in a|z) read x <<< /tmp/a;; esac; rm -rf \"$x\"",
+            "x=/; read x <<EOF\n/tmp/a\nEOF\nrm -rf \"$x\"",
+            "x=/; 3<<< /tmp/a read -u 3 x; rm -rf \"$x\"",
         ] {
             both(line, "allow");
         }
