@@ -19792,6 +19792,56 @@ hash -r 2> /dev/null
         assert_eq!(p("%s", &["a", "b"]), None);
     }
 
+    /// `tests/fixtures/printf/shells.tsv` lists what bash 5.2 and dash
+    /// 0.5.12 write for each printable byte after `%` and `\`, each
+    /// flag, width and precision, and the escapes one shell reads as
+    /// a code point. The text is either unknown or the bytes both
+    /// shells write.
+    #[test]
+    fn printf_text_is_unknown_where_bash_and_dash_part() {
+        let unescape = |s: &str| {
+            let mut out = String::new();
+            let mut chars = s.chars();
+            while let Some(c) = chars.next() {
+                if c != '\\' {
+                    out.push(c);
+                    continue;
+                }
+                match chars.next() {
+                    Some('t') => out.push('\t'),
+                    Some('n') => out.push('\n'),
+                    Some('x') => {
+                        let hex: String = chars.by_ref().take(2).collect();
+                        out.push(char::from(u8::from_str_radix(&hex, 16).unwrap()));
+                    }
+                    Some(c) => out.push(c),
+                    None => panic!("bad escape in {s}"),
+                }
+            }
+            out
+        };
+        let rows = include_str!("../tests/fixtures/printf/shells.tsv");
+        let mut parted = 0;
+        for row in rows.lines() {
+            let f: Vec<String> = row.split('\t').map(unescape).collect();
+            let (fmt, bash, dash) = (&f[0], &f[2], &f[3]);
+            let args = if f[1].is_empty() {
+                Vec::new()
+            } else {
+                vec![f[1].clone()]
+            };
+            parted += usize::from(bash != dash);
+            if let Some(text) = render_printf(fmt, &args) {
+                assert!(
+                    text == *bash && text == *dash,
+                    "{fmt:?} {args:?}: {text:?}, bash {bash:?}, dash {dash:?}"
+                );
+            }
+        }
+        assert_eq!(rows.lines().count(), 982);
+        assert_eq!(parted, 140);
+    }
+
     /// Bash keeps writing after `%Q` and `%n` where dash stops, so the
     /// program after them is in the file python runs.
     #[test]

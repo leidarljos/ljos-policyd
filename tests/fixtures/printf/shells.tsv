@@ -1,0 +1,982 @@
+A% B		A	A
+A% B	z	A	A
+A\\ B		A\\ B	A\\ B
+A\\ B	z	A\\ B	A\\ B
+A%!B		A	A
+A%!B	z	A	A
+A\\!B		A\\!B	A\\!B
+A\\!B	z	A\\!B	A\\!B
+A%"B		A	A
+A%"B	z	A	A
+A\\"B		A"B	A\\"B
+A\\"B	z	A"B	A\\"B
+A%#B		A	A
+A%#B	z	A	A
+A\\#B		A\\#B	A\\#B
+A\\#B	z	A\\#B	A\\#B
+A%$B		A	A
+A%$B	z	A	A
+A\\$B		A\\$B	A\\$B
+A\\$B	z	A\\$B	A\\$B
+A%%B		A%B	A%B
+A%%B	z	A%B	A%B
+A\\%B		A\\	A\\
+A\\%B	z	A\\	A\\
+A%&B		A	A
+A%&B	z	A	A
+A\\&B		A\\&B	A\\&B
+A\\&B	z	A\\&B	A\\&B
+A%'B		A	A
+A%'B	z	A	A
+A\\'B		A'B	A\\'B
+A\\'B	z	A'B	A\\'B
+A%(B		A%(B	A
+A%(B	z	A%(B	A
+A\\(B		A\\(B	A\\(B
+A\\(B	z	A\\(B	A\\(B
+A%)B		A	A
+A%)B	z	A	A
+A\\)B		A\\)B	A\\)B
+A\\)B	z	A\\)B	A\\)B
+A%*B		A	A
+A%*B	z	A	A
+A\\*B		A\\*B	A\\*B
+A\\*B	z	A\\*B	A\\*B
+A%+B		A	A
+A%+B	z	A	A
+A\\+B		A\\+B	A\\+B
+A\\+B	z	A\\+B	A\\+B
+A%,B		A	A
+A%,B	z	A	A
+A\\,B		A\\,B	A\\,B
+A\\,B	z	A\\,B	A\\,B
+A%-B		A	A
+A%-B	z	A	A
+A\\-B		A\\-B	A\\-B
+A\\-B	z	A\\-B	A\\-B
+A%.B		A	A
+A%.B	z	A	A
+A\\.B		A\\.B	A\\.B
+A\\.B	z	A\\.B	A\\.B
+A%/B		A	A
+A%/B	z	A	A
+A\\/B		A\\/B	A\\/B
+A\\/B	z	A\\/B	A\\/B
+A%0B		A	A
+A%0B	z	A	A
+A\\0B		A\x00B	A\x00B
+A\\0B	z	A\x00B	A\x00B
+A%1B		A	A
+A%1B	z	A	A
+A\\1B		A\x01B	A\x01B
+A\\1B	z	A\x01B	A\x01B
+A%2B		A	A
+A%2B	z	A	A
+A\\2B		A\x02B	A\x02B
+A\\2B	z	A\x02B	A\x02B
+A%3B		A	A
+A%3B	z	A	A
+A\\3B		A\x03B	A\x03B
+A\\3B	z	A\x03B	A\x03B
+A%4B		A	A
+A%4B	z	A	A
+A\\4B		A\x04B	A\x04B
+A\\4B	z	A\x04B	A\x04B
+A%5B		A	A
+A%5B	z	A	A
+A\\5B		A\x05B	A\x05B
+A\\5B	z	A\x05B	A\x05B
+A%6B		A	A
+A%6B	z	A	A
+A\\6B		A\x06B	A\x06B
+A\\6B	z	A\x06B	A\x06B
+A%7B		A	A
+A%7B	z	A	A
+A\\7B		A\x07B	A\x07B
+A\\7B	z	A\x07B	A\x07B
+A%8B		A	A
+A%8B	z	A	A
+A\\8B		A\\8B	A\\8B
+A\\8B	z	A\\8B	A\\8B
+A%9B		A	A
+A%9B	z	A	A
+A\\9B		A\\9B	A\\9B
+A\\9B	z	A\\9B	A\\9B
+A%:B		A	A
+A%:B	z	A	A
+A\\:B		A\\:B	A\\:B
+A\\:B	z	A\\:B	A\\:B
+A%;B		A	A
+A%;B	z	A	A
+A\\;B		A\\;B	A\\;B
+A\\;B	z	A\\;B	A\\;B
+A%<B		A	A
+A%<B	z	A	A
+A\\<B		A\\<B	A\\<B
+A\\<B	z	A\\<B	A\\<B
+A%=B		A	A
+A%=B	z	A	A
+A\\=B		A\\=B	A\\=B
+A\\=B	z	A\\=B	A\\=B
+A%>B		A	A
+A%>B	z	A	A
+A\\>B		A\\>B	A\\>B
+A\\>B	z	A\\>B	A\\>B
+A%?B		A	A
+A%?B	z	A	A
+A\\?B		A?B	A\\?B
+A\\?B	z	A?B	A\\?B
+A%@B		A	A
+A%@B	z	A	A
+A\\@B		A\\@B	A\\@B
+A\\@B	z	A\\@B	A\\@B
+A%AB		A0X0P+0B	A0X0P+0B
+A%AB	z	A0X0P+0B	A0X0P+0B
+A\\AB		A\\AB	A\\AB
+A\\AB	z	A\\AB	A\\AB
+A%BB		A	A
+A%BB	z	A	A
+A\\BB		A\\BB	A\\BB
+A\\BB	z	A\\BB	A\\BB
+A%CB		A	A
+A%CB	z	A	A
+A\\CB		A\\CB	A\\CB
+A\\CB	z	A\\CB	A\\CB
+A%DB		A	A
+A%DB	z	A	A
+A\\DB		A\\DB	A\\DB
+A\\DB	z	A\\DB	A\\DB
+A%EB		A0.000000E+00B	A0.000000E+00B
+A%EB	z	A0.000000E+00B	A0.000000E+00B
+A\\EB		A\x1bB	A\\EB
+A\\EB	z	A\x1bB	A\\EB
+A%FB		A0.000000B	A0.000000B
+A%FB	z	A0.000000B	A0.000000B
+A\\FB		A\\FB	A\\FB
+A\\FB	z	A\\FB	A\\FB
+A%GB		A0B	A0B
+A%GB	z	A0B	A0B
+A\\GB		A\\GB	A\\GB
+A\\GB	z	A\\GB	A\\GB
+A%HB		A	A
+A%HB	z	A	A
+A\\HB		A\\HB	A\\HB
+A\\HB	z	A\\HB	A\\HB
+A%IB		A	A
+A%IB	z	A	A
+A\\IB		A\\IB	A\\IB
+A\\IB	z	A\\IB	A\\IB
+A%JB		A	A
+A%JB	z	A	A
+A\\JB		A\\JB	A\\JB
+A\\JB	z	A\\JB	A\\JB
+A%KB		A	A
+A%KB	z	A	A
+A\\KB		A\\KB	A\\KB
+A\\KB	z	A\\KB	A\\KB
+A%LB		A	A
+A%LB	z	A	A
+A\\LB		A\\LB	A\\LB
+A\\LB	z	A\\LB	A\\LB
+A%MB		A	A
+A%MB	z	A	A
+A\\MB		A\\MB	A\\MB
+A\\MB	z	A\\MB	A\\MB
+A%NB		A	A
+A%NB	z	A	A
+A\\NB		A\\NB	A\\NB
+A\\NB	z	A\\NB	A\\NB
+A%OB		A	A
+A%OB	z	A	A
+A\\OB		A\\OB	A\\OB
+A\\OB	z	A\\OB	A\\OB
+A%PB		A	A
+A%PB	z	A	A
+A\\PB		A\\PB	A\\PB
+A\\PB	z	A\\PB	A\\PB
+A%QB		A''B	A
+A%QB	z	AzB	A
+A\\QB		A\\QB	A\\QB
+A\\QB	z	A\\QB	A\\QB
+A%RB		A	A
+A%RB	z	A	A
+A\\RB		A\\RB	A\\RB
+A\\RB	z	A\\RB	A\\RB
+A%SB		A	A
+A%SB	z	A	A
+A\\SB		A\\SB	A\\SB
+A\\SB	z	A\\SB	A\\SB
+A%TB		A	A
+A%TB	z	A	A
+A\\TB		A\\TB	A\\TB
+A\\TB	z	A\\TB	A\\TB
+A%UB		A	A
+A%UB	z	A	A
+A\\UB		A\x0b	A\\UB
+A\\UB	z	A\x0b	A\\UB
+A%VB		A	A
+A%VB	z	A	A
+A\\VB		A\\VB	A\\VB
+A\\VB	z	A\\VB	A\\VB
+A%WB		A	A
+A%WB	z	A	A
+A\\WB		A\\WB	A\\WB
+A\\WB	z	A\\WB	A\\WB
+A%XB		A0B	A0B
+A%XB	z	A0B	A0B
+A\\XB		A\\XB	A\\XB
+A\\XB	z	A\\XB	A\\XB
+A%YB		A	A
+A%YB	z	A	A
+A\\YB		A\\YB	A\\YB
+A\\YB	z	A\\YB	A\\YB
+A%ZB		A	A
+A%ZB	z	A	A
+A\\ZB		A\\ZB	A\\ZB
+A\\ZB	z	A\\ZB	A\\ZB
+A%[B		A	A
+A%[B	z	A	A
+A\\[B		A\\[B	A\\[B
+A\\[B	z	A\\[B	A\\[B
+A%\\B		A	A
+A%\\B	z	A	A
+A\\\\B		A\\B	A\\B
+A\\\\B	z	A\\B	A\\B
+A%]B		A	A
+A%]B	z	A	A
+A\\]B		A\\]B	A\\]B
+A\\]B	z	A\\]B	A\\]B
+A%^B		A	A
+A%^B	z	A	A
+A\\^B		A\\^B	A\\^B
+A\\^B	z	A\\^B	A\\^B
+A%_B		A	A
+A%_B	z	A	A
+A\\_B		A\\_B	A\\_B
+A\\_B	z	A\\_B	A\\_B
+A%`B		A	A
+A%`B	z	A	A
+A\\`B		A\\`B	A\\`B
+A\\`B	z	A\\`B	A\\`B
+A%aB		A0x0p+0B	A0x0p+0B
+A%aB	z	A0x0p+0B	A0x0p+0B
+A\\aB		A\x07B	A\x07B
+A\\aB	z	A\x07B	A\x07B
+A%bB		AB	AB
+A%bB	z	AzB	AzB
+A\\bB		A\x08B	A\x08B
+A\\bB	z	A\x08B	A\x08B
+A%cB		A\x00B	A\x00B
+A%cB	z	AzB	AzB
+A\\cB		A\\cB	A\\cB
+A\\cB	z	A\\cB	A\\cB
+A%dB		A0B	A0B
+A%dB	z	A0B	A0B
+A\\dB		A\\dB	A\\dB
+A\\dB	z	A\\dB	A\\dB
+A%eB		A0.000000e+00B	A0.000000e+00B
+A%eB	z	A0.000000e+00B	A0.000000e+00B
+A\\eB		A\x1bB	A\x1bB
+A\\eB	z	A\x1bB	A\x1bB
+A%fB		A0.000000B	A0.000000B
+A%fB	z	A0.000000B	A0.000000B
+A\\fB		A\x0cB	A\x0cB
+A\\fB	z	A\x0cB	A\x0cB
+A%gB		A0B	A0B
+A%gB	z	A0B	A0B
+A\\gB		A\\gB	A\\gB
+A\\gB	z	A\\gB	A\\gB
+A%hB		A	A
+A%hB	z	A	A
+A\\hB		A\\hB	A\\hB
+A\\hB	z	A\\hB	A\\hB
+A%iB		A0B	A0B
+A%iB	z	A0B	A0B
+A\\iB		A\\iB	A\\iB
+A\\iB	z	A\\iB	A\\iB
+A%jB		A	A
+A%jB	z	A	A
+A\\jB		A\\jB	A\\jB
+A\\jB	z	A\\jB	A\\jB
+A%kB		A	A
+A%kB	z	A	A
+A\\kB		A\\kB	A\\kB
+A\\kB	z	A\\kB	A\\kB
+A%lB		A	A
+A%lB	z	A	A
+A\\lB		A\\lB	A\\lB
+A\\lB	z	A\\lB	A\\lB
+A%mB		A	A
+A%mB	z	A	A
+A\\mB		A\\mB	A\\mB
+A\\mB	z	A\\mB	A\\mB
+A%nB		AB	A
+A%nB	z	AB	A
+A\\nB		A\nB	A\nB
+A\\nB	z	A\nB	A\nB
+A%oB		A0B	A0B
+A%oB	z	A0B	A0B
+A\\oB		A\\oB	A\\oB
+A\\oB	z	A\\oB	A\\oB
+A%pB		A	A
+A%pB	z	A	A
+A\\pB		A\\pB	A\\pB
+A\\pB	z	A\\pB	A\\pB
+A%qB		A''B	A
+A%qB	z	AzB	A
+A\\qB		A\\qB	A\\qB
+A\\qB	z	A\\qB	A\\qB
+A%rB		A	A
+A%rB	z	A	A
+A\\rB		A\x0dB	A\x0dB
+A\\rB	z	A\x0dB	A\x0dB
+A%sB		AB	AB
+A%sB	z	AzB	AzB
+A\\sB		A\\sB	A\\sB
+A\\sB	z	A\\sB	A\\sB
+A%tB		A	A
+A%tB	z	A	A
+A\\tB		A\tB	A\tB
+A\\tB	z	A\tB	A\tB
+A%uB		A0B	A0B
+A%uB	z	A0B	A0B
+A\\uB		A\x0b	A\\uB
+A\\uB	z	A\x0b	A\\uB
+A%vB		A	A
+A%vB	z	A	A
+A\\vB		A\x0bB	A\x0bB
+A\\vB	z	A\x0bB	A\x0bB
+A%wB		A	A
+A%wB	z	A	A
+A\\wB		A\\wB	A\\wB
+A\\wB	z	A\\wB	A\\wB
+A%xB		A0B	A0B
+A%xB	z	A0B	A0B
+A\\xB		A\x0b	A\\xB
+A\\xB	z	A\x0b	A\\xB
+A%yB		A	A
+A%yB	z	A	A
+A\\yB		A\\yB	A\\yB
+A\\yB	z	A\\yB	A\\yB
+A%zB		A	A
+A%zB	z	A	A
+A\\zB		A\\zB	A\\zB
+A\\zB	z	A\\zB	A\\zB
+A%{B		A	A
+A%{B	z	A	A
+A\\{B		A\\{B	A\\{B
+A\\{B	z	A\\{B	A\\{B
+A%|B		A	A
+A%|B	z	A	A
+A\\|B		A\\|B	A\\|B
+A\\|B	z	A\\|B	A\\|B
+A%}B		A	A
+A%}B	z	A	A
+A\\}B		A\\}B	A\\}B
+A\\}B	z	A\\}B	A\\}B
+A%~B		A	A
+A%~B	z	A	A
+A\\~B		A\\~B	A\\~B
+A\\~B	z	A\\~B	A\\~B
+A%-sB		AB	AB
+A%-sB	z	AzB	AzB
+A%-dB		A0B	A0B
+A%-dB	z	A0B	A0B
+A%-iB		A0B	A0B
+A%-iB	z	A0B	A0B
+A%-oB		A0B	A0B
+A%-oB	z	A0B	A0B
+A%-uB		A0B	A0B
+A%-uB	z	A0B	A0B
+A%-xB		A0B	A0B
+A%-xB	z	A0B	A0B
+A%-XB		A0B	A0B
+A%-XB	z	A0B	A0B
+A%-eB		A0.000000e+00B	A0.000000e+00B
+A%-eB	z	A0.000000e+00B	A0.000000e+00B
+A%-EB		A0.000000E+00B	A0.000000E+00B
+A%-EB	z	A0.000000E+00B	A0.000000E+00B
+A%-fB		A0.000000B	A0.000000B
+A%-fB	z	A0.000000B	A0.000000B
+A%-FB		A0.000000B	A0.000000B
+A%-FB	z	A0.000000B	A0.000000B
+A%-gB		A0B	A0B
+A%-gB	z	A0B	A0B
+A%-GB		A0B	A0B
+A%-GB	z	A0B	A0B
+A%-aB		A0x0p+0B	A0x0p+0B
+A%-aB	z	A0x0p+0B	A0x0p+0B
+A%-AB		A0X0P+0B	A0X0P+0B
+A%-AB	z	A0X0P+0B	A0X0P+0B
+A%-cB		A\x00B	A\x00B
+A%-cB	z	AzB	AzB
+A%-bB		AB	AB
+A%-bB	z	AzB	AzB
+A%-qB		A''B	A
+A%-qB	z	AzB	A
+A%-QB		A''B	A
+A%-QB	z	AzB	A
+A%-nB		AB	A
+A%-nB	z	AB	A
+A%-TB		A	A
+A%-TB	z	A	A
+A%-%B		A	A
+A%-%B	z	A	A
+A%+sB		AB	AB
+A%+sB	z	AzB	AzB
+A%+dB		A+0B	A+0B
+A%+dB	z	A+0B	A+0B
+A%+iB		A+0B	A+0B
+A%+iB	z	A+0B	A+0B
+A%+oB		A0B	A0B
+A%+oB	z	A0B	A0B
+A%+uB		A0B	A0B
+A%+uB	z	A0B	A0B
+A%+xB		A0B	A0B
+A%+xB	z	A0B	A0B
+A%+XB		A0B	A0B
+A%+XB	z	A0B	A0B
+A%+eB		A+0.000000e+00B	A+0.000000e+00B
+A%+eB	z	A+0.000000e+00B	A+0.000000e+00B
+A%+EB		A+0.000000E+00B	A+0.000000E+00B
+A%+EB	z	A+0.000000E+00B	A+0.000000E+00B
+A%+fB		A+0.000000B	A+0.000000B
+A%+fB	z	A+0.000000B	A+0.000000B
+A%+FB		A+0.000000B	A+0.000000B
+A%+FB	z	A+0.000000B	A+0.000000B
+A%+gB		A+0B	A+0B
+A%+gB	z	A+0B	A+0B
+A%+GB		A+0B	A+0B
+A%+GB	z	A+0B	A+0B
+A%+aB		A+0x0p+0B	A+0x0p+0B
+A%+aB	z	A+0x0p+0B	A+0x0p+0B
+A%+AB		A+0X0P+0B	A+0X0P+0B
+A%+AB	z	A+0X0P+0B	A+0X0P+0B
+A%+cB		A\x00B	A\x00B
+A%+cB	z	AzB	AzB
+A%+bB		AB	AB
+A%+bB	z	AzB	AzB
+A%+qB		A''B	A
+A%+qB	z	AzB	A
+A%+QB		A''B	A
+A%+QB	z	AzB	A
+A%+nB		AB	A
+A%+nB	z	AB	A
+A%+TB		A	A
+A%+TB	z	A	A
+A%+%B		A	A
+A%+%B	z	A	A
+A% sB		AB	AB
+A% sB	z	AzB	AzB
+A% dB		A 0B	A 0B
+A% dB	z	A 0B	A 0B
+A% iB		A 0B	A 0B
+A% iB	z	A 0B	A 0B
+A% oB		A0B	A0B
+A% oB	z	A0B	A0B
+A% uB		A0B	A0B
+A% uB	z	A0B	A0B
+A% xB		A0B	A0B
+A% xB	z	A0B	A0B
+A% XB		A0B	A0B
+A% XB	z	A0B	A0B
+A% eB		A 0.000000e+00B	A 0.000000e+00B
+A% eB	z	A 0.000000e+00B	A 0.000000e+00B
+A% EB		A 0.000000E+00B	A 0.000000E+00B
+A% EB	z	A 0.000000E+00B	A 0.000000E+00B
+A% fB		A 0.000000B	A 0.000000B
+A% fB	z	A 0.000000B	A 0.000000B
+A% FB		A 0.000000B	A 0.000000B
+A% FB	z	A 0.000000B	A 0.000000B
+A% gB		A 0B	A 0B
+A% gB	z	A 0B	A 0B
+A% GB		A 0B	A 0B
+A% GB	z	A 0B	A 0B
+A% aB		A 0x0p+0B	A 0x0p+0B
+A% aB	z	A 0x0p+0B	A 0x0p+0B
+A% AB		A 0X0P+0B	A 0X0P+0B
+A% AB	z	A 0X0P+0B	A 0X0P+0B
+A% cB		A\x00B	A\x00B
+A% cB	z	AzB	AzB
+A% bB		AB	AB
+A% bB	z	AzB	AzB
+A% qB		A''B	A
+A% qB	z	AzB	A
+A% QB		A''B	A
+A% QB	z	AzB	A
+A% nB		AB	A
+A% nB	z	AB	A
+A% TB		A	A
+A% TB	z	A	A
+A% %B		A	A
+A% %B	z	A	A
+A%#sB		AB	AB
+A%#sB	z	AzB	AzB
+A%#dB		A0B	A0B
+A%#dB	z	A0B	A0B
+A%#iB		A0B	A0B
+A%#iB	z	A0B	A0B
+A%#oB		A0B	A0B
+A%#oB	z	A0B	A0B
+A%#uB		A0B	A0B
+A%#uB	z	A0B	A0B
+A%#xB		A0B	A0B
+A%#xB	z	A0B	A0B
+A%#XB		A0B	A0B
+A%#XB	z	A0B	A0B
+A%#eB		A0.000000e+00B	A0.000000e+00B
+A%#eB	z	A0.000000e+00B	A0.000000e+00B
+A%#EB		A0.000000E+00B	A0.000000E+00B
+A%#EB	z	A0.000000E+00B	A0.000000E+00B
+A%#fB		A0.000000B	A0.000000B
+A%#fB	z	A0.000000B	A0.000000B
+A%#FB		A0.000000B	A0.000000B
+A%#FB	z	A0.000000B	A0.000000B
+A%#gB		A0.00000B	A0.00000B
+A%#gB	z	A0.00000B	A0.00000B
+A%#GB		A0.00000B	A0.00000B
+A%#GB	z	A0.00000B	A0.00000B
+A%#aB		A0x0.p+0B	A0x0.p+0B
+A%#aB	z	A0x0.p+0B	A0x0.p+0B
+A%#AB		A0X0.P+0B	A0X0.P+0B
+A%#AB	z	A0X0.P+0B	A0X0.P+0B
+A%#cB		A\x00B	A\x00B
+A%#cB	z	AzB	AzB
+A%#bB		AB	AB
+A%#bB	z	AzB	AzB
+A%#qB		A''B	A
+A%#qB	z	AzB	A
+A%#QB		A''B	A
+A%#QB	z	AzB	A
+A%#nB		AB	A
+A%#nB	z	AB	A
+A%#TB		A	A
+A%#TB	z	A	A
+A%#%B		A	A
+A%#%B	z	A	A
+A%0sB		AB	AB
+A%0sB	z	AzB	AzB
+A%0dB		A0B	A0B
+A%0dB	z	A0B	A0B
+A%0iB		A0B	A0B
+A%0iB	z	A0B	A0B
+A%0oB		A0B	A0B
+A%0oB	z	A0B	A0B
+A%0uB		A0B	A0B
+A%0uB	z	A0B	A0B
+A%0xB		A0B	A0B
+A%0xB	z	A0B	A0B
+A%0XB		A0B	A0B
+A%0XB	z	A0B	A0B
+A%0eB		A0.000000e+00B	A0.000000e+00B
+A%0eB	z	A0.000000e+00B	A0.000000e+00B
+A%0EB		A0.000000E+00B	A0.000000E+00B
+A%0EB	z	A0.000000E+00B	A0.000000E+00B
+A%0fB		A0.000000B	A0.000000B
+A%0fB	z	A0.000000B	A0.000000B
+A%0FB		A0.000000B	A0.000000B
+A%0FB	z	A0.000000B	A0.000000B
+A%0gB		A0B	A0B
+A%0gB	z	A0B	A0B
+A%0GB		A0B	A0B
+A%0GB	z	A0B	A0B
+A%0aB		A0x0p+0B	A0x0p+0B
+A%0aB	z	A0x0p+0B	A0x0p+0B
+A%0AB		A0X0P+0B	A0X0P+0B
+A%0AB	z	A0X0P+0B	A0X0P+0B
+A%0cB		A\x00B	A\x00B
+A%0cB	z	AzB	AzB
+A%0bB		AB	AB
+A%0bB	z	AzB	AzB
+A%0qB		A''B	A
+A%0qB	z	AzB	A
+A%0QB		A''B	A
+A%0QB	z	AzB	A
+A%0nB		AB	A
+A%0nB	z	AB	A
+A%0TB		A	A
+A%0TB	z	A	A
+A%0%B		A	A
+A%0%B	z	A	A
+A%'sB		AB	A
+A%'sB	z	AzB	A
+A%'dB		A0B	A
+A%'dB	z	A0B	A
+A%'iB		A0B	A
+A%'iB	z	A0B	A
+A%'oB		A0B	A
+A%'oB	z	A0B	A
+A%'uB		A0B	A
+A%'uB	z	A0B	A
+A%'xB		A0B	A
+A%'xB	z	A0B	A
+A%'XB		A0B	A
+A%'XB	z	A0B	A
+A%'eB		A0.000000e+00B	A
+A%'eB	z	A0.000000e+00B	A
+A%'EB		A0.000000E+00B	A
+A%'EB	z	A0.000000E+00B	A
+A%'fB		A0.000000B	A
+A%'fB	z	A0.000000B	A
+A%'FB		A0.000000B	A
+A%'FB	z	A0.000000B	A
+A%'gB		A0B	A
+A%'gB	z	A0B	A
+A%'GB		A0B	A
+A%'GB	z	A0B	A
+A%'aB		A0x0p+0B	A
+A%'aB	z	A0x0p+0B	A
+A%'AB		A0X0P+0B	A
+A%'AB	z	A0X0P+0B	A
+A%'cB		A\x00B	A
+A%'cB	z	AzB	A
+A%'bB		AB	A
+A%'bB	z	AzB	A
+A%'qB		A''B	A
+A%'qB	z	AzB	A
+A%'QB		A''B	A
+A%'QB	z	AzB	A
+A%'nB		AB	A
+A%'nB	z	AB	A
+A%'TB		A	A
+A%'TB	z	A	A
+A%'%B		A	A
+A%'%B	z	A	A
+A%5sB		A     B	A     B
+A%5sB	z	A    zB	A    zB
+A%5dB		A    0B	A    0B
+A%5dB	z	A    0B	A    0B
+A%5iB		A    0B	A    0B
+A%5iB	z	A    0B	A    0B
+A%5oB		A    0B	A    0B
+A%5oB	z	A    0B	A    0B
+A%5uB		A    0B	A    0B
+A%5uB	z	A    0B	A    0B
+A%5xB		A    0B	A    0B
+A%5xB	z	A    0B	A    0B
+A%5XB		A    0B	A    0B
+A%5XB	z	A    0B	A    0B
+A%5eB		A0.000000e+00B	A0.000000e+00B
+A%5eB	z	A0.000000e+00B	A0.000000e+00B
+A%5EB		A0.000000E+00B	A0.000000E+00B
+A%5EB	z	A0.000000E+00B	A0.000000E+00B
+A%5fB		A0.000000B	A0.000000B
+A%5fB	z	A0.000000B	A0.000000B
+A%5FB		A0.000000B	A0.000000B
+A%5FB	z	A0.000000B	A0.000000B
+A%5gB		A    0B	A    0B
+A%5gB	z	A    0B	A    0B
+A%5GB		A    0B	A    0B
+A%5GB	z	A    0B	A    0B
+A%5aB		A0x0p+0B	A0x0p+0B
+A%5aB	z	A0x0p+0B	A0x0p+0B
+A%5AB		A0X0P+0B	A0X0P+0B
+A%5AB	z	A0X0P+0B	A0X0P+0B
+A%5cB		A    \x00B	A    \x00B
+A%5cB	z	A    zB	A    zB
+A%5bB		A     B	A     B
+A%5bB	z	A    zB	A    zB
+A%5qB		A   ''B	A
+A%5qB	z	A    zB	A
+A%5QB		A   ''B	A
+A%5QB	z	A    zB	A
+A%5nB		AB	A
+A%5nB	z	AB	A
+A%5TB		A	A
+A%5TB	z	A	A
+A%5%B		A	A
+A%5%B	z	A	A
+A%.2sB		AB	AB
+A%.2sB	z	AzB	AzB
+A%.2dB		A00B	A00B
+A%.2dB	z	A00B	A00B
+A%.2iB		A00B	A00B
+A%.2iB	z	A00B	A00B
+A%.2oB		A00B	A00B
+A%.2oB	z	A00B	A00B
+A%.2uB		A00B	A00B
+A%.2uB	z	A00B	A00B
+A%.2xB		A00B	A00B
+A%.2xB	z	A00B	A00B
+A%.2XB		A00B	A00B
+A%.2XB	z	A00B	A00B
+A%.2eB		A0.00e+00B	A0.00e+00B
+A%.2eB	z	A0.00e+00B	A0.00e+00B
+A%.2EB		A0.00E+00B	A0.00E+00B
+A%.2EB	z	A0.00E+00B	A0.00E+00B
+A%.2fB		A0.00B	A0.00B
+A%.2fB	z	A0.00B	A0.00B
+A%.2FB		A0.00B	A0.00B
+A%.2FB	z	A0.00B	A0.00B
+A%.2gB		A0B	A0B
+A%.2gB	z	A0B	A0B
+A%.2GB		A0B	A0B
+A%.2GB	z	A0B	A0B
+A%.2aB		A0x0.00p+0B	A0x0.00p+0B
+A%.2aB	z	A0x0.00p+0B	A0x0.00p+0B
+A%.2AB		A0X0.00P+0B	A0X0.00P+0B
+A%.2AB	z	A0X0.00P+0B	A0X0.00P+0B
+A%.2cB		A\x00B	A\x00B
+A%.2cB	z	AzB	AzB
+A%.2bB		AB	AB
+A%.2bB	z	AzB	AzB
+A%.2qB		A''B	A
+A%.2qB	z	AzB	A
+A%.2QB		A''B	A
+A%.2QB	z	AzB	A
+A%.2nB		AB	A
+A%.2nB	z	AB	A
+A%.2TB		A	A
+A%.2TB	z	A	A
+A%.2%B		A	A
+A%.2%B	z	A	A
+A%*sB		AB	AB
+A%*sB	z	AB	AB
+A%*dB		A0B	A0B
+A%*dB	z	A0B	A0B
+A%*iB		A0B	A0B
+A%*iB	z	A0B	A0B
+A%*oB		A0B	A0B
+A%*oB	z	A0B	A0B
+A%*uB		A0B	A0B
+A%*uB	z	A0B	A0B
+A%*xB		A0B	A0B
+A%*xB	z	A0B	A0B
+A%*XB		A0B	A0B
+A%*XB	z	A0B	A0B
+A%*eB		A0.000000e+00B	A0.000000e+00B
+A%*eB	z	A0.000000e+00B	A0.000000e+00B
+A%*EB		A0.000000E+00B	A0.000000E+00B
+A%*EB	z	A0.000000E+00B	A0.000000E+00B
+A%*fB		A0.000000B	A0.000000B
+A%*fB	z	A0.000000B	A0.000000B
+A%*FB		A0.000000B	A0.000000B
+A%*FB	z	A0.000000B	A0.000000B
+A%*gB		A0B	A0B
+A%*gB	z	A0B	A0B
+A%*GB		A0B	A0B
+A%*GB	z	A0B	A0B
+A%*aB		A0x0p+0B	A0x0p+0B
+A%*aB	z	A0x0p+0B	A0x0p+0B
+A%*AB		A0X0P+0B	A0X0P+0B
+A%*AB	z	A0X0P+0B	A0X0P+0B
+A%*cB		A\x00B	A\x00B
+A%*cB	z	A\x00B	A\x00B
+A%*bB		AB	AB
+A%*bB	z	AB	AB
+A%*qB		A''B	A
+A%*qB	z	A''B	A
+A%*QB		A''B	A
+A%*QB	z	A''B	A
+A%*nB		AB	A
+A%*nB	z	AB	A
+A%*TB		A	A
+A%*TB	z	A	A
+A%*%B		A	A
+A%*%B	z	A	A
+A%5.2sB		A     B	A     B
+A%5.2sB	z	A    zB	A    zB
+A%5.2dB		A   00B	A   00B
+A%5.2dB	z	A   00B	A   00B
+A%5.2iB		A   00B	A   00B
+A%5.2iB	z	A   00B	A   00B
+A%5.2oB		A   00B	A   00B
+A%5.2oB	z	A   00B	A   00B
+A%5.2uB		A   00B	A   00B
+A%5.2uB	z	A   00B	A   00B
+A%5.2xB		A   00B	A   00B
+A%5.2xB	z	A   00B	A   00B
+A%5.2XB		A   00B	A   00B
+A%5.2XB	z	A   00B	A   00B
+A%5.2eB		A0.00e+00B	A0.00e+00B
+A%5.2eB	z	A0.00e+00B	A0.00e+00B
+A%5.2EB		A0.00E+00B	A0.00E+00B
+A%5.2EB	z	A0.00E+00B	A0.00E+00B
+A%5.2fB		A 0.00B	A 0.00B
+A%5.2fB	z	A 0.00B	A 0.00B
+A%5.2FB		A 0.00B	A 0.00B
+A%5.2FB	z	A 0.00B	A 0.00B
+A%5.2gB		A    0B	A    0B
+A%5.2gB	z	A    0B	A    0B
+A%5.2GB		A    0B	A    0B
+A%5.2GB	z	A    0B	A    0B
+A%5.2aB		A0x0.00p+0B	A0x0.00p+0B
+A%5.2aB	z	A0x0.00p+0B	A0x0.00p+0B
+A%5.2AB		A0X0.00P+0B	A0X0.00P+0B
+A%5.2AB	z	A0X0.00P+0B	A0X0.00P+0B
+A%5.2cB		A    \x00B	A    \x00B
+A%5.2cB	z	A    zB	A    zB
+A%5.2bB		A     B	A     B
+A%5.2bB	z	A    zB	A    zB
+A%5.2qB		A   ''B	A
+A%5.2qB	z	A    zB	A
+A%5.2QB		A   ''B	A
+A%5.2QB	z	A    zB	A
+A%5.2nB		AB	A
+A%5.2nB	z	AB	A
+A%5.2TB		A	A
+A%5.2TB	z	A	A
+A%5.2%B		A	A
+A%5.2%B	z	A	A
+A%-5sB		A     B	A     B
+A%-5sB	z	Az    B	Az    B
+A%-5dB		A0    B	A0    B
+A%-5dB	z	A0    B	A0    B
+A%-5iB		A0    B	A0    B
+A%-5iB	z	A0    B	A0    B
+A%-5oB		A0    B	A0    B
+A%-5oB	z	A0    B	A0    B
+A%-5uB		A0    B	A0    B
+A%-5uB	z	A0    B	A0    B
+A%-5xB		A0    B	A0    B
+A%-5xB	z	A0    B	A0    B
+A%-5XB		A0    B	A0    B
+A%-5XB	z	A0    B	A0    B
+A%-5eB		A0.000000e+00B	A0.000000e+00B
+A%-5eB	z	A0.000000e+00B	A0.000000e+00B
+A%-5EB		A0.000000E+00B	A0.000000E+00B
+A%-5EB	z	A0.000000E+00B	A0.000000E+00B
+A%-5fB		A0.000000B	A0.000000B
+A%-5fB	z	A0.000000B	A0.000000B
+A%-5FB		A0.000000B	A0.000000B
+A%-5FB	z	A0.000000B	A0.000000B
+A%-5gB		A0    B	A0    B
+A%-5gB	z	A0    B	A0    B
+A%-5GB		A0    B	A0    B
+A%-5GB	z	A0    B	A0    B
+A%-5aB		A0x0p+0B	A0x0p+0B
+A%-5aB	z	A0x0p+0B	A0x0p+0B
+A%-5AB		A0X0P+0B	A0X0P+0B
+A%-5AB	z	A0X0P+0B	A0X0P+0B
+A%-5cB		A\x00    B	A\x00    B
+A%-5cB	z	Az    B	Az    B
+A%-5bB		A     B	A     B
+A%-5bB	z	Az    B	Az    B
+A%-5qB		A''   B	A
+A%-5qB	z	Az    B	A
+A%-5QB		A''   B	A
+A%-5QB	z	Az    B	A
+A%-5nB		AB	A
+A%-5nB	z	AB	A
+A%-5TB		A	A
+A%-5TB	z	A	A
+A%-5%B		A	A
+A%-5%B	z	A	A
+A%05sB		A     B	A     B
+A%05sB	z	A    zB	A    zB
+A%05dB		A00000B	A00000B
+A%05dB	z	A00000B	A00000B
+A%05iB		A00000B	A00000B
+A%05iB	z	A00000B	A00000B
+A%05oB		A00000B	A00000B
+A%05oB	z	A00000B	A00000B
+A%05uB		A00000B	A00000B
+A%05uB	z	A00000B	A00000B
+A%05xB		A00000B	A00000B
+A%05xB	z	A00000B	A00000B
+A%05XB		A00000B	A00000B
+A%05XB	z	A00000B	A00000B
+A%05eB		A0.000000e+00B	A0.000000e+00B
+A%05eB	z	A0.000000e+00B	A0.000000e+00B
+A%05EB		A0.000000E+00B	A0.000000E+00B
+A%05EB	z	A0.000000E+00B	A0.000000E+00B
+A%05fB		A0.000000B	A0.000000B
+A%05fB	z	A0.000000B	A0.000000B
+A%05FB		A0.000000B	A0.000000B
+A%05FB	z	A0.000000B	A0.000000B
+A%05gB		A00000B	A00000B
+A%05gB	z	A00000B	A00000B
+A%05GB		A00000B	A00000B
+A%05GB	z	A00000B	A00000B
+A%05aB		A0x0p+0B	A0x0p+0B
+A%05aB	z	A0x0p+0B	A0x0p+0B
+A%05AB		A0X0P+0B	A0X0P+0B
+A%05AB	z	A0X0P+0B	A0X0P+0B
+A%05cB		A    \x00B	A    \x00B
+A%05cB	z	A    zB	A    zB
+A%05bB		A     B	A     B
+A%05bB	z	A    zB	A    zB
+A%05qB		A   ''B	A
+A%05qB	z	A    zB	A
+A%05QB		A   ''B	A
+A%05QB	z	A    zB	A
+A%05nB		AB	A
+A%05nB	z	AB	A
+A%05TB		A	A
+A%05TB	z	A	A
+A%05%B		A	A
+A%05%B	z	A	A
+A%#xsB		A0sB	A0sB
+A%#xsB	z	A0sB	A0sB
+A%#xdB		A0dB	A0dB
+A%#xdB	z	A0dB	A0dB
+A%#xiB		A0iB	A0iB
+A%#xiB	z	A0iB	A0iB
+A%#xoB		A0oB	A0oB
+A%#xoB	z	A0oB	A0oB
+A%#xuB		A0uB	A0uB
+A%#xuB	z	A0uB	A0uB
+A%#xxB		A0xB	A0xB
+A%#xxB	z	A0xB	A0xB
+A%#xXB		A0XB	A0XB
+A%#xXB	z	A0XB	A0XB
+A%#xeB		A0eB	A0eB
+A%#xeB	z	A0eB	A0eB
+A%#xEB		A0EB	A0EB
+A%#xEB	z	A0EB	A0EB
+A%#xfB		A0fB	A0fB
+A%#xfB	z	A0fB	A0fB
+A%#xFB		A0FB	A0FB
+A%#xFB	z	A0FB	A0FB
+A%#xgB		A0gB	A0gB
+A%#xgB	z	A0gB	A0gB
+A%#xGB		A0GB	A0GB
+A%#xGB	z	A0GB	A0GB
+A%#xaB		A0aB	A0aB
+A%#xaB	z	A0aB	A0aB
+A%#xAB		A0AB	A0AB
+A%#xAB	z	A0AB	A0AB
+A%#xcB		A0cB	A0cB
+A%#xcB	z	A0cB	A0cB
+A%#xbB		A0bB	A0bB
+A%#xbB	z	A0bB	A0bB
+A%#xqB		A0qB	A0qB
+A%#xqB	z	A0qB	A0qB
+A%#xQB		A0QB	A0QB
+A%#xQB	z	A0QB	A0QB
+A%#xnB		A0nB	A0nB
+A%#xnB	z	A0nB	A0nB
+A%#xTB		A0TB	A0TB
+A%#xTB	z	A0TB	A0TB
+A%#x%B		A0	A0
+A%#x%B	z	A0	A0
+A\\x41B		AAB	A\\x41B
+A\\x41B	z	AAB	A\\x41B
+A\\x4B		AK	A\\x4B
+A\\x4B	z	AK	A\\x4B
+A\\u0041B		AAB	A\\u0041B
+A\\u0041B	z	AAB	A\\u0041B
+A\\U00000041B		AAB	A\\U00000041B
+A\\U00000041B	z	AAB	A\\U00000041B
+A\\0B		A\x00B	A\x00B
+A\\0B	z	A\x00B	A\x00B
+A\\00B		A\x00B	A\x00B
+A\\00B	z	A\x00B	A\x00B
+A\\000B		A\x00B	A\x00B
+A\\000B	z	A\x00B	A\x00B
+A\\0101B		A\x081B	A\x081B
+A\\0101B	z	A\x081B	A\x081B
+A\\101B		AAB	AAB
+A\\101B	z	AAB	AAB
+A\\1011B		AA1B	AA1B
+A\\1011B	z	AA1B	AA1B
+A\\8B		A\\8B	A\\8B
+A\\8B	z	A\\8B	A\\8B
+A\\cB		A\\cB	A\\cB
+A\\cB	z	A\\cB	A\\cB
+A%(%Y)TB		A2026B	A
+A%(%Y)TB	z	A1970B	A
+A%()TB		A01:12:58 PMB	A
+A%()TB	z	A12:00:00 AMB	A
+A%B		A	A
+A%B	z	A	A
