@@ -1107,6 +1107,10 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                         .map(bare)
                         .filter(|h| out.imports.contains(h)),
                 );
+                if !matches!(toks.get(i + 1), Some(Tok::Mark('.' | '('))) {
+                    out.handed
+                        .extend(held_module(n).map(|m| bare(m.to_string())));
+                }
                 let call = match n.as_str() {
                     "__import__" => "__import__",
                     "import_module" => "importlib.import_module",
@@ -1143,6 +1147,10 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                             .map(bare)
                             .filter(|h| out.imports.contains(h)),
                     );
+                } else if !called && !target && !subscript {
+                    let last = chain.rsplit('.').next().unwrap_or_default();
+                    out.handed
+                        .extend(held_module(last).map(|m| bare(m.to_string())));
                 }
                 let mut hidden = false;
                 if called || subscript {
@@ -1235,8 +1243,62 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
             })
             .collect();
         out.refs.extend(reached);
+        let kept: Vec<Ref> = out
+            .refs
+            .iter()
+            .map(|r| (r, 1))
+            .chain(out.tails.iter().map(|t| (t, 0)))
+            .flat_map(|(r, from)| held(r, from))
+            .collect();
+        for s in kept {
+            if !out
+                .refs
+                .iter()
+                .any(|r| r.name == s.name && r.args == s.args)
+            {
+                out.refs.push(s);
+            }
+        }
     }
     Some(())
+}
+
+/// Whether `m` is a module, or another name of one, whose calls a
+/// rule names.
+fn rule_module(m: &str) -> bool {
+    TWINS.iter().any(|(t, _)| *t == m)
+        || process_names()
+            .chain(EXEC_CALLS.iter().copied())
+            .chain(CODE_CALLS.iter().copied())
+            .chain(WRITE_CALLS.iter().copied())
+            .chain(NETWORK.iter().copied())
+            .chain(HIDDEN_CODE.iter().copied())
+            .chain(LOADS.iter().copied())
+            .any(|n| n.split_once('.').is_some_and(|(h, _)| h == m))
+}
+
+/// The module a chain segment names: `os`, or `_os` as modules keep it.
+fn held_module(seg: &str) -> Option<&str> {
+    [seg, seg.trim_start_matches('_')]
+        .into_iter()
+        .find(|m| rule_module(m))
+}
+
+/// A module keeps the modules it imports as attributes, so
+/// `subprocess.os.system` and `tempfile._os.system` are `os.system`.
+/// Each chain is read again from each segment at or after `from` that
+/// names a module a rule knows.
+fn held(r: &Ref, from: usize) -> Vec<Ref> {
+    let segs: Vec<&str> = r.name.split('.').collect();
+    (from..segs.len().saturating_sub(1))
+        .filter_map(|k| {
+            let m = held_module(segs[k])?;
+            Some(Ref {
+                name: bare(format!("{m}.{}", segs[k + 1..].join("."))),
+                ..r.clone()
+            })
+        })
+        .collect()
 }
 
 /// Whether the `"/"` at `toks[i]` names the root or starts a path
@@ -3586,6 +3648,32 @@ mod tests {
             "import json; mods = [json]; print(mods[0].dumps({'a': 1}))",
             "import os; print(hasattr(os, 'fork'))",
             "import os; lst = [1, 2]; lst.remove(1); print(os, lst)",
+        ] {
+            assert_eq!(refused_for(code), None, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_module_kept_on_another_module_is_that_module() {
+        for code in [
+            "import subprocess; subprocess.os.system(input())",
+            "import tempfile; tempfile._os.system(input())",
+            "import os; os.path.os.system(input())",
+            "import inspect; inspect.builtins.exec(input())",
+            "import subprocess; m = subprocess.os; m.system(input())",
+            "import subprocess; [subprocess.os][0].system(input())",
+        ] {
+            let c = class_of(code);
+            assert!(c.starts_with("python-runs-unshown-"), "{code}: {c}");
+        }
+        assert_eq!(
+            shell_commands("import subprocess; subprocess._os.system('id')"),
+            ["id"]
+        );
+        for code in [
+            "import subprocess; print(subprocess.os.getcwd())",
+            "import asyncio; asyncio.run(asyncio.sleep(0)); print(asyncio.subprocess.PIPE)",
+            "import json; print(json.decoder.re.compile('x'))",
         ] {
             assert_eq!(refused_for(code), None, "{code}");
         }
