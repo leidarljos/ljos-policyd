@@ -170,8 +170,14 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
             }
         }
     };
-    for (path, text) in texts {
-        let c = check_shell_in(&["sh".into(), "-c".into(), text], cwd, depth + 1);
+    for rejudged in texts {
+        let (path, c) = match rejudged {
+            Rejudged::Shell(path, text) => {
+                let sh = ["sh".into(), "-c".into(), text];
+                (path, check_shell_in(&sh, cwd, depth + 1))
+            }
+            Rejudged::Python(path, text, dirs) => (path, check_python_in(text, cwd, &dirs)),
+        };
         if c.decision != Decision::Allow {
             return Checked {
                 decision: c.decision,
@@ -240,6 +246,35 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
         }
     }
     table
+}
+
+/// Judge the program python runs from a file the line wrote, as the
+/// same program passed inline. It runs in each of `dirs`, which stay in
+/// the tree when each is under `cwd`.
+fn check_python_in(text: String, cwd: &std::path::Path, dirs: &[std::path::PathBuf]) -> Checked {
+    let argv = ["python3".to_string(), "-c".to_string(), text];
+    let moved = dirs.iter().any(|d| is_untracked(d) || !d.starts_with(cwd));
+    for dir in dirs {
+        let at = Scratch {
+            root: Some(dir.clone()),
+            ..Scratch::default()
+        };
+        let c = host_argv_table_at(&argv, 0, moved, &at);
+        #[cfg(has_phronesis)]
+        let c = if c.decision == Decision::Allow {
+            check_shell_phronesis(&argv, dir)
+        } else {
+            c
+        };
+        if c.decision != Decision::Allow {
+            return c;
+        }
+    }
+    Checked {
+        decision: Decision::Allow,
+        code: PolicyReason::Unspecified,
+        token: Cow::Borrowed("allow"),
+    }
 }
 
 /// How many directories the commands after a `cd` that may have failed
@@ -316,7 +351,7 @@ struct LineFiles {
     /// again on its own.
     data: bool,
     written: Vec<Written>,
-    ran: Vec<(Option<std::path::PathBuf>, String, Vec<usize>, Ran)>,
+    ran: Vec<Run>,
     /// Variables whose value is the script being judged (`$0`).
     script_vars: std::collections::HashSet<String>,
 }
@@ -339,12 +374,31 @@ struct Written {
 
 /// How a file is run: by a shell (a script operand, `source`, a startup
 /// file, a file on stdin), as a command word, which is a shell script
-/// unless it is a binary, or as the program of another interpreter.
+/// unless it is a binary, by python, or as the program of another
+/// interpreter.
 #[derive(Clone, Copy, PartialEq)]
 enum Ran {
     Shell,
     Exec,
+    Python,
     Program,
+}
+
+/// A script a command runs: its path, the word naming it, the place of
+/// the command, how it is run and the directories it may run in.
+type Run = (
+    Option<std::path::PathBuf>,
+    String,
+    Vec<usize>,
+    Ran,
+    Vec<std::path::PathBuf>,
+);
+
+/// A script the line writes and then runs, with the text it writes:
+/// a shell's script, or python's program and where python runs it.
+enum Rejudged {
+    Shell(String, String),
+    Python(String, String, Vec<std::path::PathBuf>),
 }
 
 type Files = std::rc::Rc<std::cell::RefCell<LineFiles>>;
@@ -416,9 +470,14 @@ impl LineFiles {
         let program = word
             .map(base_of)
             .is_some_and(|b| !SHELLS.contains(&b) && stdin_interpreter(b).is_some());
+        let python = word.map(base_of).is_some_and(|b| {
+            stdin_interpreter(b).is_some_and(|i| matches!(i.0, "python" | "pypy"))
+        });
         for w in ran_paths(run) {
             let how = if Some(w) == word {
                 Ran::Exec
+            } else if python {
+                Ran::Python
             } else if program {
                 Ran::Program
             } else {
@@ -474,7 +533,8 @@ impl LineFiles {
                 _ if how == Ran::Exec => Ran::Shell,
                 _ => how,
             };
-            self.ran.push((p, w.to_string(), self.cmd.clone(), how));
+            self.ran
+                .push((p, w.to_string(), self.cmd.clone(), how, dirs.to_vec()));
         }
     }
 
@@ -485,9 +545,9 @@ impl LineFiles {
     /// to the file while the shell reads it. A loose write counts only
     /// for a script a shell runs from a path the line shows, and not
     /// for one its own command runs.
-    fn written_then_run(&self) -> Result<Vec<(String, String)>, String> {
+    fn written_then_run(&self) -> Result<Vec<Rejudged>, String> {
         let mut texts = Vec::new();
-        for (r, run_word, rid, how) in &self.ran {
+        for (r, run_word, rid, how, dirs) in &self.ran {
             let shown = |p: &Option<std::path::PathBuf>| {
                 p.as_ref().map_or_else(
                     || "a script the line does not show".into(),
@@ -508,12 +568,15 @@ impl LineFiles {
             if hits.peek().is_none() {
                 continue;
             }
-            // A shell script whose every write the line spells out is
-            // judged on that text instead.
+            // A shell script or a python program whose every write the
+            // line spells out is judged on that text instead.
             for w in hits {
                 match &w.text {
                     Some(t) if *how == Ran::Shell && r.is_some() && w.path == *r => {
-                        texts.push((shown(r), t.clone()))
+                        texts.push(Rejudged::Shell(shown(r), t.clone()))
+                    }
+                    Some(t) if *how == Ran::Python && r.is_some() && w.path == *r => {
+                        texts.push(Rejudged::Python(shown(r), t.clone(), dirs.clone()))
                     }
                     _ => return Err(written_reason(&shown(r), w)),
                 }
@@ -18587,7 +18650,7 @@ hash -r 2> /dev/null
             "bash -c \"echo 'git push -f' > x.sh; source x.sh\"",
             "echo 'git push -f' > x.sh; BASH_ENV=x.sh bash -c 'echo ok'",
             "echo 'git push -f' > x.sh; bash <(cat x.sh)",
-            "echo 'import os' > x.py; python3 x.py",
+            "echo 'import os; os.system(\"git push -f\")' > x.py; python3 x.py",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
@@ -19811,6 +19874,8 @@ hash -r 2> /dev/null
             "cat > build/run.sh <<'EOF'\necho ok\nls -la\nEOF\nsh build/run.sh",
             "echo 'make test' > run.sh && . ./run.sh",
             "cat > notes.txt <<EOF\nhello world\nEOF\necho 'echo ok' > run.sh; sh run.sh",
+            "echo 'import os' > build/run.py; python3 build/run.py",
+            "printf 'import os\\nprint(os.listdir(%s))\\n' \"'.'\" > build/run.py; python3 build/run.py",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
@@ -19821,7 +19886,8 @@ hash -r 2> /dev/null
             "echo 'echo ok' >> build/run.sh && sh build/run.sh",
             "echo 'echo ok' > build/run.sh; cp evil/force.sh build/run.sh; sh build/run.sh",
             "echo 'echo ok' > build/run.sh; tar xf a.tar; sh build/run.sh",
-            "echo 'import os' > build/run.py; python3 build/run.py",
+            "echo 'import shutil; shutil.rmtree(\"/home\")' > build/run.py; python3 build/run.py",
+            "printf 'import os\\nos.system(\"rm -rf ~\")\\n' > build/run.py; python3 build/run.py",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
