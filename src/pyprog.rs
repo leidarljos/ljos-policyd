@@ -2515,10 +2515,10 @@ fn unshown(r: &Read) -> Option<Refusal> {
             || c.name.ends_with(".__dict__")
             || c.name == "__dict__"
             || r.scopes.contains(&c.name);
-        let scope_method = c
-            .name
-            .split_once('.')
-            .is_some_and(|(s, m)| r.scopes.contains(s) && LOOKUPS.contains(&m));
+        let scope_method = c.name.rsplit_once('.').is_some_and(|(s, m)| {
+            (r.scopes.contains(s) || s == "__dict__" || s.ends_with(".__dict__"))
+                && LOOKUPS.contains(&m)
+        });
         if (scope && looked_up)
             || scope_method
             || (c.name == "sys.modules" && c.then == Some(Tok::Mark('[')))
@@ -3386,5 +3386,20 @@ mod tests {
             refused_for("import os; print(getattr(getattr(os, 'path'), 'sep'))"),
             None
         );
+    }
+
+    #[test]
+    fn a_lookup_method_on_a_module_dict_is_a_scope_lookup() {
+        for code in [
+            "import os; os.__dict__.get('system')('id')",
+            "import os\nf = os.__dict__.get('system')\nf('id')",
+            "import os; d = os.__dict__; d.get('system')('id')",
+            "import os; os.__dict__.setdefault('x', 1)",
+            "import builtins; builtins.__dict__.get('__import__')('os').system('id')",
+            "import os; getattr(os.__dict__, 'get')('system')('id')",
+        ] {
+            assert_eq!(class_of(code), "python-runs-unshown-code", "{code}");
+        }
+        assert_eq!(refused_for("d = {'a': 1}; print(d.get('a'))"), None);
     }
 }
