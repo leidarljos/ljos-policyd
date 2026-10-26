@@ -2644,6 +2644,13 @@ const HIDDEN_CODE: &[&str] = &[
     "atexit.register",
     "pydoc.locate",
     "pkgutil.resolve_name",
+    "inspect.getmodule",
+    "inspect.getmembers",
+    "inspect.getmembers_static",
+    "inspect.getattr_static",
+    "gc.get_objects",
+    "gc.get_referrers",
+    "gc.get_referents",
 ];
 /// Methods of a loader, found from a spec or a module's `__spec__`,
 /// that run a module's code.
@@ -3870,6 +3877,27 @@ mod tests {
             "import argparse; a = argparse.Namespace(x=1); print(dict(vars(a)))",
             "class C: pass\nc = C(); c.x = 1; print(dict(c.__dict__))",
             "print(len(globals()))",
+        ] {
+            assert_eq!(refused_for(code), None, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_call_that_hands_back_a_module_or_its_members_is_refused() {
+        for code in [
+            "import inspect, os; inspect.getmodule(os.getcwd).system(input())",
+            "import inspect, os; dict(inspect.getmembers(os))['system'](input())",
+            "import inspect, os; inspect.getattr_static(os, 'system')(input())",
+            "from inspect import getmembers as g; import os; dict(g(os))['system'](input())",
+            "import pydoc, os; pydoc.inspect.getmodule(os.getcwd).system(input())",
+            "import gc; [o for o in gc.get_objects() if getattr(o, '__name__', '') == 'system'][0](input())",
+            "import gc; gc.get_referents(vars)",
+        ] {
+            assert_eq!(class_of(code), "python-runs-unshown-code", "{code}");
+        }
+        for code in [
+            "import inspect, json; print(inspect.signature(json.dumps))",
+            "import gc; gc.collect(); print(gc.isenabled())",
         ] {
             assert_eq!(refused_for(code), None, "{code}");
         }
