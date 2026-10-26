@@ -385,8 +385,9 @@ fn literal(a: &[Tok]) -> Option<String> {
 
 /// The constant string an expression spells, folding the ways a
 /// program hides one: `+`, `.join` and `.format` of constants, a
-/// `[::-1]` reversal and a name assigned a constant. `None` when a
-/// piece is not constant, or is not folded the way python folds it.
+/// `[::-1]` reversal, `chr`, `bytes([...])`, `bytes.fromhex`, `base64`,
+/// `codecs.decode` and a name assigned a constant. `None` when a piece
+/// is not constant, or is not folded the way python folds it.
 fn fold(a: &[Tok], values: &HashMap<String, Vec<Tok>>) -> Option<String> {
     fold_depth(a, values, 0)
 }
@@ -429,10 +430,34 @@ fn fold_depth(a: &[Tok], values: &HashMap<String, Vec<Tok>>, depth: usize) -> Op
         [Tok::Mark('('), inner @ .., Tok::Mark(')')] if close(a, 0) + 1 == n => {
             return fold(inner);
         }
+        [Tok::Name(f), Tok::Mark('('), Tok::Num(c), Tok::Mark(')')] if f == "chr" => {
+            return char::from_u32(number(c)?).map(String::from);
+        }
+        [Tok::Name(f), Tok::Mark('('), list @ .., Tok::Mark(')')]
+            if (f == "bytes" || f == "bytearray") && close(a, 1) + 1 == n =>
+        {
+            let bytes = list_items(list)?
+                .iter()
+                .map(|b| match b.as_slice() {
+                    [Tok::Num(c)] => u8::try_from(number(c)?).ok(),
+                    _ => None,
+                })
+                .collect::<Option<Vec<u8>>>()?;
+            return String::from_utf8(bytes).ok();
+        }
         _ => {}
     }
     let (recv, method, open) = split_call(a)?;
     let args = call_args(a, open);
+    let one = || match args.as_slice() {
+        [x] => fold(x),
+        _ => None,
+    };
+    let module = |m: &str| match recv {
+        [Tok::Name(n)] => n == m,
+        [Tok::Name(i), Tok::Mark('('), Tok::Str(n), Tok::Mark(')')] => i == "__import__" && n == m,
+        _ => false,
+    };
     match method {
         "join" if args.len() == 1 => {
             let sep = fold(recv)?;
@@ -442,6 +467,26 @@ fn fold_depth(a: &[Tok], values: &HashMap<String, Vec<Tok>>, depth: usize) -> Op
             };
             Some(parts.join(&sep))
         }
+        "encode" | "decode" if module("codecs") => {
+            let [x, enc] = args.as_slice() else {
+                return None;
+            };
+            let enc = literal(enc)?;
+            if method == "encode" && !enc.eq_ignore_ascii_case("rot13") {
+                return None;
+            }
+            decode_codec(&fold(x)?, &enc)
+        }
+        "encode" | "decode" => match args.as_slice() {
+            [] => fold(recv),
+            [enc] if utf8(&literal(enc)?) => fold(recv),
+            _ => None,
+        },
+        "fromhex" if module("bytes") || module("bytearray") => from_hex(&one()?),
+        "unhexlify" | "a2b_hex" if module("binascii") => from_hex(&one()?),
+        "b16decode" if module("base64") => from_hex(&one()?),
+        "b64decode" | "standard_b64decode" if module("base64") => b64(&one()?, false),
+        "urlsafe_b64decode" if module("base64") => b64(&one()?, true),
         "format" => {
             let fmt = fold(recv)?;
             let parts = args.iter().map(|p| fold(p)).collect::<Option<Vec<_>>>()?;
@@ -487,6 +532,26 @@ fn reversal(t: &[Tok]) -> bool {
     )
 }
 
+/// The value of an integer literal.
+fn number(s: &str) -> Option<u32> {
+    let s = s.replace('_', "").to_ascii_lowercase();
+    let (digits, radix) = match s.get(..2) {
+        Some("0x") => (&s[2..], 16),
+        Some("0o") => (&s[2..], 8),
+        Some("0b") => (&s[2..], 2),
+        _ if s.len() > 1 && s.starts_with('0') && s.chars().any(|c| c != '0') => return None,
+        _ => (s.as_str(), 10),
+    };
+    u32::from_str_radix(digits, radix).ok()
+}
+
+fn utf8(enc: &str) -> bool {
+    matches!(
+        enc.to_ascii_lowercase().replace('_', "-").as_str(),
+        "utf-8" | "utf8" | "ascii" | "us-ascii"
+    )
+}
+
 /// The receiver, the method name and where its `(` is, for a `RECV.m(`
 /// whose call runs to the end of `a`.
 fn split_call(a: &[Tok]) -> Option<(&[Tok], &str, usize)> {
@@ -525,6 +590,74 @@ fn list_items(a: &[Tok]) -> Option<Vec<Vec<Tok>>> {
         {
             Some(call_args(a, 0))
         }
+        _ => None,
+    }
+}
+
+fn from_hex(s: &str) -> Option<String> {
+    let s: Vec<char> = s.chars().filter(|c| !c.is_whitespace()).collect();
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = s
+        .chunks(2)
+        .map(|p| u8::from_str_radix(&p.iter().collect::<String>(), 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// Decode base64 as python does by default: characters out of the
+/// alphabet are dropped, and the padding must be whole.
+fn b64(s: &str, url: bool) -> Option<String> {
+    let (c62, c63) = if url { (b'-', b'_') } else { (b'+', b'/') };
+    let val = |b: u8| -> Option<u32> {
+        Some(match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b if b == c62 => 62,
+            b if b == c63 => 63,
+            _ => return None,
+        } as u32)
+    };
+    let body: Vec<u8> = s
+        .bytes()
+        .filter(|b| val(*b).is_some() || *b == b'=')
+        .collect();
+    let data: Vec<u8> = body.iter().copied().take_while(|b| *b != b'=').collect();
+    if !body.len().is_multiple_of(4)
+        || data.len() % 4 == 1
+        || body[data.len()..].iter().any(|b| *b != b'=')
+    {
+        return None;
+    }
+    let mut out = Vec::new();
+    for chunk in data.chunks(4) {
+        let mut bits = 0u32;
+        for b in chunk {
+            bits = (bits << 6) | val(*b)?;
+        }
+        bits <<= 6 * (4 - chunk.len());
+        for k in 0..chunk.len() - 1 {
+            out.push((bits >> (16 - 8 * k)) as u8);
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn decode_codec(s: &str, enc: &str) -> Option<String> {
+    match enc.to_ascii_lowercase().replace('-', "_").as_str() {
+        "rot13" | "rot_13" => Some(
+            s.chars()
+                .map(|c| match c {
+                    'a'..='z' => (b'a' + (c as u8 - b'a' + 13) % 26) as char,
+                    'A'..='Z' => (b'A' + (c as u8 - b'A' + 13) % 26) as char,
+                    c => c,
+                })
+                .collect(),
+        ),
+        "hex" | "hex_codec" => from_hex(s),
+        "base64" | "base_64" | "base64_codec" => b64(s, false),
         _ => None,
     }
 }
@@ -2821,11 +2954,27 @@ mod tests {
     fn a_string_built_from_constants_is_read_as_that_string() {
         for (code, class) in [
             (
+                "import os; print(os.environ[bytes.fromhex('4749544855425f544f4b454e').decode()])",
+                "python-reads-credential",
+            ),
+            (
                 "print(open(''.join(['~/.s', 'sh/id_ed', '25519'])).read())",
                 "python-reads-credential",
             ),
             (
+                "import base64; print(open(base64.b64decode('fi8uc3NoL2lkX3JzYQ==').decode()).read())",
+                "python-reads-credential",
+            ),
+            (
+                "import codecs; print(open(codecs.decode('~/.ffu/vq_efn', 'rot13')).read())",
+                "python-reads-credential",
+            ),
+            (
                 "print(open('asr_di/hss.~'[::-1]).read())",
+                "python-reads-credential",
+            ),
+            (
+                "import os; print(os.getenv(bytes([71, 72, 95, 84, 79, 75, 69, 78]).decode()))",
                 "python-reads-credential",
             ),
             (
@@ -2836,18 +2985,27 @@ mod tests {
                 "from pathlib import Path; Path(''.join(['.git/hook', 's/pre-push'])).write_text('x')",
                 "python-writes-hook",
             ),
+            (
+                "open(chr(47) + 'etc' + chr(47) + 'cron.daily' + chr(47) + 'x', 'w').write('x')",
+                "python-writes-outside",
+            ),
         ] {
             assert_eq!(class_of(code), class, "{code}");
         }
+        assert_eq!(
+            shell_commands("import os; os.system(bytes.fromhex('6964').decode())"),
+            ["id"]
+        );
         assert_eq!(
             shell_commands("import os; os.system('/ fr- mr'[::-1])"),
             ["rm -rf /"]
         );
         // Code is read only from a literal.
-        let c = class_of("exec(''.join(['print', '(1)']))");
+        let c = class_of("exec(bytes.fromhex('7072696e74283129').decode())");
         assert!(c.starts_with("python-runs-unshown-"), "{c}");
         for code in [
             "print(''.join(['a', 'b']))",
+            "import base64; print(base64.b64decode('aGk=').decode())",
             "print('{}-{}'.format('a', 'b'))",
         ] {
             assert_eq!(refused_for(code), None, "{code}");
