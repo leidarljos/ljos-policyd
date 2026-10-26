@@ -6,6 +6,8 @@
 //! python decodes them, and an f-string's fields are read as code. A
 //! program the reader cannot split is refused.
 
+use std::collections::HashMap;
+
 use unicode_normalization::UnicodeNormalization;
 
 use crate::policy_capnp::PolicyReason;
@@ -233,8 +235,8 @@ fn escape(src: &[char], i: usize, text: &mut String) -> Option<usize> {
     Some(next)
 }
 
-/// A dotted name the program reaches, with the arguments when it is
-/// called there.
+/// A name the program reaches through its imports, with the arguments
+/// when it is called there.
 #[derive(Clone)]
 struct Ref {
     name: String,
@@ -333,6 +335,72 @@ fn literal(a: &[Tok]) -> Option<String> {
     (!want).then_some(out)
 }
 
+/// What each name the imports bind stands for, and the modules a
+/// `from M import *` spills into the program.
+fn bindings(toks: &[Tok]) -> (HashMap<String, Vec<String>>, Vec<String>) {
+    let mut names: HashMap<String, Vec<String>> = HashMap::new();
+    let mut stars = Vec::new();
+    for (stmt, _) in statements(toks) {
+        let Some(at) = import_at(stmt) else {
+            continue;
+        };
+        let module = stmt[..at]
+            .iter()
+            .position(|t| matches!(t, Tok::Name(n) if n == "from"))
+            .map(|f| dotted(stmt, f + 1).0);
+        let mut i = at + 1;
+        while let Some(t) = stmt.get(i) {
+            match t {
+                Tok::Mark('(' | ')' | ',') => {
+                    i += 1;
+                    continue;
+                }
+                Tok::Mark('*') => {
+                    stars.extend(module.clone());
+                    i += 1;
+                    continue;
+                }
+                Tok::Name(_) => {}
+                _ => break,
+            }
+            let (path, next) = dotted(stmt, i);
+            i = next;
+            let alias = match (stmt.get(i), stmt.get(i + 1)) {
+                (Some(Tok::Name(a)), Some(Tok::Name(n))) if a == "as" => {
+                    i += 2;
+                    Some(n.clone())
+                }
+                _ => None,
+            };
+            let (bound, target) = match (&module, alias) {
+                (Some(m), alias) => (alias.unwrap_or_else(|| path.clone()), format!("{m}.{path}")),
+                (None, Some(a)) => (a, path),
+                (None, None) => {
+                    let top = path.split('.').next().unwrap_or_default().to_string();
+                    (top.clone(), top)
+                }
+            };
+            names.entry(bound).or_default().push(target);
+        }
+    }
+    (names, stars)
+}
+
+/// Each statement, with where it starts.
+fn statements(toks: &[Tok]) -> impl Iterator<Item = (&[Tok], usize)> {
+    let mut at = 0;
+    toks.split(|t| *t == Tok::Mark(';')).map(move |s| {
+        let from = at;
+        at += s.len() + 1;
+        (s, from)
+    })
+}
+
+fn import_at(stmt: &[Tok]) -> Option<usize> {
+    stmt.iter()
+        .position(|t| matches!(t, Tok::Name(n) if n == "import"))
+}
+
 impl Read {
     fn calls<'a>(&'a self, set: &'a [&str]) -> impl Iterator<Item = &'a Ref> + 'a {
         self.refs
@@ -346,6 +414,26 @@ fn matches(name: &str, set: &[&str]) -> bool {
         .any(|s| *s == name || (s.ends_with('.') && name.starts_with(s)))
 }
 
+/// The name `head` stands for: what an import bound it to, else
+/// itself and each `from M import *` spelling of it.
+fn heads(head: &str, binds: &HashMap<String, Vec<String>>, stars: &[String]) -> Vec<String> {
+    match binds.get(head) {
+        Some(t) => t.clone(),
+        None => std::iter::once(head.to_string())
+            .chain(stars.iter().map(|m| format!("{m}.{head}")))
+            .collect(),
+    }
+}
+
+/// `f.__call__` is `f`.
+fn bare(name: String) -> String {
+    let name = name.replace(".__call__", "");
+    match name.strip_prefix("builtins.") {
+        Some(rest) => rest.to_string(),
+        None => name,
+    }
+}
+
 /// Read `code` into `out`. `None` when python would read it in a way
 /// the reader does not follow.
 fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
@@ -355,6 +443,14 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
     let chars: Vec<char> = code.chars().collect();
     let mut toks = Vec::new();
     lex(&chars, 0, &mut toks)?;
+    let (binds, stars) = bindings(&toks);
+    // The words of an import name modules, not calls of them.
+    let mut skip = vec![false; toks.len()];
+    for (stmt, at) in statements(&toks) {
+        if import_at(stmt).is_some() {
+            skip[at..at + stmt.len()].fill(true);
+        }
+    }
     for (i, t) in toks.iter().enumerate() {
         match t {
             Tok::Str(s) => {
@@ -365,11 +461,19 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                     }
                 }
             }
-            Tok::Name(_) => {
-                let (name, next) = dotted(&toks, i);
+            Tok::Name(_) if skip[i] => {}
+            Tok::Name(n) => {
+                let (chain, next) = dotted(&toks, i);
+                let tail = chain.strip_prefix(n.as_str()).unwrap_or_default();
                 let called = toks.get(next) == Some(&Tok::Mark('('));
                 let args = called.then(|| call_args(&toks, next));
-                out.refs.push(Ref { name, args });
+                for h in heads(n, &binds, &stars) {
+                    let name = bare(format!("{h}{tail}"));
+                    out.refs.push(Ref {
+                        name,
+                        args: args.clone(),
+                    });
+                }
             }
             _ => {}
         }
@@ -650,6 +754,22 @@ mod tests {
 
     fn refused_for(code: &str) -> Option<String> {
         refusal(code).map(|r| r.token)
+    }
+
+    #[test]
+    fn names_go_through_the_imports() {
+        let mut r = Read::default();
+        read(
+            "import os as o\nfrom subprocess import run as go\nfrom shutil import *\n\
+             o.system('x'); go(['a']); rmtree('d')",
+            0,
+            &mut r,
+        )
+        .unwrap();
+        let names: Vec<&str> = r.refs.iter().map(|r| r.name.as_str()).collect();
+        for n in ["os.system", "subprocess.run", "shutil.rmtree"] {
+            assert!(names.contains(&n), "{n} not in {names:?}");
+        }
     }
 
     #[test]
