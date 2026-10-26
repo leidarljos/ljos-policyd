@@ -15,6 +15,7 @@ pub mod policy_capnp;
 
 mod envelope;
 mod mail;
+mod pyprog;
 mod scripts;
 
 pub use envelope::{check_mail_argv, check_mail_bytes, MailReason, MailVerdict, MAIL_MESSAGE_MAX};
@@ -10280,6 +10281,13 @@ fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
             token: Cow::Borrowed("rm-rf-outside-tmp"),
         };
     }
+    if let Some(r) = python_refusal(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: r.code,
+            token: Cow::Owned(r.token),
+        };
+    }
     if deletes_a_root_tree(argv) {
         return Checked {
             decision: Decision::Deny,
@@ -12557,6 +12565,24 @@ fn interpreter_rmtree(argv: &[String]) -> bool {
         }
         hit
     })
+}
+
+/// Why python must not run a program the line passes it inline.
+fn python_refusal(argv: &[String]) -> Option<pyprog::Refusal> {
+    commands(argv).iter().find_map(|cmd| {
+        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        let run = peeled(&owned);
+        python_program(run).and_then(pyprog::refusal)
+    })
+}
+
+/// The program a python call runs inline.
+fn python_program(run: &[String]) -> Option<&str> {
+    let b = base_of(run.first()?);
+    if !b.starts_with("python") && !b.starts_with("pypy") {
+        return None;
+    }
+    inline_program(run)
 }
 
 /// Whether a path names a parent directory anywhere, so a `/tmp/` prefix
