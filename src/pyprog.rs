@@ -2023,6 +2023,32 @@ fn outside_string(s: &str, place: Place) -> bool {
     false
 }
 
+/// A tar extract with no filter that keeps members in the directory.
+/// Before python 3.14 a member named `../x` or `/etc/x` is written
+/// where its name says.
+fn tar_paths(r: &Read) -> Option<String> {
+    let safe = |a: &[Tok]| {
+        literal(r.value(a)).is_some_and(|f| f == "data" || f == "tar")
+            || matches!(a, [Tok::Name(m), Tok::Mark('.'), Tok::Name(f)]
+                if m == "tarfile" && (f == "data_filter" || f == "tar_filter"))
+    };
+    // `filter` is keyword only.
+    let unfiltered = |c: &&Ref| {
+        let args = c.args.as_deref().unwrap_or_default();
+        !args.iter().any(|a| match a.as_slice() {
+            [Tok::Name(k), Tok::Mark('='), v @ ..] => k == "filter" && safe(v),
+            _ => false,
+        })
+    };
+    if let Some(c) = r.calls(&["shutil.unpack_archive"]).find(unfiltered) {
+        return Some(c.name.clone());
+    }
+    r.reaches(&["tarfile."])?;
+    r.attr_calls(&["extractall", "extract"])
+        .find(unfiltered)
+        .map(|c| format!("tarfile {}", c.name))
+}
+
 /// A program that may write a file and may name one out of the tree.
 fn outside_write(r: &Read, place: Place) -> Option<Refusal> {
     let call = writes(r)?;
@@ -2063,6 +2089,9 @@ fn outside_write(r: &Read, place: Place) -> Option<Refusal> {
         .or_else(|| r.has_attr(&["resolve", "absolute", "cwd"]));
     if let (Some(u), Some(_)) = (up, here) {
         return out(u);
+    }
+    if let Some(t) = tar_paths(r) {
+        return out(&t);
     }
     for c in r.calls(&["os.chdir", "os.fchdir"]) {
         let to = c
@@ -2295,6 +2324,28 @@ mod tests {
             "open('/tmp/x', 'w').write('x')",
             "import os; os.makedirs('build/a', exist_ok=True)",
             "print('/'.join(['a', 'b']))",
+        ] {
+            assert_eq!(refused_for(code), None, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_tar_extract_without_a_filter_is_refused() {
+        for code in [
+            "import tarfile; tarfile.open('x.tar').extractall()",
+            "import tarfile as t\nwith t.open('x.tgz') as a:\n    a.extractall('out')",
+            "import tarfile; tarfile.open('x.tar').extractall(filter='fully_trusted')",
+            "import tarfile; a = tarfile.open('x.tar'); a.extract('m')",
+            "import shutil; shutil.unpack_archive('x.tar.gz', 'out')",
+        ] {
+            assert_eq!(class_of(code), "python-writes-outside", "{code}");
+        }
+        for code in [
+            "import tarfile; tarfile.open('x.tar').extractall(filter='data')",
+            "import tarfile; tarfile.open('x.tar').extractall('out', filter=tarfile.data_filter)",
+            "import tarfile; print(tarfile.open('x.tar').getnames())",
+            "import zipfile; zipfile.ZipFile('x.zip').extractall('out')",
+            "import shutil; shutil.unpack_archive('x.tar', 'out', filter='data')",
         ] {
             assert_eq!(refused_for(code), None, "{code}");
         }
