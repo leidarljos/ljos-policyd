@@ -264,6 +264,11 @@ struct Read {
     /// Names bound to `globals()`, `locals()` or `vars()`, whose
     /// subscript reaches a scope the program does not show.
     scopes: HashSet<String>,
+    /// Those of them bound to a module's scope.
+    module_scopes: HashSet<String>,
+    /// A module's scope the program copies or hands on, where a lookup
+    /// the reader does not see may follow.
+    scope_handed: Vec<String>,
     /// Names assigned one literal and then read once, with the literal.
     values: HashMap<String, Vec<Tok>>,
     /// Literal paths the program writes a file at.
@@ -1041,6 +1046,16 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                 };
                 if matches!(name.as_str(), "globals" | "locals" | "vars") {
                     if close(&toks, open) + 1 == at + stmt.len() {
+                        if name != "vars"
+                            || mentions_module(
+                                &toks[open + 1..close(&toks, open)],
+                                &binds,
+                                &stars,
+                                out,
+                            )
+                        {
+                            out.module_scopes.insert(v.clone());
+                        }
                         out.scopes.insert(v.clone());
                         skip[at + 2..at + stmt.len()].fill(true);
                     }
@@ -1119,15 +1134,8 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                 if toks.get(i + 1) == Some(&Tok::Mark('(')) {
                     let a = call_args(&toks, i + 1);
                     import_call(out, call, &a, toks.get(close(&toks, i + 1) + 1));
-                    out.refs.extend(named_by(
-                        call,
-                        Some(&a),
-                        &toks,
-                        i + 1,
-                        &binds,
-                        &stars,
-                        &out.values,
-                    ));
+                    let named = named_by(call, Some(&a), &toks, i + 1, &binds, &stars, &out.values);
+                    named_scopes(out, named);
                 }
             }
             Tok::Name(_) if skip[i] => {}
@@ -1194,7 +1202,7 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                         import_call(out, &name, a, toks.get(after));
                     }
                     if NAMING_CALLS.contains(&name.as_str()) {
-                        out.refs.extend(named_by(
+                        let named = named_by(
                             &name,
                             args.as_deref(),
                             &toks,
@@ -1202,7 +1210,18 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                             &binds,
                             &stars,
                             &out.values,
-                        ));
+                        );
+                        named_scopes(out, named);
+                    }
+                    if let Some(rest) =
+                        module_scope(&name, n, tail, called, args.as_deref(), &binds, &stars, out)
+                            .filter(|_| !target)
+                    {
+                        if !scope_read(rest, then(&toks, after))
+                            && !names_only(&toks, i, after, &binds)
+                        {
+                            out.scope_handed.push(name.clone());
+                        }
                     }
                     out.refs.push(Ref {
                         name,
@@ -1275,6 +1294,117 @@ fn rule_module(m: &str) -> bool {
             .chain(HIDDEN_CODE.iter().copied())
             .chain(LOADS.iter().copied())
             .any(|n| n.split_once('.').is_some_and(|(h, _)| h == m))
+}
+
+/// Whether a `vars()` argument names a module or a call that hands one
+/// back, so its value is that module's scope. No argument is the scope
+/// the call runs in.
+fn mentions_module(
+    a: &[Tok],
+    binds: &HashMap<String, Vec<String>>,
+    stars: &[String],
+    out: &Read,
+) -> bool {
+    a.is_empty()
+        || a.iter().any(|t| {
+            let Tok::Name(n) = t else { return false };
+            matches!(n.as_str(), "builtins" | "__builtins__" | "import_module")
+                || NAMING_CALLS.contains(&n.as_str())
+                || out.modules.contains(n)
+                || heads(n, binds, stars)
+                    .into_iter()
+                    .any(|h| out.imports.contains(&h) || out.imports.contains(&bare(h)))
+        })
+}
+
+/// When `name` is a module's scope: `globals()`, `locals()`, `vars()`
+/// of a module, a module's `__dict__`, or a name bound to one. Gives
+/// the attribute read on it next, if the chain goes on.
+#[allow(clippy::too_many_arguments)]
+fn module_scope(
+    name: &str,
+    head: &str,
+    tail: &str,
+    called: bool,
+    args: Option<&[Vec<Tok>]>,
+    binds: &HashMap<String, Vec<String>>,
+    stars: &[String],
+    out: &Read,
+) -> Option<Option<String>> {
+    let next = |rest: &str| rest.split('.').find(|s| !s.is_empty()).map(str::to_string);
+    if let Some((m, rest)) = name.split_once("__dict__") {
+        let m = m.strip_suffix('.').unwrap_or(m);
+        let module = m.is_empty()
+            || matches!(m, "builtins" | "__builtins__")
+            || out.imports.contains(m)
+            || out.modules.contains(m);
+        return module.then(|| next(rest));
+    }
+    if out.module_scopes.contains(head) {
+        return Some(next(tail));
+    }
+    let scope = match name {
+        "globals" | "locals" => called,
+        "vars" => args.is_some_and(|a| mentions_module(&a.concat(), binds, stars, out)),
+        _ => false,
+    };
+    scope.then_some(None)
+}
+
+/// Whether what follows a scope reads it in place: a subscript or a
+/// mapping method, which the scope rule judges, or its keys.
+fn scope_read(rest: Option<String>, then: Option<Tok>) -> bool {
+    match rest.map(Tok::Name).or(then) {
+        Some(Tok::Mark('[')) => true,
+        Some(Tok::Name(m)) => m == "keys" || LOOKUPS.contains(&m.as_str()),
+        _ => false,
+    }
+}
+
+/// Takes the names a naming call reaches. A module's `__dict__` among
+/// them that is not read in place is a scope handed on.
+fn named_scopes(out: &mut Read, named: Vec<Ref>) {
+    for r in &named {
+        if let Some((m, rest)) = r.name.split_once(".__dict__") {
+            if !m.is_empty()
+                && !scope_read(rest.split('.').nth(1).map(str::to_string), r.then.clone())
+            {
+                out.scope_handed.push(r.name.clone());
+            }
+        }
+    }
+    out.refs.extend(named);
+}
+
+/// Builtins that read a mapping's names, or print it, and hand on none
+/// of its values.
+const NAME_READS: &[&str] = &[
+    "len",
+    "sorted",
+    "list",
+    "set",
+    "tuple",
+    "frozenset",
+    "iter",
+    "enumerate",
+    "print",
+    "str",
+    "repr",
+    "bool",
+];
+
+/// Whether the value at `toks[i..end]` is read only for its names: the
+/// right of an `in`, or the one argument of a builtin that reads names.
+fn names_only(toks: &[Tok], i: usize, end: usize, binds: &HashMap<String, Vec<String>>) -> bool {
+    let before = |k: usize| i.checked_sub(k).and_then(|p| toks.get(p));
+    if matches!(before(1), Some(Tok::Name(w)) if w == "in") {
+        return true;
+    }
+    before(1) == Some(&Tok::Mark('('))
+        && toks.get(end) == Some(&Tok::Mark(')'))
+        && before(3) != Some(&Tok::Mark('.'))
+        && matches!(before(2), Some(Tok::Name(f))
+            if NAME_READS.contains(&f.as_str()) && !binds.contains_key(f))
 }
 
 /// The module a chain segment names: `os`, or `_os` as modules keep it.
@@ -2755,6 +2885,9 @@ fn unshown(r: &Read) -> Option<Refusal> {
             return hidden(&c.name);
         }
     }
+    if let Some(n) = r.scope_handed.first() {
+        return hidden(n);
+    }
     if let Some(n) = r.unfolded.iter().find(|n| sink(n)) {
         return hidden(&format!("{n} with a built string"));
     }
@@ -3701,6 +3834,42 @@ mod tests {
         for code in [
             "import importlib.util; print(importlib.util.find_spec('json') is not None)",
             "import pkgutil; print([m.name for m in pkgutil.iter_modules()][:3])",
+        ] {
+            assert_eq!(refused_for(code), None, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_module_scope_copied_or_handed_on_is_a_scope_lookup() {
+        for code in [
+            "import os; dict(vars(os))['system'](input())",
+            "import os; {**vars(os)}['system'](input())",
+            "import os; vars(os).copy()['system'](input())",
+            "import os; os.__dict__.copy()['system'](input())",
+            "import os; d = dict(os.__dict__); d['system'](input())",
+            "import os, collections; collections.ChainMap(vars(os))['system'](input())",
+            "dict(globals())['__builtins__'].exec(input())",
+            "import os; globals().copy()['os'].system(input())",
+            "import builtins; dict(vars(builtins))['exec'](input())",
+            "import os; (vars(os) | {})['system'](input())",
+            "import os; f = lambda: vars(os); f()['system'](input())",
+            "def f(d): return d['system']\nimport os; f(vars(os))(input())",
+            "import os; d = vars(os); e = dict(d); e['system'](input())",
+            "import os as o; dict(o.__dict__)['system'](input())",
+            "dict(vars(__import__('os')))['system'](input())",
+            "dict(__import__('os').__dict__)['system'](input())",
+        ] {
+            assert_eq!(class_of(code), "python-runs-unshown-code", "{code}");
+        }
+        for code in [
+            "import os; print(len(vars(os)))",
+            "import os; print(sorted(vars(os))[:3])",
+            "import os; d = vars(os); print(len(d))",
+            "import os; print('system' in vars(os))",
+            "import os; print(list(vars(os).keys())[:3])",
+            "import argparse; a = argparse.Namespace(x=1); print(dict(vars(a)))",
+            "class C: pass\nc = C(); c.x = 1; print(dict(c.__dict__))",
+            "print(len(globals()))",
         ] {
             assert_eq!(refused_for(code), None, "{code}");
         }
