@@ -960,6 +960,41 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
             skip[at..at + stmt.len()].fill(true);
         }
     }
+    let uses = |v: &str| {
+        toks.iter()
+            .filter(|t| matches!(t, Tok::Name(n) if n == v))
+            .count()
+    };
+    for _ in 0..2 {
+        for (stmt, _) in statements(&toks) {
+            let (v, rest) = match stmt {
+                [Tok::Name(v), Tok::Mark('='), rest @ ..]
+                    if rest.first() != Some(&Tok::Mark('=')) =>
+                {
+                    (v, rest)
+                }
+                [Tok::Name(v), Tok::Mark(_), Tok::Mark('='), rest @ ..] => {
+                    if builds(rest, &out.opaque) {
+                        out.opaque.insert(v.clone());
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            let folded = fold(rest, &out.values);
+            let shown = folded.is_some() || literal_words(rest).is_some();
+            if shown && uses(v) == 2 {
+                out.values.insert(v.clone(), rest.to_vec());
+            }
+            match folded {
+                Some(s) if literal(rest).is_none() => out.strs.push(s),
+                None if builds(rest, &out.opaque) => {
+                    out.opaque.insert(v.clone());
+                }
+                _ => {}
+            }
+        }
+    }
     // `run = os.system` makes `run` that name. `m = __import__("os")`
     // and `m = importlib.import_module("os")` make `m` that module, so
     // `m.system` is `os.system`. `m = getattr(os, "popen")` is the
@@ -1001,21 +1036,16 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                     continue;
                 }
                 let args = call_args(&toks, open);
-                let Some(r) = named_by(&name, Some(&args), &toks, open, &binds, &stars) else {
+                let named = named_by(&name, Some(&args), &toks, open, &binds, &stars, &out.values);
+                if named.is_empty() {
                     continue;
-                };
+                }
                 // A module the call hands back, so `getattr(m, x)` with
                 // a computed `x` is a reach the text does not show.
-                // `__import__("a.b")` hands back `a`.
                 if name != "getattr" {
                     out.modules.insert(v.clone());
                 }
-                let top = r.name.split('.').next().unwrap_or_default().to_string();
-                let mut to = vec![r.name];
-                if name.ends_with("__import__") && !to.contains(&top) {
-                    to.push(top);
-                }
-                to
+                named.into_iter().map(|r| r.name).collect()
             } else {
                 continue;
             };
@@ -1026,41 +1056,6 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                 }
             }
             skip[at + 2..at + stmt.len()].fill(true);
-        }
-    }
-    let uses = |v: &str| {
-        toks.iter()
-            .filter(|t| matches!(t, Tok::Name(n) if n == v))
-            .count()
-    };
-    for _ in 0..2 {
-        for (stmt, _) in statements(&toks) {
-            let (v, rest) = match stmt {
-                [Tok::Name(v), Tok::Mark('='), rest @ ..]
-                    if rest.first() != Some(&Tok::Mark('=')) =>
-                {
-                    (v, rest)
-                }
-                [Tok::Name(v), Tok::Mark(_), Tok::Mark('='), rest @ ..] => {
-                    if builds(rest, &out.opaque) {
-                        out.opaque.insert(v.clone());
-                    }
-                    continue;
-                }
-                _ => continue,
-            };
-            let folded = fold(rest, &out.values);
-            let shown = folded.is_some() || literal_words(rest).is_some();
-            if shown && uses(v) == 2 {
-                out.values.insert(v.clone(), rest.to_vec());
-            }
-            match folded {
-                Some(s) if literal(rest).is_none() => out.strs.push(s),
-                None if builds(rest, &out.opaque) => {
-                    out.opaque.insert(v.clone());
-                }
-                _ => {}
-            }
         }
     }
     let from = out.refs.len();
@@ -1128,11 +1123,15 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                         out.strs.push(path.0);
                     }
                     if NAMING_CALLS.contains(&name.as_str()) {
-                        if let Some(r) =
-                            named_by(&name, args.as_deref(), &toks, next, &binds, &stars)
-                        {
-                            out.refs.push(r);
-                        }
+                        out.refs.extend(named_by(
+                            &name,
+                            args.as_deref(),
+                            &toks,
+                            next,
+                            &binds,
+                            &stars,
+                            &out.values,
+                        ));
                     }
                     out.refs.push(Ref {
                         name,
@@ -1260,8 +1259,10 @@ fn write_after(toks: &[Tok], at: usize) -> bool {
     )
 }
 
-/// The name a call in [`NAMING_CALLS`] hands back, with what follows it
-/// on the line: `__import__("os").system(x)` reaches `os.system`.
+/// The names a call in [`NAMING_CALLS`] may hand back, each with what
+/// follows it on the line: `__import__("os").system(x)` reaches
+/// `os.system`. A name the program assigns a constant counts as that
+/// constant.
 fn named_by(
     call: &str,
     args: Option<&[Vec<Tok>]>,
@@ -1269,62 +1270,93 @@ fn named_by(
     open: usize,
     binds: &HashMap<String, Vec<String>>,
     stars: &[String],
-) -> Option<Ref> {
-    let args = args?;
-    let base = if call == "getattr" {
-        let first = args.first()?;
-        let (obj, end) = match first.as_slice() {
-            [Tok::Name(_), ..] => dotted(first, 0),
-            _ => return None,
-        };
-        // `getattr(__import__("os"), "system")` is `os.system`.
-        let module = (end < first.len() && first.get(end) == Some(&Tok::Mark('(')))
-            .then(|| {
-                let importer = heads(&obj, binds, stars).into_iter().map(bare).any(|h| {
-                    matches!(
-                        h.as_str(),
-                        "__import__" | "importlib.import_module" | "importlib.__import__"
-                    )
-                });
-                let inner = call_args(first, end);
-                (importer && close(first, end) + 1 == first.len())
-                    .then(|| literal(inner.first()?))
-                    .flatten()
-            })
-            .flatten();
-        let attr = literal(args.get(1)?)?;
-        if let Some(m) = module {
-            format!("{m}.{attr}")
-        } else if end < first.len() {
-            return None;
-        } else {
-            let (h, tail) = obj.split_once('.').unwrap_or((obj.as_str(), ""));
-            let head = heads(h, binds, stars).into_iter().next()?;
-            let tail = if tail.is_empty() {
-                String::new()
-            } else {
-                format!(".{tail}")
-            };
-            format!("{head}{tail}.{attr}")
-        }
+    values: &HashMap<String, Vec<Tok>>,
+) -> Vec<Ref> {
+    let Some(args) = args else {
+        return Vec::new();
+    };
+    let bases = if call == "getattr" {
+        getattr_names(args, binds, stars, values)
     } else {
-        literal(args.first()?)?
+        imported(call, args, values)
     };
     let after = close(toks, open) + 1;
-    let (chain, next) = if toks.get(after) == Some(&Tok::Mark('.')) {
+    let (tail, next) = if toks.get(after) == Some(&Tok::Mark('.')) {
         let (c, n) = dotted(toks, after + 1);
-        (format!("{base}.{c}"), n)
+        (format!(".{c}"), n)
     } else {
-        (base, after)
+        (String::new(), after)
     };
     let called = toks.get(next) == Some(&Tok::Mark('('));
     let args = called.then(|| call_args(toks, next));
     let then_at = if called { close(toks, next) + 1 } else { next };
-    Some(Ref {
-        name: bare(chain),
-        args,
-        then: then(toks, then_at),
-    })
+    bases
+        .into_iter()
+        .map(|b| Ref {
+            name: bare(format!("{b}{tail}")),
+            args: args.clone(),
+            then: then(toks, then_at),
+        })
+        .collect()
+}
+
+/// The modules an import call may hand back. `__import__("a.b")` hands
+/// back `a`, or `a.b` when its fromlist names something, so it is
+/// followed as both.
+fn imported(call: &str, args: &[Vec<Tok>], values: &HashMap<String, Vec<Tok>>) -> Vec<String> {
+    let Some(name) = args.first().and_then(|a| fold(a, values)) else {
+        return Vec::new();
+    };
+    let top = name.split('.').next().unwrap_or_default().to_string();
+    if call.ends_with("__import__") && top != name {
+        vec![top, name]
+    } else {
+        vec![name]
+    }
+}
+
+/// The names `getattr(obj, attr)` may hand back.
+fn getattr_names(
+    args: &[Vec<Tok>],
+    binds: &HashMap<String, Vec<String>>,
+    stars: &[String],
+    values: &HashMap<String, Vec<Tok>>,
+) -> Vec<String> {
+    let (Some(first), Some(attr)) = (args.first(), args.get(1).and_then(|a| fold(a, values)))
+    else {
+        return Vec::new();
+    };
+    let (obj, end) = match first.as_slice() {
+        [Tok::Name(_), ..] => dotted(first, 0),
+        _ => return Vec::new(),
+    };
+    let objects = if end == first.len() {
+        let (h, tail) = obj.split_once('.').unwrap_or((obj.as_str(), ""));
+        let tail = if tail.is_empty() {
+            String::new()
+        } else {
+            format!(".{tail}")
+        };
+        heads(h, binds, stars)
+            .into_iter()
+            .take(1)
+            .map(|head| format!("{head}{tail}"))
+            .collect()
+    } else if first.get(end) == Some(&Tok::Mark('(')) && close(first, end) + 1 == first.len() {
+        // `getattr(__import__("os"), "system")` is `os.system`.
+        match heads(&obj, binds, stars).into_iter().map(bare).find(|h| {
+            matches!(
+                h.as_str(),
+                "__import__" | "importlib.import_module" | "importlib.__import__"
+            )
+        }) {
+            Some(i) => imported(&i, &call_args(first, end), values),
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    objects.into_iter().map(|o| format!("{o}.{attr}")).collect()
 }
 
 /// The mark at `toks[at]`, or for a `.` the name after it.
@@ -2401,7 +2433,7 @@ fn unshown(r: &Read) -> Option<Refusal> {
         if c.args
             .as_ref()
             .and_then(|a| a.first())
-            .and_then(|a| literal(r.value(a)))
+            .and_then(|a| r.text(a))
             .is_none()
         {
             return hidden(&c.name);
@@ -2419,7 +2451,7 @@ fn unshown(r: &Read) -> Option<Refusal> {
             }
             _ => false,
         };
-        let named = args.get(1).and_then(|a| literal(r.value(a))).is_some();
+        let named = args.get(1).and_then(|a| r.text(a)).is_some();
         if c.args.is_none() || (on_module && (!named || c.name != "getattr")) {
             return hidden(&c.name);
         }
@@ -3269,5 +3301,50 @@ mod tests {
         );
         let c = class_of("import subprocess; subprocess.run([executable, 'x.py'])");
         assert!(c.starts_with("python-runs-unshown-"), "{c}");
+    }
+
+    #[test]
+    fn an_import_or_attribute_a_constant_names_is_that_name() {
+        for code in [
+            "x = 'os'; __import__(x).system(input())",
+            "x = 'os'\nm = __import__(x)\nm.system(input())",
+            "import importlib; x = 'os'; importlib.import_module(x).system(input())",
+            "__import__('os.path').system(input())",
+            "m = __import__('os.path'); m.system(input())",
+            "getattr(__import__('os.path'), 'system')(input())",
+            "import os\nx = 'system'\ngetattr(os, x)(input())",
+            "import os; x = 'system'; f = getattr(os, x); f(input())",
+            "import subprocess as s; x = 'run'; getattr(s, x)(input(), shell=True)",
+        ] {
+            let c = class_of(code);
+            assert!(c.starts_with("python-runs-unshown-"), "{code}: {c}");
+        }
+        for code in [
+            "x = 'os'; __import__(x).system('touch .git/hooks/pre-commit')",
+            "__import__('os.path').system('touch .git/hooks/pre-commit')",
+            "import os\nx = 'system'\ngetattr(os, x)('touch .git/hooks/pre-commit')",
+        ] {
+            assert_eq!(class_of(code), "python-writes-hook", "{code}");
+        }
+        assert_eq!(
+            class_of(
+                "h = __import__('http.client'); c = h.HTTPConnection('e'); \
+                 c.request('POST', '/', open('data.csv').read())"
+            ),
+            "python-sends-local-data"
+        );
+        // `__import__` of a dotted name is followed as both modules.
+        assert_eq!(
+            shell_commands("__import__('os.x', fromlist=['y']).system('id')"),
+            ["id"]
+        );
+        assert_eq!(
+            shell_commands("__import__('os.path', fromlist=['join']).join('a', 'b')"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            refused_for("x = 'json'; print(__import__(x).dumps([1]))"),
+            None
+        );
     }
 }
