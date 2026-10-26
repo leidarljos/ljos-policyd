@@ -518,6 +518,19 @@ fn bare(name: String) -> String {
     }
 }
 
+/// Calls whose literal first argument is python code that runs.
+const CODE_CALLS: &[&str] = &[
+    "exec",
+    "eval",
+    "compile",
+    "timeit.timeit",
+    "timeit.repeat",
+    "timeit.Timer",
+    "cProfile.run",
+    "profile.run",
+    "pdb.run",
+];
+
 /// Read `code` into `out`. `None` when python would read it in a way
 /// the reader does not follow.
 fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
@@ -568,6 +581,7 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
             }
         }
     }
+    let from = out.refs.len();
     for (i, t) in toks.iter().enumerate() {
         match t {
             Tok::Str(s) => {
@@ -617,6 +631,14 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
             }
             _ => {}
         }
+    }
+    let inner: Vec<String> = out.refs[from..]
+        .iter()
+        .filter(|r| CODE_CALLS.contains(&r.name.as_str()))
+        .filter_map(|r| literal(out.value(arg(r.args.as_ref()?, 0, "source")?)))
+        .collect();
+    for code in inner {
+        read(&code, depth + 1, out)?;
     }
     Some(())
 }
@@ -1356,6 +1378,14 @@ mod tests {
         assert_eq!(
             refused_for("m = 'r'; print(open('.git/config', m).read())"),
             None
+        );
+    }
+
+    #[test]
+    fn code_a_literal_runs_is_read_too() {
+        assert_eq!(
+            class_of("exec(\"open('.cursor/hooks.json', 'w')\")"),
+            "python-writes-hook"
         );
     }
 }
