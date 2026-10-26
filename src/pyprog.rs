@@ -261,6 +261,8 @@ struct Read {
     modules: HashSet<String>,
     /// Names assigned one literal and then read once, with the literal.
     values: HashMap<String, Vec<Tok>>,
+    /// Literal paths the program writes a file at.
+    written: Vec<String>,
 }
 
 /// The dotted name from `toks[i]`, and where it ends.
@@ -637,6 +639,9 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                         .filter(|_| PATH_JOINS.contains(&name.as_str()))
                         .and_then(|a| joined_path(a, &toks, after))
                     {
+                        if write_after(&toks, path.1) {
+                            out.written.push(path.0.clone());
+                        }
                         out.strs.push(path.0);
                     }
                     if NAMING_CALLS.contains(&name.as_str()) {
@@ -765,6 +770,20 @@ fn joined_path(args: &[Vec<Tok>], toks: &[Tok], after: usize) -> Option<(String,
         }
     }
     (!parts.is_empty()).then(|| (parts.join("/"), at))
+}
+
+/// Whether a path ending at `toks[at]` has a write method called on it.
+fn write_after(toks: &[Tok], at: usize) -> bool {
+    let at = if toks.get(at) == Some(&Tok::Mark(')')) {
+        at + 1
+    } else {
+        at
+    };
+    matches!(
+        (toks.get(at), toks.get(at + 1)),
+        (Some(Tok::Mark('.')), Some(Tok::Name(m)))
+            if matches!(m.as_str(), "write_text" | "write_bytes" | "symlink_to" | "hardlink_to")
+    )
 }
 
 /// The name a call in [`NAMING_CALLS`] hands back, with what follows it
@@ -916,6 +935,7 @@ pub(crate) fn refusal(code: &str, place: Place) -> Option<Refusal> {
     credential(&r)
         .or_else(|| hook_write(&r))
         .or_else(|| network(&r))
+        .or_else(|| runs_written(&r))
         .or_else(|| unshown(&r))
         .or_else(|| outside_write(&r, place))
 }
@@ -1524,6 +1544,43 @@ fn network(r: &Read) -> Option<Refusal> {
         "sends-local-data",
         &format!("{net} with {data}"),
     )
+}
+
+/// Commands that run the file their first operand names.
+const FILE_RUNNERS: &[&str] = &[
+    "sh", "bash", "dash", "zsh", "ksh", "fish", "source", ".", "python", "python3", "perl", "ruby",
+    "node", "php", "lua", "Rscript",
+];
+
+/// A program that writes a file and then runs a command that runs it.
+/// The text the file holds is not judged where it runs.
+fn runs_written(r: &Read) -> Option<Refusal> {
+    let mut written = r.written.clone();
+    for (call, pos) in OPEN_CALLS {
+        for c in r.calls(&[call]) {
+            let args = c.args.as_deref().unwrap_or_default();
+            if mode_writes(arg(args, *pos, "mode"), r) {
+                written.extend(arg(args, 0, "file").and_then(|a| literal(r.value(a))));
+            }
+        }
+    }
+    let name = |p: &str| Path::new(p).file_name().map(|n| n.to_owned());
+    let is_written = |w: &str| name(w).is_some() && written.iter().any(|p| name(p) == name(w));
+    commands(r).filter_map(Result::ok).find_map(|c| {
+        let words: Vec<&str> = c
+            .split_whitespace()
+            .map(|w| w.trim_matches(['\'', '"']))
+            .collect();
+        let head = words.first()?;
+        let runner = FILE_RUNNERS.contains(&head.rsplit('/').next().unwrap_or(head));
+        let run = if runner {
+            words[1..].iter().find(|w| !w.starts_with('-'))
+        } else {
+            Some(head)
+        };
+        run.filter(|w| is_written(w))
+            .and_then(|w| refused(PolicyReason::ShellDangerousRunner, "runs-written-file", w))
+    })
 }
 
 /// Attributes and names that reach the interpreter's own frames, code
@@ -2203,6 +2260,24 @@ mod tests {
             "import importlib; importlib.import_module('os').system('id')",
         ] {
             assert_eq!(shell_commands(code), ["id"], "{code}");
+        }
+    }
+
+    #[test]
+    fn a_file_the_program_writes_and_runs_is_refused() {
+        for code in [
+            "import os; open('e.sh', 'w').write('x'); os.system('sh e.sh')",
+            "import os; open('e.sh', 'w').write('x'); os.chmod('e.sh', 0o755); os.system('./e.sh')",
+            "import subprocess; open('e.py', 'w').write('x'); subprocess.run(['python3', 'e.py'])",
+            "from pathlib import Path; import os; Path('e.sh').write_text('x'); os.system('bash e.sh')",
+        ] {
+            assert_eq!(class_of(code), "python-runs-written-file", "{code}");
+        }
+        for code in [
+            "import os; open('out.txt', 'w').write('x'); os.system('cat out.txt')",
+            "import subprocess; open('e.sh', 'w').write('x'); subprocess.run(['sh', 'run.sh'])",
+        ] {
+            assert_eq!(refused_for(code), None, "{code}");
         }
     }
 
