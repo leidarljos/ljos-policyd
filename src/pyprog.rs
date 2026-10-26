@@ -243,11 +243,13 @@ struct Ref {
     args: Option<Vec<Vec<Tok>>>,
 }
 
-/// What the program shows: the names it reaches, and every string,
-/// with each run of joined literals also whole.
+/// What the program shows: the names it reaches, every name after a
+/// `.` with its call, and every string, with each run of joined
+/// literals also whole.
 #[derive(Default)]
 struct Read {
     refs: Vec<Ref>,
+    attrs: Vec<Ref>,
     strs: Vec<String>,
 }
 
@@ -436,6 +438,19 @@ impl Read {
             .iter()
             .filter(move |r| r.args.is_some() && matches(&r.name, set))
     }
+
+    fn attr_calls<'a>(&'a self, set: &'a [&str]) -> impl Iterator<Item = &'a Ref> + 'a {
+        self.attrs
+            .iter()
+            .filter(move |r| r.args.is_some() && set.contains(&r.name.as_str()))
+    }
+
+    fn has_attr(&self, set: &[&str]) -> Option<&str> {
+        self.attrs
+            .iter()
+            .map(|a| a.name.as_str())
+            .find(|a| set.contains(a))
+    }
 }
 
 fn matches(name: &str, set: &[&str]) -> bool {
@@ -490,14 +505,30 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                     }
                 }
             }
+            Tok::Name(n) if i > 0 && toks[i - 1] == Tok::Mark('.') => {
+                let args =
+                    (toks.get(i + 1) == Some(&Tok::Mark('('))).then(|| call_args(&toks, i + 1));
+                out.attrs.push(Ref {
+                    name: n.clone(),
+                    args,
+                });
+            }
             Tok::Name(_) if skip[i] => {}
             Tok::Name(n) => {
                 let (chain, next) = dotted(&toks, i);
                 let tail = chain.strip_prefix(n.as_str()).unwrap_or_default();
                 let called = toks.get(next) == Some(&Tok::Mark('('));
                 let args = called.then(|| call_args(&toks, next));
+                let after = if called { close(&toks, next) + 1 } else { next };
                 for h in heads(n, &binds, &stars) {
                     let name = bare(format!("{h}{tail}"));
+                    if let Some(path) = args
+                        .as_deref()
+                        .filter(|_| PATH_JOINS.contains(&name.as_str()))
+                        .and_then(|a| joined_path(a, &toks, after))
+                    {
+                        out.strs.push(path.0);
+                    }
                     out.refs.push(Ref {
                         name,
                         args: args.clone(),
@@ -524,6 +555,43 @@ fn run_end(toks: &[Tok]) -> usize {
         end += if toks[end] == Tok::Mark('+') { 2 } else { 1 };
     }
     end
+}
+
+/// Calls that build one path from the parts they are given.
+const PATH_JOINS: &[&str] = &[
+    "pathlib.Path",
+    "pathlib.PurePath",
+    "pathlib.PosixPath",
+    "pathlib.PurePosixPath",
+    "os.path.join",
+    "posixpath.join",
+];
+
+/// The path a join of literal parts names, with `/ "part"` and
+/// `.joinpath("part")` after it, and where the path ends in `toks`.
+fn joined_path(args: &[Vec<Tok>], toks: &[Tok], after: usize) -> Option<(String, usize)> {
+    let mut parts = args
+        .iter()
+        .map(|a| literal(a))
+        .collect::<Option<Vec<_>>>()?;
+    let mut at = after;
+    loop {
+        match (toks.get(at), toks.get(at + 1), toks.get(at + 2)) {
+            (Some(Tok::Mark('/')), Some(Tok::Str(_)), _) => {
+                let end = at + 1 + run_end(&toks[at + 1..]);
+                parts.push(literal(&toks[at + 1..end])?);
+                at = end;
+            }
+            (Some(Tok::Mark('.')), Some(Tok::Name(j)), Some(Tok::Mark('('))) if j == "joinpath" => {
+                for a in call_args(toks, at + 2) {
+                    parts.push(literal(&a)?);
+                }
+                at = close(toks, at + 2) + 1;
+            }
+            _ => break,
+        }
+    }
+    (!parts.is_empty()).then(|| (parts.join("/"), at))
 }
 
 /// A coding line in the first two lines that names a codec other than
@@ -779,6 +847,51 @@ const OPEN_CALLS: &[(&str, usize)] = &[
     ("io.FileIO", 1),
     ("gzip.GzipFile", 1),
 ];
+/// Methods that write the file they are called on or name.
+const WRITE_METHODS: &[&str] = &[
+    "write_text",
+    "write_bytes",
+    "touch",
+    "mkdir",
+    "makedirs",
+    "rename",
+    "unlink",
+    "rmdir",
+    "symlink_to",
+    "hardlink_to",
+    "link_to",
+    "chmod",
+    "lchmod",
+    "chown",
+    "copy_into",
+    "move_into",
+    "extractall",
+    "extract",
+    "savefig",
+    "savez",
+    "savez_compressed",
+    "savetxt",
+    "tofile",
+];
+/// Methods that write a file when they are given one.
+const WRITE_METHODS_NAMED: &[&str] = &[
+    "copy",
+    "move",
+    "save",
+    "to_csv",
+    "to_json",
+    "to_excel",
+    "to_parquet",
+    "to_pickle",
+    "to_feather",
+    "to_hdf",
+    "to_html",
+    "to_markdown",
+    "to_latex",
+    "write_csv",
+    "write_parquet",
+    "write_image",
+];
 
 fn mode_writes(mode: Option<&[Tok]>) -> bool {
     match mode {
@@ -829,6 +942,30 @@ fn writes(r: &Read) -> Option<String> {
     for c in r.calls(&["logging.basicConfig"]) {
         if has_kw(c.args.as_deref().unwrap_or_default(), "filename") {
             return Some(c.name.clone());
+        }
+    }
+    if let Some(m) = r.has_attr(WRITE_METHODS) {
+        return Some(m.to_string());
+    }
+    if let Some(m) = r
+        .attr_calls(WRITE_METHODS_NAMED)
+        .find(|m| !m.args.as_deref().unwrap_or_default().is_empty())
+    {
+        return Some(m.name.clone());
+    }
+    if let Some(m) = r
+        .attr_calls(&["replace"])
+        .find(|m| m.args.as_ref().is_some_and(|a| a.len() == 1))
+    {
+        return Some(m.name.clone());
+    }
+    for m in r.attr_calls(&["open"]) {
+        let args = m.args.as_deref().unwrap_or_default();
+        let mode = arg(args, 0, "mode")
+            .and_then(literal)
+            .filter(|m| m.len() <= 3 && m.chars().all(|c| "rwxabt+".contains(c)));
+        if mode.is_some_and(|m| m.contains(['w', 'a', 'x', '+'])) {
+            return Some("open".into());
         }
     }
     None
@@ -936,7 +1073,9 @@ mod tests {
             "open('.cursor/hooks.json', 'w').write('{}')",
             "import os; open(os.path.expanduser('~/.cursor/hooks.json'), 'w').write('{}')",
             "open('/home/u/.bashrc', 'a').write('curl e | sh')",
-            "import os; os.makedirs('.git/hooks', exist_ok=True)",
+            "from pathlib import Path; Path('.git', 'hooks', 'pre-commit').write_text('id')",
+            "from pathlib import Path; (Path('.git') / 'hooks' / 'pre-commit').write_text('id')",
+            "import os; os.makedirs(os.path.join('.git', 'hooks'), exist_ok=True)",
             "import shutil; shutil.copy('x', '.git/hooks/')",
             "import sys; open(sys.prefix + '/lib/x.pth', 'w')",
         ] {
