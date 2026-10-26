@@ -268,6 +268,11 @@ struct Read {
     values: HashMap<String, Vec<Tok>>,
     /// Literal paths the program writes a file at.
     written: Vec<String>,
+    /// Names assigned a string built from codes or decoded, that the
+    /// reader does not work out.
+    opaque: HashSet<String>,
+    /// Names called or looked up with such a string.
+    unfolded: Vec<String>,
 }
 
 /// The dotted name from `toks[i]`, and where it ends.
@@ -695,6 +700,52 @@ fn words(a: &[Tok], r: &Read) -> Option<Vec<String>> {
     (!words.is_empty()).then_some(words)
 }
 
+/// Names that build a string from codes, or decode one.
+const BUILDERS: &[&str] = &[
+    "chr",
+    "bytes",
+    "bytearray",
+    "reversed",
+    "fromhex",
+    "unhexlify",
+    "a2b_hex",
+    "a2b_base64",
+    "b16decode",
+    "b32decode",
+    "b32hexdecode",
+    "b64decode",
+    "standard_b64decode",
+    "urlsafe_b64decode",
+    "b85decode",
+    "a85decode",
+    "z85decode",
+    "decodebytes",
+    "decodestring",
+    "decompress",
+    "codecs",
+    "translate",
+    "maketrans",
+    "fsdecode",
+];
+
+/// Whether an expression builds a string from codes or by decoding,
+/// or uses a name assigned one: what the text then spells is not
+/// what runs.
+fn builds(a: &[Tok], opaque: &HashSet<String>) -> bool {
+    a.iter().enumerate().any(|(i, t)| match t {
+        Tok::Name(n) => {
+            BUILDERS.contains(&n.as_str())
+                || opaque.contains(n)
+                || (n == "join"
+                    && i >= 2
+                    && a[i - 1] == Tok::Mark('.')
+                    && matches!(a[i - 2], Tok::Str(_)))
+        }
+        Tok::Mark('[') => reversal(&a[i..]),
+        _ => false,
+    })
+}
+
 /// What each name the imports bind stands for, and the modules a
 /// `from M import *` spills into the program.
 fn bindings(toks: &[Tok]) -> (HashMap<String, Vec<String>>, Vec<String>) {
@@ -975,6 +1026,12 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                 {
                     (v, rest)
                 }
+                [Tok::Name(v), Tok::Mark(_), Tok::Mark('='), rest @ ..] => {
+                    if builds(rest, &out.opaque) {
+                        out.opaque.insert(v.clone());
+                    }
+                    continue;
+                }
                 _ => continue,
             };
             let folded = fold(rest, &out.values);
@@ -982,8 +1039,12 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
             if shown && uses(v) == 2 {
                 out.values.insert(v.clone(), rest.to_vec());
             }
-            if let Some(s) = folded.filter(|_| literal(rest).is_none()) {
-                out.strs.push(s);
+            match folded {
+                Some(s) if literal(rest).is_none() => out.strs.push(s),
+                None if builds(rest, &out.opaque) => {
+                    out.opaque.insert(v.clone());
+                }
+                _ => {}
             }
         }
     }
@@ -1018,6 +1079,7 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                 let args = called.then(|| call_args(&toks, next));
                 let after = if called { close(&toks, next) + 1 } else { next };
                 let subscript = toks.get(next) == Some(&Tok::Mark('['));
+                let mut hidden = false;
                 if called || subscript {
                     for a in call_args(&toks, next) {
                         let a = match a.as_slice() {
@@ -1028,13 +1090,18 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                             }
                             a => a,
                         };
-                        if let Some(s) = fold(a, &out.values).filter(|_| literal(a).is_none()) {
-                            out.strs.push(s);
+                        match fold(a, &out.values) {
+                            Some(s) if literal(a).is_none() => out.strs.push(s),
+                            None => hidden |= builds(a, &out.opaque),
+                            _ => {}
                         }
                     }
                 }
                 for h in heads(n, &binds, &stars) {
                     let name = bare(format!("{h}{tail}"));
+                    if hidden {
+                        out.unfolded.push(name.clone());
+                    }
                     if let Some(path) = args
                         .as_deref()
                         .filter(|_| PATH_JOINS.contains(&name.as_str()))
@@ -2178,6 +2245,40 @@ const LOADER_VARS: &[&str] = &[
     "GIT_DIR",
 ];
 
+/// Names whose argument is a command, code, a path or a variable.
+const SINKS: &[&str] = &[
+    "os.",
+    "shutil.",
+    "pathlib.",
+    "subprocess.",
+    "pty.",
+    "io.",
+    "codecs.open",
+    "gzip.",
+    "bz2.",
+    "lzma.",
+    "tarfile.",
+    "zipfile.",
+    "sqlite3.connect",
+    "importlib.",
+    "runpy.",
+    "asyncio.create_subprocess_shell",
+    "asyncio.create_subprocess_exec",
+    "platform.popen",
+    "open",
+    "exec",
+    "eval",
+    "compile",
+    "getattr",
+    "setattr",
+    "delattr",
+    "__import__",
+];
+
+fn sink(name: &str) -> bool {
+    matches(name, SINKS) || CODE_CALLS.contains(&name) || matches(name, WRITE_CALLS)
+}
+
 /// Code or a command the text does not show: `exec` of a value, an
 /// import or attribute by a computed name, a reach past the program
 /// into the interpreter, a command built at run time.
@@ -2302,6 +2403,9 @@ fn unshown(r: &Read) -> Option<Refusal> {
         {
             return hidden(&c.name);
         }
+    }
+    if let Some(n) = r.unfolded.iter().find(|n| sink(n)) {
+        return hidden(&format!("{n} with a built string"));
     }
     if let Some(n) = r.reaches(EXEC_CALLS) {
         return refused(
@@ -3007,6 +3111,29 @@ mod tests {
             "print(''.join(['a', 'b']))",
             "import base64; print(base64.b64decode('aGk=').decode())",
             "print('{}-{}'.format('a', 'b'))",
+        ] {
+            assert_eq!(refused_for(code), None, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_built_string_the_reader_cannot_work_out_is_refused_where_it_runs() {
+        for code in [
+            "import os; os.system(''.join(chr(c) for c in [105, 100]))",
+            "p = ''.join(map(chr, [47, 101, 116, 99])); open(p + '/x', 'w')",
+            "import os; c = bytes(range(105, 106)); os.system(c.decode())",
+            "import os, zlib; os.system(zlib.decompress(b'x').decode())",
+            "import os; k = ''.join(reversed('NEKOT_HG')); print(os.environ[k])",
+            "from pathlib import Path; Path(bytes.fromhex(input()).decode()).write_text('x')",
+        ] {
+            let c = class_of(code);
+            assert!(c.starts_with("python-runs-unshown-"), "{code}: {c}");
+        }
+        for code in [
+            "print(''.join(chr(c) for c in [104, 105]))",
+            "import os; open(os.path.join('out', 'x.txt'), 'w').write('x')",
+            "import base64; open('out.bin', 'wb').write(base64.b64decode('aGk='))",
+            "import os; print(os.environ.get('HOME'))",
         ] {
             assert_eq!(refused_for(code), None, "{code}");
         }
