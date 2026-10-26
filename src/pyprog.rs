@@ -2199,6 +2199,11 @@ const LOADS: &[&str] = &[
     "marshal.loads",
     "dill.loads",
     "cloudpickle.loads",
+    "pickle.load",
+    "cPickle.load",
+    "pickle.Unpickler",
+    "cPickle.Unpickler",
+    "dill.Unpickler",
 ];
 
 /// Whether an attribute by this name runs a command or code, or writes
@@ -3137,5 +3142,22 @@ mod tests {
         ] {
             assert_eq!(refused_for(code), None, "{code}");
         }
+    }
+
+    #[test]
+    fn a_pickle_loaded_from_a_file_is_refused() {
+        for code in [
+            "import pickle; pickle.load(open('data.csv', 'rb'))",
+            "p = __import__('pickle'); p.load(open('data.csv', 'rb'))",
+            "import _pickle; _pickle.load(open('x', 'rb'))",
+            "import pickle; pickle.Unpickler(open('x', 'rb')).load()",
+        ] {
+            let c = class_of(code);
+            assert!(c.starts_with("python-runs-unshown-"), "{code}: {c}");
+        }
+        assert_eq!(
+            refused_for("import pickle; print(pickle.loads(pickle.dumps(1)))"),
+            None
+        );
     }
 }
