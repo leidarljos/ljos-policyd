@@ -1385,8 +1385,16 @@ pub(crate) struct Place<'a> {
     pub(crate) work: Option<&'a Path>,
 }
 
-/// Why python must not run `code` at `place`, or `None`.
+/// Why python must not run `code` at `place`, or `None`. A program
+/// a string of which a newline cuts is also read with the newline as
+/// `\n`: python runs neither, but the text was most likely written by
+/// a `printf` that turned the `\n` into a newline, and the reader
+/// would else read the rest of the string as code.
 pub(crate) fn refusal(code: &str, place: Place) -> Option<Refusal> {
+    judge(code, place).or_else(|| mended(code).and_then(|c| judge(&c, place)))
+}
+
+fn judge(code: &str, place: Place) -> Option<Refusal> {
     let mut r = Read::default();
     if read(code, 0, &mut r).is_none() {
         return refused(PolicyReason::ShellDangerousRunner, "unread", "");
@@ -1403,11 +1411,61 @@ pub(crate) fn refusal(code: &str, place: Place) -> Option<Refusal> {
 /// The commands `code` hands a shell or runs, as shell text, so the
 /// shell rules judge each one.
 pub(crate) fn shell_commands(code: &str) -> Vec<String> {
-    let mut r = Read::default();
-    if read(code, 0, &mut r).is_none() {
-        return Vec::new();
+    let mut out = Vec::new();
+    for code in std::iter::once(code.to_string()).chain(mended(code)) {
+        let mut r = Read::default();
+        if read(&code, 0, &mut r).is_some() {
+            out.extend(commands(&r).filter_map(Result::ok));
+        }
     }
-    commands(&r).filter_map(Result::ok).collect()
+    out
+}
+
+/// `code` with each newline that cuts a one-line string written as
+/// `\n`, or `None` when no string is cut.
+fn mended(code: &str) -> Option<String> {
+    let src: Vec<char> = code.chars().collect();
+    let mut out = String::new();
+    let mut cut = false;
+    let mut i = 0;
+    while let Some(&c) = src.get(i) {
+        if c == '#' {
+            while let Some(&c) = src.get(i).filter(|c| **c != '\n') {
+                out.push(c);
+                i += 1;
+            }
+            continue;
+        }
+        if c != '\'' && c != '"' {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let triple = src.get(i + 1) == Some(&c) && src.get(i + 2) == Some(&c);
+        let n = if triple { 3 } else { 1 };
+        out.extend(&src[i..i + n]);
+        i += n;
+        while let Some(&d) = src.get(i) {
+            if d == '\\' && i + 1 < src.len() {
+                out.extend(&src[i..i + 2]);
+                i += 2;
+                continue;
+            }
+            if d == c && (!triple || (src.get(i + 1) == Some(&c) && src.get(i + 2) == Some(&c))) {
+                out.extend(&src[i..i + n]);
+                i += n;
+                break;
+            }
+            if d == '\n' && !triple {
+                out.push_str("\\n");
+                cut = true;
+            } else {
+                out.push(d);
+            }
+            i += 1;
+        }
+    }
+    cut.then_some(out)
 }
 
 /// Paths and parts of paths that hold a login, a key or a token.
@@ -3157,6 +3215,27 @@ mod tests {
         }
         assert_eq!(
             refused_for("import pickle; print(pickle.loads(pickle.dumps(1)))"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_string_a_newline_cuts_is_read_both_ways() {
+        // What `printf 'open(...).write("x\n"); ...'` leaves in a file.
+        for code in [
+            "open('e.sh','w').write('rm -rf /\n'); o=__import__('os'); o.execv('sh',['sh','e.sh'])",
+            "print('\n'); import os; os.system(input())",
+        ] {
+            let c = class_of(code);
+            assert!(c.starts_with("python-runs-"), "{code:?}: {c}");
+        }
+        assert_eq!(
+            shell_commands("print('\n'); import os; os.system('id')"),
+            ["id"]
+        );
+        assert_eq!(refused_for("print('a\nb')"), None);
+        assert_eq!(
+            refused_for("import sys; print(\"\n\".join(sys.path))"),
             None
         );
     }
