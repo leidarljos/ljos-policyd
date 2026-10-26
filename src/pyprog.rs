@@ -91,7 +91,8 @@ fn lex(src: &[char], depth: usize, out: &mut Vec<Tok>) -> Option<()> {
     Some(())
 }
 
-/// Read the string whose quote is at `src[i]` and push it.
+/// Read the string whose quote is at `src[i]` and push it. The code in
+/// an f-string's fields follows it, in parentheses.
 fn string(
     src: &[char],
     mut i: usize,
@@ -106,7 +107,9 @@ fn string(
     let triple = src.get(i + 1) == Some(&q) && src.get(i + 2) == Some(&q);
     i += if triple { 3 } else { 1 };
     let raw = prefix.contains('r');
+    let fields = prefix.contains('f') || prefix.contains('t');
     let mut text = String::new();
+    let mut code = Vec::new();
     while let Some(&c) = src.get(i) {
         if c == q && (!triple || (src.get(i + 1) == Some(&q) && src.get(i + 2) == Some(&q))) {
             i += if triple { 3 } else { 1 };
@@ -131,11 +134,62 @@ fn string(
             }
             continue;
         }
+        if fields && c == '{' {
+            if src.get(i + 1) == Some(&'{') {
+                text.push('{');
+                i += 2;
+                continue;
+            }
+            let end = field_end(src, i + 1, depth)?;
+            text.push(FIELD);
+            code.push(Tok::Mark('('));
+            lex(&src[i + 1..end], depth + 1, &mut code)?;
+            code.push(Tok::Mark(')'));
+            i = end + 1;
+            continue;
+        }
+        if fields && c == '}' && src.get(i + 1) == Some(&'}') {
+            text.push('}');
+            i += 2;
+            continue;
+        }
         text.push(c);
         i += 1;
     }
     out.push(Tok::Str(text));
+    out.extend(code);
     Some(i)
+}
+
+/// The `}` that closes the f-string field opened before `from`. Strings
+/// inside the field may use any quote, as python 3.12 reads them.
+fn field_end(src: &[char], from: usize, depth: usize) -> Option<usize> {
+    let mut nest = 0usize;
+    let mut i = from;
+    while let Some(&c) = src.get(i) {
+        match c {
+            '\'' | '"' => {
+                let mut s = i;
+                while s > from && name_char(src[s - 1]) {
+                    s -= 1;
+                }
+                let p: String = src[s..i].iter().collect();
+                let p = if string_prefix(&p) {
+                    p.to_ascii_lowercase()
+                } else {
+                    String::new()
+                };
+                i = string(src, i, &p, depth + 1, &mut Vec::new())?;
+                continue;
+            }
+            '(' | '[' | '{' => nest += 1,
+            '}' if nest == 0 => return Some(i),
+            ')' | ']' | '}' => nest = nest.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Decode the escape after a backslash, as a python string does. An
@@ -257,6 +311,7 @@ mod tests {
         for code in [
             "# -*- coding: utf-7 -*-\nprint(1)",
             "print('\\N{FULL STOP}ssh')",
+            "f'{x'",
         ] {
             assert_eq!(
                 refused_for(code).as_deref(),
