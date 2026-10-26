@@ -1798,7 +1798,16 @@ pub(crate) struct Place<'a> {
 /// `\n`: python runs neither, but the text was most likely written by
 /// a `printf` that turned the `\n` into a newline, and the reader
 /// would else read the rest of the string as code.
+/// The most inline python the reader reads. A call's arguments and the
+/// closers of a subscript are each scanned from the token on, so a
+/// program of nested calls costs the square of its length; past the cap
+/// the program is unread, and refused as one.
+const CODE_CAP: usize = 64 * 1024;
+
 pub(crate) fn refusal(code: &str, place: Place) -> Option<Refusal> {
+    if code.len() > CODE_CAP {
+        return refused(PolicyReason::ShellDangerousRunner, "unread", "");
+    }
     judge(code, place).or_else(|| mended(code).and_then(|c| judge(&c, place)))
 }
 
@@ -1820,6 +1829,9 @@ fn judge(code: &str, place: Place) -> Option<Refusal> {
 /// shell rules judge each one.
 pub(crate) fn shell_commands(code: &str) -> Vec<String> {
     let mut out = Vec::new();
+    if code.len() > CODE_CAP {
+        return out;
+    }
     for code in std::iter::once(code.to_string()).chain(mended(code)) {
         let mut r = Read::default();
         if read(&code, 0, &mut r).is_some() {
