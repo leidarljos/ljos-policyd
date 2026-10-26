@@ -1315,7 +1315,9 @@ fn imported(call: &str, args: &[Vec<Tok>], values: &HashMap<String, Vec<Tok>>) -
     }
 }
 
-/// The names `getattr(obj, attr)` may hand back.
+/// The names `getattr(obj, attr)` may hand back. `obj` is a name, or
+/// a call of a naming call: `getattr(getattr(b, "__import__")("os"),
+/// "system")` is `os.system`.
 fn getattr_names(
     args: &[Vec<Tok>],
     binds: &HashMap<String, Vec<String>>,
@@ -1330,33 +1332,46 @@ fn getattr_names(
         [Tok::Name(_), ..] => dotted(first, 0),
         _ => return Vec::new(),
     };
-    let objects = if end == first.len() {
-        let (h, tail) = obj.split_once('.').unwrap_or((obj.as_str(), ""));
-        let tail = if tail.is_empty() {
-            String::new()
-        } else {
-            format!(".{tail}")
-        };
-        heads(h, binds, stars)
-            .into_iter()
-            .take(1)
-            .map(|head| format!("{head}{tail}"))
-            .collect()
-    } else if first.get(end) == Some(&Tok::Mark('(')) && close(first, end) + 1 == first.len() {
-        // `getattr(__import__("os"), "system")` is `os.system`.
-        match heads(&obj, binds, stars).into_iter().map(bare).find(|h| {
-            matches!(
-                h.as_str(),
-                "__import__" | "importlib.import_module" | "importlib.__import__"
-            )
-        }) {
-            Some(i) => imported(&i, &call_args(first, end), values),
-            None => Vec::new(),
-        }
+    let (h, tail) = obj.split_once('.').unwrap_or((obj.as_str(), ""));
+    let tail = if tail.is_empty() {
+        String::new()
     } else {
-        Vec::new()
+        format!(".{tail}")
     };
-    objects.into_iter().map(|o| format!("{o}.{attr}")).collect()
+    let names = heads(h, binds, stars)
+        .into_iter()
+        .map(|head| bare(format!("{head}{tail}")));
+    if end == first.len() {
+        return names.map(|o| format!("{o}.{attr}")).collect();
+    }
+    if first.get(end) != Some(&Tok::Mark('(')) {
+        return Vec::new();
+    }
+    // A naming call, maybe an attribute of what it hands back, maybe
+    // called: the call must be the whole of `obj`.
+    let after = close(first, end) + 1;
+    let next = if first.get(after) == Some(&Tok::Mark('.')) {
+        dotted(first, after + 1).1
+    } else {
+        after
+    };
+    let called = first.get(next) == Some(&Tok::Mark('('));
+    let stop = if called { close(first, next) + 1 } else { next };
+    if stop != first.len() {
+        return Vec::new();
+    }
+    let args = call_args(first, end);
+    names
+        .filter(|n| NAMING_CALLS.contains(&n.as_str()))
+        .flat_map(|n| named_by(&n, Some(&args), first, end, binds, stars, values))
+        .flat_map(|r| match (&r.args, r.name.as_str()) {
+            (None, _) => vec![r.name.clone()],
+            (Some(a), "getattr") => getattr_names(a, binds, stars, values),
+            (Some(a), n) if NAMING_CALLS.contains(&n) => imported(n, a, values),
+            _ => Vec::new(),
+        })
+        .map(|o| format!("{o}.{attr}"))
+        .collect()
 }
 
 /// The mark at `toks[at]`, or for a `.` the name after it.
@@ -3344,6 +3359,31 @@ mod tests {
         );
         assert_eq!(
             refused_for("x = 'json'; print(__import__(x).dumps([1]))"),
+            None
+        );
+    }
+
+    #[test]
+    fn getattr_of_an_aliased_or_nested_naming_call_is_its_name() {
+        for code in [
+            "import builtins as b; b.getattr(b.__import__('os'), 'system')(input())",
+            "import builtins as b; getattr(getattr(b, '__import__')('os'), 'system')(input())",
+            "import builtins as b; getattr(b.__import__('os'), 'system')(input())",
+            "import importlib as l; getattr(l.import_module('os'), 'popen')(input())",
+            "m = __import__('os'); n = m; getattr(n, 'system')(input())",
+        ] {
+            let c = class_of(code);
+            assert!(c.starts_with("python-runs-unshown-"), "{code}: {c}");
+        }
+        assert_eq!(
+            class_of(
+                "import builtins as b; getattr(getattr(b, '__import__')('os'), 'system')\
+                 ('touch .git/hooks/pre-commit')"
+            ),
+            "python-writes-hook"
+        );
+        assert_eq!(
+            refused_for("import os; print(getattr(getattr(os, 'path'), 'sep'))"),
             None
         );
     }
