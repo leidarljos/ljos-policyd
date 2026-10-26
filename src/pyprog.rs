@@ -6,7 +6,7 @@
 //! python decodes them, and an f-string's fields are read as code. A
 //! program the reader cannot split is refused.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use unicode_normalization::UnicodeNormalization;
@@ -237,11 +237,12 @@ fn escape(src: &[char], i: usize, text: &mut String) -> Option<usize> {
 }
 
 /// A name the program reaches through its imports, with the arguments
-/// when it is called there.
+/// when it is called there, and the mark that follows the name or call.
 #[derive(Clone)]
 struct Ref {
     name: String,
     args: Option<Vec<Vec<Tok>>>,
+    then: Option<Tok>,
 }
 
 /// What the program shows: the names it reaches, every name after a
@@ -256,6 +257,8 @@ struct Read {
     reversed: bool,
     /// A `"/"` joined to a value, so the path starts at the root.
     rooted: bool,
+    /// Names an import binds to a module.
+    modules: HashSet<String>,
     /// Names assigned one literal and then read once, with the literal.
     values: HashMap<String, Vec<Tok>>,
 }
@@ -556,6 +559,7 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
     let mut toks = Vec::new();
     lex(&chars, 0, &mut toks)?;
     let (mut binds, stars) = bindings(&toks);
+    out.modules.extend(binds.keys().cloned());
     // The words of an import name modules, not calls of them.
     let mut skip = vec![false; toks.len()];
     for (stmt, at) in statements(&toks) {
@@ -616,6 +620,7 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                 out.attrs.push(Ref {
                     name: n.clone(),
                     args,
+                    then: None,
                 });
             }
             Tok::Name(_) if skip[i] => {}
@@ -644,6 +649,7 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                     out.refs.push(Ref {
                         name,
                         args: args.clone(),
+                        then: then(&toks, after),
                     });
                 }
             }
@@ -820,10 +826,20 @@ fn named_by(
     };
     let called = toks.get(next) == Some(&Tok::Mark('('));
     let args = called.then(|| call_args(toks, next));
+    let then_at = if called { close(toks, next) + 1 } else { next };
     Some(Ref {
         name: bare(chain),
         args,
+        then: then(toks, then_at),
     })
+}
+
+/// The mark at `toks[at]`, or for a `.` the name after it.
+fn then(toks: &[Tok], at: usize) -> Option<Tok> {
+    match (toks.get(at), toks.get(at + 1)) {
+        (Some(Tok::Mark('.')), Some(n @ Tok::Name(_))) => Some(n.clone()),
+        (t, _) => t.cloned(),
+    }
 }
 
 /// A coding line in the first two lines that names a codec other than
@@ -900,6 +916,7 @@ pub(crate) fn refusal(code: &str, place: Place) -> Option<Refusal> {
     credential(&r)
         .or_else(|| hook_write(&r))
         .or_else(|| network(&r))
+        .or_else(|| unshown(&r))
         .or_else(|| outside_write(&r, place))
 }
 
@@ -1509,6 +1526,281 @@ fn network(r: &Read) -> Option<Refusal> {
     )
 }
 
+/// Attributes and names that reach the interpreter's own frames, code
+/// and builtins, past what the program shows.
+const ESCAPES: &[&str] = &[
+    "__builtins__",
+    "__globals__",
+    "__subclasses__",
+    "__code__",
+    "__getattribute__",
+    "__mro__",
+    "__bases__",
+    "__base__",
+    "__reduce__",
+    "__reduce_ex__",
+    "__loader__",
+    "__closure__",
+    "__self__",
+    "__func__",
+    "func_globals",
+    "f_globals",
+    "f_builtins",
+    "f_locals",
+    "f_back",
+    "gi_frame",
+    "tb_frame",
+    "cr_frame",
+];
+/// Names that load or run code the program does not show.
+const HIDDEN_CODE: &[&str] = &[
+    "runpy",
+    "runpy.",
+    "importlib.util.spec_from_file_location",
+    "importlib.util.spec_from_loader",
+    "importlib.util.module_from_spec",
+    "importlib.machinery.",
+    "zipimport.",
+    "imp.",
+    "marshal.load",
+    "dill.load",
+    "cloudpickle.load",
+    "types.CodeType",
+    "types.FunctionType",
+    "ctypes.CDLL",
+    "ctypes.cdll",
+    "ctypes.PyDLL",
+    "ctypes.pydll",
+    "ctypes.LibraryLoader",
+    "ctypes.WinDLL",
+    "ctypes.windll",
+    "ctypes.OleDLL",
+    "ctypes.oledll",
+    "ctypes.pythonapi",
+    "ctypes.cdll.",
+    "_ctypes.",
+    "cffi.",
+    "code.interact",
+    "code.InteractiveInterpreter",
+    "code.InteractiveConsole",
+    "sys.settrace",
+    "sys.setprofile",
+    "sys.addaudithook",
+    "os.register_at_fork",
+    "atexit.register",
+];
+/// Methods of a mapping that hand back or change what it holds.
+const LOOKUPS: &[&str] = &[
+    "get",
+    "pop",
+    "popitem",
+    "setdefault",
+    "update",
+    "values",
+    "items",
+    "__getitem__",
+    "__setitem__",
+];
+
+/// Calls that turn bytes into objects, and so may run code the bytes
+/// carry.
+const LOADS: &[&str] = &[
+    "pickle.loads",
+    "_pickle.loads",
+    "cPickle.loads",
+    "marshal.loads",
+    "dill.loads",
+    "cloudpickle.loads",
+];
+
+/// Whether an attribute by this name runs a command or code, or writes
+/// or opens a file, on one of the modules the rules know.
+fn runs_something(attr: &str) -> bool {
+    let last = |n: &&str| n.rsplit('.').next().unwrap_or(n).to_string();
+    attr == "open"
+        || process_names()
+            .chain(EXEC_CALLS.iter().copied())
+            .chain(CODE_CALLS.iter().copied())
+            .chain(WRITE_CALLS.iter().copied())
+            .chain([
+                "__import__",
+                "import_module",
+                "rmtree",
+                "move",
+                "copy",
+                "copyfile",
+                "copytree",
+            ])
+            .any(|n| !n.ends_with('.') && last(&n) == attr)
+        || WRITE_METHODS.contains(&attr)
+}
+
+/// Variables that make a command load or run something else first.
+const LOADER_VARS: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "DYLD_INSERT_LIBRARIES",
+    "BASH_ENV",
+    "ENV",
+    "PROMPT_COMMAND",
+    "PYTHONSTARTUP",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "PERL5OPT",
+    "NODE_OPTIONS",
+    "RUBYOPT",
+    "GIT_SSH_COMMAND",
+    "GIT_EXEC_PATH",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_DIR",
+];
+
+/// Code or a command the text does not show: `exec` of a value, an
+/// import or attribute by a computed name, a reach past the program
+/// into the interpreter, a command built at run time.
+fn unshown(r: &Read) -> Option<Refusal> {
+    let hidden = |what: &str| {
+        refused(
+            PolicyReason::ShellDangerousRunner,
+            "runs-unshown-code",
+            what,
+        )
+    };
+    for c in r
+        .refs
+        .iter()
+        .filter(|c| CODE_CALLS.contains(&c.name.as_str()))
+    {
+        let Some(args) = &c.args else {
+            return hidden(&c.name);
+        };
+        let Some(a) = arg(args, 0, "source").or_else(|| arg(args, 0, "stmt")) else {
+            continue;
+        };
+        // A timer or profiler also takes a function, which is code the
+        // program shows.
+        let text = matches!(c.name.as_str(), "exec" | "eval" | "compile");
+        let callable =
+            matches!(a, [Tok::Name(n), ..] if n == "lambda") || matches!(a, [Tok::Name(_)]);
+        if literal(r.value(a)).is_none() && (text || !callable) {
+            return hidden(&c.name);
+        }
+    }
+    for c in r.refs.iter().filter(|c| {
+        matches(
+            &c.name,
+            &[
+                "__import__",
+                "importlib.import_module",
+                "importlib.__import__",
+            ],
+        )
+    }) {
+        if c.args
+            .as_ref()
+            .and_then(|a| a.first())
+            .and_then(|a| literal(r.value(a)))
+            .is_none()
+        {
+            return hidden(&c.name);
+        }
+    }
+    for c in r
+        .refs
+        .iter()
+        .filter(|c| matches!(c.name.as_str(), "getattr" | "setattr" | "delattr"))
+    {
+        let args = c.args.as_deref().unwrap_or_default();
+        let on_module = match args.first().map(Vec::as_slice) {
+            Some([Tok::Name(m), ..]) => {
+                r.modules.contains(m) || m == "builtins" || m == "__builtins__"
+            }
+            _ => false,
+        };
+        let named = args.get(1).and_then(|a| literal(r.value(a))).is_some();
+        if c.args.is_none() || (on_module && (!named || c.name != "getattr")) {
+            return hidden(&c.name);
+        }
+    }
+    // `methodcaller("system", x)(os)` calls a method by its name on
+    // whatever it is later given.
+    for c in r.calls(&["operator.methodcaller", "operator.attrgetter"]) {
+        let named = c
+            .args
+            .as_ref()
+            .and_then(|a| a.first())
+            .and_then(|a| literal(r.value(a)));
+        if named.is_none_or(|n| n.split('.').any(runs_something)) {
+            return hidden(&c.name);
+        }
+    }
+    if let Some(e) = r
+        .names()
+        .flat_map(|n| n.split('.'))
+        .find(|n| ESCAPES.contains(n))
+        .or_else(|| r.has_attr(ESCAPES))
+    {
+        return hidden(e);
+    }
+    if let Some(n) = r.reaches(HIDDEN_CODE) {
+        return hidden(n);
+    }
+    // Bytes a program loads hold code of their own, unless the program
+    // made them from its own value.
+    for c in r.refs.iter().filter(|c| matches(&c.name, LOADS)) {
+        let own = c.args.as_ref().and_then(|a| a.first()).is_some_and(|a| {
+            matches!(r.value(a), [Tok::Name(_), Tok::Mark('.'), Tok::Name(d), Tok::Mark('('), .., Tok::Mark(')')]
+                if d == "dumps" && close(r.value(a), 3) + 1 == r.value(a).len())
+        });
+        if !own {
+            return hidden(&c.name);
+        }
+    }
+    for c in &r.refs {
+        let looked_up = match &c.then {
+            Some(Tok::Mark('[')) => true,
+            Some(Tok::Name(m)) => LOOKUPS.contains(&m.as_str()),
+            _ => false,
+        };
+        let scope = (matches!(c.name.as_str(), "globals" | "locals" | "vars") && c.args.is_some())
+            || c.name.ends_with(".__dict__");
+        if (scope && looked_up)
+            || (c.name == "sys.modules" && c.then == Some(Tok::Mark('[')))
+            || c.name
+                .strip_prefix("sys.modules.")
+                .is_some_and(|m| LOOKUPS.contains(&m))
+        {
+            return hidden(&c.name);
+        }
+    }
+    if let Some(n) = r.reaches(EXEC_CALLS) {
+        return refused(
+            PolicyReason::ShellDangerousRunner,
+            "runs-unshown-command",
+            n,
+        );
+    }
+    if let Some(Err(n)) = commands(r).find(Result::is_err) {
+        return refused(
+            PolicyReason::ShellDangerousRunner,
+            "runs-unshown-command",
+            &n,
+        );
+    }
+    if commands(r).next().is_some() {
+        if let Some(v) = r.strs.iter().find(|s| LOADER_VARS.contains(&s.as_str())) {
+            return refused(
+                PolicyReason::ShellDangerousRunner,
+                "runs-unshown-command",
+                v,
+            );
+        }
+    }
+    None
+}
+
 /// Names whose value is a directory out of the tree: the home, the
 /// interpreter's own files, a directory the environment names.
 const OUTSIDE_NAMES: &[&str] = &[
@@ -1878,6 +2170,56 @@ mod tests {
         ] {
             assert_eq!(refused_for(code), None, "{code}");
         }
+    }
+
+    #[test]
+    fn code_or_a_command_the_text_does_not_show_is_refused() {
+        for code in [
+            "import os; exec(os.environ['X'])",
+            "import os; os.__dict__['system']('id')",
+            "import os; vars(os)['system']('id')",
+            "import operator, os; operator.methodcaller('system', 'id')(os)",
+            "import operator, os; operator.attrgetter('system')(os)('id')",
+            "import ctypes; ctypes.CDLL(None).system(b'id')",
+            "import os; os.system(input())",
+            "import os; os.execl('/bin/sh', 'sh')",
+        ] {
+            let c = class_of(code);
+            assert!(c.starts_with("python-runs-unshown-"), "{code}: {c}");
+        }
+        for code in [
+            "import operator; print(sorted([{'a': 1}], key=operator.itemgetter('a')))",
+            "import operator; print(operator.attrgetter('real')(1))",
+            "exec('print(1)')",
+            "import timeit; print(timeit.timeit(lambda: 1, number=3))",
+        ] {
+            assert_eq!(refused_for(code), None, "{code}");
+        }
+        // A module and an attribute named by literals are the call they
+        // name, and the shell rules judge its command.
+        for code in [
+            "getattr(__import__('os'), 'system')('id')",
+            "getattr(__import__('o' + 's'), 'system')('id')",
+            "import importlib; importlib.import_module('os').system('id')",
+        ] {
+            assert_eq!(shell_commands(code), ["id"], "{code}");
+        }
+    }
+
+    #[test]
+    fn a_call_through_dunder_call_is_the_call() {
+        let mut r = Read::default();
+        read(
+            "import os; f = os.system; f.__call__('x'); os.popen.__call__('y')",
+            0,
+            &mut r,
+        )
+        .unwrap();
+        let names: Vec<&str> = r.names().collect();
+        assert!(
+            names.contains(&"os.system") && names.contains(&"os.popen"),
+            "{names:?}"
+        );
     }
 
     #[test]
