@@ -366,6 +366,27 @@ fn literal(a: &[Tok]) -> Option<String> {
     (!want).then_some(out)
 }
 
+/// The words of a list or tuple made only of string literals, or of a
+/// literal split on white space.
+fn literal_words(a: &[Tok]) -> Option<Vec<String>> {
+    let inner = match a {
+        [Tok::Mark('['), inner @ .., Tok::Mark(']')]
+        | [Tok::Mark('('), inner @ .., Tok::Mark(')')] => inner,
+        [Tok::Str(s), Tok::Mark('.'), Tok::Name(f), Tok::Mark('('), Tok::Mark(')')]
+            if f == "split" && !s.contains(FIELD) =>
+        {
+            return Some(s.split_whitespace().map(str::to_string).collect());
+        }
+        _ => return None,
+    };
+    let words = inner
+        .split(|t| *t == Tok::Mark(','))
+        .filter(|p| !p.is_empty())
+        .map(literal)
+        .collect::<Option<Vec<_>>>()?;
+    (!words.is_empty()).then_some(words)
+}
+
 /// What each name the imports bind stands for, and the modules a
 /// `from M import *` spills into the program.
 fn bindings(toks: &[Tok]) -> (HashMap<String, Vec<String>>, Vec<String>) {
@@ -892,6 +913,11 @@ const WRITE_METHODS_NAMED: &[&str] = &[
     "write_parquet",
     "write_image",
 ];
+/// Commands that write files, and the words that send output to one.
+const WRITERS: &[&str] = &[
+    "cp", "mv", "tee", "install", "ln", "rsync", "dd", "touch", "mkdir", "chmod", "chown", "rm",
+    "truncate", "sed", "perl", "git", "tar", "unzip",
+];
 
 fn mode_writes(mode: Option<&[Tok]>) -> bool {
     match mode {
@@ -968,7 +994,92 @@ fn writes(r: &Read) -> Option<String> {
             return Some("open".into());
         }
     }
-    None
+    commands(r).filter_map(Result::ok).find(|c| {
+        let words: Vec<&str> = c.split_whitespace().collect();
+        words.iter().any(|w| w.starts_with('>'))
+            || words
+                .first()
+                .is_some_and(|w| WRITERS.contains(&w.rsplit('/').next().unwrap_or(w)))
+    })
+}
+
+/// Calls that run a command, with the keyword their command goes by.
+const PROCESS_CALLS: &[(&str, &str)] = &[
+    ("os.system", "command"),
+    ("os.popen", "cmd"),
+    ("subprocess.run", "args"),
+    ("subprocess.call", "args"),
+    ("subprocess.check_call", "args"),
+    ("subprocess.check_output", "args"),
+    ("subprocess.Popen", "args"),
+    ("subprocess.getoutput", "cmd"),
+    ("subprocess.getstatusoutput", "cmd"),
+    ("asyncio.create_subprocess_shell", "cmd"),
+    ("asyncio.create_subprocess_exec", "program"),
+    ("platform.popen", "cmd"),
+    ("commands.getoutput", "cmd"),
+];
+/// Each command the program runs: its shell text when the program
+/// spells it out, else the call that runs it.
+fn commands(r: &Read) -> impl Iterator<Item = Result<String, String>> + '_ {
+    r.refs.iter().filter_map(|c| {
+        let (_, kw) = PROCESS_CALLS.iter().find(|(n, _)| *n == c.name)?;
+        let Some(args) = &c.args else {
+            return Some(Err(c.name.clone()));
+        };
+        let exec = c.name == "asyncio.create_subprocess_exec";
+        let a = arg(args, 0, kw);
+        let shown = if exec {
+            args.iter()
+                .take_while(|a| !keyed(a))
+                .map(|a| literal(a))
+                .collect::<Option<Vec<_>>>()
+                .map(|w| quoted(&w))
+        } else {
+            a.and_then(|a| {
+                literal(a)
+                    .or_else(|| literal_words(a).map(|w| quoted(&w)))
+                    .or_else(|| shlex_split(a))
+            })
+        };
+        Some(
+            shown
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| c.name.clone()),
+        )
+    })
+}
+
+/// The text of `shlex.split("...")`, which splits as a shell does.
+fn shlex_split(a: &[Tok]) -> Option<String> {
+    match a {
+        [Tok::Name(m), Tok::Mark('.'), Tok::Name(f), Tok::Mark('('), Tok::Str(s), Tok::Mark(')')]
+            if m == "shlex" && f == "split" && !s.contains(FIELD) =>
+        {
+            Some(s.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Words as shell text that splits back into them.
+fn quoted(words: &[String]) -> String {
+    let plain = |w: &str| {
+        !w.is_empty()
+            && w.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_./=:,@%+-".contains(c))
+    };
+    words
+        .iter()
+        .map(|w| {
+            if plain(w) {
+                w.clone()
+            } else {
+                format!("'{}'", w.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -1088,5 +1199,17 @@ mod tests {
         ] {
             assert_eq!(refused_for(code), None, "{code}");
         }
+    }
+
+    #[test]
+    fn a_command_that_writes_is_a_write() {
+        for code in [
+            "import os; os.system('cp x .git/hooks/pre-commit')",
+            "import subprocess; subprocess.run(['tee', '.cursor/hooks.json'])",
+            "import os; os.system('echo x > ~/.bashrc')",
+        ] {
+            assert_eq!(class_of(code), "python-writes-hook", "{code}");
+        }
+        assert_eq!(refused_for("import os; os.system('cat .git/config')"), None);
     }
 }
