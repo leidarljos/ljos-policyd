@@ -890,6 +890,16 @@ pub(crate) fn refusal(code: &str, place: Place) -> Option<Refusal> {
         .or_else(|| outside_write(&r, place))
 }
 
+/// The commands `code` hands a shell or runs, as shell text, so the
+/// shell rules judge each one.
+pub(crate) fn shell_commands(code: &str) -> Vec<String> {
+    let mut r = Read::default();
+    if read(code, 0, &mut r).is_none() {
+        return Vec::new();
+    }
+    commands(&r).filter_map(Result::ok).collect()
+}
+
 /// Paths and parts of paths that hold a login, a key or a token.
 const CREDENTIAL_PARTS: &[&str] = &[
     ".ssh",

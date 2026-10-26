@@ -6694,6 +6694,11 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
                 out.extend(script_lines(&s, 0).iter().map(|l| (i, shell_words(l))));
             }
         }
+        if let Some(code) = python_program(run) {
+            for s in pyprog::shell_commands(code) {
+                out.extend(script_lines(&s, 0).iter().map(|l| (i, shell_words(l))));
+            }
+        }
         if let Some(script) = handed {
             out.extend(script_lines(script, 0).iter().map(|l| (i, shell_words(l))));
             continue;
