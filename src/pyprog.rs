@@ -17,6 +17,7 @@ use crate::policy_capnp::PolicyReason;
 enum Tok {
     Name(String),
     Str(String),
+    Num(String),
     Mark(char),
 }
 
@@ -74,13 +75,14 @@ fn lex(src: &[char], depth: usize, out: &mut Vec<Tok>) -> Option<()> {
         } else if c == '\'' || c == '"' {
             i = string(src, i, "", depth, out)?;
         } else if c.is_ascii_digit() {
+            let s = i;
             while src
                 .get(i)
                 .is_some_and(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
             {
                 i += 1;
             }
-            out.push(Tok::Mark('0'));
+            out.push(Tok::Num(src[s..i].iter().collect()));
         } else {
             match c {
                 '(' | '[' | '{' => nest += 1,
@@ -379,6 +381,22 @@ fn literal(a: &[Tok]) -> Option<String> {
         }
     }
     (!want).then_some(out)
+}
+
+/// Whether `t` starts with a `[::-N]` slice.
+fn reversal(t: &[Tok]) -> bool {
+    matches!(
+        t,
+        [
+            Tok::Mark('['),
+            Tok::Mark(':'),
+            Tok::Mark(':'),
+            Tok::Mark('-'),
+            Tok::Num(_),
+            Tok::Mark(']'),
+            ..
+        ]
+    )
 }
 
 /// The words of a list or tuple made only of string literals, or of a
@@ -733,7 +751,7 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                     });
                 }
             }
-            Tok::Mark('[') if toks[i..].starts_with(&REVERSED) => out.reversed = true,
+            Tok::Mark('[') if reversal(&toks[i..]) => out.reversed = true,
             _ => {}
         }
     }
@@ -747,15 +765,6 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
     }
     Some(())
 }
-
-const REVERSED: [Tok; 6] = [
-    Tok::Mark('['),
-    Tok::Mark(':'),
-    Tok::Mark(':'),
-    Tok::Mark('-'),
-    Tok::Mark('0'),
-    Tok::Mark(']'),
-];
 
 /// Whether the `"/"` at `toks[i]` names the root or starts a path
 /// joined to a value: `"/" + p`, `os.path.join("/", p)`, `f("/")`,
