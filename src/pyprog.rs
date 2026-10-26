@@ -2512,7 +2512,12 @@ const HIDDEN_CODE: &[&str] = &[
     "sys.addaudithook",
     "os.register_at_fork",
     "atexit.register",
+    "pydoc.locate",
+    "pkgutil.resolve_name",
 ];
+/// Methods of a loader, found from a spec or a module's `__spec__`,
+/// that run a module's code.
+const LOADER_METHODS: &[&str] = &["load_module", "exec_module"];
 /// Methods of a mapping that hand back or change what it holds.
 const LOOKUPS: &[&str] = &[
     "get",
@@ -2709,7 +2714,10 @@ fn unshown(r: &Read) -> Option<Refusal> {
     {
         return hidden(e);
     }
-    if let Some(n) = r.reaches(HIDDEN_CODE) {
+    if let Some(n) = r
+        .reaches(HIDDEN_CODE)
+        .or_else(|| r.has_attr(LOADER_METHODS))
+    {
         return hidden(n);
     }
     // Bytes a program loads hold code of their own, unless the program
@@ -3674,6 +3682,25 @@ mod tests {
             "import subprocess; print(subprocess.os.getcwd())",
             "import asyncio; asyncio.run(asyncio.sleep(0)); print(asyncio.subprocess.PIPE)",
             "import json; print(json.decoder.re.compile('x'))",
+        ] {
+            assert_eq!(refused_for(code), None, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_call_that_finds_code_by_its_name_is_refused() {
+        for code in [
+            "import pydoc; pydoc.locate('os.system')(input())",
+            "from pydoc import locate; locate('os.system')(input())",
+            "import pkgutil; pkgutil.resolve_name('os:system')(input())",
+            "import os; os.__spec__.loader.load_module('os').system(input())",
+            "import importlib.util as u; u.find_spec('os').loader.load_module().system(input())",
+        ] {
+            assert_eq!(class_of(code), "python-runs-unshown-code", "{code}");
+        }
+        for code in [
+            "import importlib.util; print(importlib.util.find_spec('json') is not None)",
+            "import pkgutil; print([m.name for m in pkgutil.iter_modules()][:3])",
         ] {
             assert_eq!(refused_for(code), None, "{code}");
         }
