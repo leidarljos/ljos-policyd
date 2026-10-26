@@ -9623,7 +9623,11 @@ fn render_printf(fmt: &str, args: &[String]) -> Option<String> {
             'f' | 'F' => out.push_str("0.000000"),
             'e' => out.push_str("0.000000e+00"),
             'E' => out.push_str("0.000000E+00"),
-            'a' | 'A' | 'c' | 'q' | 'T' => return None,
+            // Bash writes these and goes on where dash stops, or this
+            // does not render them.
+            'a' | 'A' | 'c' | 'n' | 'q' | 'Q' | 'T' => return None,
+            // A letter neither shell knows stops both after the text
+            // before it.
             d if d.is_ascii_alphabetic() => return Some(out),
             _ => return None,
         }
@@ -19782,6 +19786,24 @@ hash -r 2> /dev/null
             assert_eq!(p(fmt, &[]), None, "{fmt}");
         }
         assert_eq!(p("%s", &["a", "b"]), None);
+    }
+
+    /// Bash keeps writing after `%Q` and `%n` where dash stops, so the
+    /// program after them is in the file python runs.
+    #[test]
+    fn a_printf_conversion_only_bash_reads_hides_nothing() {
+        let root = startup_root("printfbash");
+        for line in [
+            "printf 'print(1)\\n%Q\\nimport os\\nos.system(\"rm -rf /\")\\n' > ljos-stdin.py && python3 ljos-stdin.py",
+            "printf 'print(1)\\n%n\\nimport os\\nos.system(\"rm -rf /\")\\n' > ljos-stdin.py && python3 ljos-stdin.py",
+            "printf 'print(1)\\n%q\\nimport os\\nos.system(\"rm -rf /\")\\n' > ljos-stdin.py && python3 ljos-stdin.py",
+        ] {
+            let c = check_shell_in(&shell_words(line), &root, 0);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+        }
+        for fmt in ["%Q", "%n", "%5Q"] {
+            assert_eq!(render_printf(fmt, &[]), None, "{fmt}");
+        }
     }
 
     #[test]
