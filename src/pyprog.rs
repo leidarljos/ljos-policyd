@@ -257,7 +257,7 @@ struct Read {
     reversed: bool,
     /// A `"/"` joined to a value, so the path starts at the root.
     rooted: bool,
-    /// Names an import binds to a module.
+    /// Names an import or an alias binds to a module.
     modules: HashSet<String>,
     /// Names assigned one literal and then read once, with the literal.
     values: HashMap<String, Vec<Tok>>,
@@ -562,6 +562,7 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
     lex(&chars, 0, &mut toks)?;
     let (mut binds, stars) = bindings(&toks);
     out.modules.extend(binds.keys().cloned());
+    let imported: HashSet<String> = binds.values().flatten().cloned().collect();
     // The words of an import name modules, not calls of them.
     let mut skip = vec![false; toks.len()];
     for (stmt, at) in statements(&toks) {
@@ -569,24 +570,65 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
             skip[at..at + stmt.len()].fill(true);
         }
     }
-    // `run = os.system` makes `run` that name. Twice, so a name bound
-    // to another bound name is followed. The right side is that name
-    // where `run` is used, not a use of its own.
+    // `run = os.system` makes `run` that name. `m = __import__("os")`
+    // and `m = importlib.import_module("os")` make `m` that module, so
+    // `m.system` is `os.system`. `m = getattr(os, "popen")` is the
+    // name the call returns. Twice, so a name bound to another bound
+    // name is followed. The right side is that name where it is used,
+    // not a use of its own.
     for _ in 0..2 {
         for (stmt, at) in statements(&toks) {
-            if let [Tok::Name(v), Tok::Mark('='), Tok::Name(h), rest @ ..] = stmt {
-                let (chain, end) = dotted(stmt, 2);
-                if end != stmt.len() || rest.first() == Some(&Tok::Mark('=')) {
-                    continue;
-                }
-                let tail = chain.strip_prefix(h.as_str()).unwrap_or_default();
-                let to: Vec<String> = heads(h, &binds, &stars)
-                    .into_iter()
-                    .map(|b| bare(format!("{b}{tail}")))
-                    .collect();
-                binds.insert(v.clone(), to);
-                skip[at + 2..at + stmt.len()].fill(true);
+            let [Tok::Name(v), Tok::Mark('='), Tok::Name(h), rest @ ..] = stmt else {
+                continue;
+            };
+            if rest.first() == Some(&Tok::Mark('=')) {
+                continue;
             }
+            let (chain, end) = dotted(stmt, 2);
+            let tail = chain.strip_prefix(h.as_str()).unwrap_or_default();
+            let names: Vec<String> = heads(h, &binds, &stars)
+                .into_iter()
+                .map(|b| bare(format!("{b}{tail}")))
+                .collect();
+            let to = if end == stmt.len() {
+                if names.iter().any(|n| imported.contains(n)) {
+                    out.modules.insert(v.clone());
+                }
+                names
+            } else if toks.get(at + end) == Some(&Tok::Mark('(')) {
+                let open = at + end;
+                let Some(name) = names
+                    .into_iter()
+                    .find(|n| NAMING_CALLS.contains(&n.as_str()))
+                else {
+                    continue;
+                };
+                let args = call_args(&toks, open);
+                let Some(r) = named_by(&name, Some(&args), &toks, open, &binds, &stars) else {
+                    continue;
+                };
+                // A module the call hands back, so `getattr(m, x)` with
+                // a computed `x` is a reach the text does not show.
+                // `__import__("a.b")` hands back `a`.
+                if name != "getattr" {
+                    out.modules.insert(v.clone());
+                }
+                let top = r.name.split('.').next().unwrap_or_default().to_string();
+                let mut to = vec![r.name];
+                if name.ends_with("__import__") && !to.contains(&top) {
+                    to.push(top);
+                }
+                to
+            } else {
+                continue;
+            };
+            let have = binds.entry(v.clone()).or_default();
+            for n in to {
+                if !have.contains(&n) {
+                    have.push(n);
+                }
+            }
+            skip[at + 2..at + stmt.len()].fill(true);
         }
     }
     let uses = |v: &str| {
@@ -2467,5 +2509,48 @@ mod tests {
         ] {
             assert_eq!(class_of(code), "python-writes-outside", "{code}");
         }
+    }
+
+    #[test]
+    fn a_name_bound_to_a_module_is_that_module() {
+        let mut r = Read::default();
+        read(
+            "m = __import__('os'); m.system('a')\n\
+             import importlib; n = importlib.import_module('subprocess'); n.run(['b'])\n\
+             p = m.path; p.join('c')\n\
+             q = getattr(m, 'popen'); q('d')\n\
+             h = __import__('http.client'); h.client.HTTPConnection('e')\n\
+             s = m; s.remove('f')",
+            0,
+            &mut r,
+        )
+        .unwrap();
+        let names: Vec<&str> = r.names().collect();
+        for n in [
+            "os.system",
+            "subprocess.run",
+            "os.path.join",
+            "os.popen",
+            "http.client.HTTPConnection",
+            "os.remove",
+        ] {
+            assert!(names.contains(&n), "{n} not in {names:?}");
+        }
+        for code in [
+            "m = __import__('os'); getattr(m, input())('id')",
+            "import importlib; m = importlib.import_module('os'); getattr(m, 'sys' + input())('id')",
+            "m = __import__('os'); setattr(m, 'x', 1)",
+        ] {
+            let c = class_of(code);
+            assert!(c.starts_with("python-runs-unshown-"), "{code}: {c}");
+        }
+        assert_eq!(
+            shell_commands("m = __import__('os'); m.system('id')"),
+            ["id"]
+        );
+        assert_eq!(
+            refused_for("j = __import__('json'); print(j.dumps({}))"),
+            None
+        );
     }
 }
