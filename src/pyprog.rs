@@ -532,13 +532,36 @@ fn heads(head: &str, binds: &HashMap<String, Vec<String>>, stars: &[String]) -> 
     }
 }
 
-/// `f.__call__` is `f`.
+/// Modules that are another module's functions under their own name.
+const TWINS: &[(&str, &str)] = &[
+    ("builtins", ""),
+    ("__builtin__", ""),
+    ("posix", "os"),
+    ("nt", "os"),
+    ("posixpath", "os.path"),
+    ("ntpath", "os.path"),
+    ("_io", "io"),
+    ("_socket", "socket"),
+    ("_pickle", "pickle"),
+    ("_posixsubprocess", "subprocess"),
+];
+
+/// `f.__call__` is `f`, and `posix.system` is `os.system`.
 fn bare(name: String) -> String {
     let name = name.replace(".__call__", "");
-    match name.strip_prefix("builtins.") {
-        Some(rest) => rest.to_string(),
-        None => name,
+    for (twin, to) in TWINS {
+        if name == *twin && !to.is_empty() {
+            return (*to).to_string();
+        }
+        if let Some(rest) = name.strip_prefix(twin).and_then(|r| r.strip_prefix('.')) {
+            return if to.is_empty() {
+                rest.to_string()
+            } else {
+                format!("{to}.{rest}")
+            };
+        }
     }
+    name
 }
 
 /// Calls whose literal first argument is python code that runs.
@@ -1364,6 +1387,7 @@ const EXEC_CALLS: &[&str] = &[
     "os.posix_spawn",
     "os.posix_spawnp",
     "pty.spawn",
+    "subprocess.fork_exec",
 ];
 
 fn process_names() -> impl Iterator<Item = &'static str> {
@@ -2583,5 +2607,29 @@ mod tests {
             assert!(c.starts_with("python-runs-unshown-"), "{code}: {c}");
         }
         assert_eq!(refused_for("g = globals(); print(sorted(g))"), None);
+    }
+
+    #[test]
+    fn a_module_under_another_name_is_that_module() {
+        let mut r = Read::default();
+        read(
+            "import posix, builtins, posixpath, _posixsubprocess\n\
+             posix.system('a'); builtins.exec('b'); posixpath.expanduser('c')\n\
+             _posixsubprocess.fork_exec('d')",
+            0,
+            &mut r,
+        )
+        .unwrap();
+        let names: Vec<&str> = r.names().collect();
+        for n in [
+            "os.system",
+            "exec",
+            "os.path.expanduser",
+            "subprocess.fork_exec",
+        ] {
+            assert!(names.contains(&n), "{n} not in {names:?}");
+        }
+        let c = class_of("import _posixsubprocess as p; p.fork_exec(['sh'])");
+        assert!(c.starts_with("python-runs-unshown-"), "{c}");
     }
 }
