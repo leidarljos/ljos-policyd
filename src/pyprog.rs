@@ -936,6 +936,7 @@ pub(crate) fn refusal(code: &str, place: Place) -> Option<Refusal> {
         .or_else(|| hook_write(&r))
         .or_else(|| network(&r))
         .or_else(|| runs_written(&r))
+        .or_else(|| git_write(&r))
         .or_else(|| unshown(&r))
         .or_else(|| outside_write(&r, place))
 }
@@ -1581,6 +1582,76 @@ fn runs_written(r: &Read) -> Option<Refusal> {
         run.filter(|w| is_written(w))
             .and_then(|w| refused(PolicyReason::ShellDangerousRunner, "runs-written-file", w))
     })
+}
+
+/// Git verbs that write history, as the seat's sitting rule names them.
+const GIT_WRITES: &[&str] = &[
+    "commit",
+    "merge",
+    "rebase",
+    "cherry-pick",
+    "revert",
+    "am",
+    "pull",
+    "push",
+];
+
+/// A git command the program runs that skips or moves the git hooks,
+/// or writes history. The seat asks for a sitting before a history
+/// write on the line, and a python program hides it from that check.
+fn git_write(r: &Read) -> Option<Refusal> {
+    for c in commands(r).filter_map(Result::ok) {
+        let words: Vec<&str> = c
+            .split(|ch: char| ch.is_whitespace() || ";&|()".contains(ch))
+            .map(|w| w.trim_matches(['\'', '"']))
+            .filter(|w| !w.is_empty())
+            .collect();
+        for (at, w) in words.iter().enumerate() {
+            if w.rsplit('/').next() != Some("git") {
+                continue;
+            }
+            let rest = &words[at + 1..];
+            if let Some(h) = rest
+                .iter()
+                .find(|a| **a == "--no-verify" || a.to_ascii_lowercase().contains("core.hookspath"))
+            {
+                return refused(PolicyReason::ShellGitDangerous, "skips-git-hooks", h);
+            }
+            let mut i = 0;
+            while let Some(a) = rest.get(i) {
+                match *a {
+                    "-c" | "-C" | "--git-dir" | "--work-tree" => i += 2,
+                    a if a.starts_with('-') => i += 1,
+                    _ => break,
+                }
+            }
+            let Some(sub) = rest.get(i) else {
+                continue;
+            };
+            let args = &rest[i + 1..];
+            // `commit -n` is `--no-verify`. `push -n` is a dry run.
+            if *sub == "commit" && args.contains(&"-n") {
+                return refused(
+                    PolicyReason::ShellGitDangerous,
+                    "skips-git-hooks",
+                    "commit -n",
+                );
+            }
+            let dry = args
+                .iter()
+                .any(|a| matches!(*a, "-h" | "--help" | "--abort" | "--quit" | "--dry-run"))
+                || (*sub == "push" && args.contains(&"-n"));
+            // The shell rules refuse a force push by its own name.
+            let forced = *sub == "push"
+                && args
+                    .iter()
+                    .any(|a| a.starts_with("-f") || a.starts_with("--force") || a.starts_with('+'));
+            if GIT_WRITES.contains(sub) && !dry && !forced {
+                return refused(PolicyReason::ShellGitDangerous, "writes-git-history", sub);
+            }
+        }
+    }
+    None
 }
 
 /// Attributes and names that reach the interpreter's own frames, code
@@ -2276,6 +2347,46 @@ mod tests {
         for code in [
             "import os; open('out.txt', 'w').write('x'); os.system('cat out.txt')",
             "import subprocess; open('e.sh', 'w').write('x'); subprocess.run(['sh', 'run.sh'])",
+        ] {
+            assert_eq!(refused_for(code), None, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_git_hook_skip_or_history_write_is_refused() {
+        for (code, class) in [
+            (
+                "import os; os.system('git commit --no-verify -m x')",
+                "python-skips-git-hooks",
+            ),
+            (
+                "import subprocess; subprocess.run(['git', 'commit', '-n', '-m', 'x'])",
+                "python-skips-git-hooks",
+            ),
+            (
+                "import subprocess; subprocess.run(['git', 'push', '--no-verify'])",
+                "python-skips-git-hooks",
+            ),
+            (
+                "import subprocess; subprocess.run(['git', 'config', 'core.hooksPath', '/tmp/h'])",
+                "python-writes-hook",
+            ),
+            (
+                "import os; os.system('git add . && git commit -m x')",
+                "python-writes-git-history",
+            ),
+            (
+                "import subprocess; subprocess.run(['git', '-C', 'sub', 'push'])",
+                "python-writes-git-history",
+            ),
+        ] {
+            assert_eq!(class_of(code), class, "{code}");
+        }
+        for code in [
+            "import subprocess; subprocess.run(['git', 'status'])",
+            "import subprocess; print(subprocess.check_output(['git', 'log', '-1']))",
+            "import subprocess; subprocess.run(['git', 'push', '--dry-run'])",
+            "import os; os.system('git rebase --abort')",
         ] {
             assert_eq!(refused_for(code), None, "{code}");
         }
