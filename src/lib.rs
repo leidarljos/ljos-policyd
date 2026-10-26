@@ -10281,7 +10281,7 @@ fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
             token: Cow::Borrowed("rm-rf-outside-tmp"),
         };
     }
-    if let Some(r) = python_refusal(argv) {
+    if let Some(r) = python_refusal(argv, moved, bound) {
         return Checked {
             decision: Decision::Deny,
             code: r.code,
@@ -12567,12 +12567,19 @@ fn interpreter_rmtree(argv: &[String]) -> bool {
     })
 }
 
-/// Why python must not run a program the line passes it inline.
-fn python_refusal(argv: &[String]) -> Option<pyprog::Refusal> {
+/// Why python must not run a program the line passes it inline. A
+/// relative path is in the directory the line is in, and stays in the
+/// tree while the line has not left it.
+fn python_refusal(argv: &[String], moved: bool, bound: &Scratch) -> Option<pyprog::Refusal> {
+    let cwd = bound.root.as_deref().filter(|d| !is_untracked(d));
+    let place = pyprog::Place {
+        cwd,
+        work: cwd.filter(|_| !moved),
+    };
     commands(argv).iter().find_map(|cmd| {
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
         let run = peeled(&owned);
-        python_program(run).and_then(pyprog::refusal)
+        python_program(run).and_then(|code| pyprog::refusal(code, place))
     })
 }
 

@@ -7,6 +7,7 @@
 //! program the reader cannot split is refused.
 
 use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 
 use unicode_normalization::UnicodeNormalization;
 
@@ -465,6 +466,16 @@ const NAMING_CALLS: &[&str] = &[
 ];
 
 impl Read {
+    fn names(&self) -> impl Iterator<Item = &str> {
+        self.refs.iter().map(|r| r.name.as_str())
+    }
+
+    /// Whether the program reaches a name in `set`. A name there that
+    /// ends in `.` stands for every name under it.
+    fn reaches(&self, set: &[&str]) -> Option<&str> {
+        self.names().find(|n| matches(n, set))
+    }
+
     fn calls<'a>(&'a self, set: &'a [&str]) -> impl Iterator<Item = &'a Ref> + 'a {
         self.refs
             .iter()
@@ -817,13 +828,24 @@ fn refused(code: PolicyReason, class: &str, what: &str) -> Option<Refusal> {
     })
 }
 
-/// Why python must not run `code`, or `None`.
-pub(crate) fn refusal(code: &str) -> Option<Refusal> {
+/// Where a program runs. `cwd` is the directory a relative path is in,
+/// `None` when the line does not show one. `work` is the tree the line
+/// runs in, `None` once the line has left it.
+#[derive(Clone, Copy)]
+pub(crate) struct Place<'a> {
+    pub(crate) cwd: Option<&'a Path>,
+    pub(crate) work: Option<&'a Path>,
+}
+
+/// Why python must not run `code` at `place`, or `None`.
+pub(crate) fn refusal(code: &str, place: Place) -> Option<Refusal> {
     let mut r = Read::default();
     if read(code, 0, &mut r).is_none() {
         return refused(PolicyReason::ShellDangerousRunner, "unread", "");
     }
-    credential(&r).or_else(|| hook_write(&r))
+    credential(&r)
+        .or_else(|| hook_write(&r))
+        .or_else(|| outside_write(&r, place))
 }
 
 /// Paths and parts of paths that hold a login, a key or a token.
@@ -1228,12 +1250,166 @@ fn quoted(words: &[String]) -> String {
         .join(" ")
 }
 
+/// Names whose value is a directory out of the tree: the home, the
+/// interpreter's own files, a directory the environment names.
+const OUTSIDE_NAMES: &[&str] = &[
+    "os.path.expanduser",
+    "os.path.expandvars",
+    "pathlib.Path.home",
+    "pathlib.PosixPath.home",
+    "pwd.",
+    "sys.prefix",
+    "sys.exec_prefix",
+    "sys.base_prefix",
+    "sys.base_exec_prefix",
+    "sys.executable",
+    "sys.path",
+    "sys.path.",
+    "site.",
+    "sysconfig.",
+    "shutil.which",
+    "inspect.getfile",
+    "inspect.getsourcefile",
+    "importlib.util.find_spec",
+    "importlib.resources.",
+];
+const HERE_NAMES: &[&str] = &[
+    "os.getcwd",
+    "os.getcwdb",
+    "pathlib.Path.cwd",
+    "os.path.abspath",
+    "os.path.realpath",
+];
+
+/// A variable name whose value is a directory.
+fn path_variable(s: &str) -> bool {
+    matches!(
+        s,
+        "HOME" | "USERPROFILE" | "APPDATA" | "LOCALAPPDATA" | "OLDPWD" | "PWD" | "ZDOTDIR"
+    ) || s.starts_with("XDG_")
+        || ["_HOME", "_DIR", "_PATH", "PATH", "_ROOT", "_PREFIX"]
+            .iter()
+            .any(|e| s.ends_with(e))
+}
+
+fn is_dir_like(s: &str) -> bool {
+    !s.is_empty()
+        && !s
+            .chars()
+            .any(|c| c.is_whitespace() || "\\^$*?[]()|<>\"'".contains(c))
+}
+
+/// `a/../b` as `b`, without asking the disk.
+fn lexical(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Whether a write to `p` stays in the tree, a temp directory or a
+/// device that keeps nothing.
+fn inside(p: &Path, work: Option<&Path>) -> bool {
+    let tmp = ["/tmp", "/var/tmp", "/dev/shm", "/dev/fd", "/proc/self/fd"];
+    let dev = ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"];
+    tmp.iter().any(|t| p.starts_with(t))
+        || dev.iter().any(|d| p == Path::new(d))
+        || work.is_some_and(|w| p.starts_with(w))
+}
+
+/// A string the program spells that names a place out of the tree.
+fn outside_string(s: &str, place: Place) -> bool {
+    let s = s.split(FIELD).next().unwrap_or_default();
+    if !is_dir_like(s) {
+        return false;
+    }
+    if s.starts_with('~') {
+        return true;
+    }
+    if s.starts_with('/') {
+        return s.chars().any(char::is_alphanumeric) && !inside(&lexical(Path::new(s)), place.work);
+    }
+    if s.split('/').any(|p| p == "..") {
+        return place
+            .cwd
+            .is_none_or(|c| !inside(&lexical(&c.join(s)), place.work));
+    }
+    false
+}
+
+/// A program that may write a file and may name one out of the tree.
+fn outside_write(r: &Read, place: Place) -> Option<Refusal> {
+    let call = writes(r)?;
+    let out = |what: &str| {
+        refused(
+            PolicyReason::PathOutsideWorkspace,
+            "writes-outside",
+            &format!("{call} with {what}"),
+        )
+    };
+    let Some(cwd) = place.cwd else {
+        return out("a directory the line does not show");
+    };
+    if !inside(cwd, place.work) {
+        return out(&cwd.display().to_string());
+    }
+    if let Some(s) = r.strs.iter().find(|s| outside_string(s, place)) {
+        return out(s);
+    }
+    if let Some(n) = r.reaches(OUTSIDE_NAMES) {
+        return out(n);
+    }
+    if r.has_attr(&["home", "expanduser", "__file__"]).is_some() {
+        return out("a home or module path");
+    }
+    let env = r.reaches(&["os.environ", "os.environ.", "os.getenv", "os.environb"]);
+    if let Some(v) = env.and(r.strs.iter().find(|s| path_variable(s))) {
+        return out(v);
+    }
+    let up = r
+        .has_attr(&["parent", "parents"])
+        .or_else(|| r.reaches(&["os.path.dirname"]));
+    let here = r
+        .reaches(HERE_NAMES)
+        .or_else(|| r.has_attr(&["resolve", "absolute", "cwd"]));
+    if let (Some(u), Some(_)) = (up, here) {
+        return out(u);
+    }
+    for c in r.calls(&["os.chdir", "os.fchdir"]) {
+        let to = c
+            .args
+            .as_ref()
+            .and_then(|a| a.first())
+            .and_then(|a| literal(r.value(a)));
+        if to.is_none_or(|t| {
+            t.starts_with('/') || t.starts_with('~') || t.split('/').any(|p| p == "..")
+        }) {
+            return out(&c.name);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn refused_for(code: &str) -> Option<String> {
-        refusal(code).map(|r| r.token)
+        refusal(
+            code,
+            Place {
+                cwd: Some(Path::new("/w")),
+                work: Some(Path::new("/w")),
+            },
+        )
+        .map(|r| r.token)
     }
 
     #[test]
@@ -1247,7 +1423,7 @@ mod tests {
             &mut r,
         )
         .unwrap();
-        let names: Vec<&str> = r.refs.iter().map(|r| r.name.as_str()).collect();
+        let names: Vec<&str> = r.names().collect();
         for n in [
             "os.system",
             "subprocess.run",
@@ -1276,7 +1452,7 @@ mod tests {
                 r.strs
             );
         }
-        assert!(r.refs.iter().any(|r| r.name == "h"));
+        assert!(r.names().any(|n| n == "h"));
     }
 
     #[test]
@@ -1387,5 +1563,27 @@ mod tests {
             class_of("exec(\"open('.cursor/hooks.json', 'w')\")"),
             "python-writes-hook"
         );
+    }
+
+    #[test]
+    fn a_write_out_of_the_tree_is_refused() {
+        for code in [
+            "open('/etc/x', 'w')",
+            "open('../x', 'w')",
+            "import os; open(os.path.expanduser('~/x'), 'w')",
+            "import shutil; shutil.rmtree('/home')",
+            "import os; os.chdir('/'); open('x', 'w')",
+            "from pathlib import Path; Path.home().joinpath('x').write_text('x')",
+        ] {
+            assert_eq!(class_of(code), "python-writes-outside", "{code}");
+        }
+        for code in [
+            "open('out.txt', 'w').write('x')",
+            "open('/tmp/x', 'w').write('x')",
+            "import os; os.makedirs('build/a', exist_ok=True)",
+            "print('/'.join(['a', 'b']))",
+        ] {
+            assert_eq!(refused_for(code), None, "{code}");
+        }
     }
 }
