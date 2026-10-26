@@ -20205,15 +20205,22 @@ hash -r 2> /dev/null
         out
     }
 
-    /// The policydpy1 review found programs the reader allowed, and
-    /// listed them as items 3 to 118. Each is refused in every shape
-    /// the hook sends.
+    /// The two policydpy1 reviews found programs the reader allowed: one
+    /// listed them as items 3 to 118, the other named their classes.
+    /// Each is refused in every shape the hook sends.
     #[test]
     fn programs_the_policydpy1_reviews_ran_are_refused() {
         let root = review_tree("policydpy2-risky");
-        let text = include_str!("../tests/fixtures/policydpy2/items.tsv");
-        assert_eq!(policydpy2_set(text).len(), 116);
-        assert_eq!(policydpy2_allowed(text, &root), Vec::<String>::new());
+        for (text, rows) in [
+            (include_str!("../tests/fixtures/policydpy2/items.tsv"), 116),
+            (
+                include_str!("../tests/fixtures/policydpy2/classes.tsv"),
+                417,
+            ),
+        ] {
+            assert_eq!(policydpy2_set(text).len(), rows);
+            assert_eq!(policydpy2_allowed(text, &root), Vec::<String>::new());
+        }
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
