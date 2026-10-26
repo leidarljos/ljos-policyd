@@ -383,6 +383,94 @@ fn literal(a: &[Tok]) -> Option<String> {
     (!want).then_some(out)
 }
 
+/// The constant string an expression spells, folding the ways a
+/// program hides one: `+`, `.join` and `.format` of constants, a
+/// `[::-1]` reversal and a name assigned a constant. `None` when a
+/// piece is not constant, or is not folded the way python folds it.
+fn fold(a: &[Tok], values: &HashMap<String, Vec<Tok>>) -> Option<String> {
+    fold_depth(a, values, 0)
+}
+
+fn fold_depth(a: &[Tok], values: &HashMap<String, Vec<Tok>>, depth: usize) -> Option<String> {
+    if depth > DEPTH || a.is_empty() {
+        return None;
+    }
+    if let Some(s) = literal(a) {
+        return Some(s);
+    }
+    let fold = |t: &[Tok]| fold_depth(t, values, depth + 1);
+    // `x + y` folds each side. A `+` inside brackets, or a sign after
+    // another operator, is not where the sum splits.
+    let mut nest = 0usize;
+    for i in 0..a.len() {
+        match &a[i] {
+            Tok::Mark('(' | '[' | '{') => nest += 1,
+            Tok::Mark(')' | ']' | '}') => nest = nest.saturating_sub(1),
+            Tok::Mark('+')
+                if nest == 0
+                    && i > 0
+                    && !matches!(a[i - 1], Tok::Mark('+' | '-' | '*' | '/' | '%' | '=')) =>
+            {
+                return Some(fold(&a[..i])? + &fold(&a[i + 1..])?);
+            }
+            // Any other operator, or a keyword, makes a value the reader
+            // does not work out.
+            Tok::Mark(c) if nest == 0 && *c != '.' => return None,
+            Tok::Name(_) if nest == 0 && keyword(&a[i]) => return None,
+            _ => {}
+        }
+    }
+    let n = a.len();
+    if n > 6 && reversal(&a[n - 6..]) && a[n - 2] == Tok::Num("1".into()) {
+        return Some(fold(&a[..n - 6])?.chars().rev().collect());
+    }
+    match a {
+        [Tok::Name(v)] => return values.get(v).and_then(|t| fold(t)),
+        [Tok::Mark('('), inner @ .., Tok::Mark(')')] if close(a, 0) + 1 == n => {
+            return fold(inner);
+        }
+        _ => {}
+    }
+    let (recv, method, open) = split_call(a)?;
+    let args = call_args(a, open);
+    match method {
+        "join" if args.len() == 1 => {
+            let sep = fold(recv)?;
+            let parts = match list_items(&args[0]) {
+                Some(items) => items.iter().map(|p| fold(p)).collect::<Option<Vec<_>>>()?,
+                None => fold(&args[0])?.chars().map(String::from).collect(),
+            };
+            Some(parts.join(&sep))
+        }
+        "format" => {
+            let fmt = fold(recv)?;
+            let parts = args.iter().map(|p| fold(p)).collect::<Option<Vec<_>>>()?;
+            let mut it = parts.iter();
+            let mut out = String::new();
+            let mut chars = fmt.chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    '{' if chars.next_if_eq(&'{').is_some() => out.push('{'),
+                    '}' if chars.next_if_eq(&'}').is_some() => out.push('}'),
+                    // Only `{}` takes the next argument as it is.
+                    '{' if chars.next_if_eq(&'}').is_some() => out.push_str(it.next()?),
+                    '{' | '}' => return None,
+                    _ => out.push(c),
+                }
+            }
+            it.next().is_none().then_some(out)
+        }
+        _ => None,
+    }
+}
+
+fn keyword(t: &Tok) -> bool {
+    matches!(t, Tok::Name(n) if matches!(
+        n.as_str(),
+        "if" | "else" | "and" | "or" | "for" | "in" | "is" | "not" | "lambda" | "await"
+    ))
+}
+
 /// Whether `t` starts with a `[::-N]` slice.
 fn reversal(t: &[Tok]) -> bool {
     matches!(
@@ -397,6 +485,48 @@ fn reversal(t: &[Tok]) -> bool {
             ..
         ]
     )
+}
+
+/// The receiver, the method name and where its `(` is, for a `RECV.m(`
+/// whose call runs to the end of `a`.
+fn split_call(a: &[Tok]) -> Option<(&[Tok], &str, usize)> {
+    let last = a.len().checked_sub(1)?;
+    if a[last] != Tok::Mark(')') {
+        return None;
+    }
+    let mut nest = 0usize;
+    let mut i = last;
+    loop {
+        match &a[i] {
+            Tok::Mark(')' | ']' | '}') => nest += 1,
+            Tok::Mark('(' | '[' | '{') => {
+                nest -= 1;
+                if nest == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i = i.checked_sub(1)?;
+    }
+    let (Tok::Name(m), Tok::Mark('.')) = (a.get(i.checked_sub(1)?)?, a.get(i.checked_sub(2)?)?)
+    else {
+        return None;
+    };
+    Some((&a[..i - 2], m.as_str(), i))
+}
+
+/// The items of a `[...]` or `(...)` list of expressions.
+fn list_items(a: &[Tok]) -> Option<Vec<Vec<Tok>>> {
+    match (a.first(), a.last()) {
+        (Some(Tok::Mark('[')), Some(Tok::Mark(']')))
+        | (Some(Tok::Mark('(')), Some(Tok::Mark(')')))
+            if close(a, 0) + 1 == a.len() =>
+        {
+            Some(call_args(a, 0))
+        }
+        _ => None,
+    }
 }
 
 /// The words of a list or tuple made only of string literals, or of a
@@ -416,6 +546,18 @@ fn literal_words(a: &[Tok]) -> Option<Vec<String>> {
         .split(|t| *t == Tok::Mark(','))
         .filter(|p| !p.is_empty())
         .map(literal)
+        .collect::<Option<Vec<_>>>()?;
+    (!words.is_empty()).then_some(words)
+}
+
+/// The words of a list or tuple of constant strings.
+fn words(a: &[Tok], r: &Read) -> Option<Vec<String>> {
+    if let Some(w) = literal_words(a) {
+        return Some(w);
+    }
+    let words = list_items(a)?
+        .iter()
+        .map(|w| r.text(w))
         .collect::<Option<Vec<_>>>()?;
     (!words.is_empty()).then_some(words)
 }
@@ -523,6 +665,11 @@ impl Read {
             .iter()
             .map(|a| a.name.as_str())
             .find(|a| set.contains(a))
+    }
+
+    /// The constant string the argument spells.
+    fn text(&self, a: &[Tok]) -> Option<String> {
+        fold(a, &self.values)
     }
 
     /// The argument's tokens, or the literal a name in it was given.
@@ -687,11 +834,23 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
             .filter(|t| matches!(t, Tok::Name(n) if n == v))
             .count()
     };
-    for (stmt, _) in statements(&toks) {
-        if let [Tok::Name(v), Tok::Mark('='), rest @ ..] = stmt {
-            let shown = literal(rest).is_some() || literal_words(rest).is_some();
-            if shown && rest.first() != Some(&Tok::Mark('=')) && uses(v) == 2 {
+    for _ in 0..2 {
+        for (stmt, _) in statements(&toks) {
+            let (v, rest) = match stmt {
+                [Tok::Name(v), Tok::Mark('='), rest @ ..]
+                    if rest.first() != Some(&Tok::Mark('=')) =>
+                {
+                    (v, rest)
+                }
+                _ => continue,
+            };
+            let folded = fold(rest, &out.values);
+            let shown = folded.is_some() || literal_words(rest).is_some();
+            if shown && uses(v) == 2 {
                 out.values.insert(v.clone(), rest.to_vec());
+            }
+            if let Some(s) = folded.filter(|_| literal(rest).is_none()) {
+                out.strs.push(s);
             }
         }
     }
@@ -725,6 +884,22 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                 let called = toks.get(next) == Some(&Tok::Mark('('));
                 let args = called.then(|| call_args(&toks, next));
                 let after = if called { close(&toks, next) + 1 } else { next };
+                let subscript = toks.get(next) == Some(&Tok::Mark('['));
+                if called || subscript {
+                    for a in call_args(&toks, next) {
+                        let a = match a.as_slice() {
+                            [Tok::Name(_), Tok::Mark('='), v @ ..]
+                                if v.first() != Some(&Tok::Mark('=')) =>
+                            {
+                                v
+                            }
+                            a => a,
+                        };
+                        if let Some(s) = fold(a, &out.values).filter(|_| literal(a).is_none()) {
+                            out.strs.push(s);
+                        }
+                    }
+                }
                 for h in heads(n, &binds, &stars) {
                     let name = bare(format!("{h}{tail}"));
                     if let Some(path) = args
@@ -1277,7 +1452,7 @@ const WRITERS: &[&str] = &[
 fn mode_writes(mode: Option<&[Tok]>, r: &Read) -> bool {
     match mode {
         None => false,
-        Some(m) => literal(r.value(m)).is_none_or(|m| m.contains(['w', 'a', 'x', '+'])),
+        Some(m) => r.text(m).is_none_or(|m| m.contains(['w', 'a', 'x', '+'])),
     }
 }
 
@@ -1416,13 +1591,13 @@ fn commands(r: &Read) -> impl Iterator<Item = Result<String, String>> + '_ {
         let shown = if exec {
             args.iter()
                 .take_while(|a| !keyed(a))
-                .map(|a| literal(r.value(a)))
+                .map(|a| r.text(a))
                 .collect::<Option<Vec<_>>>()
                 .map(|w| quoted(&w))
         } else {
             a.and_then(|a| {
-                literal(a)
-                    .or_else(|| literal_words(a).map(|w| quoted(&w)))
+                r.text(a)
+                    .or_else(|| words(a, r).map(|w| quoted(&w)))
                     .or_else(|| shlex_split(a))
             })
         };
@@ -1646,7 +1821,7 @@ fn runs_written(r: &Read) -> Option<Refusal> {
         for c in r.calls(&[call]) {
             let args = c.args.as_deref().unwrap_or_default();
             if mode_writes(arg(args, *pos, "mode"), r) {
-                written.extend(arg(args, 0, "file").and_then(|a| literal(r.value(a))));
+                written.extend(arg(args, 0, "file").and_then(|a| r.text(a)));
             }
         }
     }
@@ -2640,5 +2815,42 @@ mod tests {
         }
         let c = class_of("import _posixsubprocess as p; p.fork_exec(['sh'])");
         assert!(c.starts_with("python-runs-unshown-"), "{c}");
+    }
+
+    #[test]
+    fn a_string_built_from_constants_is_read_as_that_string() {
+        for (code, class) in [
+            (
+                "print(open(''.join(['~/.s', 'sh/id_ed', '25519'])).read())",
+                "python-reads-credential",
+            ),
+            (
+                "print(open('asr_di/hss.~'[::-1]).read())",
+                "python-reads-credential",
+            ),
+            (
+                "p = '{}/{}'.format('.git', 'hooks/pre-push'); open(p, 'w').write('x')",
+                "python-writes-hook",
+            ),
+            (
+                "from pathlib import Path; Path(''.join(['.git/hook', 's/pre-push'])).write_text('x')",
+                "python-writes-hook",
+            ),
+        ] {
+            assert_eq!(class_of(code), class, "{code}");
+        }
+        assert_eq!(
+            shell_commands("import os; os.system('/ fr- mr'[::-1])"),
+            ["rm -rf /"]
+        );
+        // Code is read only from a literal.
+        let c = class_of("exec(''.join(['print', '(1)']))");
+        assert!(c.starts_with("python-runs-unshown-"), "{c}");
+        for code in [
+            "print(''.join(['a', 'b']))",
+            "print('{}-{}'.format('a', 'b'))",
+        ] {
+            assert_eq!(refused_for(code), None, "{code}");
+        }
     }
 }
