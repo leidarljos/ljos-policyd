@@ -455,6 +455,15 @@ fn import_at(stmt: &[Tok]) -> Option<usize> {
         .position(|t| matches!(t, Tok::Name(n) if n == "import"))
 }
 
+/// Calls that hand back the module or attribute their literal arguments
+/// name: `__import__("os")`, `getattr(os, "system")`.
+const NAMING_CALLS: &[&str] = &[
+    "__import__",
+    "importlib.import_module",
+    "importlib.__import__",
+    "getattr",
+];
+
 impl Read {
     fn calls<'a>(&'a self, set: &'a [&str]) -> impl Iterator<Item = &'a Ref> + 'a {
         self.refs
@@ -593,6 +602,13 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                     {
                         out.strs.push(path.0);
                     }
+                    if NAMING_CALLS.contains(&name.as_str()) {
+                        if let Some(r) =
+                            named_by(&name, args.as_deref(), &toks, next, &binds, &stars)
+                        {
+                            out.refs.push(r);
+                        }
+                    }
                     out.refs.push(Ref {
                         name,
                         args: args.clone(),
@@ -656,6 +672,71 @@ fn joined_path(args: &[Vec<Tok>], toks: &[Tok], after: usize) -> Option<(String,
         }
     }
     (!parts.is_empty()).then(|| (parts.join("/"), at))
+}
+
+/// The name a call in [`NAMING_CALLS`] hands back, with what follows it
+/// on the line: `__import__("os").system(x)` reaches `os.system`.
+fn named_by(
+    call: &str,
+    args: Option<&[Vec<Tok>]>,
+    toks: &[Tok],
+    open: usize,
+    binds: &HashMap<String, Vec<String>>,
+    stars: &[String],
+) -> Option<Ref> {
+    let args = args?;
+    let base = if call == "getattr" {
+        let first = args.first()?;
+        let (obj, end) = match first.as_slice() {
+            [Tok::Name(_), ..] => dotted(first, 0),
+            _ => return None,
+        };
+        // `getattr(__import__("os"), "system")` is `os.system`.
+        let module = (end < first.len() && first.get(end) == Some(&Tok::Mark('(')))
+            .then(|| {
+                let importer = heads(&obj, binds, stars).into_iter().map(bare).any(|h| {
+                    matches!(
+                        h.as_str(),
+                        "__import__" | "importlib.import_module" | "importlib.__import__"
+                    )
+                });
+                let inner = call_args(first, end);
+                (importer && close(first, end) + 1 == first.len())
+                    .then(|| literal(inner.first()?))
+                    .flatten()
+            })
+            .flatten();
+        let attr = literal(args.get(1)?)?;
+        if let Some(m) = module {
+            format!("{m}.{attr}")
+        } else if end < first.len() {
+            return None;
+        } else {
+            let (h, tail) = obj.split_once('.').unwrap_or((obj.as_str(), ""));
+            let head = heads(h, binds, stars).into_iter().next()?;
+            let tail = if tail.is_empty() {
+                String::new()
+            } else {
+                format!(".{tail}")
+            };
+            format!("{head}{tail}.{attr}")
+        }
+    } else {
+        literal(args.first()?)?
+    };
+    let after = close(toks, open) + 1;
+    let (chain, next) = if toks.get(after) == Some(&Tok::Mark('.')) {
+        let (c, n) = dotted(toks, after + 1);
+        (format!("{base}.{c}"), n)
+    } else {
+        (base, after)
+    };
+    let called = toks.get(next) == Some(&Tok::Mark('('));
+    let args = called.then(|| call_args(toks, next));
+    Some(Ref {
+        name: bare(chain),
+        args,
+    })
 }
 
 /// A coding line in the first two lines that names a codec other than
@@ -1138,13 +1219,21 @@ mod tests {
         let mut r = Read::default();
         read(
             "import os as o\nfrom subprocess import run as go\nfrom shutil import *\n\
-             o.system('x'); go(['a']); rmtree('d'); f = o.popen; f('y')",
+             o.system('x'); go(['a']); rmtree('d'); f = o.popen; f('y')\n\
+             getattr(o, 'remove')('z'); __import__('socket').socket()",
             0,
             &mut r,
         )
         .unwrap();
         let names: Vec<&str> = r.refs.iter().map(|r| r.name.as_str()).collect();
-        for n in ["os.system", "subprocess.run", "shutil.rmtree", "os.popen"] {
+        for n in [
+            "os.system",
+            "subprocess.run",
+            "shutil.rmtree",
+            "os.popen",
+            "os.remove",
+            "socket.socket",
+        ] {
             assert!(names.contains(&n), "{n} not in {names:?}");
         }
     }
