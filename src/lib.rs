@@ -20140,6 +20140,83 @@ hash -r 2> /dev/null
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
+    /// The rows of a policydpy2 set: a program, `P`, or a shell line,
+    /// `S`, with its number in the review.
+    fn policydpy2_set(text: &str) -> Vec<(bool, String, String)> {
+        let unescape = |s: &str| {
+            let mut out = String::new();
+            let mut chars = s.chars();
+            while let Some(c) = chars.next() {
+                out.push(match (c, c == '\\') {
+                    (_, false) => c,
+                    (_, true) => match chars.next() {
+                        Some('n') => '\n',
+                        Some('t') => '\t',
+                        Some('r') => '\r',
+                        Some('\\') => '\\',
+                        c => panic!("bad escape {c:?} in {s}"),
+                    },
+                });
+            }
+            out
+        };
+        text.lines()
+            .map(|record| {
+                let mut f = record.splitn(3, '\t');
+                let kind = f.next().unwrap();
+                let n = f.next().unwrap().to_string();
+                let body = unescape(f.next().unwrap());
+                match kind {
+                    "P" => (true, n, body),
+                    "S" => (false, n, body),
+                    _ => panic!("bad record {record}"),
+                }
+            })
+            .collect()
+    }
+
+    /// How the hook sends a program: `python3 -c`, that line under
+    /// `bash -c`, and the file `printf` writes for python to run.
+    fn policydpy2_shapes(program: &str, is_program: bool) -> Vec<Vec<String>> {
+        let bash = |line: String| vec!["bash".to_string(), "-c".to_string(), line];
+        if !is_program {
+            return vec![bash(program.to_string())];
+        }
+        let q = format!("'{}'", program.replace('\'', "'\\''"));
+        vec![
+            vec!["python3".into(), "-c".into(), program.into()],
+            bash(format!("python3 -c {q}")),
+            bash(format!(
+                "printf {q} > ljos-stdin.py && python3 ljos-stdin.py"
+            )),
+        ]
+    }
+
+    /// Each row and shape of a set policyd allows, as `row/shape`.
+    fn policydpy2_allowed(text: &str, root: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        for (is_program, n, body) in policydpy2_set(text) {
+            for (shape, argv) in policydpy2_shapes(&body, is_program).iter().enumerate() {
+                if check_shell_in(argv, root, 0).decision == Decision::Allow {
+                    out.push(format!("{n}/{shape}"));
+                }
+            }
+        }
+        out
+    }
+
+    /// The policydpy1 review found programs the reader allowed, and
+    /// listed them as items 3 to 118. Each is refused in every shape
+    /// the hook sends.
+    #[test]
+    fn programs_the_policydpy1_reviews_ran_are_refused() {
+        let root = review_tree("policydpy2-risky");
+        let text = include_str!("../tests/fixtures/policydpy2/items.tsv");
+        assert_eq!(policydpy2_set(text).len(), 116);
+        assert_eq!(policydpy2_allowed(text, &root), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
     #[test]
     fn a_write_to_a_path_not_shown_says_which_word() {
         let root = startup_root("unshownw");
