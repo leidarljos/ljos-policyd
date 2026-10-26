@@ -251,6 +251,8 @@ struct Read {
     refs: Vec<Ref>,
     attrs: Vec<Ref>,
     strs: Vec<String>,
+    /// Names assigned one literal and then read once, with the literal.
+    values: HashMap<String, Vec<Tok>>,
 }
 
 /// The dotted name from `toks[i]`, and where it ends.
@@ -472,6 +474,14 @@ impl Read {
             .map(|a| a.name.as_str())
             .find(|a| set.contains(a))
     }
+
+    /// The argument's tokens, or the literal a name in it was given.
+    fn value<'a>(&'a self, a: &'a [Tok]) -> &'a [Tok] {
+        match a {
+            [Tok::Name(v)] => self.values.get(v).map_or(a, Vec::as_slice),
+            _ => a,
+        }
+    }
 }
 
 fn matches(name: &str, set: &[&str]) -> bool {
@@ -479,8 +489,8 @@ fn matches(name: &str, set: &[&str]) -> bool {
         .any(|s| *s == name || (s.ends_with('.') && name.starts_with(s)))
 }
 
-/// The name `head` stands for: what an import bound it to, else
-/// itself and each `from M import *` spelling of it.
+/// The name `head` stands for: what an import or an assignment bound
+/// it to, else itself and each `from M import *` spelling of it.
 fn heads(head: &str, binds: &HashMap<String, Vec<String>>, stars: &[String]) -> Vec<String> {
     match binds.get(head) {
         Some(t) => t.clone(),
@@ -508,12 +518,45 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
     let chars: Vec<char> = code.chars().collect();
     let mut toks = Vec::new();
     lex(&chars, 0, &mut toks)?;
-    let (binds, stars) = bindings(&toks);
+    let (mut binds, stars) = bindings(&toks);
     // The words of an import name modules, not calls of them.
     let mut skip = vec![false; toks.len()];
     for (stmt, at) in statements(&toks) {
         if import_at(stmt).is_some() {
             skip[at..at + stmt.len()].fill(true);
+        }
+    }
+    // `run = os.system` makes `run` that name. Twice, so a name bound
+    // to another bound name is followed. The right side is that name
+    // where `run` is used, not a use of its own.
+    for _ in 0..2 {
+        for (stmt, at) in statements(&toks) {
+            if let [Tok::Name(v), Tok::Mark('='), Tok::Name(h), rest @ ..] = stmt {
+                let (chain, end) = dotted(stmt, 2);
+                if end != stmt.len() || rest.first() == Some(&Tok::Mark('=')) {
+                    continue;
+                }
+                let tail = chain.strip_prefix(h.as_str()).unwrap_or_default();
+                let to: Vec<String> = heads(h, &binds, &stars)
+                    .into_iter()
+                    .map(|b| bare(format!("{b}{tail}")))
+                    .collect();
+                binds.insert(v.clone(), to);
+                skip[at + 2..at + stmt.len()].fill(true);
+            }
+        }
+    }
+    let uses = |v: &str| {
+        toks.iter()
+            .filter(|t| matches!(t, Tok::Name(n) if n == v))
+            .count()
+    };
+    for (stmt, _) in statements(&toks) {
+        if let [Tok::Name(v), Tok::Mark('='), rest @ ..] = stmt {
+            let shown = literal(rest).is_some() || literal_words(rest).is_some();
+            if shown && rest.first() != Some(&Tok::Mark('=')) && uses(v) == 2 {
+                out.values.insert(v.clone(), rest.to_vec());
+            }
         }
     }
     for (i, t) in toks.iter().enumerate() {
@@ -919,10 +962,10 @@ const WRITERS: &[&str] = &[
     "truncate", "sed", "perl", "git", "tar", "unzip",
 ];
 
-fn mode_writes(mode: Option<&[Tok]>) -> bool {
+fn mode_writes(mode: Option<&[Tok]>, r: &Read) -> bool {
     match mode {
         None => false,
-        Some(m) => literal(m).is_none_or(|m| m.contains(['w', 'a', 'x', '+'])),
+        Some(m) => literal(r.value(m)).is_none_or(|m| m.contains(['w', 'a', 'x', '+'])),
     }
 }
 
@@ -938,7 +981,7 @@ fn writes(r: &Read) -> Option<String> {
         for c in r.calls(&[call]) {
             let args = c.args.as_deref().unwrap_or_default();
             let mode = arg(args, *pos, "mode");
-            if mode_writes(mode) || args.iter().any(|a| a.first() == Some(&Tok::Mark('*'))) {
+            if mode_writes(mode, r) || args.iter().any(|a| a.first() == Some(&Tok::Mark('*'))) {
                 return Some(c.name.clone());
             }
         }
@@ -1028,11 +1071,11 @@ fn commands(r: &Read) -> impl Iterator<Item = Result<String, String>> + '_ {
             return Some(Err(c.name.clone()));
         };
         let exec = c.name == "asyncio.create_subprocess_exec";
-        let a = arg(args, 0, kw);
+        let a = arg(args, 0, kw).map(|a| r.value(a));
         let shown = if exec {
             args.iter()
                 .take_while(|a| !keyed(a))
-                .map(|a| literal(a))
+                .map(|a| literal(r.value(a)))
                 .collect::<Option<Vec<_>>>()
                 .map(|w| quoted(&w))
         } else {
@@ -1095,13 +1138,13 @@ mod tests {
         let mut r = Read::default();
         read(
             "import os as o\nfrom subprocess import run as go\nfrom shutil import *\n\
-             o.system('x'); go(['a']); rmtree('d')",
+             o.system('x'); go(['a']); rmtree('d'); f = o.popen; f('y')",
             0,
             &mut r,
         )
         .unwrap();
         let names: Vec<&str> = r.refs.iter().map(|r| r.name.as_str()).collect();
-        for n in ["os.system", "subprocess.run", "shutil.rmtree"] {
+        for n in ["os.system", "subprocess.run", "shutil.rmtree", "os.popen"] {
             assert!(names.contains(&n), "{n} not in {names:?}");
         }
     }
@@ -1157,7 +1200,7 @@ mod tests {
             "import os; print(os.environ['GITHUB_TOKEN'])",
             "import os; print(os.getenv('AWS_SECRET_ACCESS_KEY'))",
             "print(open('/proc/self/environ').read())",
-            "print(open('~/.config/gh/' + 'hosts.yml').read())",
+            "p = '~/.config/gh/' + 'hosts.yml'; print(open(p).read())",
             "print(open('\\x2fhome/u/\\x2essh/id_rsa').read())",
         ] {
             let t = refused_for(code).unwrap_or_default();
@@ -1211,5 +1254,19 @@ mod tests {
             assert_eq!(class_of(code), "python-writes-hook", "{code}");
         }
         assert_eq!(refused_for("import os; os.system('cat .git/config')"), None);
+    }
+
+    #[test]
+    fn a_name_given_a_literal_or_a_call_is_what_it_was_given() {
+        for code in [
+            "m = 'w'; open('.cursor/hooks.json', m).write('{}')",
+            "import os; run = os.makedirs; run('.git/hooks')",
+        ] {
+            assert_eq!(class_of(code), "python-writes-hook", "{code}");
+        }
+        assert_eq!(
+            refused_for("m = 'r'; print(open('.git/config', m).read())"),
+            None
+        );
     }
 }
