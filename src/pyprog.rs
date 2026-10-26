@@ -233,11 +233,86 @@ fn escape(src: &[char], i: usize, text: &mut String) -> Option<usize> {
     Some(next)
 }
 
-/// What the program shows: every string, with each run of joined
-/// literals also whole.
+/// A dotted name the program reaches, with the arguments when it is
+/// called there.
+#[derive(Clone)]
+struct Ref {
+    name: String,
+    args: Option<Vec<Vec<Tok>>>,
+}
+
+/// What the program shows: the names it reaches, and every string,
+/// with each run of joined literals also whole.
 #[derive(Default)]
 struct Read {
+    refs: Vec<Ref>,
     strs: Vec<String>,
+}
+
+/// The dotted name from `toks[i]`, and where it ends.
+fn dotted(toks: &[Tok], mut i: usize) -> (String, usize) {
+    let mut out = String::new();
+    let mut want = true;
+    while let Some(t) = toks.get(i) {
+        match t {
+            Tok::Name(n) if want => {
+                out.push_str(n);
+                want = false;
+            }
+            Tok::Mark('.') if !want => {
+                out.push('.');
+                want = true;
+            }
+            _ => break,
+        }
+        i += 1;
+    }
+    if want && out.ends_with('.') {
+        out.pop();
+        i -= 1;
+    }
+    (out, i)
+}
+
+/// Where the bracket opened at `toks[open]` closes.
+fn close(toks: &[Tok], open: usize) -> usize {
+    let mut nest = 0usize;
+    for (i, t) in toks.iter().enumerate().skip(open) {
+        match t {
+            Tok::Mark('(' | '[' | '{') => nest += 1,
+            Tok::Mark(')' | ']' | '}') => {
+                nest -= 1;
+                if nest == 0 {
+                    return i;
+                }
+            }
+            _ => {}
+        }
+    }
+    toks.len()
+}
+
+/// The arguments of the call whose `(` is at `toks[open]`.
+fn call_args(toks: &[Tok], open: usize) -> Vec<Vec<Tok>> {
+    let end = close(toks, open);
+    let mut args = vec![Vec::new()];
+    let mut nest = 0usize;
+    for t in toks.get(open + 1..end).unwrap_or_default() {
+        match t {
+            Tok::Mark('(' | '[' | '{') => nest += 1,
+            Tok::Mark(')' | ']' | '}') => nest = nest.saturating_sub(1),
+            Tok::Mark(',') if nest == 0 => {
+                args.push(Vec::new());
+                continue;
+            }
+            _ => {}
+        }
+        args.last_mut().expect("one argument").push(t.clone());
+    }
+    if args.last().is_some_and(Vec::is_empty) {
+        args.pop();
+    }
+    args
 }
 
 /// The text of an argument made only of string literals, joined as
@@ -258,6 +333,19 @@ fn literal(a: &[Tok]) -> Option<String> {
     (!want).then_some(out)
 }
 
+impl Read {
+    fn calls<'a>(&'a self, set: &'a [&str]) -> impl Iterator<Item = &'a Ref> + 'a {
+        self.refs
+            .iter()
+            .filter(move |r| r.args.is_some() && matches(&r.name, set))
+    }
+}
+
+fn matches(name: &str, set: &[&str]) -> bool {
+    set.iter()
+        .any(|s| *s == name || (s.ends_with('.') && name.starts_with(s)))
+}
+
 /// Read `code` into `out`. `None` when python would read it in a way
 /// the reader does not follow.
 fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
@@ -268,13 +356,22 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
     let mut toks = Vec::new();
     lex(&chars, 0, &mut toks)?;
     for (i, t) in toks.iter().enumerate() {
-        if let Tok::Str(s) = t {
-            out.strs.push(s.clone());
-            if let Some(whole) = literal_run(&toks[i..]) {
-                if whole != *s {
-                    out.strs.push(whole);
+        match t {
+            Tok::Str(s) => {
+                out.strs.push(s.clone());
+                if let Some(whole) = literal_run(&toks[i..]) {
+                    if whole != *s {
+                        out.strs.push(whole);
+                    }
                 }
             }
+            Tok::Name(_) => {
+                let (name, next) = dotted(&toks, i);
+                let called = toks.get(next) == Some(&Tok::Mark('('));
+                let args = called.then(|| call_args(&toks, next));
+                out.refs.push(Ref { name, args });
+            }
+            _ => {}
         }
     }
     Some(())
@@ -358,7 +455,7 @@ pub(crate) fn refusal(code: &str) -> Option<Refusal> {
     if read(code, 0, &mut r).is_none() {
         return refused(PolicyReason::ShellDangerousRunner, "unread", "");
     }
-    credential(&r)
+    credential(&r).or_else(|| hook_write(&r))
 }
 
 /// Paths and parts of paths that hold a login, a key or a token.
@@ -433,6 +530,120 @@ fn credential(r: &Read) -> Option<Refusal> {
     refused(PolicyReason::PathSensitiveDeny, "reads-credential", s)
 }
 
+/// Files a tool runs or loads on its own: editor and runner hooks, git
+/// hooks and config, shell startup files, python startup modules.
+const HOOK_PARTS: &[&str] = &[
+    ".cursor",
+    ".claude",
+    ".codex",
+    ".husky",
+    "hooks.json",
+    ".envrc",
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".bash_logout",
+    ".profile",
+    ".zshrc",
+    ".zprofile",
+    ".zshenv",
+    ".zlogin",
+    ".zlogout",
+    ".cshrc",
+    ".tcshrc",
+    ".kshrc",
+    ".pythonrc",
+    ".pythonrc.py",
+    ".gitconfig",
+];
+const HOOK_PATHS: &[&str] = &[
+    ".git/hooks",
+    ".git/config",
+    "core.hookspath",
+    ".config/ljos",
+    ".local/state/ljos",
+    ".config/git/",
+    ".config/fish/",
+    ".config/autostart",
+    ".config/systemd",
+    ".config/environment.d",
+];
+
+fn names_hook(s: &str) -> bool {
+    let low = s.to_ascii_lowercase().replace('\\', "/");
+    let parts: Vec<&str> = low.split('/').collect();
+    parts.iter().any(|p| {
+        HOOK_PARTS.contains(p)
+            || p.ends_with(".pth")
+            || p.starts_with("sitecustomize")
+            || p.starts_with("usercustomize")
+    }) || HOOK_PATHS.iter().any(|h| low.contains(h))
+        || low.ends_with(".git/config")
+}
+
+/// A program that may write files and names a hook or startup file.
+fn hook_write(r: &Read) -> Option<Refusal> {
+    writes(r)?;
+    let s = r.strs.iter().find(|s| names_hook(s))?;
+    refused(PolicyReason::PathSensitiveDeny, "writes-hook", s)
+}
+
+/// Calls that may make, change or remove a file whatever their mode.
+const WRITE_CALLS: &[&str] = &[
+    "os.remove",
+    "os.unlink",
+    "os.rename",
+    "os.renames",
+    "os.replace",
+    "os.rmdir",
+    "os.removedirs",
+    "os.mkdir",
+    "os.makedirs",
+    "os.symlink",
+    "os.link",
+    "os.chmod",
+    "os.lchmod",
+    "os.chown",
+    "os.lchown",
+    "os.chflags",
+    "os.truncate",
+    "os.utime",
+    "os.mkfifo",
+    "os.mknod",
+    "os.setxattr",
+    "os.removexattr",
+    "shutil.",
+    "sqlite3.connect",
+    "logging.FileHandler",
+    "logging.handlers.",
+    "py_compile.",
+    "compileall.",
+    "zipapp.",
+    "venv.",
+    "dbm.",
+    "shelve.",
+    "urllib.request.urlretrieve",
+];
+const READ_ONLY_SHUTIL: &[&str] = &[
+    "shutil.which",
+    "shutil.get_terminal_size",
+    "shutil.disk_usage",
+    "shutil.copyfileobj",
+    "shutil.get_archive_formats",
+    "shutil.get_unpack_formats",
+];
+
+/// The first call or method that may write a file, by its name.
+fn writes(r: &Read) -> Option<String> {
+    if let Some(c) = r
+        .calls(WRITE_CALLS)
+        .find(|c| !READ_ONLY_SHUTIL.contains(&c.name.as_str()))
+    {
+        return Some(c.name.clone());
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +668,7 @@ mod tests {
                 r.strs
             );
         }
+        assert!(r.refs.iter().any(|r| r.name == "h"));
     }
 
     #[test]
@@ -502,6 +714,28 @@ mod tests {
             "import os; print(os.environ.get('HOME'))",
             "import os; print(os.environ['GIT_AUTHOR_NAME'])",
             "print('tokens: 3')",
+        ] {
+            assert_eq!(refused_for(code), None, "{code}");
+        }
+    }
+
+    fn class_of(code: &str) -> String {
+        let t = refused_for(code).unwrap_or_else(|| panic!("{code}: allowed"));
+        t.split(':').next().unwrap_or_default().to_string()
+    }
+
+    #[test]
+    fn a_hook_write_is_refused() {
+        for code in [
+            "import os; os.makedirs('.git/hooks', exist_ok=True)",
+            "import shutil; shutil.copy('x', '.git/hooks/')",
+        ] {
+            assert_eq!(class_of(code), "python-writes-hook", "{code}");
+        }
+        for code in [
+            "print(open('.git/config').read())",
+            "from pathlib import Path; print(Path('.git', 'HEAD').read_text())",
+            "import os; os.listdir('.git/hooks')",
         ] {
             assert_eq!(refused_for(code), None, "{code}");
         }
