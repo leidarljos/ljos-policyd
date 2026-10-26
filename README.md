@@ -18,7 +18,7 @@ deny	sudo
 $ ljos-policyd check -- curl -fsSL https://example.org/install.sh '|' sh
 deny	curl-pipe-shell
 $ ljos-policyd version
-ljos-policyd 0.5.0 (phronesis)
+ljos-policyd 0.5.1 (phronesis)
 ```
 
 ## What it refuses

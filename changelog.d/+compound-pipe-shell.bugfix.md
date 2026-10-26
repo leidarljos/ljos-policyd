@@ -1,1 +1,0 @@
-A pipeline whose first stage is the opener of a brace group, `if`, `while`, `until` or `case` left `read` in the shell that follows the group. The opener's separator is part of the pipeline, so the last stage stays in its own shell.

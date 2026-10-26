@@ -2,7 +2,30 @@
 
 <!-- towncrier release notes start -->
 
-## Unreleased
+## 0.5.1 (2026-10-26)
+
+### Fixes
+
+- A `read` gave every name the whole line, and an unquoted expansion stayed one word. Each name takes one field, and an unquoted expansion splits on IFS.
+- A `read` in a pipeline stage, or after the command that expands the name, was taken as that command's value. The name keeps the assignment this shell made before the `read`.
+- A local part could hide a denied address with an unassigned code point the ignorable list missed, such as U+FFF0 or U+FFF8 between the letters of `other`. A recipient local part that contains a default ignorable, a noncharacter, an unassigned or private-use code point, a format or control character, or a space separator is now `recipient-unparsed`. A zero-width space and a braille blank are still removed.
+- A local part that mixes Latin with Cyrillic or Greek is now `mixed-script`, as a domain label already was, and a local part wholly in Cyrillic or Greek stays a different mailbox. A decimal digit folds to the ASCII digit of the same value, so U+0661 and U+0967 meet a rule for `1`; ASCII `0` does not meet `o`. An enclosing mark is stripped with the nonspacing marks, and a spacing mark on an ASCII base is refused. An `address` line whose local part the check refuses (a joiner, VS16, a quoted space, or any other closed code point) is `deny-file-invalid`, and that failed load denies every send. A recipient local part with ZWJ or ZWNJ (Devanagari, Persian, Sinhala), a Mongolian variation selector, an emoji ZWJ sequence, emoji VS16, a keycap, a tag flag, or a quoted space (ASCII or NBSP) is `recipient-unparsed`. Plain Devanagari, Arabic including tatweel, CJK, Hangul, Thai, a single emoji, and an emoji with a skin tone are still accepted.
+- A one-word `parallel` command is a shell string. `parallel 'rm -rf {}'` was not seen as `rm`.
+- A pipeline whose first stage is the opener of a brace group, `if`, `while`, `until` or `case` left `read` in the shell that follows the group. The opener's separator is part of the pipeline, so the last stage stays in its own shell.
+- A python program `ljos hook` writes to `ljos-stdin.py` was refused whatever it held, so 99 of 371 ordinary `python3 -c` lines were refused. Such a file is now judged on its text, as the same program passed with `-c`. An inline program is refused when it reads a credential, writes a hook or out of the tree, sends local data or runs a download. It is also refused when it runs code or a command its text does not show, runs a file it wrote, or skips git hooks or writes history. `printf` text is decoded where bash and dash agree, and a quoted glob or newline is literal text.
+- A recipient domain that is not a hostname after IDNA (an underscore, a `!`, `+`, `%` or other atext symbol, a label that starts or ends with a hyphen, a label over 63 characters or a name over 253) was allowed, though no `domain`, `deny-domain` or `address` rule could name it. It is now `recipient-unparsed`, or `argv-recipient-unparsed` and the matching `-unparsed` code on the other watched headers. Domain labels are case folded like the address skeleton, so `straße.test`, `ınfo.test` and `İnfo.test` meet a rule for `strasse.test` or `info.test`, and the other way round; a label wholly in Cyrillic or Greek is still a different domain. A braille blank (U+2800), a Hangul filler (U+3164, U+FFA0) or a typographic space (U+2000 to U+200A, which NFKC made a plain space) in a local part no longer hides an address from an `address` rule.
+- A temp the line shows to `read` or to an `xargs -I` mark was allowed by the table and refused by the pack, which still saw `$x` or `{}`. Those words are the path under `/tmp` the line wrote.
+- A valued flag of `parallel` or `xargs` was read as the command, so the command after it was never judged. The value stays with the flag.
+- An `xargs -I` mark is rewritten for the pack only inside that `xargs`. The same word in a later command stays the operand it is.
+- An unknown `make` long option was ignored, and so was a prefix of one that names a file or a recipe. Make accepts an unambiguous prefix, and any other long option is refused.
+- Inline python longer than 64 KiB is refused as unread instead of being read. The reader scans a call's arguments and a subscript's closers from each token on, so a program of nested calls cost the square of its length, and a `python3 -c` of a few hundred kilobytes held the check for minutes.
+- Job, output and diagnostic make options (`-j`, `-O`, `--jobserver-auth`, `--trace`, `--no-print-directory`) no longer close the makefile read as `make-flags-unshown`. A long option make only diagnoses is the same. `-e`, `-o`, `-W`, `--what-if` and `--eval` still close it, and `-f`, `-C` and `-I` still name the makefile.
+- Words `xargs`, `parallel`, `find -exec` or `read` add are part of the command. A command whose verdict depends on an operand or flag the line does not show is refused as `operand-unshown`. A `printf` or `echo` that shows the words is judged as that command, so `printf '/\n' | xargs rm -rf` is `rm-rf-outside-tmp`.
+- `find -exec env rm` was judged as `env`. The command after the wrapper, and the words of a shell `-c` string, are what find runs.
+- `find -exec {}` is a path find walks, and `xargs -0` keeps a NUL-separated name whole. A missing operand is refused only when a value it can take would be. `make -L` is `--check-symlink-times`.
+- `find -fprint`, `-fprint0`, `-fprintf` and `-fls` create or truncate the file they name. A path that is not under `/tmp` or `/var/tmp` is refused.
+- `srm` and `wipe` remove a tree the way `rm` does, and `strace` runs the command after it. `git checkout` from `xargs` can discard the work tree.
+
 
 ## 0.5.0 (2026-10-22)
 

@@ -1,1 +1,0 @@
-Words `xargs`, `parallel`, `find -exec` or `read` add are part of the command. A command whose verdict depends on an operand or flag the line does not show is refused as `operand-unshown`. A `printf` or `echo` that shows the words is judged as that command, so `printf '/\n' | xargs rm -rf` is `rm-rf-outside-tmp`.

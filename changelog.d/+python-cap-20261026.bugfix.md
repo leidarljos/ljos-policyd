@@ -1,1 +1,0 @@
-Inline python longer than 64 KiB is refused as unread instead of being read. The reader scans a call's arguments and a subscript's closers from each token on, so a program of nested calls cost the square of its length, and a `python3 -c` of a few hundred kilobytes held the check for minutes.
