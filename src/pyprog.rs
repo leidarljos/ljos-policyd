@@ -273,6 +273,8 @@ struct Read {
     opaque: HashSet<String>,
     /// Names called or looked up with such a string.
     unfolded: Vec<String>,
+    /// Names bound to `sys`, whose `executable` is a python.
+    sys: HashSet<String>,
 }
 
 /// The dotted name from `toks[i]`, and where it ends.
@@ -695,7 +697,14 @@ fn words(a: &[Tok], r: &Read) -> Option<Vec<String>> {
     }
     let words = list_items(a)?
         .iter()
-        .map(|w| r.text(w))
+        .map(|w| match w.as_slice() {
+            [Tok::Name(s), Tok::Mark('.'), Tok::Name(e)]
+                if e == "executable" && r.sys.contains(s) =>
+            {
+                Some("python3".to_string())
+            }
+            w => r.text(w),
+        })
         .collect::<Option<Vec<_>>>()?;
     (!words.is_empty()).then_some(words)
 }
@@ -937,6 +946,12 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
     lex(&chars, 0, &mut toks)?;
     let (mut binds, stars) = bindings(&toks);
     out.modules.extend(binds.keys().cloned());
+    out.sys.extend(
+        binds
+            .iter()
+            .filter(|(_, t)| t.iter().any(|t| t == "sys"))
+            .map(|(k, _)| k.clone()),
+    );
     let imported: HashSet<String> = binds.values().flatten().cloned().collect();
     // The words of an import name modules, not calls of them.
     let mut skip = vec![false; toks.len()];
@@ -3238,5 +3253,21 @@ mod tests {
             refused_for("import sys; print(\"\n\".join(sys.path))"),
             None
         );
+    }
+
+    #[test]
+    fn sys_executable_is_python() {
+        assert_eq!(
+            shell_commands(
+                "import subprocess, sys; subprocess.run([sys.executable, '-c', 'print(1)'])"
+            ),
+            ["python3 -c 'print(1)'"]
+        );
+        assert_eq!(
+            shell_commands("import subprocess as s, sys as y; s.run([y.executable, 'x.py'])"),
+            ["python3 x.py"]
+        );
+        let c = class_of("import subprocess; subprocess.run([executable, 'x.py'])");
+        assert!(c.starts_with("python-runs-unshown-"), "{c}");
     }
 }
