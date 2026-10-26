@@ -77,7 +77,31 @@ pub struct Checked {
 #[must_use]
 pub fn check_shell(argv: &[String]) -> Checked {
     let cwd = std::env::current_dir().unwrap_or_default();
+    SPELLED.with(|s| s.borrow_mut().clear());
     check_shell_in(argv, &cwd, 0)
+}
+
+thread_local! {
+    /// Each word [`shell_words`] made during a check that holds a glob,
+    /// `~`, `$`, a backtick or a newline, and whether the shell reads
+    /// every one of those as itself in every place the word was split
+    /// from. Glob and tilde characters need a quote, `$` and backtick a
+    /// single quote or a backslash.
+    static SPELLED: std::cell::RefCell<std::collections::HashMap<String, bool>> =
+        std::cell::RefCell::default();
+}
+
+/// The characters a shell may expand in an unquoted word.
+const EXPANDS: [char; 7] = ['$', '`', '*', '?', '[', '~', '\n'];
+
+fn spelled(w: &str, quoted: bool) {
+    if w.contains(EXPANDS) {
+        SPELLED.with(|s| {
+            let mut s = s.borrow_mut();
+            let all = s.entry(w.to_string()).or_insert(quoted);
+            *all &= quoted;
+        });
+    }
 }
 
 /// How many runner levels deep (`make a` whose recipe runs `npm run b`)
@@ -9467,9 +9491,10 @@ fn source_reads_unshown(argv: &[String]) -> bool {
     })
 }
 
-/// Text with no parameter, command substitution, glob or `~`.
+/// Text with no parameter, command substitution, glob or `~`, other
+/// than ones a quote kept as themselves everywhere the word was split.
 fn literal_text(s: &str) -> bool {
-    !s.contains(['$', '`', '*', '?', '[', '~', '\n'])
+    !s.contains(EXPANDS) || SPELLED.with(|m| m.borrow().get(s) == Some(&true))
 }
 
 /// The text `echo` writes, when every argument is literal. `-e` escapes
@@ -9940,6 +9965,8 @@ fn shell_words(script: &str) -> Vec<String> {
     // `"$x"` from `$x`. A quoted word with no `$` stays bare.
     let mut dq_at: Option<usize> = None;
     let mut dq_dollar = false;
+    // The word has a character the shell may expand where it stands.
+    let mut bare = false;
     let mut i = 0;
     // Here-documents opened on the command just finished, read from the
     // next line. A body is not the script that follows it: a quote in
@@ -9956,6 +9983,7 @@ fn shell_words(script: &str) -> Vec<String> {
                 let end = nested_end(&chars, i - 1);
                 cur.extend(&chars[i - 1..end]);
                 word = true;
+                bare = true;
                 i = end;
             }
             '$' if !single && !double && chars.get(i) == Some(&'\'') => {
@@ -10023,6 +10051,7 @@ fn shell_words(script: &str) -> Vec<String> {
             }
             c if !single && !double && (c.is_whitespace() || matches!(c, ';' | '|' | '&')) => {
                 if word {
+                    spelled(&cur, !std::mem::take(&mut bare));
                     finish_word(
                         std::mem::take(&mut cur),
                         &mut out,
@@ -10049,12 +10078,16 @@ fn shell_words(script: &str) -> Vec<String> {
                 if double && c == '$' {
                     dq_dollar = true;
                 }
+                if !single && (matches!(c, '$' | '`') || (!double && EXPANDS.contains(&c))) {
+                    bare = true;
+                }
                 cur.push(c);
                 word = true;
             }
         }
     }
     if word {
+        spelled(&cur, !bare);
         finish_word(cur, &mut out, &mut pending, &mut want_delim);
     }
     take_heredoc_bodies(&chars, &mut i, &mut out, &mut pending);
@@ -19857,6 +19890,30 @@ hash -r 2> /dev/null
         }
         for fmt in ["%Q", "%n", "%5Q"] {
             assert_eq!(render_printf(fmt, &[]), None, "{fmt}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_glob_or_newline_is_text() {
+        let root = startup_root("quotedglob");
+        std::fs::create_dir_all(root.join("build")).unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "echo 'ls *.txt' > build/run.sh && sh build/run.sh",
+            "echo \"ls [ab]?.txt\" > build/run.sh && sh build/run.sh",
+            "printf 'echo a\nls ~\n' > build/run.sh && sh build/run.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for line in [
+            "echo ls *.txt > build/run.sh && sh build/run.sh",
+            "echo \"ls $X\" > build/run.sh && sh build/run.sh",
+            "echo \"ls `id`\" > build/run.sh && sh build/run.sh",
+            "echo 'git push -f' '*' > build/run.sh && sh build/run.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
         }
     }
 
