@@ -20021,6 +20021,125 @@ hash -r 2> /dev/null
         }
     }
 
+    /// The lines of a `tests/fixtures/pyopts17` set, each with the argvs
+    /// `ljos hook` sent policyd for it. `@W@` is the tree.
+    fn pyopts17_set(text: &str, root: &std::path::Path) -> Vec<(String, Vec<Vec<String>>)> {
+        let unescape = |s: &str| {
+            let mut out = String::new();
+            let mut chars = s.chars();
+            while let Some(c) = chars.next() {
+                out.push(if c == '\\' {
+                    match chars.next() {
+                        Some('n') => '\n',
+                        Some('t') => '\t',
+                        Some('r') => '\r',
+                        _ => '\\',
+                    }
+                } else {
+                    c
+                });
+            }
+            out.replace("@W@", &root.display().to_string())
+        };
+        let mut rows: Vec<(String, Vec<Vec<String>>)> = Vec::new();
+        for record in text.lines() {
+            let mut fields = record.split('\t');
+            match fields.next() {
+                Some("L") => rows.push((unescape(fields.nth(1).unwrap()), Vec::new())),
+                Some("A") => {
+                    let argv = fields.skip(1).map(unescape).collect();
+                    rows.last_mut().unwrap().1.push(argv);
+                }
+                _ => panic!("bad record {record}"),
+            }
+        }
+        rows
+    }
+
+    /// The rows of a set policyd refuses: the line, or a call the hook
+    /// made for it.
+    fn pyopts17_refused(text: &str, root: &std::path::Path) -> Vec<usize> {
+        pyopts17_set(text, root)
+            .iter()
+            .enumerate()
+            .filter(|(_, (line, argvs))| {
+                std::iter::once(shell_words(line))
+                    .chain(argvs.iter().cloned())
+                    .any(|argv| check_shell_in(&argv, root, 0).decision != Decision::Allow)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// A python project of the kind the reviews ran their lines in.
+    /// Writes to `/tmp` are allowed, so the tree is not under it.
+    fn review_tree(tag: &str) -> std::path::PathBuf {
+        let temp = |d: &std::path::Path| {
+            ["/tmp", "/var/tmp", "/dev/shm"]
+                .iter()
+                .any(|t| d.starts_with(t))
+        };
+        let name = format!("policyd-{tag}-{}/w", std::process::id());
+        let root = [
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target"),
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache"),
+        ]
+        .into_iter()
+        .find(|d| d.is_absolute() && !temp(d))
+        .expect("a checkout or a HOME out of /tmp")
+        .join(name);
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["src/pkg", "tests", ".git"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        for (path, text) in [
+            ("src/pkg/__init__.py", "def add(a, b):\n    return a + b\n"),
+            (
+                "tests/test_a.py",
+                "from pkg import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
+            ),
+            ("data.csv", "a,b\n1,2\n3,4\n"),
+            ("data.json", "{\"a\": 1, \"b\": [1, 2]}\n"),
+            (
+                "pyproject.toml",
+                "[project]\nname = \"pkg\"\nversion = \"0.1\"\n",
+            ),
+            ("hello.py", "print(\"hi\")\n"),
+        ] {
+            std::fs::write(root.join(path), text).unwrap();
+        }
+        root
+    }
+
+    /// The pyopts17 review ran 371 `python3` lines through `ljos hook`.
+    /// Develop refused 99 of them, and 248 of 360 more ordinary lines,
+    /// because a file python runs after the line writes it was refused
+    /// whatever it held. Develop allowed 23 of the 209 risky lines, and
+    /// none is allowed now.
+    #[test]
+    fn python_lines_from_the_pyopts17_review() {
+        let root = review_tree("pyopts17");
+        let corpus = include_str!("../tests/fixtures/pyopts17/corpus.tsv");
+        let ordinary = include_str!("../tests/fixtures/pyopts17/ordinary.tsv");
+        let risky = include_str!("../tests/fixtures/pyopts17/risky.tsv");
+        assert_eq!(pyopts17_set(corpus, &root).len(), 371);
+        assert_eq!(pyopts17_refused(corpus, &root), Vec::<usize>::new());
+        // 73 has `\x01`, which bash and dash print apart. 136 has a
+        // newline printf puts inside a python string. 245 loads a
+        // pickle from a file in the tree, which runs the code the file
+        // holds. The rest are a heredoc file run with words after it,
+        // whose text the hook does not send.
+        assert_eq!(pyopts17_set(ordinary, &root).len(), 360);
+        assert_eq!(
+            pyopts17_refused(ordinary, &root),
+            [73, 136, 245, 316, 318, 320, 322, 324, 326, 328, 330, 332, 334, 336, 338]
+        );
+        let risky_rows = pyopts17_set(risky, &root).len();
+        assert_eq!(risky_rows, 209);
+        assert_eq!(pyopts17_refused(risky, &root).len(), risky_rows);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
     #[test]
     fn a_write_to_a_path_not_shown_says_which_word() {
         let root = startup_root("unshownw");
