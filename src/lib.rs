@@ -9557,33 +9557,76 @@ fn printf_text(args: &[String]) -> Option<String> {
     render_printf(fmt, rest)
 }
 
+/// The text `printf FMT ARGS` writes, where bash and dash write the same
+/// bytes. A conversion with no argument left writes its zero or empty
+/// value. A directive neither shell knows stops printf there, after it
+/// wrote the text before it. A byte past ASCII, `%c` and the escapes and
+/// conversions only one shell knows are unknown.
 fn render_printf(fmt: &str, args: &[String]) -> Option<String> {
     let mut out = String::new();
-    let mut chars = fmt.chars();
+    let chars: Vec<char> = fmt.chars().collect();
+    let mut i = 0;
     let mut ai = 0;
-    while let Some(c) = chars.next() {
+    while let Some(&c) = chars.get(i) {
+        i += 1;
         if c == '\\' {
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some('r') => out.push('\r'),
-                Some('\\') => out.push('\\'),
-                _ => return None,
-            }
-            continue;
-        }
-        if c == '%' {
-            match chars.next() {
-                Some('%') => out.push('%'),
-                Some('s') => {
-                    out.push_str(args.get(ai)?);
-                    ai += 1;
+            let e = *chars.get(i)?;
+            i += 1;
+            match e {
+                '\\' => out.push('\\'),
+                'a' => out.push('\u{7}'),
+                'b' => out.push('\u{8}'),
+                'e' => out.push('\u{1b}'),
+                'f' => out.push('\u{c}'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'v' => out.push('\u{b}'),
+                '0'..='7' => {
+                    let mut v = e.to_digit(8)?;
+                    for _ in 0..2 {
+                        match chars.get(i).and_then(|d| d.to_digit(8)) {
+                            Some(d) => {
+                                v = v * 8 + d;
+                                i += 1;
+                            }
+                            None => break,
+                        }
+                    }
+                    let byte = u8::try_from(v & 0xff).ok().filter(u8::is_ascii)?;
+                    out.push(char::from(byte));
                 }
-                _ => return None,
+                'E' | '\'' | '"' | '?' | 'x' | 'u' | 'U' => return None,
+                other => {
+                    out.push('\\');
+                    out.push(other);
+                }
             }
             continue;
         }
-        out.push(c);
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        let d = *chars.get(i)?;
+        i += 1;
+        let arg = args.get(ai);
+        match d {
+            '%' => out.push('%'),
+            's' => {
+                out.push_str(arg.map_or("", String::as_str));
+                ai += usize::from(arg.is_some());
+            }
+            _ if arg.is_some() => return None,
+            'b' => {}
+            'd' | 'i' | 'o' | 'u' | 'x' | 'X' | 'g' | 'G' => out.push('0'),
+            'f' | 'F' => out.push_str("0.000000"),
+            'e' => out.push_str("0.000000e+00"),
+            'E' => out.push_str("0.000000E+00"),
+            'a' | 'A' | 'c' | 'q' | 'T' => return None,
+            d if d.is_ascii_alphabetic() => return Some(out),
+            _ => return None,
+        }
     }
     (ai == args.len()).then_some(out)
 }
@@ -19717,6 +19760,28 @@ hash -r 2> /dev/null
         ] {
             assert_eq!(at(line).decision, Decision::Deny, "{line}");
         }
+    }
+
+    #[test]
+    fn printf_text_is_what_bash_and_dash_both_write() {
+        let p = |fmt: &str, args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            render_printf(fmt, &args)
+        };
+        assert_eq!(
+            p("a\\tb\\101\\0101\\n", &[]).as_deref(),
+            Some("a\tbA\u{8}1\n")
+        );
+        assert_eq!(p("\\d \\k\\\\", &[]).as_deref(), Some("\\d \\k\\"));
+        assert_eq!(p("%s=%d %f%%", &["x"]).as_deref(), Some("x=0 0.000000%"));
+        assert_eq!(p("%s %s", &["a", "b"]).as_deref(), Some("a b"));
+        // An unknown directive stops printf, so the `&&` after it does
+        // not run: the text before it is what was written.
+        assert_eq!(p("d = %Y-%m", &[]).as_deref(), Some("d = "));
+        for fmt in ["\\x41", "\\u0041", "\\E", "%q", "%c", "\\200"] {
+            assert_eq!(p(fmt, &[]), None, "{fmt}");
+        }
+        assert_eq!(p("%s", &["a", "b"]), None);
     }
 
     #[test]
