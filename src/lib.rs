@@ -9597,9 +9597,11 @@ fn render_printf(fmt: &str, args: &[String]) -> Option<String> {
                     out.push(char::from(byte));
                 }
                 'E' | '\'' | '"' | '?' | 'x' | 'u' | 'U' => return None,
-                other => {
+                // The backslash stays, and the byte after it is read
+                // again: `\%` is a backslash and then a directive.
+                _ => {
                     out.push('\\');
-                    out.push(other);
+                    i -= 1;
                 }
             }
             continue;
@@ -19782,6 +19784,8 @@ hash -r 2> /dev/null
         // An unknown directive stops printf, so the `&&` after it does
         // not run: the text before it is what was written.
         assert_eq!(p("d = %Y-%m", &[]).as_deref(), Some("d = "));
+        assert_eq!(p("A\\%B", &[]).as_deref(), Some("A\\"));
+        assert_eq!(p("\\%s|", &["x"]).as_deref(), Some("\\x|"));
         for fmt in ["\\x41", "\\u0041", "\\E", "%q", "%c", "\\200"] {
             assert_eq!(p(fmt, &[]), None, "{fmt}");
         }
