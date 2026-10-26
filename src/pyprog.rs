@@ -233,6 +233,69 @@ fn escape(src: &[char], i: usize, text: &mut String) -> Option<usize> {
     Some(next)
 }
 
+/// What the program shows: every string, with each run of joined
+/// literals also whole.
+#[derive(Default)]
+struct Read {
+    strs: Vec<String>,
+}
+
+/// The text of an argument made only of string literals, joined as
+/// python joins them.
+fn literal(a: &[Tok]) -> Option<String> {
+    let mut out = String::new();
+    let mut want = true;
+    for t in a {
+        match t {
+            Tok::Str(s) if !s.contains(FIELD) => {
+                out.push_str(s);
+                want = false;
+            }
+            Tok::Mark('+') if !want => want = true,
+            _ => return None,
+        }
+    }
+    (!want).then_some(out)
+}
+
+/// Read `code` into `out`. `None` when python would read it in a way
+/// the reader does not follow.
+fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
+    if depth > DEPTH || foreign_coding(code) {
+        return None;
+    }
+    let chars: Vec<char> = code.chars().collect();
+    let mut toks = Vec::new();
+    lex(&chars, 0, &mut toks)?;
+    for (i, t) in toks.iter().enumerate() {
+        if let Tok::Str(s) = t {
+            out.strs.push(s.clone());
+            if let Some(whole) = literal_run(&toks[i..]) {
+                if whole != *s {
+                    out.strs.push(whole);
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+/// The string literals from `toks[0]` that python joins into one.
+fn literal_run(toks: &[Tok]) -> Option<String> {
+    literal(&toks[..run_end(toks)])
+}
+
+fn run_end(toks: &[Tok]) -> usize {
+    let mut end = 1;
+    while matches!(toks.get(end), Some(Tok::Str(_)))
+        || (toks.get(end) == Some(&Tok::Mark('+'))
+            && matches!(toks.get(end + 1), Some(Tok::Str(_))))
+    {
+        end += if toks[end] == Tok::Mark('+') { 2 } else { 1 };
+    }
+    end
+}
+
 /// A coding line in the first two lines that names a codec other than
 /// UTF-8 or Latin-1. Python decodes the file with it, so the bytes the
 /// reader sees are not the program.
@@ -291,11 +354,83 @@ fn refused(code: PolicyReason, class: &str, what: &str) -> Option<Refusal> {
 
 /// Why python must not run `code`, or `None`.
 pub(crate) fn refusal(code: &str) -> Option<Refusal> {
-    let chars: Vec<char> = code.chars().collect();
-    if foreign_coding(code) || lex(&chars, 0, &mut Vec::new()).is_none() {
+    let mut r = Read::default();
+    if read(code, 0, &mut r).is_none() {
         return refused(PolicyReason::ShellDangerousRunner, "unread", "");
     }
-    None
+    credential(&r)
+}
+
+/// Paths and parts of paths that hold a login, a key or a token.
+const CREDENTIAL_PARTS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".azure",
+    ".kube",
+    ".docker",
+    ".password-store",
+    ".netrc",
+    "_netrc",
+    ".git-credentials",
+    ".npmrc",
+    ".pypirc",
+    ".pgpass",
+    ".vault-token",
+];
+const CREDENTIAL_PATHS: &[&str] = &[
+    ".config/gh/",
+    ".config/gcloud",
+    ".config/hub",
+    ".config/ljos",
+    ".cargo/credentials",
+    ".local/share/keyrings",
+    ".codex/auth.json",
+    ".claude/.credentials.json",
+    "/etc/shadow",
+    "/etc/gshadow",
+    "/etc/sudoers",
+];
+const KEY_FILES: &[&str] = &["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"];
+
+/// Whether a string names a credential store, or a secret's variable.
+fn names_credential(s: &str) -> bool {
+    let low = s.to_ascii_lowercase().replace('\\', "/");
+    let parts: Vec<&str> = low.split('/').collect();
+    parts.iter().any(|p| CREDENTIAL_PARTS.contains(p))
+        || parts
+            .iter()
+            .any(|p| KEY_FILES.iter().any(|k| p.starts_with(k)))
+        || CREDENTIAL_PATHS.iter().any(|c| low.contains(c))
+        || (low.starts_with("/proc/") && low.ends_with("/environ"))
+        || secret_variable(s)
+}
+
+/// `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`: a variable a secret is kept
+/// in, by the words of its name.
+fn secret_variable(s: &str) -> bool {
+    if s.is_empty()
+        || !s
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    {
+        return false;
+    }
+    let words: Vec<&str> = s.split('_').collect();
+    words.iter().any(|w| {
+        matches!(
+            *w,
+            "TOKEN" | "SECRET" | "PASSWORD" | "PASSWD" | "APIKEY" | "CREDENTIAL" | "CREDENTIALS"
+        )
+    }) || words
+        .windows(2)
+        .any(|p| matches!(p, ["API" | "ACCESS" | "PRIVATE" | "SECRET", "KEY"]))
+}
+
+/// A program that names a credential store or a secret's variable.
+fn credential(r: &Read) -> Option<Refusal> {
+    let s = r.strs.iter().find(|s| names_credential(s))?;
+    refused(PolicyReason::PathSensitiveDeny, "reads-credential", s)
 }
 
 #[cfg(test)]
@@ -304,6 +439,24 @@ mod tests {
 
     fn refused_for(code: &str) -> Option<String> {
         refusal(code).map(|r| r.token)
+    }
+
+    #[test]
+    fn strings_are_decoded_as_python_decodes_them() {
+        let mut r = Read::default();
+        read(
+            r#"a = "\x2essh"; b = '~/.' 'aws'; c = f"{h}/.kube/{n!r}"; d = rb'\x41'; e = "x" + "y""#,
+            0,
+            &mut r,
+        )
+        .unwrap();
+        for s in [".ssh", "~/.aws", "/.kube/", "\\x41", "xy"] {
+            assert!(
+                r.strs.iter().any(|t| t.split(FIELD).any(|p| p == s)),
+                "{s} not in {:?}",
+                r.strs
+            );
+        }
     }
 
     #[test]
@@ -323,6 +476,32 @@ mod tests {
             "# -*- coding: utf-8 -*-\nprint(1)",
             "print('a\\nb')",
             "print('open",
+        ] {
+            assert_eq!(refused_for(code), None, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_credential_read_is_refused() {
+        for code in [
+            "print(open('/home/u/.ssh/id_rsa').read())",
+            "import os; print(open(os.path.expanduser('~/.ssh/id_ed25519')).read())",
+            "from pathlib import Path; Path.home().joinpath('.aws', 'credentials').read_text()",
+            "print(open('/home/u/.netrc').read())",
+            "import os; print(os.environ['GITHUB_TOKEN'])",
+            "import os; print(os.getenv('AWS_SECRET_ACCESS_KEY'))",
+            "print(open('/proc/self/environ').read())",
+            "print(open('~/.config/gh/' + 'hosts.yml').read())",
+            "print(open('\\x2fhome/u/\\x2essh/id_rsa').read())",
+        ] {
+            let t = refused_for(code).unwrap_or_default();
+            assert!(t.starts_with("python-reads-credential"), "{code}: {t}");
+        }
+        for code in [
+            "print(open('data.csv').read())",
+            "import os; print(os.environ.get('HOME'))",
+            "import os; print(os.environ['GIT_AUTHOR_NAME'])",
+            "print('tokens: 3')",
         ] {
             assert_eq!(refused_for(code), None, "{code}");
         }
