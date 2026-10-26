@@ -20224,6 +20224,28 @@ hash -r 2> /dev/null
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
+    /// 331 everyday programs and 67 shell lines. A program printf would
+    /// write as other text is refused in that shape: `%` and `\\x` are
+    /// read apart by bash and dash.
+    #[test]
+    fn everyday_programs_and_lines_are_allowed() {
+        let root = review_tree("policydpy2-ordinary");
+        let text = include_str!("../tests/fixtures/policydpy2/ordinary.tsv");
+        let set = policydpy2_set(text);
+        assert_eq!(set.len(), 398);
+        let shapes: usize = set
+            .iter()
+            .map(|(p, _, b)| policydpy2_shapes(b, *p).len())
+            .sum();
+        let allowed = policydpy2_allowed(text, &root);
+        let refused: Vec<&str> = ["143/2", "164/2", "179/2", "202/2", "242/2", "291/2"].into();
+        assert_eq!(allowed.len(), shapes - refused.len());
+        for r in refused {
+            assert!(!allowed.iter().any(|a| a == r), "{r} allowed");
+        }
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
     #[test]
     fn a_write_to_a_path_not_shown_says_which_word() {
         let root = startup_root("unshownw");
