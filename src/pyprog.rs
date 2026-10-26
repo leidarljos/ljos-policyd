@@ -127,9 +127,7 @@ fn string(
                 }
                 i += 1;
             } else {
-                text.push('\\');
-                text.push(next);
-                i += 2;
+                i = escape(src, i + 1, &mut text)?;
             }
             continue;
         }
@@ -138,6 +136,47 @@ fn string(
     }
     out.push(Tok::Str(text));
     Some(i)
+}
+
+/// Decode the escape after a backslash, as a python string does. An
+/// escape python does not know keeps its backslash. A `\N{...}` name is
+/// not looked up, so its string is not known.
+fn escape(src: &[char], i: usize, text: &mut String) -> Option<usize> {
+    let code = |from: usize, n: usize, radix: u32| -> Option<(char, usize)> {
+        let s: String = src.get(from..from + n)?.iter().collect();
+        let v = u32::from_str_radix(&s, radix).ok()?;
+        Some((char::from_u32(v).unwrap_or('\u{fffd}'), from + n))
+    };
+    let c = src[i];
+    let (ch, next) = match c {
+        '\n' => return Some(i + 1),
+        'n' => ('\n', i + 1),
+        't' => ('\t', i + 1),
+        'r' => ('\r', i + 1),
+        'a' => ('\u{7}', i + 1),
+        'b' => ('\u{8}', i + 1),
+        'f' => ('\u{c}', i + 1),
+        'v' => ('\u{b}', i + 1),
+        '\\' | '\'' | '"' => (c, i + 1),
+        'x' => code(i + 1, 2, 16).unwrap_or(('x', i + 1)),
+        'u' => code(i + 1, 4, 16).unwrap_or(('u', i + 1)),
+        'U' => code(i + 1, 8, 16).unwrap_or(('U', i + 1)),
+        'N' => return None,
+        '0'..='7' => {
+            let n = src[i..]
+                .iter()
+                .take(3)
+                .take_while(|c| ('0'..='7').contains(*c))
+                .count();
+            code(i, n, 8)?
+        }
+        _ => {
+            text.push('\\');
+            (c, i + 1)
+        }
+    };
+    text.push(ch);
+    Some(next)
 }
 
 /// A coding line in the first two lines that names a codec other than
@@ -217,7 +256,7 @@ mod tests {
     fn a_program_the_reader_cannot_split_is_refused() {
         for code in [
             "# -*- coding: utf-7 -*-\nprint(1)",
-            "#!/usr/bin/python\n# vim: set fileencoding=cp1252 :\nprint(1)",
+            "print('\\N{FULL STOP}ssh')",
         ] {
             assert_eq!(
                 refused_for(code).as_deref(),
