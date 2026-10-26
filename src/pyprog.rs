@@ -252,6 +252,8 @@ struct Read {
     refs: Vec<Ref>,
     attrs: Vec<Ref>,
     strs: Vec<String>,
+    /// A `"/"` joined to a value, so the path starts at the root.
+    rooted: bool,
     /// Names assigned one literal and then read once, with the literal.
     values: HashMap<String, Vec<Tok>>,
 }
@@ -602,6 +604,9 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                         out.strs.push(whole);
                     }
                 }
+                if s == "/" && rooted(&toks, i) {
+                    out.rooted = true;
+                }
             }
             Tok::Name(n) if i > 0 && toks[i - 1] == Tok::Mark('.') => {
                 let args =
@@ -653,6 +658,43 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
     }
     Some(())
 }
+
+/// Whether the `"/"` at `toks[i]` names the root or starts a path
+/// joined to a value: `"/" + p`, `os.path.join("/", p)`, `f("/")`,
+/// `path="/"`. A string method's separator is not a path.
+fn rooted(toks: &[Tok], i: usize) -> bool {
+    let next = toks.get(i + 1);
+    let prev = i.checked_sub(1).map(|p| &toks[p]);
+    let call = i.checked_sub(2).map(|p| &toks[p]);
+    let separator = matches!(call, Some(Tok::Name(n)) if STRING_METHODS.contains(&n.as_str()));
+    next == Some(&Tok::Mark('+'))
+        || next == Some(&Tok::Mark('/'))
+        || prev == Some(&Tok::Mark('='))
+        || (prev == Some(&Tok::Mark('('))
+            && matches!(next, Some(Tok::Mark(',' | ')')))
+            && !separator)
+}
+
+/// Methods of `str` and `bytes` that take a separator or affix.
+const STRING_METHODS: &[&str] = &[
+    "split",
+    "rsplit",
+    "strip",
+    "lstrip",
+    "rstrip",
+    "removeprefix",
+    "removesuffix",
+    "startswith",
+    "endswith",
+    "count",
+    "find",
+    "rfind",
+    "index",
+    "rindex",
+    "partition",
+    "rpartition",
+    "replace",
+];
 
 /// The string literals from `toks[0]` that python joins into one.
 fn literal_run(toks: &[Tok]) -> Option<String> {
@@ -1363,6 +1405,9 @@ fn outside_write(r: &Read, place: Place) -> Option<Refusal> {
     if let Some(s) = r.strs.iter().find(|s| outside_string(s, place)) {
         return out(s);
     }
+    if r.rooted {
+        return out("/");
+    }
     if let Some(n) = r.reaches(OUTSIDE_NAMES) {
         return out(n);
     }
@@ -1584,6 +1629,16 @@ mod tests {
             "print('/'.join(['a', 'b']))",
         ] {
             assert_eq!(refused_for(code), None, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_path_joined_to_the_root_is_outside() {
+        for code in [
+            "name = input(); open('/' + name, 'w')",
+            "import os; open(os.path.join('/', input()), 'w')",
+        ] {
+            assert_eq!(class_of(code), "python-writes-outside", "{code}");
         }
     }
 }
