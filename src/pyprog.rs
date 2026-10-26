@@ -259,6 +259,9 @@ struct Read {
     rooted: bool,
     /// Names an import or an alias binds to a module.
     modules: HashSet<String>,
+    /// Names bound to `globals()`, `locals()` or `vars()`, whose
+    /// subscript reaches a scope the program does not show.
+    scopes: HashSet<String>,
     /// Names assigned one literal and then read once, with the literal.
     values: HashMap<String, Vec<Tok>>,
     /// Literal paths the program writes a file at.
@@ -597,12 +600,19 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
                 names
             } else if toks.get(at + end) == Some(&Tok::Mark('(')) {
                 let open = at + end;
-                let Some(name) = names
-                    .into_iter()
-                    .find(|n| NAMING_CALLS.contains(&n.as_str()))
-                else {
+                let Some(name) = names.into_iter().find(|n| {
+                    NAMING_CALLS.contains(&n.as_str())
+                        || matches!(n.as_str(), "globals" | "locals" | "vars")
+                }) else {
                     continue;
                 };
+                if matches!(name.as_str(), "globals" | "locals" | "vars") {
+                    if close(&toks, open) + 1 == at + stmt.len() {
+                        out.scopes.insert(v.clone());
+                        skip[at + 2..at + stmt.len()].fill(true);
+                    }
+                    continue;
+                }
                 let args = call_args(&toks, open);
                 let Some(r) = named_by(&name, Some(&args), &toks, open, &binds, &stars) else {
                     continue;
@@ -1935,8 +1945,15 @@ fn unshown(r: &Read) -> Option<Refusal> {
             _ => false,
         };
         let scope = (matches!(c.name.as_str(), "globals" | "locals" | "vars") && c.args.is_some())
-            || c.name.ends_with(".__dict__");
+            || c.name.ends_with(".__dict__")
+            || c.name == "__dict__"
+            || r.scopes.contains(&c.name);
+        let scope_method = c
+            .name
+            .split_once('.')
+            .is_some_and(|(s, m)| r.scopes.contains(s) && LOOKUPS.contains(&m));
         if (scope && looked_up)
+            || scope_method
             || (c.name == "sys.modules" && c.then == Some(Tok::Mark('[')))
             || c.name
                 .strip_prefix("sys.modules.")
@@ -2552,5 +2569,19 @@ mod tests {
             refused_for("j = __import__('json'); print(j.dumps({}))"),
             None
         );
+    }
+
+    #[test]
+    fn a_name_bound_to_a_scope_is_that_scope() {
+        for code in [
+            "g = globals(); g['__builtins__'].__import__('os').system('id')",
+            "g = globals(); g.get('os').system('id')",
+            "v = vars(); v['exec']('print(1)')",
+            "import builtins; b = builtins.__dict__; b['exec']('print(1)')",
+        ] {
+            let c = class_of(code);
+            assert!(c.starts_with("python-runs-unshown-"), "{code}: {c}");
+        }
+        assert_eq!(refused_for("g = globals(); print(sorted(g))"), None);
     }
 }
