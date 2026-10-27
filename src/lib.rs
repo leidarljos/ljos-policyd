@@ -24,6 +24,179 @@ use std::borrow::Cow;
 
 use policy_capnp::{Decision, PolicyReason};
 
+/// Exclusive time inside one judgment. A test turns it on around a check.
+/// While it is off, each timed function does one relaxed read.
+mod phase {
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    pub const SHELL_WORDS: usize = 0;
+    pub const SUBST: usize = 1;
+    pub const NESTED: usize = 2;
+    pub const HASH: usize = 3;
+    pub const TABLE: usize = 4;
+    pub const WALK: usize = 5;
+    pub const PYTHON: usize = 6;
+    pub const OBSERVE: usize = 7;
+    pub const RULES: usize = 8;
+    pub const INNER: usize = 9;
+    const N: usize = 10;
+
+    #[cfg(test)]
+    const NAMES: [&str; N] = [
+        "parsing shell words",
+        "substitution scan",
+        "nested construct scan",
+        "comment paren scan",
+        "per-line rule walk",
+        "script walk",
+        "python",
+        "scratch observe",
+        "argv rules",
+        "inner command split",
+    ];
+
+    static ON: AtomicBool = AtomicBool::new(false);
+
+    struct Frame {
+        slot: usize,
+        start: Instant,
+        child: Duration,
+    }
+
+    struct Rec {
+        exclusive: [Duration; N],
+        calls: [u64; N],
+        hash_chars: u64,
+        stack: Vec<Frame>,
+        walk_buckets: [u64; 6],
+    }
+
+    thread_local! {
+        static REC: RefCell<Rec> = const {
+            RefCell::new(Rec {
+                exclusive: [Duration::ZERO; N],
+                calls: [0; N],
+                hash_chars: 0,
+                stack: Vec::new(),
+                walk_buckets: [0; 6],
+            })
+        };
+    }
+
+    pub struct Guard(bool);
+
+    #[cfg(test)]
+    pub fn enable() {
+        ON.store(true, Ordering::Relaxed);
+        REC.with(|r| {
+            let mut r = r.borrow_mut();
+            r.exclusive = [Duration::ZERO; N];
+            r.calls = [0; N];
+            r.hash_chars = 0;
+            r.stack.clear();
+            r.walk_buckets = [0; 6];
+        });
+    }
+
+    #[cfg(test)]
+    pub fn disable() {
+        ON.store(false, Ordering::Relaxed);
+    }
+
+    pub fn enter(slot: usize) -> Guard {
+        if !ON.load(Ordering::Relaxed) {
+            return Guard(false);
+        }
+        REC.with(|r| {
+            let mut r = r.borrow_mut();
+            r.calls[slot] += 1;
+            r.stack.push(Frame {
+                slot,
+                start: Instant::now(),
+                child: Duration::ZERO,
+            });
+        });
+        Guard(true)
+    }
+
+    pub fn walk_words(n: usize) {
+        if !ON.load(Ordering::Relaxed) {
+            return;
+        }
+        let bucket = match n {
+            0..=8 => 0,
+            9..=32 => 1,
+            33..=128 => 2,
+            129..=512 => 3,
+            513..=2048 => 4,
+            _ => 5,
+        };
+        REC.with(|r| r.borrow_mut().walk_buckets[bucket] += 1);
+    }
+
+    pub fn hash_chars(n: usize) {
+        if !ON.load(Ordering::Relaxed) {
+            return;
+        }
+        REC.with(|r| r.borrow_mut().hash_chars += n as u64);
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            if !self.0 {
+                return;
+            }
+            REC.with(|r| {
+                let mut r = r.borrow_mut();
+                let Some(frame) = r.stack.pop() else {
+                    return;
+                };
+                let total = frame.start.elapsed();
+                r.exclusive[frame.slot] += total.saturating_sub(frame.child);
+                if let Some(parent) = r.stack.last_mut() {
+                    parent.child += total;
+                }
+            });
+        }
+    }
+
+    #[cfg(test)]
+    pub fn report() -> String {
+        REC.with(|r| {
+            let r = r.borrow();
+            let mut total = Duration::ZERO;
+            let mut lines = Vec::new();
+            for (i, name) in NAMES.iter().enumerate() {
+                total += r.exclusive[i];
+                if r.calls[i] == 0 {
+                    continue;
+                }
+                lines.push(format!(
+                    "  {name}: {:?} ({} calls)",
+                    r.exclusive[i], r.calls[i]
+                ));
+            }
+            if r.hash_chars > 0 {
+                lines.push(format!("  comment paren chars scanned {}", r.hash_chars));
+            }
+            let labels = ["1-8", "9-32", "33-128", "129-512", "513-2048", "2049+"];
+            let buckets: Vec<String> = r
+                .walk_buckets
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| **n > 0)
+                .map(|(i, n)| format!("{}:{n}", labels[i]))
+                .collect();
+            if !buckets.is_empty() {
+                lines.push(format!("  walk argv sizes {}", buckets.join(" ")));
+            }
+            format!("exclusive phases {total:?}\n{}", lines.join("\n"))
+        })
+    }
+}
+
 #[cfg(has_phronesis)]
 mod embedded {
     include!(concat!(env!("OUT_DIR"), "/pack.rs"));
@@ -139,7 +312,7 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
     let mut runs = Vec::new();
     let mut denied = None;
     let vars = Vars::from_env();
-    let funcs = FnMap::new();
+    let funcs = std::rc::Rc::new(FnMap::new());
     let old = [oldpwd];
     let files = Files::default();
     let cmd_values = initial_cmd_values();
@@ -147,7 +320,7 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
         cwd,
         oldpwd: &old,
         vars: &vars,
-        funcs: &funcs,
+        funcs: std::rc::Rc::clone(&funcs),
         fn_depth: 0,
         left_tree: false,
         files: &files,
@@ -328,9 +501,11 @@ fn add_dirs(set: &mut Vec<std::path::PathBuf>, dirs: impl IntoIterator<Item = st
 
 /// A function body the walk can replay. A body in parentheses runs in a
 /// subshell: its commands are judged, and they do not move the caller.
+/// The words are shared. A long script saves the shell at every command,
+/// and copying each body each time made that save the square of the script.
 #[derive(Clone)]
 struct FnBody {
-    words: Vec<String>,
+    words: std::rc::Rc<Vec<String>>,
     subshell: bool,
 }
 
@@ -1285,7 +1460,7 @@ struct Shell {
     old: Vec<std::path::PathBuf>,
     pushed: Vec<(Vec<std::path::PathBuf>, bool)>,
     vars: Vars,
-    funcs: FnMap,
+    funcs: std::rc::Rc<FnMap>,
     aliases: Vec<(String, String)>,
     pwd_set: bool,
     lastpipe: bool,
@@ -1349,7 +1524,7 @@ struct Saved {
     old: Vec<std::path::PathBuf>,
     pushed: Vec<(Vec<std::path::PathBuf>, bool)>,
     vars: Vars,
-    funcs: FnMap,
+    funcs: std::rc::Rc<FnMap>,
     pwd_set: bool,
     left_tree: bool,
     known: Option<std::path::PathBuf>,
@@ -1403,7 +1578,8 @@ impl Shell {
         self.left_tree = true;
         self.known = None;
         // A body recorded before this no longer says what a call runs.
-        self.funcs.clear();
+        // Replace the map. Clearing a shared one would empty a snapshot.
+        self.funcs = std::rc::Rc::new(FnMap::new());
         // The command may have assigned over what was proven.
         self.names.clear();
         self.name_frames.clear();
@@ -1416,7 +1592,7 @@ struct ShellIn<'a> {
     cwd: &'a std::path::Path,
     oldpwd: &'a [std::path::PathBuf],
     vars: &'a Vars,
-    funcs: &'a FnMap,
+    funcs: std::rc::Rc<FnMap>,
     fn_depth: usize,
     left_tree: bool,
     files: &'a Files,
@@ -1458,7 +1634,7 @@ fn lift_functions(words: &[String]) -> (Vec<String>, Vec<(String, FnBody)>) {
             defs.push((
                 name,
                 FnBody {
-                    words: body,
+                    words: std::rc::Rc::new(body),
                     subshell,
                 },
             ));
@@ -1582,7 +1758,7 @@ fn unset_functions(cmd: &[&str], shell: &mut Shell) {
             continue;
         }
         if is_name(a) {
-            shell.funcs.remove(*a);
+            std::rc::Rc::make_mut(&mut shell.funcs).remove(*a);
         } else {
             bad = true;
         }
@@ -1910,13 +2086,13 @@ fn replay_subshell(
     let dirs = shell.here.clone();
     let old = shell.old.clone();
     let vars = shell.vars.clone();
-    let funcs = shell.funcs.clone();
+    let funcs = std::rc::Rc::clone(&shell.funcs);
     for dir in &dirs {
         let inn = ShellIn {
             cwd: dir,
             oldpwd: &old,
             vars: &vars,
-            funcs: &funcs,
+            funcs: std::rc::Rc::clone(&funcs),
             fn_depth: shell.fn_depth,
             left_tree: shell.left_tree,
             files: &shell.files,
@@ -1967,7 +2143,7 @@ fn runner_commands(
         old: inn.oldpwd.to_vec(),
         pushed: Vec::new(),
         vars: inn.vars.clone(),
-        funcs: inn.funcs.clone(),
+        funcs: std::rc::Rc::clone(&inn.funcs),
         aliases: Vec::new(),
         pwd_set: false,
         lastpipe: inn.vars.lastpipe,
@@ -2135,6 +2311,8 @@ fn walk(
     out: &mut Vec<(Vec<String>, std::path::PathBuf, bool)>,
     denied: &mut Option<Checked>,
 ) {
+    let _span = phase::enter(phase::WALK);
+    phase::walk_words(argv.len());
     if denied.is_some() {
         return;
     }
@@ -2270,7 +2448,7 @@ fn walk(
             let dirs = shell.here.clone();
             let oldpwd = shell.old.clone();
             let vars_now = shell.vars.clone();
-            let funcs = shell.funcs.clone();
+            let funcs = std::rc::Rc::clone(&shell.funcs);
             let fn_depth = shell.fn_depth;
             let left = shell.left_tree;
             let files = shell.files.clone();
@@ -2288,7 +2466,7 @@ fn walk(
                             cwd: dir,
                             oldpwd: &oldpwd,
                             vars: &vars_now,
-                            funcs: &funcs,
+                            funcs: std::rc::Rc::clone(&funcs),
                             fn_depth,
                             left_tree: left,
                             files: &files,
@@ -2580,7 +2758,7 @@ fn walk(
             if let Some(i) = marker_index(&w) {
                 if in_shell {
                     if let Some((name, body)) = defs.get(i) {
-                        shell.funcs.insert(name.clone(), body.clone());
+                        std::rc::Rc::make_mut(&mut shell.funcs).insert(name.clone(), body.clone());
                     }
                 }
                 continue;
@@ -2804,6 +2982,16 @@ fn walk(
         return;
     }
     let fresh = initial_cmd_values();
+    // One peel for the whole line. Looking the command up again per
+    // entry rebuilt this split from the first word each time.
+    let peeled: Vec<Vec<String>> = commands(&argv)
+        .into_iter()
+        .map(|cmd| {
+            let owned: Vec<String> = cmd.into_iter().map(str::to_string).collect();
+            let owned = split_env_strings(&owned).into_owned();
+            unwrap_wrappers(&owned).0.to_vec()
+        })
+        .collect();
     for (i, inner) in inner_commands_expanded(&argv) {
         if data.get(i).copied().unwrap_or(false) || pattern_skip.get(i).copied().unwrap_or(false) {
             continue;
@@ -2817,8 +3005,17 @@ fn walk(
             // A nested script does not inherit an unexported assignment.
             // The command itself does: `. ./$x` was already judged with
             // these values, and this walk must see the same file.
-            let same = unwrapped_command(&argv, i).is_some_and(|r| r == inner);
+            let same = peeled.get(i).is_some_and(|r| r == &inner);
             let own = source_operand(&refs).is_some_and(|p| p.contains('$')) && same;
+            // The loop above already walked this command. Walking it
+            // again only repeats that work, and on a long script the
+            // repeat walks every function body the call already walked.
+            // A nested script is a different `inner` and still runs, in
+            // the directory this command reached. A sourced path that
+            // holds `$` still runs, with the values it was judged with.
+            if same && !own {
+                continue;
+            }
             let values = if own {
                 cmd_at.get(i).unwrap_or(&fresh)
             } else {
@@ -2834,7 +3031,7 @@ fn walk(
                     cwd: dir,
                     oldpwd,
                     vars: set,
-                    funcs: &shell.funcs,
+                    funcs: std::rc::Rc::clone(&shell.funcs),
                     fn_depth: shell.fn_depth,
                     left_tree: shell.left_tree,
                     files: &shell.files,
@@ -3839,7 +4036,7 @@ fn eval_text_keeps(
     let funcs: FnMap = defs.into_iter().collect();
     let bodies: std::collections::HashMap<String, Vec<String>> = funcs
         .iter()
-        .map(|(n, b)| (n.clone(), b.words.clone()))
+        .map(|(n, b)| (n.clone(), b.words.as_ref().clone()))
         .collect();
     let mut memo = std::collections::HashMap::new();
     let mut stack = std::collections::HashSet::new();
@@ -6484,10 +6681,94 @@ fn expanded_command(cmd: &[&str]) -> Result<Option<Vec<String>>, ()> {
 /// -f` and `sh -c "git push -f"` meet the same rules as `git push -f`.
 /// `moved` is true when a `cd` or `pushd` anywhere on the line can leave the
 /// working tree, so a relative path no longer says where a delete lands.
+/// Programs and keywords the deny rules do not read. A second command,
+/// a substitution, a brace or a privilege word is not in this set: the
+/// table still walks those. A program that writes a file is not here
+/// either: `cp`, `ln`, `mv`, `install`, `tee` and `dd` overwrite whatever
+/// path they are given. `export`, `readonly`, `declare`, `typeset`,
+/// `local`, `alias` and `unalias` change what a later command runs.
+fn inert_program(base: &str) -> bool {
+    matches!(
+        base,
+        "echo"
+            | "printf"
+            | "mkdir"
+            | "cat"
+            | "true"
+            | "false"
+            | "test"
+            | "["
+            | "[["
+            | "return"
+            | ":"
+            | "pwd"
+            | "basename"
+            | "dirname"
+            | "date"
+            | "id"
+            | "uname"
+            | "hostname"
+            | "sleep"
+            | "touch"
+            | "ls"
+            | "stat"
+            | "readlink"
+            | "realpath"
+            | "mktemp"
+    )
+}
+
+/// `argv` is one inert program and nothing the table has to open: no
+/// second command, no `$(...)`, no backtick, no process substitution,
+/// no brace expansion and no redirection. A `$name` in an argument stays,
+/// because these programs are not `rm`.
+fn inert_argv(argv: &[String]) -> bool {
+    // `echo x > /dev/sda` and `echo x > file` both write. The program
+    // name does not say so, so any redirection takes the full table.
+    if writes_block_device(argv) || argv.iter().any(|w| is_redirection(w)) {
+        return false;
+    }
+    let mut head = "";
+    let mut saw = false;
+    for w in argv {
+        if matches!(w.as_str(), ";" | "&&" | "||" | "|" | "&") || w.ends_with(';') {
+            return false;
+        }
+        if is_privilege(base_of(w)) {
+            return false;
+        }
+        if w.contains('`')
+            || w.contains("$(")
+            || w.contains("<(")
+            || w.contains(">(")
+            || w.contains('\n')
+            || (w.contains('{') && brace_expands(w))
+        {
+            return false;
+        }
+        if !saw && !is_assignment(w) && !is_redirection(w) {
+            head = base_of(w);
+            saw = true;
+        }
+    }
+    saw && inert_program(head)
+}
+
 fn host_argv_table_at(argv: &[String], depth: usize, moved: bool, parent: &Scratch) -> Checked {
+    let _span = phase::enter(phase::TABLE);
     let mut bound = parent.clone();
     bound.observe(argv);
-    let own = host_argv_rules(argv, moved, &bound);
+    if inert_argv(argv) {
+        return Checked {
+            decision: Decision::Allow,
+            code: PolicyReason::Unspecified,
+            token: Cow::Borrowed("allow"),
+        };
+    }
+    let own = {
+        let _span = phase::enter(phase::RULES);
+        host_argv_rules(argv, moved, &bound)
+    };
     if own.decision != Decision::Allow {
         return own;
     }
@@ -6530,9 +6811,14 @@ fn host_argv_table_at(argv: &[String], depth: usize, moved: bool, parent: &Scrat
     // A later command runs where `cd` left it. Judging the `rm` on its
     // own from the starting directory would see the wrong parent.
     if depth < MAX_DEPTH {
-        let expanded = expand_aliases(argv);
-        let roots = command_roots(&expanded, bound.root.clone());
-        for (i, inner) in inner_commands_expanded(&expanded) {
+        let (roots, inners) = {
+            let _span = phase::enter(phase::INNER);
+            let expanded = expand_aliases(argv);
+            let roots = command_roots(&expanded, bound.root.clone());
+            let inners = inner_commands_expanded(&expanded);
+            (roots, inners)
+        };
+        for (i, inner) in inners {
             if inner.as_slice() == argv {
                 continue;
             }
@@ -6677,15 +6963,6 @@ fn alias_defs(cmd: &[&str]) -> Vec<(String, String)> {
             .collect(),
         _ => Vec::new(),
     }
-}
-
-/// The command at `i` once wrappers are peeled, as
-/// [`inner_commands_expanded`] re-walks it. A nested script is not this.
-fn unwrapped_command(argv: &[String], i: usize) -> Option<Vec<String>> {
-    let cmd = commands(argv).into_iter().nth(i)?;
-    let owned: Vec<String> = cmd.into_iter().map(str::to_string).collect();
-    let owned = split_env_strings(&owned).into_owned();
-    Some(unwrap_wrappers(&owned).0.to_vec())
 }
 
 /// [`inner_commands_at`] on a line whose aliases are already expanded.
@@ -8711,6 +8988,7 @@ fn with_names(w: &str, names: &[(String, String)], argv: &[String]) -> String {
 /// subshell, read the same way down to [`MAX_DEPTH`] levels. Nothing in
 /// single quotes runs, and an escaped `$` is a dollar sign.
 fn script_lines(script: &str, depth: usize) -> Vec<String> {
+    let _span = phase::enter(phase::SUBST);
     let mut out = vec![script.to_string()];
     if depth < MAX_DEPTH {
         for body in substitutions(script) {
@@ -8725,6 +9003,7 @@ fn script_lines(script: &str, depth: usize) -> Vec<String> {
 /// or after `i`. Quotes, escapes and constructs nested inside count; an
 /// unclosed one runs to the end.
 fn nested_end(chars: &[char], i: usize) -> usize {
+    let _span = phase::enter(phase::NESTED);
     let n = chars.len();
     if chars.get(i) == Some(&'`') {
         let mut j = i + 1;
@@ -8800,6 +9079,8 @@ enum Paren {
 /// word. A substitution, array or function does. A subshell or a case
 /// pattern does not.
 fn hash_stays_in_word(chars: &[char], close: usize) -> bool {
+    let _span = phase::enter(phase::HASH);
+    phase::hash_chars(close);
     let n = chars.len();
     if close >= n || chars[close] != ')' {
         return true;
@@ -8948,6 +9229,7 @@ fn opens_nested(chars: &[char], i: usize, double: bool) -> bool {
 /// and `\$` unescaped, and outside double quotes each `<(...)`, `>(...)`
 /// and subshell.
 fn substitutions(script: &str) -> Vec<String> {
+    let _span = phase::enter(phase::SUBST);
     let chars: Vec<char> = script.chars().collect();
     let n = chars.len();
     let mut out = Vec::new();
@@ -10025,6 +10307,7 @@ fn pure_param(w: &str) -> bool {
 /// `&>log`) stays in its word. A double-quoted `$name` or `${name}` keeps
 /// its quotes so a later split can tell `"$x"` from `$x`.
 fn shell_words(script: &str) -> Vec<String> {
+    let _span = phase::enter(phase::SHELL_WORDS);
     let chars: Vec<char> = script.chars().collect();
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -12639,6 +12922,7 @@ fn interpreter_rmtree(argv: &[String]) -> bool {
 /// relative path is in the directory the line is in, and stays in the
 /// tree while the line has not left it.
 fn python_refusal(argv: &[String], moved: bool, bound: &Scratch) -> Option<pyprog::Refusal> {
+    let _span = phase::enter(phase::PYTHON);
     let cwd = bound.root.as_deref().filter(|d| !is_untracked(d));
     let place = pyprog::Place {
         cwd,
@@ -12823,6 +13107,7 @@ struct Scratch {
 
 impl Scratch {
     fn observe(&mut self, argv: &[String]) {
+        let _span = phase::enter(phase::OBSERVE);
         for cmd in commands(argv) {
             for w in &cmd {
                 self.observe_word(w);
@@ -16363,14 +16648,14 @@ hash -r 2> /dev/null
             let mut runs = Vec::new();
             let mut denied = None;
             let vars = Vars::from_env();
-            let funcs = FnMap::new();
+            let funcs = std::rc::Rc::new(FnMap::new());
             let files = Files::default();
             let cmd_values = initial_cmd_values();
             let inn = ShellIn {
                 cwd: &root,
                 oldpwd: &[],
                 vars: &vars,
-                funcs: &funcs,
+                funcs: std::rc::Rc::clone(&funcs),
                 fn_depth: 0,
                 left_tree: false,
                 files: &files,
@@ -17148,6 +17433,44 @@ hash -r 2> /dev/null
             assert_eq!(v(argv), "allow", "{argv:?}");
         }
         assert_eq!(v(&["env", "dd", "if=x", "of=/dev/sda"]), "deny\traw-disk");
+    }
+
+    /// A redirection writes a file, and so do `cp`, `ln` and `tee`.
+    /// The fast path used to return before those rules. A block device
+    /// is the file this table guards. A script copied onto one that is
+    /// then run is that script.
+    #[test]
+    fn a_write_does_not_take_the_fast_path() {
+        let line = |s: &str| verdict(&shell_words(s));
+        for s in [
+            "echo x > /dev/sda",
+            "echo x >/dev/sda",
+            "printf x > /dev/nvme0n1",
+            "printf x >>/dev/sda",
+        ] {
+            let got = line(s);
+            assert!(got.starts_with("deny\traw-disk"), "{s} -> {got}");
+        }
+        for s in ["echo ok", "printf '%s\\n' ok", "echo ok > /tmp/out.txt"] {
+            assert_eq!(line(s), "allow", "{s}");
+        }
+        let root = startup_root("fastwrite");
+        std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
+        let at = |s: &str| check_shell_in(&shell_words(s), &root, 0);
+        for s in [
+            "echo 'git push -f origin' > ok.sh; source ok.sh",
+            "printf 'git push -f origin\\n' > ok.sh; source ok.sh",
+            "cp evil/force.sh ok.sh; source ok.sh",
+            "ln -sf evil/force.sh ok.sh; source ok.sh",
+            "printf 'git push -f origin\\n' | tee ok.sh; source ok.sh",
+        ] {
+            let c = at(s);
+            assert_eq!(c.decision, Decision::Deny, "{s}: {}", c.token);
+        }
+        let c = at("echo ok > /tmp/out.txt");
+        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
+        let c = at("cp ok.sh backup.sh; source ok.sh");
+        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
     }
 
     #[test]
@@ -21676,5 +21999,139 @@ make -C safe test
         ] {
             assert_eq!(evil_and_safe("evalbuilt", line), Decision::Deny, "{line}");
         }
+    }
+
+    /// A long plain CI script: functions, `[[ ]]`, command substitutions,
+    /// a quoted python heredoc, and deletes that stay under `/tmp`.
+    /// `danger` adds one recursive delete outside `/tmp` on the last line.
+    fn ci_script(steps: usize, danger: bool) -> String {
+        let mut s = String::from(
+            "#!/usr/bin/env bash\n\
+             # Ephemeral CI runner. No privilege command is executed.\n\
+             # A caller that passes sudo, su, doas, pkexec or run0 is refused.\n\
+             set -euo pipefail\n\
+             job_root=\"${TMPDIR:-/tmp}/ci-job\"\n\
+             mkdir -p \"$job_root\"\n\
+             rm -rf /tmp/ci-job-old\n\
+             \n\
+             write_stamp() {\n\
+               local dest=\"$1\"\n\
+               python3 - \"$dest\" <<'PY'\n\
+             import sys\n\
+             print(sys.argv[1] if len(sys.argv) > 1 else \"ok\")\n\
+             PY\n\
+               echo \"stamped $(basename \"$dest\")\"\n\
+             }\n\
+             \n",
+        );
+        for i in 0..steps {
+            s.push_str(&format!(
+                "step_{i}() {{\n\
+                 \x20 local name=\"step-{i}\"\n\
+                 \x20 local src=\"${{job_root}}/${{name}}\"\n\
+                 \x20 mkdir -p \"$src\"\n\
+                 \x20 if [[ -f \"$src/config.sh\" ]]; then\n\
+                 \x20   echo \"keeping $name\"\n\
+                 \x20   return 0\n\
+                 \x20 fi\n\
+                 \x20 case \"$name\" in\n\
+                 \x20   step-0) echo \"first\" ;;\n\
+                 \x20   *) echo \"later\" ;;\n\
+                 \x20 esac\n\
+                 \x20 printf '%s\\n' \"$name\" > \"$src/config.sh\"\n\
+                 \x20 cp \"$src/config.sh\" \"${{job_root}}/last.txt\"\n\
+                 \x20 echo \"ran $(basename \"$src\")\"\n\
+                 }}\n\
+                 \n"
+            ));
+        }
+        s.push_str("main() {\n");
+        for i in 0..steps {
+            s.push_str(&format!("  step_{i}\n"));
+        }
+        s.push_str("  write_stamp \"${job_root}/last.txt\"\n}\nmain\n");
+        if danger {
+            s.push_str("rm -rf /var/lib/ci-runner\n");
+        }
+        s
+    }
+
+    fn time_script(dir: &std::path::Path, body: &str) -> (Checked, std::time::Duration, String) {
+        std::fs::create_dir_all(dir.join("scripts/ci")).unwrap();
+        std::fs::write(dir.join("scripts/ci/ephemeral-runner.sh"), body).unwrap();
+        let argv = vec![
+            "scripts/ci/ephemeral-runner.sh".to_string(),
+            "org/repo".to_string(),
+            "abc123".to_string(),
+        ];
+        phase::enable();
+        let start = std::time::Instant::now();
+        let got = check_shell_in(&argv, dir, 0);
+        let elapsed = start.elapsed();
+        let report = phase::report();
+        phase::disable();
+        (got, elapsed, report)
+    }
+
+    /// The guard has five seconds. A script of this shape has to be judged
+    /// inside one second, with the same allow or deny it has when the
+    /// deadline is long. `steps` 70 is about a thousand lines. `steps` 642
+    /// is the byte size of the real runner (243400) without being that file.
+    #[test]
+    fn a_long_ci_script_is_judged_inside_the_deadline() {
+        // The guard is a release build and has one second. A debug test
+        // only has to finish: the same script takes longer without
+        // optimizations.
+        let limit = if cfg!(debug_assertions) {
+            std::time::Duration::from_secs(15)
+        } else {
+            std::time::Duration::from_secs(1)
+        };
+        let root =
+            std::env::temp_dir().join(format!("policyd-lib-{}-scriptbudget", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for (steps, lines_at, bytes_at) in [
+            (70usize, 900usize..1400, 20_000..40_000),
+            (642, 10_000..14_000, 240_000..250_000),
+        ] {
+            let benign = ci_script(steps, false);
+            let lines = benign.lines().count();
+            assert!(
+                lines_at.contains(&lines),
+                "steps {steps}: lines {lines} bytes {}",
+                benign.len()
+            );
+            assert!(
+                bytes_at.contains(&benign.len()),
+                "steps {steps}: {} bytes",
+                benign.len()
+            );
+            assert!(
+                !benign.lines().any(|l| {
+                    let t = l.trim();
+                    t.starts_with("sudo") || t.contains(" rm -rf /var")
+                }),
+                "benign fixture must not run sudo or delete outside /tmp"
+            );
+            let (allow, allow_dt, allow_ph) =
+                time_script(&root.join(format!("benign-{steps}")), &benign);
+            let danger = ci_script(steps, true);
+            let (deny, deny_dt, deny_ph) =
+                time_script(&root.join(format!("danger-{steps}")), &danger);
+            eprintln!(
+                "steps {steps} lines {lines} bytes {} allow {allow_dt:?} {}\n{allow_ph}",
+                benign.len(),
+                allow.token
+            );
+            eprintln!("danger deny {deny_dt:?} {}\n{deny_ph}", deny.token);
+            assert_eq!(allow.decision, Decision::Allow, "{}", allow.token);
+            assert_eq!(deny.decision, Decision::Deny, "{}", deny.token);
+            assert!(deny.token.contains("rm-rf-outside-tmp"), "{}", deny.token);
+            assert!(
+                allow_dt < limit && deny_dt < limit,
+                "steps {steps} allow {allow_dt:?}\n{allow_ph}\ndeny {deny_dt:?}\n{deny_ph}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

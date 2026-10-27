@@ -1,0 +1,1 @@
+Judging a long shell script copied its function bodies on every command and walked each command again after the line that already walked it. A plain program the deny rules do not read now returns as soon as the words are known. A script of this shape, about 240KB, is allowed or refused in under a second instead of several seconds past the guard's deadline.

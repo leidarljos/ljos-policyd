@@ -1,0 +1,1 @@
+A redirection, and cp, ln, mv, install, tee or dd, no longer returns before the deny rules. export, readonly, alias, unalias, declare, typeset and local do not either. observe runs on that early return too. A plain echo with no redirection still returns as soon as the words are known.
