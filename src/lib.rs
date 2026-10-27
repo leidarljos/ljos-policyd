@@ -10811,6 +10811,16 @@ fn guard_writer(w: &str) -> bool {
             | "chmod"
             | "rm"
             | "git"
+            | "curl"
+            | "wget"
+            | "rsync"
+            | "tar"
+            | "unzip"
+            | "patch"
+            | "perl"
+            | "awk"
+            | "chown"
+            | "rmdir"
     )
 }
 
@@ -11103,16 +11113,14 @@ fn expand_guard(
     w
 }
 
-fn landed(path: &str, cwd: Option<&std::path::Path>) -> Option<String> {
+fn landed(path: &str, cwd: Option<&str>) -> Option<String> {
     if path.is_empty() || path.contains(['$', '`', '*', '?', '[', '~']) {
         return None;
     }
     if path.starts_with('/') {
         return Some(lexical_norm(path));
     }
-    let cwd = cwd
-        .and_then(|p| p.to_str())
-        .filter(|p| p.starts_with('/'))?;
+    let cwd = cwd.filter(|p| p.starts_with('/'))?;
     Some(lexical_norm(&format!(
         "{}/{}",
         cwd.trim_end_matches('/'),
@@ -11120,35 +11128,50 @@ fn landed(path: &str, cwd: Option<&std::path::Path>) -> Option<String> {
     )))
 }
 
-fn guard_path(
-    word: &str,
-    names: &[(String, String)],
-    home: &str,
-    cfg: &str,
-    data: &str,
-    cwd: Option<&std::path::Path>,
-    guards: &GuardSet,
-) -> Option<String> {
-    let expanded = expand_guard(word, names, home, cfg, data);
-    let abs = landed(&expanded, cwd)?;
-    guards.hit(&abs).then_some(abs)
+/// A symlink this line created: `link` is the new path, `target` is where
+/// it points. A later write through `link` is a write to `target`.
+fn follow_links(path: &str, links: &[(String, String)]) -> String {
+    let mut path = path.to_string();
+    for _ in 0..8 {
+        let Some((link, target)) = links
+            .iter()
+            .filter(|(link, _)| path == *link || path.starts_with(&format!("{link}/")))
+            .max_by_key(|(link, _)| link.len())
+        else {
+            break;
+        };
+        path = if path == *link {
+            target.clone()
+        } else {
+            format!("{target}{}", &path[link.len()..])
+        };
+        path = lexical_norm(&path);
+    }
+    path
 }
 
-fn first_guard<'a, I>(
-    words: I,
-    names: &[(String, String)],
-    home: &str,
-    cfg: &str,
-    data: &str,
-    cwd: Option<&std::path::Path>,
-    guards: &GuardSet,
-) -> Option<String>
+/// The directories and the seat files one command is judged against.
+struct GuardLook<'a> {
+    names: &'a [(String, String)],
+    home: &'a str,
+    cfg: &'a str,
+    data: &'a str,
+    cwd: Option<&'a str>,
+    guards: &'a GuardSet,
+}
+
+fn guard_path(word: &str, look: &GuardLook<'_>, links: &[(String, String)]) -> Option<String> {
+    let expanded = expand_guard(word, look.names, look.home, look.cfg, look.data);
+    let abs = landed(&expanded, look.cwd)?;
+    let abs = follow_links(&abs, links);
+    look.guards.hit(&abs).then_some(abs)
+}
+
+fn first_guard<'a, I>(words: I, look: &GuardLook<'_>, links: &[(String, String)]) -> Option<String>
 where
     I: IntoIterator<Item = &'a str>,
 {
-    words
-        .into_iter()
-        .find_map(|w| guard_path(w, names, home, cfg, data, cwd, guards))
+    words.into_iter().find_map(|w| guard_path(w, look, links))
 }
 
 fn redirect_targets_of<'a>(cmd: &'a [&'a str]) -> Vec<&'a str> {
@@ -11229,27 +11252,31 @@ fn cmd_head<'a>(cmd: &[&'a str]) -> Option<(&'a str, Vec<&'a str>)> {
 
 /// `git config --global` of `core.hooksPath`, an unset of that key, or
 /// `git -c core.hooksPath=...`. A `--get` reads the key and is allowed.
-fn git_hooks_path_write(cmd: &[&str]) -> bool {
-    let Some(git_at) = cmd.iter().position(|w| base_of(w) == "git") else {
-        return false;
-    };
-    let owned: Vec<String> = cmd[git_at..].iter().map(|s| (*s).to_string()).collect();
-    if git_configs(&owned)
-        .iter()
-        .any(|(k, _)| k == "core.hookspath")
-    {
-        return true;
+/// The path named by `git config --file` / `-f`, still unexpanded.
+fn config_file_arg(rest: &[String]) -> Option<&str> {
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i].as_str();
+        if a == "--file" || a == "-f" {
+            return rest.get(i + 1).map(String::as_str);
+        }
+        if let Some(v) = a.strip_prefix("--file=") {
+            return Some(v);
+        }
+        if let Some(v) = a.strip_prefix("-f").filter(|v| !v.is_empty()) {
+            return Some(v);
+        }
+        i += 1;
     }
-    let Some((sub, rest)) = git_subcommand(&owned) else {
-        return false;
-    };
-    if sub != "config" || !rest.iter().any(|a| a == "--global") {
-        return false;
-    }
+    None
+}
+
+/// A `git config` that writes a value. `--get` and a bare key read it.
+fn config_writes(rest: &[String]) -> bool {
     let unset = rest.iter().any(|a| {
         matches!(
             a.as_str(),
-            "--unset" | "--unset-all" | "--replace-all" | "--add"
+            "--unset" | "--unset-all" | "--replace-all" | "--add" | "--edit"
         )
     });
     let get = rest.iter().any(|a| {
@@ -11261,51 +11288,346 @@ fn git_hooks_path_write(cmd: &[&str]) -> bool {
     if get && !unset {
         return false;
     }
-    let operands: Vec<&str> = rest
-        .iter()
-        .map(String::as_str)
-        .filter(|a| !a.starts_with('-'))
-        .collect();
-    if !operands
-        .iter()
-        .any(|a| a.eq_ignore_ascii_case("core.hooksPath"))
-    {
-        return false;
+    if unset {
+        return true;
     }
-    unset || operands.len() >= 2
+    let mut skip_file = false;
+    let mut operands = 0usize;
+    for a in rest {
+        if skip_file {
+            skip_file = false;
+            continue;
+        }
+        if a == "--file" || a == "-f" {
+            skip_file = true;
+            continue;
+        }
+        if a.starts_with("--file=") || (a.starts_with("-f") && a.len() > 2 && !a.starts_with("--"))
+        {
+            continue;
+        }
+        if !a.starts_with('-') {
+            operands += 1;
+        }
+    }
+    operands >= 2
+}
+
+/// `core.hooksPath` set with `--global` or `--system`, or any write
+/// through `--file` onto a guarded config. A `--get` stays allowed.
+fn git_config_guard(
+    cmd: &[&str],
+    look: &GuardLook<'_>,
+    links: &[(String, String)],
+) -> Option<String> {
+    let git_at = cmd.iter().position(|w| base_of(w) == "git")?;
+    let owned: Vec<String> = cmd[git_at..].iter().map(|s| (*s).to_string()).collect();
+    if git_configs(&owned)
+        .iter()
+        .any(|(k, _)| k == "core.hookspath")
+    {
+        return Some("core.hooksPath".to_string());
+    }
+    let (sub, rest) = git_subcommand(&owned)?;
+    if sub != "config" {
+        return None;
+    }
+    if let Some(file) = config_file_arg(rest) {
+        if config_writes(rest) {
+            if let Some(hit) = guard_path(file, look, links) {
+                return Some(hit);
+            }
+        }
+    }
+    let wide = rest.iter().any(|a| a == "--global" || a == "--system");
+    if !wide || !config_writes(rest) {
+        return None;
+    }
+    let key = rest
+        .iter()
+        .any(|a| !a.starts_with('-') && a.eq_ignore_ascii_case("core.hooksPath"));
+    key.then(|| "core.hooksPath".to_string())
+}
+
+/// `(target, link)` of `ln` / `ln -s`. One operand links under the
+/// current directory, named by the target's last part.
+fn link_pair(args: &[&str]) -> Option<(String, String)> {
+    let mut ops = Vec::new();
+    let mut it = args.iter().copied();
+    while let Some(a) = it.next() {
+        if a == "--" {
+            ops.extend(it);
+            break;
+        }
+        if a == "-t" || a == "--target-directory" {
+            it.next();
+            continue;
+        }
+        if let Some(rest) = a.strip_prefix("--target-directory=") {
+            let _ = rest;
+            continue;
+        }
+        if a.starts_with('-') && a != "-" {
+            continue;
+        }
+        ops.push(a);
+    }
+    match ops.as_slice() {
+        [target, link] => Some(((*target).to_string(), (*link).to_string())),
+        [target] => Some(((*target).to_string(), base_of(target).to_string())),
+        _ => None,
+    }
+}
+
+fn resolve_word(word: &str, look: &GuardLook<'_>, links: &[(String, String)]) -> Option<String> {
+    let expanded = expand_guard(word, look.names, look.home, look.cfg, look.data);
+    let abs = landed(&expanded, look.cwd)?;
+    Some(follow_links(&abs, links))
+}
+
+/// Paths a `tar` extract writes into, or the archive a `tar -c` creates.
+fn tar_paths(args: &[&str]) -> Vec<String> {
+    let mut extract = false;
+    let mut create = false;
+    let mut dirs = Vec::new();
+    let mut archive = None;
+    let mut first = true;
+    let mut it = args.iter().copied();
+    while let Some(a) = it.next() {
+        if a == "--extract" || a == "--get" {
+            extract = true;
+            first = false;
+            continue;
+        }
+        if a == "--create" {
+            create = true;
+            first = false;
+            continue;
+        }
+        if a == "-C" || a == "--directory" {
+            if let Some(d) = it.next() {
+                dirs.push(d.to_string());
+            }
+            first = false;
+            continue;
+        }
+        if let Some(d) = a.strip_prefix("--directory=") {
+            dirs.push(d.to_string());
+            first = false;
+            continue;
+        }
+        if a == "-f" || a == "--file" {
+            archive = it.next().map(str::to_string);
+            first = false;
+            continue;
+        }
+        if let Some(f) = a.strip_prefix("--file=") {
+            archive = Some(f.to_string());
+            first = false;
+            continue;
+        }
+        if let Some(cluster) = a
+            .strip_prefix('-')
+            .filter(|c| !c.is_empty() && !c.starts_with('-'))
+        {
+            extract |= cluster.contains('x');
+            create |= cluster.contains('c');
+            if let Some(i) = cluster.find('f') {
+                let rest = &cluster[i + 1..];
+                archive = if rest.is_empty() {
+                    it.next().map(str::to_string)
+                } else {
+                    Some(rest.to_string())
+                };
+            }
+            if let Some(i) = cluster.find('C') {
+                let rest = &cluster[i + 1..];
+                if rest.is_empty() {
+                    if let Some(d) = it.next() {
+                        dirs.push(d.to_string());
+                    }
+                } else {
+                    dirs.push(rest.to_string());
+                }
+            }
+            first = false;
+            continue;
+        }
+        if first
+            && a.chars().all(|c| "xtczfjJhvOp".contains(c))
+            && (a.contains('x') || a.contains('c'))
+        {
+            extract |= a.contains('x');
+            create |= a.contains('c');
+            first = false;
+            continue;
+        }
+        first = false;
+    }
+    if extract {
+        if dirs.is_empty() {
+            vec![".".to_string()]
+        } else {
+            dirs
+        }
+    } else if create {
+        archive.into_iter().collect()
+    } else {
+        Vec::new()
+    }
+}
+
+fn unzip_paths(args: &[&str]) -> Vec<String> {
+    let mut dir = None;
+    let mut it = args.iter().copied();
+    while let Some(a) = it.next() {
+        if a == "-d" {
+            dir = it.next().map(str::to_string);
+            continue;
+        }
+        if let Some(d) = a.strip_prefix("-d").filter(|d| !d.is_empty()) {
+            dir = Some(d.to_string());
+        }
+    }
+    vec![dir.unwrap_or_else(|| ".".to_string())]
+}
+
+fn patch_paths(args: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = args.iter().copied();
+    let mut saw_dir = false;
+    while let Some(a) = it.next() {
+        if matches!(a, "-o" | "-d" | "--output" | "--directory") {
+            if let Some(p) = it.next() {
+                saw_dir |= a == "-d" || a == "--directory";
+                out.push(p.to_string());
+            }
+            continue;
+        }
+        if let Some(p) = a
+            .strip_prefix("--output=")
+            .or_else(|| a.strip_prefix("--directory="))
+        {
+            saw_dir |= a.starts_with("--directory=");
+            out.push(p.to_string());
+            continue;
+        }
+        if a.starts_with('-') && a != "-" {
+            continue;
+        }
+        out.push(a.to_string());
+    }
+    if out.is_empty() && !saw_dir {
+        out.push(".".to_string());
+    }
+    out
+}
+
+fn awk_inplace(args: &[&str]) -> bool {
+    args.windows(2).any(|w| w[0] == "-i" && w[1] == "inplace")
+        || args.iter().any(|a| *a == "-iinplace" || *a == "--inplace")
+}
+
+fn awk_files(args: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = args.iter().copied();
+    let mut program = false;
+    while let Some(a) = it.next() {
+        if a == "--" {
+            out.extend(it.map(str::to_string));
+            break;
+        }
+        if matches!(a, "-e" | "-f" | "--source" | "--file" | "-v" | "--assign") {
+            program |= matches!(a, "-e" | "-f" | "--source" | "--file");
+            it.next();
+            continue;
+        }
+        if a == "-i" || a == "--include" {
+            it.next();
+            continue;
+        }
+        if a.starts_with('-') && a != "-" {
+            continue;
+        }
+        if !program {
+            program = true;
+            continue;
+        }
+        out.push(a.to_string());
+    }
+    out
+}
+
+fn chown_paths(args: &[&str]) -> Vec<String> {
+    let mut paths = bare_words(args, "", &["reference", "from"]);
+    if paths
+        .first()
+        .is_some_and(|p| !p.contains('/') && !p.starts_with(['~', '$', '.']))
+    {
+        paths.remove(0);
+    }
+    paths.into_iter().map(str::to_string).collect()
+}
+
+/// The command word after assignments and `command` / `builtin`.
+fn peeled_head<'a>(cmd: &'a [&'a str]) -> Option<(&'a str, &'a [&'a str])> {
+    let mut i = 0;
+    while i < cmd.len() && (is_assignment(cmd[i]) || is_redirection(cmd[i])) {
+        i += 1;
+    }
+    while i < cmd.len() && matches!(base_of(cmd[i]), "command" | "builtin") {
+        i += 1;
+    }
+    let head = *cmd.get(i)?;
+    Some((base_of(head), &cmd[i + 1..]))
+}
+
+/// Where `cd` leaves this shell. `None` when the word is not `cd`.
+/// `Some(None)` when it is `cd` and the directory is not known (`cd -`).
+fn cd_destination(cmd: &[&str], look: &GuardLook<'_>) -> Option<Option<String>> {
+    let (head, args) = peeled_head(cmd)?;
+    if head != "cd" {
+        return None;
+    }
+    let ops = bare_words(args, "", &[]);
+    match ops.first().copied() {
+        None => Some((!look.home.is_empty()).then(|| look.home.to_string())),
+        Some("-") => Some(None),
+        Some(dest) => {
+            let expanded = expand_guard(dest, look.names, look.home, look.cfg, look.data);
+            Some(landed(&expanded, look.cwd))
+        }
+    }
 }
 
 fn command_guard_hit(
     cmd: &[&str],
-    names: &[(String, String)],
-    home: &str,
-    cfg: &str,
-    data: &str,
-    cwd: Option<&std::path::Path>,
-    guards: &GuardSet,
+    look: &GuardLook<'_>,
+    links: &mut Vec<(String, String)>,
 ) -> Option<String> {
-    let see = |w: &str| guard_path(w, names, home, cfg, data, cwd, guards);
-    if let Some(hit) = first_guard(
-        redirect_targets_of(cmd),
-        names,
-        home,
-        cfg,
-        data,
-        cwd,
-        guards,
-    ) {
+    if let Some(hit) = first_guard(redirect_targets_of(cmd), look, links) {
         return Some(hit);
     }
     let (head, args) = cmd_head(cmd)?;
-    if head == "git" && git_hooks_path_write(cmd) {
-        return Some("core.hooksPath".to_string());
+    if head == "git" {
+        if let Some(hit) = git_config_guard(cmd, look, links) {
+            return Some(hit);
+        }
     }
+    let owned_cmd: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
     let paths: Vec<String> = match head {
         "tee" => bare_words(&args, "", &[])
             .into_iter()
             .map(str::to_string)
             .collect(),
-        "cp" | "ln" | "install" => copy_target(&args, head == "ln", &|_| false),
+        "cp" | "install" | "rsync" => copy_target(&args, false, &|_| false),
+        "ln" => {
+            let mut t = copy_target(&args, true, &|_| false);
+            if let Some((target, _)) = link_pair(&args) {
+                t.push(target);
+            }
+            t
+        }
         "mv" => {
             let mut t = copy_target(&args, false, &|_| false);
             t.extend(
@@ -11326,7 +11648,7 @@ fn command_guard_hit(
             .collect(),
         "sed" if sed_in_place(&args) => sed_files(&args),
         "chmod" => chmod_paths(&args).into_iter().map(str::to_string).collect(),
-        "rm" => bare_words(&args, "", &[])
+        "rm" | "rmdir" => bare_words(&args, "", &[])
             .into_iter()
             .map(str::to_string)
             .collect(),
@@ -11338,9 +11660,28 @@ fn command_guard_hit(
             .into_iter()
             .map(str::to_string)
             .collect(),
+        "curl" | "wget" => fetched_paths(&owned_cmd),
+        "tar" => tar_paths(&args),
+        "unzip" => unzip_paths(&args),
+        "patch" => patch_paths(&args),
+        "perl" if perl_in_place(&args) => perl_files(&args),
+        "awk" if awk_inplace(&args) => awk_files(&args),
+        "chown" => chown_paths(&args),
         _ => Vec::new(),
     };
-    paths.iter().find_map(|p| see(p))
+    if let Some(hit) = paths.iter().find_map(|p| guard_path(p, look, links)) {
+        return Some(hit);
+    }
+    if head == "ln" {
+        if let Some((target, link)) = link_pair(&args) {
+            let link_at = resolve_word(&link, look, links);
+            let target_at = resolve_word(&target, look, links);
+            if let (Some(link_at), Some(target_at)) = (link_at, target_at) {
+                links.push((link_at, target_at));
+            }
+        }
+    }
+    None
 }
 
 /// A write onto a file the seat keeps for itself: the hook files,
@@ -11358,13 +11699,34 @@ fn seat_guard_denial(argv: &[String], cwd: Option<&std::path::Path>) -> Option<C
     let real_cfg = process_xdg("XDG_CONFIG_HOME", &real_home, ".config");
     let real_data = process_xdg("XDG_DATA_HOME", &real_home, ".local/share");
     let mut names: Vec<(String, String)> = Vec::new();
-    for cmd in commands(argv) {
+    let mut cwd = cwd
+        .and_then(|p| p.to_str())
+        .filter(|p| p.starts_with('/'))
+        .map(ToString::to_string);
+    let mut links: Vec<(String, String)> = Vec::new();
+    let mut prev = "";
+    for (cmd, end) in ended_commands(argv) {
         if cmd.iter().all(|w| is_assignment(w)) {
             note_assignments(&cmd, &mut names, false);
+            prev = end;
             continue;
         }
         let (home, cfg, data) = shell_dirs(&names, &real_home, &real_cfg, &real_data);
-        if let Some(path) = command_guard_hit(&cmd, &names, &home, &cfg, &data, cwd, &guards) {
+        let look = GuardLook {
+            names: &names,
+            home: &home,
+            cfg: &cfg,
+            data: &data,
+            cwd: cwd.as_deref(),
+            guards: &guards,
+        };
+        let in_pipe = end == "|" || prev == "|";
+        let moved = if !in_pipe && end != "&" {
+            cd_destination(&cmd, &look)
+        } else {
+            None
+        };
+        if let Some(path) = command_guard_hit(&cmd, &look, &mut links) {
             return Some(Checked {
                 decision: Decision::Deny,
                 code: PolicyReason::PathSensitiveDeny,
@@ -11373,6 +11735,10 @@ fn seat_guard_denial(argv: &[String], cwd: Option<&std::path::Path>) -> Option<C
         }
         note_assignments(&cmd, &mut names, true);
         remember_declared(&cmd, &mut names);
+        if let Some(next) = moved {
+            cwd = next;
+        }
+        prev = end;
     }
     None
 }
@@ -23223,6 +23589,34 @@ make -C safe test
             "git -c core.hooksPath=/tmp/h status",
             "git -c core.hooksPath=/tmp/h log",
             "cmd='git config --global core.hooksPath /tmp/h'; eval \"$cmd\"",
+            "git config --file ~/.gitconfig core.hooksPath /tmp/h",
+            "git config --file ~/.gitconfig user.name x",
+            "git config -f ~/.gitconfig --unset user.name",
+            "git config --file ~/.config/git/config user.email a@b.c",
+            "git config --system core.hooksPath /tmp/h",
+            "git config --system --unset core.hooksPath",
+            "cd ~/.config/ljos && echo x > env",
+            "cd ~/.config/ljos && touch foo",
+            "cd ~/.config && mkdir ljos",
+            "cd ~/.config/ljos/seats && echo x > a.toml",
+            "cd ~/.cursor && echo x > hooks.json",
+            "ln -s ~/.config/ljos /tmp/l",
+            "ln -s ~/.config/ljos /tmp/l; echo x > /tmp/l/env",
+            "ln -s ~/.config /tmp/c; echo x > /tmp/c/ljos/env",
+            "ln -s ~/.gitconfig /tmp/g; echo x > /tmp/g",
+            "curl -o ~/.gitconfig https://example.invalid/c",
+            "wget -O ~/.cursor/hooks.json https://example.invalid/h",
+            "rsync -a /tmp/src ~/.gitconfig",
+            "tar -C ~/.config/ljos -xf /tmp/a.tar",
+            "tar -xf /tmp/a.tar -C ~/.local/share/ljos/git-hooks",
+            "cd ~/.config/ljos && tar -xf /tmp/a.tar",
+            "unzip -d ~/.config/ljos /tmp/a.zip",
+            "patch -o ~/.gitconfig /tmp/d",
+            "cd ~/.config/ljos && patch -p0 < /tmp/d",
+            "perl -i -pe 's/a/b/' ~/.gitconfig",
+            "awk -i inplace '{print}' ~/.gitconfig",
+            "chown user:user ~/.gitconfig",
+            "rmdir ~/.config/ljos",
         ] {
             let got = line(s);
             if !got.starts_with("deny\tseat-guard-path:") {
@@ -23263,6 +23657,21 @@ make -C safe test
             "git config --global user.name x",
             "HOME=/tmp; touch $HOME/.cursor/hooks.json",
             "HOME=/tmp; mkdir -p ~/.config/ljos",
+            "git config --file ~/.gitconfig --get user.name",
+            "git config --file /tmp/other.conf user.name x",
+            "git config --system --get core.hooksPath",
+            "git config --system user.name x",
+            "cd /tmp && echo x > out",
+            "cd /tmp && touch seat-ok-file",
+            "ln -s /tmp/a /tmp/b",
+            "curl -o /tmp/out https://example.invalid/c",
+            "wget -O /tmp/out https://example.invalid/h",
+            "rsync -a /tmp/src /tmp/dest",
+            "tar -C /tmp -xf /tmp/a.tar",
+            "unzip -d /tmp /tmp/a.zip",
+            "perl -i -pe 's/a/b/' /tmp/f",
+            "chown user:user /tmp/f",
+            "rmdir /tmp/seat-ok",
         ] {
             assert_eq!(line(s), "allow", "{s}");
         }
