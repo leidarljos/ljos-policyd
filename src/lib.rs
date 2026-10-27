@@ -6759,7 +6759,12 @@ fn host_argv_table_at(argv: &[String], depth: usize, moved: bool, parent: &Scrat
     let _span = phase::enter(phase::TABLE);
     let mut bound = parent.clone();
     bound.observe(argv);
+    // `touch` and `mkdir` write a path and still return here. The seat
+    // files are checked first, so a plain `echo` does not pay for that.
     if inert_argv(argv) {
+        if let Some(c) = seat_guard_denial(argv, bound.root.as_deref()) {
+            return c;
+        }
         return Checked {
             decision: Decision::Allow,
             code: PolicyReason::Unspecified,
@@ -7070,6 +7075,9 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
     // `g=git; $g push -f`: a bare assignment earlier on the line names what
     // a later `$g` or `${g}` command word runs.
     let mut names: Vec<(String, String)> = Vec::new();
+    // Set when an assignment can change where a later `~` or `$HOME`
+    // lands, so that command is judged with the path the shell opens.
+    let mut seat_names = false;
     for (i, cmd) in commands(argv).into_iter().enumerate() {
         if cmd.iter().all(|w| is_assignment(w)) {
             for w in &cmd {
@@ -7083,12 +7091,20 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
                             .map_or(v.to_string(), |(_, was)| format!("{was}{v}")),
                         None => v.to_string(),
                     };
-                    names.push((k.trim_end_matches('+').to_string(), v));
+                    let key = k.trim_end_matches('+');
+                    note_seat_name(&mut seat_names, key, &v);
+                    names.push((key.to_string(), v));
                 }
             }
             continue;
         }
+        let before = names.len();
         remember_declared(&cmd, &mut names);
+        if !seat_names {
+            for (k, v) in &names[before..] {
+                note_seat_name(&mut seat_names, k, v);
+            }
+        }
         let mut owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
         if let Some(first) = owned.first_mut() {
             let body = quoted_body(first);
@@ -7218,9 +7234,108 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
                     }
                 }
             }
-            out.push((i, run.to_vec()));
+            out.push((
+                i,
+                if seat_names {
+                    rewrite_seat_args(run, &names)
+                } else {
+                    run.to_vec()
+                },
+            ));
         }
     }
+    out
+}
+
+/// An assignment that can move a later seat path: `HOME`, an `XDG`
+/// directory, or a value that already names one of those files.
+fn note_seat_name(seat: &mut bool, key: &str, value: &str) {
+    if *seat {
+        return;
+    }
+    let value = unquote(value);
+    if matches!(key, "HOME" | "XDG_CONFIG_HOME" | "XDG_DATA_HOME")
+        || value.contains('~')
+        || value.contains(".cursor")
+        || value.contains(".claude")
+        || value.contains("ljos")
+        || value.contains("gitconfig")
+        || value.contains("/git/")
+    {
+        *seat = true;
+    }
+}
+
+fn concrete_value(v: &str) -> bool {
+    !v.is_empty() && !v.contains(['$', '`', '*', '?', '[', '\n', ';', ' '])
+}
+
+/// `$name` whose assignment is a plain path, then a leading `~` from
+/// the `HOME` assigned on this line. Other words stay as written.
+fn rewrite_seat_args(run: &[String], names: &[(String, String)]) -> Vec<String> {
+    let home = names
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "HOME")
+        .and_then(|(_, v)| {
+            let v = unquote(v);
+            (concrete_value(v) && v.starts_with('/')).then_some(v.to_string())
+        });
+    run.iter()
+        .map(|w| rewrite_seat_word(w, names, home.as_deref()))
+        .collect()
+}
+
+fn rewrite_seat_word(word: &str, names: &[(String, String)], home: Option<&str>) -> String {
+    let w = if word.contains('$') {
+        subst_concrete(word, names)
+    } else {
+        word.to_string()
+    };
+    let Some(home) = home else {
+        return w;
+    };
+    let bare = unquote(&w);
+    let replaced = if bare == "~" {
+        home.to_string()
+    } else if let Some(rest) = bare.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else {
+        return w;
+    };
+    if bare.len() == w.len() {
+        replaced
+    } else {
+        format!("\"{replaced}\"")
+    }
+}
+
+fn subst_concrete(word: &str, names: &[(String, String)]) -> String {
+    let mut out = String::new();
+    let mut rest = word;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + 1..];
+        let Some((name, len)) = param_at(rest) else {
+            out.push('$');
+            continue;
+        };
+        let value = names
+            .iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| unquote(v.as_str()))
+            .filter(|v| concrete_value(v));
+        if let Some(v) = value {
+            out.push_str(v);
+            rest = &rest[len..];
+        } else {
+            out.push('$');
+            out.push_str(&rest[..len]);
+            rest = &rest[len..];
+        }
+    }
+    out.push_str(rest);
     out
 }
 
@@ -10675,6 +10790,593 @@ fn closed_word(w: String) -> String {
     }
 }
 
+/// Words that can write a seat file. Anything else returns before the
+/// path walk, which is the fast path's whole cost for a plain `echo`.
+fn guard_writer(w: &str) -> bool {
+    if w.contains('>') {
+        return true;
+    }
+    matches!(
+        base_of(w),
+        "touch"
+            | "mkdir"
+            | "tee"
+            | "cp"
+            | "ln"
+            | "mv"
+            | "install"
+            | "dd"
+            | "truncate"
+            | "sed"
+            | "chmod"
+            | "rm"
+            | "git"
+    )
+}
+
+/// A word that could name a seat file once `~` and `$HOME` are expanded.
+/// A long script that never says so skips the path walk.
+fn seat_marker(w: &str) -> bool {
+    if w.contains('~')
+        || w.contains("HOME")
+        || w.contains("XDG_")
+        || w.contains(".cursor")
+        || w.contains(".claude")
+        || w.contains("ljos")
+        || w.contains("gitconfig")
+        || w.contains("/git/")
+    {
+        return true;
+    }
+    let hook = w.contains("hook") || w.contains("Hook") || w.contains("HOOK");
+    hook && w
+        .as_bytes()
+        .windows(9)
+        .any(|s| s.eq_ignore_ascii_case(b"hookspath"))
+}
+
+fn may_touch_seat(argv: &[String]) -> bool {
+    let mut writer = false;
+    let mut marker = false;
+    for w in argv {
+        writer |= guard_writer(w);
+        marker |= seat_marker(w);
+        if writer && marker {
+            return true;
+        }
+    }
+    false
+}
+
+fn process_home() -> String {
+    match std::env::var("HOME") {
+        Ok(h) if !h.is_empty() => lexical_norm(&h),
+        _ => {
+            let h = tilde_home(None);
+            if h.is_empty() || h == "$" {
+                String::new()
+            } else {
+                lexical_norm(&h)
+            }
+        }
+    }
+}
+
+fn process_xdg(key: &str, home: &str, suffix: &str) -> String {
+    match std::env::var(key) {
+        Ok(v) if !v.is_empty() => lexical_norm(&v),
+        _ if !home.is_empty() => format!("{home}/{suffix}"),
+        _ => String::new(),
+    }
+}
+
+/// `.` and `..` and a trailing slash come off. The result is the path
+/// the shell would open, without asking the filesystem.
+fn lexical_norm(path: &str) -> String {
+    let abs = path.starts_with('/');
+    let mut out: Vec<&str> = Vec::new();
+    for c in path.split('/') {
+        if c.is_empty() || c == "." {
+            continue;
+        }
+        if c == ".." {
+            if abs || out.last().is_some_and(|s| *s != "..") {
+                out.pop();
+            } else {
+                out.push("..");
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    if !abs {
+        return out.join("/");
+    }
+    if out.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{}", out.join("/"))
+    }
+}
+
+fn unquote(w: &str) -> &str {
+    let w = quoted_body(w);
+    w.strip_prefix('\'')
+        .and_then(|s| s.strip_suffix('\''))
+        .filter(|s| !s.contains('\''))
+        .unwrap_or(w)
+}
+
+struct GuardSet {
+    files: Vec<String>,
+    dirs: Vec<String>,
+}
+
+impl GuardSet {
+    /// The seat files on this machine: hook files, the ljos config, the
+    /// global git hooks directory, and the global git config. `XDG_*`
+    /// comes from the environment, or from `~/.config` and
+    /// `~/.local/share` when it is unset.
+    fn real() -> Self {
+        let home = process_home();
+        let cfg = process_xdg("XDG_CONFIG_HOME", &home, ".config");
+        let data = process_xdg("XDG_DATA_HOME", &home, ".local/share");
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+        if !home.is_empty() {
+            files.push(format!("{home}/.cursor/hooks.json"));
+            files.push(format!("{home}/.claude/settings.json"));
+            files.push(format!("{home}/.claude/settings.local.json"));
+            files.push(format!("{home}/.gitconfig"));
+        }
+        if !cfg.is_empty() {
+            files.push(format!("{cfg}/git/config"));
+            dirs.push(format!("{cfg}/ljos"));
+        }
+        if !data.is_empty() {
+            dirs.push(format!("{data}/ljos/git-hooks"));
+        }
+        Self { files, dirs }
+    }
+
+    fn hit(&self, path: &str) -> bool {
+        if self.files.iter().any(|f| f == path) {
+            return true;
+        }
+        self.dirs.iter().any(|d| {
+            path == d
+                || path
+                    .strip_prefix(d.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    }
+}
+
+fn push_name(names: &mut Vec<(String, String)>, key: &str, value: &str, append: bool) {
+    let value = unquote(value);
+    let value = if append {
+        names
+            .iter()
+            .rev()
+            .find(|(k, _)| k == key)
+            .map_or_else(|| value.to_string(), |(_, was)| format!("{was}{value}"))
+    } else {
+        value.to_string()
+    };
+    names.push((key.to_string(), value));
+}
+
+fn note_assignments(cmd: &[&str], names: &mut Vec<(String, String)>, prefix_only: bool) {
+    for w in cmd {
+        if let Some((k, v, append)) = assignment_of(w) {
+            push_name(names, k, v, append);
+            continue;
+        }
+        if prefix_only && !is_redirection(w) {
+            break;
+        }
+    }
+}
+
+/// A directory assignment the shell can use: absolute, or `~`, with no
+/// parameter left in it. Anything else keeps the previous value.
+fn assigned_dir(names: &[(String, String)], key: &str, home: &str) -> Option<String> {
+    let (_, raw) = names.iter().rev().find(|(k, _)| k == key)?;
+    let v = unquote(raw);
+    if v.is_empty() {
+        return Some(String::new());
+    }
+    let v = if let Some(rest) = v.strip_prefix("~/") {
+        if home.is_empty() {
+            return None;
+        }
+        format!("{home}/{rest}")
+    } else if v == "~" {
+        home.to_string()
+    } else {
+        v.to_string()
+    };
+    if !v.starts_with('/') || v.contains(['$', '`', '~', '*', '?', '[']) {
+        return None;
+    }
+    Some(lexical_norm(&v))
+}
+
+fn shell_dirs(
+    names: &[(String, String)],
+    real_home: &str,
+    real_cfg: &str,
+    real_data: &str,
+) -> (String, String, String) {
+    let home = assigned_dir(names, "HOME", real_home).unwrap_or_else(|| real_home.to_string());
+    let cfg = assigned_dir(names, "XDG_CONFIG_HOME", &home).unwrap_or_else(|| real_cfg.to_string());
+    let data = assigned_dir(names, "XDG_DATA_HOME", &home).unwrap_or_else(|| real_data.to_string());
+    (home, cfg, data)
+}
+
+fn param_at(rest: &str) -> Option<(&str, usize)> {
+    if let Some(body) = rest.strip_prefix('{') {
+        let j = body.find('}')?;
+        let name = &body[..j];
+        return is_name(name).then_some((name, j + 2));
+    }
+    let n = rest
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(rest.len());
+    (n > 0 && is_name(&rest[..n])).then_some((&rest[..n], n))
+}
+
+fn lookup_guard<'a>(
+    name: &str,
+    names: &'a [(String, String)],
+    home: &'a str,
+    cfg: &'a str,
+    data: &'a str,
+) -> Option<&'a str> {
+    if let Some((_, v)) = names.iter().rev().find(|(k, _)| k == name) {
+        return Some(v.as_str());
+    }
+    match name {
+        "HOME" if !home.is_empty() => Some(home),
+        "XDG_CONFIG_HOME" if !cfg.is_empty() => Some(cfg),
+        "XDG_DATA_HOME" if !data.is_empty() => Some(data),
+        _ => None,
+    }
+}
+
+/// `$name` and `${name}` from an assignment on this line, then `HOME`
+/// and the two `XDG` directories. A quoted form is the same text.
+fn subst_guard(
+    word: &str,
+    names: &[(String, String)],
+    home: &str,
+    cfg: &str,
+    data: &str,
+) -> String {
+    if !word.contains('$') {
+        return word.to_string();
+    }
+    let mut out = String::new();
+    let mut rest = word;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + 1..];
+        let Some((name, len)) = param_at(rest) else {
+            out.push('$');
+            continue;
+        };
+        match lookup_guard(name, names, home, cfg, data) {
+            Some(v) => {
+                out.push_str(unquote(v));
+                rest = &rest[len..];
+            }
+            None => out.push('$'),
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn expand_guard(
+    word: &str,
+    names: &[(String, String)],
+    home: &str,
+    cfg: &str,
+    data: &str,
+) -> String {
+    let mut w = unquote(word).to_string();
+    for _ in 0..2 {
+        if w.contains('$') {
+            w = subst_guard(&w, names, home, cfg, data);
+        }
+        if home.is_empty() {
+            break;
+        }
+        if let Some(rest) = w.strip_prefix("~/") {
+            w = format!("{home}/{rest}");
+        } else if w == "~" {
+            w = home.to_string();
+        } else {
+            break;
+        }
+    }
+    w
+}
+
+fn landed(path: &str, cwd: Option<&std::path::Path>) -> Option<String> {
+    if path.is_empty() || path.contains(['$', '`', '*', '?', '[', '~']) {
+        return None;
+    }
+    if path.starts_with('/') {
+        return Some(lexical_norm(path));
+    }
+    let cwd = cwd
+        .and_then(|p| p.to_str())
+        .filter(|p| p.starts_with('/'))?;
+    Some(lexical_norm(&format!(
+        "{}/{}",
+        cwd.trim_end_matches('/'),
+        path
+    )))
+}
+
+fn guard_path(
+    word: &str,
+    names: &[(String, String)],
+    home: &str,
+    cfg: &str,
+    data: &str,
+    cwd: Option<&std::path::Path>,
+    guards: &GuardSet,
+) -> Option<String> {
+    let expanded = expand_guard(word, names, home, cfg, data);
+    let abs = landed(&expanded, cwd)?;
+    guards.hit(&abs).then_some(abs)
+}
+
+fn first_guard<'a, I>(
+    words: I,
+    names: &[(String, String)],
+    home: &str,
+    cfg: &str,
+    data: &str,
+    cwd: Option<&std::path::Path>,
+    guards: &GuardSet,
+) -> Option<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    words
+        .into_iter()
+        .find_map(|w| guard_path(w, names, home, cfg, data, cwd, guards))
+}
+
+fn redirect_targets_of<'a>(cmd: &'a [&'a str]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < cmd.len() {
+        let next = cmd.get(i + 1).copied();
+        if let Some((target, ate)) = output_target(cmd[i], next) {
+            out.push(target);
+            if ate {
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Non-option words. A short or long option in `eat_short` / `eat_long`
+/// consumes the next word when its value is separate (`touch -r REF`).
+fn bare_words<'a>(args: &[&'a str], eat_short: &str, eat_long: &[&str]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut it = args.iter().copied();
+    let mut end = false;
+    while let Some(a) = it.next() {
+        if end || a == "-" || !a.starts_with('-') {
+            out.push(a);
+            continue;
+        }
+        if a == "--" {
+            end = true;
+            continue;
+        }
+        if let Some(name) = a.strip_prefix("--") {
+            let (name, glued) = name
+                .split_once('=')
+                .map_or((name, false), |(n, _)| (n, true));
+            if !glued && eat_long.contains(&name) {
+                it.next();
+            }
+            continue;
+        }
+        let cluster = &a[1..];
+        if let Some((i, _)) = cluster.char_indices().find(|(_, c)| eat_short.contains(*c)) {
+            if cluster[i + 1..].is_empty() {
+                it.next();
+            }
+        }
+    }
+    out
+}
+
+fn is_chmod_mode(p: &str) -> bool {
+    let p = unquote(p);
+    if p.is_empty() || p.contains('/') || p.starts_with(['~', '$', '.']) {
+        return false;
+    }
+    p.chars().all(|c| c.is_ascii_digit()) || p.contains(['+', '=', ','])
+}
+
+fn chmod_paths<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut paths = bare_words(args, "", &["reference"]);
+    if paths.first().is_some_and(|p| is_chmod_mode(p)) {
+        paths.remove(0);
+    }
+    paths
+}
+
+fn cmd_head<'a>(cmd: &[&'a str]) -> Option<(&'a str, Vec<&'a str>)> {
+    let words = operands(cmd);
+    let mut i = 0;
+    while i < words.len() && is_assignment(words[i]) {
+        i += 1;
+    }
+    let head = *words.get(i)?;
+    Some((base_of(head), words[i + 1..].to_vec()))
+}
+
+/// `git config --global` of `core.hooksPath`, an unset of that key, or
+/// `git -c core.hooksPath=...`. A `--get` reads the key and is allowed.
+fn git_hooks_path_write(cmd: &[&str]) -> bool {
+    let Some(git_at) = cmd.iter().position(|w| base_of(w) == "git") else {
+        return false;
+    };
+    let owned: Vec<String> = cmd[git_at..].iter().map(|s| (*s).to_string()).collect();
+    if git_configs(&owned)
+        .iter()
+        .any(|(k, _)| k == "core.hookspath")
+    {
+        return true;
+    }
+    let Some((sub, rest)) = git_subcommand(&owned) else {
+        return false;
+    };
+    if sub != "config" || !rest.iter().any(|a| a == "--global") {
+        return false;
+    }
+    let unset = rest.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "--unset" | "--unset-all" | "--replace-all" | "--add"
+        )
+    });
+    let get = rest.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "--get" | "--get-all" | "--get-regexp" | "--list" | "-l"
+        )
+    });
+    if get && !unset {
+        return false;
+    }
+    let operands: Vec<&str> = rest
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    if !operands
+        .iter()
+        .any(|a| a.eq_ignore_ascii_case("core.hooksPath"))
+    {
+        return false;
+    }
+    unset || operands.len() >= 2
+}
+
+fn command_guard_hit(
+    cmd: &[&str],
+    names: &[(String, String)],
+    home: &str,
+    cfg: &str,
+    data: &str,
+    cwd: Option<&std::path::Path>,
+    guards: &GuardSet,
+) -> Option<String> {
+    let see = |w: &str| guard_path(w, names, home, cfg, data, cwd, guards);
+    if let Some(hit) = first_guard(
+        redirect_targets_of(cmd),
+        names,
+        home,
+        cfg,
+        data,
+        cwd,
+        guards,
+    ) {
+        return Some(hit);
+    }
+    let (head, args) = cmd_head(cmd)?;
+    if head == "git" && git_hooks_path_write(cmd) {
+        return Some("core.hooksPath".to_string());
+    }
+    let paths: Vec<String> = match head {
+        "tee" => bare_words(&args, "", &[])
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        "cp" | "ln" | "install" => copy_target(&args, head == "ln", &|_| false),
+        "mv" => {
+            let mut t = copy_target(&args, false, &|_| false);
+            t.extend(
+                bare_words(&args, "t", &["target-directory"])
+                    .into_iter()
+                    .map(str::to_string),
+            );
+            t
+        }
+        "dd" => args
+            .iter()
+            .filter_map(|a| a.strip_prefix("of="))
+            .map(str::to_string)
+            .collect(),
+        "truncate" => bare_words(&args, "sr", &["size", "reference"])
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        "sed" if sed_in_place(&args) => sed_files(&args),
+        "chmod" => chmod_paths(&args).into_iter().map(str::to_string).collect(),
+        "rm" => bare_words(&args, "", &[])
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        "touch" => bare_words(&args, "drt", &["date", "reference", "time"])
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        "mkdir" => bare_words(&args, "m", &["mode", "context"])
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    };
+    paths.iter().find_map(|p| see(p))
+}
+
+/// A write onto a file the seat keeps for itself: the hook files,
+/// the ljos config directory, the global git hooks directory, and the
+/// global git config. The shell hook only sees the top-level command,
+/// so a script that writes one of these is judged here. `~`, `$HOME`,
+/// `${HOME}` and the `XDG` directories are the path the shell opens,
+/// with `..` and a trailing slash taken off.
+fn seat_guard_denial(argv: &[String], cwd: Option<&std::path::Path>) -> Option<Checked> {
+    if !may_touch_seat(argv) {
+        return None;
+    }
+    let guards = GuardSet::real();
+    let real_home = process_home();
+    let real_cfg = process_xdg("XDG_CONFIG_HOME", &real_home, ".config");
+    let real_data = process_xdg("XDG_DATA_HOME", &real_home, ".local/share");
+    let mut names: Vec<(String, String)> = Vec::new();
+    for cmd in commands(argv) {
+        if cmd.iter().all(|w| is_assignment(w)) {
+            note_assignments(&cmd, &mut names, false);
+            continue;
+        }
+        let (home, cfg, data) = shell_dirs(&names, &real_home, &real_cfg, &real_data);
+        if let Some(path) = command_guard_hit(&cmd, &names, &home, &cfg, &data, cwd, &guards) {
+            return Some(Checked {
+                decision: Decision::Deny,
+                code: PolicyReason::PathSensitiveDeny,
+                token: Cow::Owned(format!("seat-guard-path: {path}")),
+            });
+        }
+        note_assignments(&cmd, &mut names, true);
+        remember_declared(&cmd, &mut names);
+    }
+    None
+}
+
 fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
     if argv.is_empty() {
         return Checked {
@@ -10704,6 +11406,9 @@ fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
             code: PolicyReason::ShellRemoteExec,
             token: Cow::Borrowed("decoded-pipe-shell"),
         };
+    }
+    if let Some(c) = seat_guard_denial(argv, bound.root.as_deref()) {
+        return c;
     }
     if setuid_mode(argv) || interpreter_setuid(argv) {
         return Checked {
@@ -22441,6 +23146,128 @@ make -C safe test
                 "steps {steps} allow {allow_dt:?}\n{allow_ph}\ndeny {deny_dt:?}\n{deny_ph}"
             );
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A script can write a seat file that the top-level hook never sees.
+    /// Each path is refused for every write form, including a later line
+    /// and a command a variable or a wrapper runs. A read stays allowed,
+    /// and so does a write under `/tmp` or in the work tree.
+    #[test]
+    fn a_seat_guard_path_is_not_written() {
+        let line = |s: &str| verdict(&shell_words(s));
+        let paths = [
+            "~/.cursor/hooks.json",
+            "$HOME/.cursor/hooks.json",
+            "\"$HOME/.cursor/hooks.json\"",
+            "${HOME}/.cursor/hooks.json",
+            "~/.cursor/foo/../hooks.json",
+            "~/.claude/settings.json",
+            "~/.claude/settings.local.json",
+            "~/.config/ljos",
+            "~/.config/ljos/",
+            "~/.config/ljos/seats/a.toml",
+            "~/.config/ljos/seats/../env",
+            "$XDG_CONFIG_HOME/ljos/seats/a.toml",
+            "~/.local/share/ljos/git-hooks",
+            "~/.local/share/ljos/git-hooks/pre-push",
+            "${XDG_DATA_HOME}/ljos/git-hooks/pre-push",
+            "~/.gitconfig",
+            "~/.config/git/config",
+            "$XDG_CONFIG_HOME/git/config",
+        ];
+        let forms = [
+            "echo x > {p}",
+            "echo x >> {p}",
+            "printf x >| {p}",
+            "echo x &> {p}",
+            "printf x | tee {p}",
+            "cp /tmp/src {p}",
+            "ln -sf /tmp/src {p}",
+            "mv /tmp/src {p}",
+            "install /tmp/src {p}",
+            "dd if=/dev/null of={p}",
+            "truncate -s 0 {p}",
+            "sed -i 's/a/b/' {p}",
+            "chmod 644 {p}",
+            "rm -f {p}",
+            "touch {p}",
+            "mkdir -p {p}",
+        ];
+        let mut missed = Vec::new();
+        for p in paths {
+            for form in forms {
+                let s = form.replace("{p}", p);
+                let got = line(&s);
+                if !got.starts_with("deny\tseat-guard-path:") {
+                    missed.push(format!("{s} -> {got}"));
+                }
+            }
+        }
+        for s in [
+            "p=~/.cursor/hooks.json; touch \"$p\"",
+            "p=~/.cursor/hooks.json\ntouch \"$p\"",
+            "cmd=touch; $cmd ~/.cursor/hooks.json",
+            "cmd=touch\n$cmd ~/.cursor/hooks.json",
+            "readonly cmd=touch; $cmd ~/.gitconfig",
+            "declare p=~/.config/ljos/env; touch \"$p\"",
+            "local p=~/.local/share/ljos/git-hooks/pre-push; touch \"$p\"",
+            "env touch ~/.cursor/hooks.json",
+            "nice touch ~/.claude/settings.json",
+            "command mkdir -p ~/.config/ljos",
+            "exec rm -f ~/.gitconfig",
+            "env git config --global core.hooksPath /tmp/h",
+            "git config --global core.hooksPath /tmp/h",
+            "git config --global --unset core.hooksPath",
+            "git config --global --unset-all core.hooksPath",
+            "git -c core.hooksPath=/tmp/h status",
+            "git -c core.hooksPath=/tmp/h log",
+            "cmd='git config --global core.hooksPath /tmp/h'; eval \"$cmd\"",
+        ] {
+            let got = line(s);
+            if !got.starts_with("deny\tseat-guard-path:") {
+                missed.push(format!("{s} -> {got}"));
+            }
+        }
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            let s = format!("HOME=/tmp; touch {home}/.cursor/hooks.json");
+            let got = line(&s);
+            if !got.starts_with("deny\tseat-guard-path:") {
+                missed.push(format!("{s} -> {got}"));
+            }
+        }
+        assert!(missed.is_empty(), "{missed:#?}");
+
+        let root = startup_root("seatguard");
+        std::fs::write(root.join("s.sh"), "p=~/.cursor/hooks.json\ntouch \"$p\"\n").unwrap();
+        let c = check_shell_in(&shell_words("bash s.sh"), &root, 0);
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(c.token.starts_with("seat-guard-path:"), "{}", c.token);
+
+        for s in [
+            "cat ~/.cursor/hooks.json",
+            "ls ~/.config/ljos",
+            "grep x ~/.gitconfig",
+            "git config --get core.hooksPath",
+            "git config --global --get core.hooksPath",
+            "git config user.name x",
+            "echo x > /tmp/out",
+            "mkdir -p /tmp/seat-ok",
+            "touch /tmp/seat-ok-file",
+            "rm -f /tmp/seat-ok-file",
+            "echo x > notes.txt",
+            "mkdir -p build/out",
+            "chmod 644 notes.txt",
+            "cp notes.txt /tmp/notes.bak",
+            "git config --global user.name x",
+            "HOME=/tmp; touch $HOME/.cursor/hooks.json",
+            "HOME=/tmp; mkdir -p ~/.config/ljos",
+        ] {
+            assert_eq!(line(s), "allow", "{s}");
+        }
+        let c = check_shell_in(&shell_words("echo x > notes.txt"), &root, 0);
+        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
