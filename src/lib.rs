@@ -6676,17 +6676,13 @@ fn expanded_command(cmd: &[&str]) -> Result<Option<Vec<String>>, ()> {
     Ok(changed.then_some(out))
 }
 
-/// The table on one argv, then on every command it runs through a wrapper
-/// (`env`, `nice`, `xargs`, ...) or a shell's `-c` script, so `env git push
-/// -f` and `sh -c "git push -f"` meet the same rules as `git push -f`.
-/// `moved` is true when a `cd` or `pushd` anywhere on the line can leave the
-/// working tree, so a relative path no longer says where a delete lands.
-/// Programs and keywords the deny rules do not read. A second command,
-/// a substitution, a brace or a privilege word is not in this set: the
-/// table still walks those. A program that writes a file is not here
-/// either: `cp`, `ln`, `mv`, `install`, `tee` and `dd` overwrite whatever
-/// path they are given. `export`, `readonly`, `declare`, `typeset`,
-/// `local`, `alias` and `unalias` change what a later command runs.
+/// Programs the deny rules do not read. A second command, a substitution,
+/// a brace or a privilege word is not in this set: the table still walks
+/// those. A wrapper is not here, and neither is a `$name`. A program that
+/// writes a file is not here either: `cp`, `ln`, `mv`, `install`, `tee`
+/// and `dd` overwrite whatever path they are given. `export`, `readonly`,
+/// `declare`, `typeset`, `local`, `alias` and `unalias` change what a
+/// later command runs.
 fn inert_program(base: &str) -> bool {
     matches!(
         base,
@@ -6754,6 +6750,11 @@ fn inert_argv(argv: &[String]) -> bool {
     saw && inert_program(head)
 }
 
+/// The table on one argv, then on every command it runs through a wrapper
+/// (`env`, `nice`, `xargs`, ...) or a shell's `-c` script, so `env git push
+/// -f` and `sh -c "git push -f"` meet the same rules as `git push -f`.
+/// `moved` is true when a `cd` or `pushd` anywhere on the line can leave the
+/// working tree, so a relative path no longer says where a delete lands.
 fn host_argv_table_at(argv: &[String], depth: usize, moved: bool, parent: &Scratch) -> Checked {
     let _span = phase::enter(phase::TABLE);
     let mut bound = parent.clone();
@@ -6965,6 +6966,62 @@ fn alias_defs(cmd: &[&str]) -> Vec<(String, String)> {
     }
 }
 
+/// `$name` or `${name}` when an earlier assignment shows its value.
+/// `"$name"` is that word. A longer word is not a command by itself.
+fn assigned_words(word: &str, names: &[(String, String)]) -> Option<Vec<String>> {
+    let name = var_command_name(word)?;
+    let v = names.iter().rev().find(|(k, _)| k == name)?.1.as_str();
+    let words = shell_words(v);
+    (!words.is_empty()).then_some(words)
+}
+
+/// `script` with each `$name` and `${name}` an earlier assignment shows
+/// written in place of the parameter. A single-quoted word keeps its
+/// `$`. The value is inserted once: the shell does not expand it again.
+fn expand_assigned_params<'a>(script: &'a str, names: &[(String, String)]) -> Cow<'a, str> {
+    if literal_text(script) || !script.contains('$') {
+        return Cow::Borrowed(script);
+    }
+    let mut out = String::new();
+    let mut rest = script;
+    let mut changed = false;
+    while let Some(i) = rest.find('$') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i + 1..];
+        let (name, len) = match rest.strip_prefix('{') {
+            Some(b) => match b.find('}') {
+                Some(j) => (&b[..j], j + 2),
+                None => {
+                    out.push('$');
+                    continue;
+                }
+            },
+            None => {
+                let n = rest
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .unwrap_or(rest.len());
+                (&rest[..n], n)
+            }
+        };
+        let plain = !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if plain {
+            if let Some((_, v)) = names.iter().rev().find(|(k, _)| k == name) {
+                out.push_str(v);
+                rest = &rest[len..];
+                changed = true;
+                continue;
+            }
+        }
+        out.push('$');
+    }
+    out.push_str(rest);
+    if changed {
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(script)
+    }
+}
+
 /// [`inner_commands_at`] on a line whose aliases are already expanded.
 fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
     let mut out = Vec::new();
@@ -7029,6 +7086,21 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
             out.push((i, owned.clone()));
         }
         let (run, handed) = unwrap_wrappers(&owned);
+        // `cmd=rm; env $cmd` runs rm. The wrapper is not the command word,
+        // so the `$cmd` at the front of what it runs is substituted the
+        // same way a bare `$cmd` is.
+        let mut run_owned = None;
+        if handed.is_none() {
+            if let Some(head) = run.first() {
+                if head.contains('$') {
+                    if let Some(mut words) = assigned_words(head, &names) {
+                        words.extend(run.iter().skip(1).cloned());
+                        run_owned = Some(words);
+                    }
+                }
+            }
+        }
+        let run: &[String] = run_owned.as_deref().unwrap_or(run);
         if let Some(code) = inline_program(run) {
             for s in program_shell_strings(code) {
                 out.extend(script_lines(&s, 0).iter().map(|l| (i, shell_words(l))));
@@ -7040,7 +7112,8 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
             }
         }
         if let Some(script) = handed {
-            out.extend(script_lines(script, 0).iter().map(|l| (i, shell_words(l))));
+            let script = expand_assigned_params(quoted_body(script), &names);
+            out.extend(script_lines(&script, 0).iter().map(|l| (i, shell_words(l))));
             continue;
         }
         if run.is_empty() {
@@ -7056,14 +7129,20 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
             out.extend(script_lines(cb, 0).iter().map(|l| (i, shell_words(l))));
         }
         if let Some(script) = shell_script(run) {
-            out.extend(script_lines(script, 0).iter().map(|l| (i, shell_words(l))));
+            // `"$cmd"` keeps its quotes so a later split can see one
+            // parameter. The shell parses the expanded text as the script.
+            let script = expand_assigned_params(quoted_body(script), &names);
+            out.extend(script_lines(&script, 0).iter().map(|l| (i, shell_words(l))));
         } else if base_of(&run[0]) == "eval" {
             // eval joins its words with spaces and runs that as a script.
-            out.extend(
-                script_lines(&run[1..].join(" "), 0)
-                    .iter()
-                    .map(|l| (i, shell_words(l))),
-            );
+            // `cmd=rm; eval "$cmd -rf /var"` is that rm.
+            let joined = run[1..]
+                .iter()
+                .map(|w| quoted_body(w))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let script = expand_assigned_params(&joined, &names);
+            out.extend(script_lines(&script, 0).iter().map(|l| (i, shell_words(l))));
         } else if base_of(&run[0]) == ":::" {
             // `parallel ::: 'git push -f'`: with no command in front, each
             // argument is a shell command.
@@ -17433,6 +17512,121 @@ hash -r 2> /dev/null
             assert_eq!(v(argv), "allow", "{argv:?}");
         }
         assert_eq!(v(&["env", "dd", "if=x", "of=/dev/sda"]), "deny\traw-disk");
+    }
+
+    /// A plain program returns before the table reads it. That return is
+    /// only the program the line wrote. A wrapper, an alias, a function
+    /// or a variable in front of a delete is still that delete.
+    #[test]
+    fn a_plain_program_does_not_hide_a_wrapped_delete() {
+        let line = |s: &str| verdict(&shell_words(s));
+        let mut missed = Vec::new();
+        for s in [
+            "env rm -rf /var/lib/x",
+            "sh -c 'rm -rf /var/lib/x'",
+            "bash -c 'rm -rf /var/lib/x'",
+            "printf '/var/lib/x\\n' | xargs rm -rf",
+            "find /var/lib/x -exec rm -rf {} \\;",
+            "sudo rm -rf /var/lib/x",
+            "nice rm -rf /var/lib/x",
+            "nice -n 10 rm -rf /var/lib/x",
+            "timeout 5 rm -rf /var/lib/x",
+            "command rm -rf /var/lib/x",
+            "exec rm -rf /var/lib/x",
+            "alias echo='rm -rf /var/lib/x'; echo",
+            "alias echo='rm -rf /var/lib/x'\necho",
+            "alias rm='rm -rf /var/lib/x'; rm /etc",
+            "echo() { rm -rf /var/lib/x; }; echo",
+            "function echo { rm -rf /var/lib/x; }; echo",
+            "f() { rm -rf /var/lib/x; }; f",
+            "f() { rm -rf /var/lib/x; }\nf",
+            "cmd=rm; $cmd -rf /var/lib/x",
+            "cmd='rm -rf /var/lib/x'; $cmd",
+            "cmd=rm\n$cmd -rf /var/lib/x",
+            "cmd=rm; env $cmd -rf /var/lib/x",
+            "cmd=rm; nice $cmd -rf /var/lib/x",
+            "cmd=rm; timeout 5 $cmd -rf /var/lib/x",
+            "cmd=rm; command $cmd -rf /var/lib/x",
+            "cmd=rm; exec $cmd -rf /var/lib/x",
+            "cmd=rm; sh -c \"$cmd -rf /var/lib/x\"",
+            "cmd=rm; bash -c \"$cmd -rf /var/lib/x\"",
+            "cmd=rm; xargs $cmd -rf /var/lib/x",
+            "cmd=rm; find /var/lib/x -exec $cmd -rf {} \\;",
+            "cmd='rm -rf /var/lib/x'; sh -c \"$cmd\"",
+            "cmd='rm -rf /var/lib/x'; bash -c \"$cmd\"",
+            "cmd='rm -rf /var/lib/x'; eval \"$cmd\"",
+            "f() { rm -rf /var/lib/x; }; env f",
+            "f() { rm -rf /var/lib/x; }; nice f",
+            "f() { rm -rf /var/lib/x; }; timeout 5 f",
+            "f() { rm -rf /var/lib/x; }; command f",
+            "f() { rm -rf /var/lib/x; }; exec f",
+            "f() { rm -rf /var/lib/x; }; sh -c f",
+            "f() { rm -rf /var/lib/x; }; bash -c f",
+            "f() { rm -rf /var/lib/x; }; xargs f",
+            "f() { rm -rf /var/lib/x; }; find /var/lib/x -exec f {} \\;",
+        ] {
+            let got = line(s);
+            if !got.starts_with("deny") {
+                missed.push(format!("{s} -> {got}"));
+            }
+        }
+        assert!(missed.is_empty(), "{missed:#?}");
+        for s in [
+            "echo ok",
+            "env echo ok",
+            "sh -c 'echo ok'",
+            "bash -c 'echo ok'",
+            "command echo ok",
+            "exec echo ok",
+            "nice echo ok",
+            "timeout 5 echo ok",
+            "alias echo='printf %s\\n'; echo ok",
+            "cmd=echo; $cmd ok",
+            "cmd=echo; env $cmd ok",
+            "cmd=echo; sh -c \"$cmd ok\"",
+            "cmd=echo; bash -c \"$cmd ok\"",
+            "cmd=echo; command $cmd ok",
+            "cmd=echo; exec $cmd ok",
+            "cmd=echo; nice $cmd ok",
+            "cmd=echo; timeout 5 $cmd ok",
+            // A new shell does not see an alias from the parent line.
+            "alias echo='rm -rf /var/lib/x'; sh -c echo",
+            "alias echo='rm -rf /var/lib/x'; bash -c echo",
+            "f() { echo ok; }; f",
+            "function f { printf ok; }; f",
+        ] {
+            assert_eq!(line(s), "allow", "{s}");
+        }
+        let root =
+            std::env::temp_dir().join(format!("policyd-lib-{}-plain-wrap", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        for (name, body) in [
+            ("alias.sh", "alias echo='rm -rf /var/lib/x'\necho\n"),
+            ("fn.sh", "f() { rm -rf /var/lib/x; }\nf\n"),
+            ("var.sh", "cmd=rm\n$cmd -rf /var/lib/x\n"),
+            ("ok.sh", "echo ok\n"),
+        ] {
+            let path = root.join(name);
+            std::fs::write(&path, body).unwrap();
+            let rel = format!("./{name}");
+            for argv in [
+                vec!["sh".into(), rel.clone()],
+                vec!["bash".into(), rel.clone()],
+                vec![rel],
+            ] {
+                let got = check_shell_in(&argv, &root, 0);
+                let text = match got.decision {
+                    Decision::Allow => "allow".to_string(),
+                    Decision::Deny => format!("deny\t{}", got.token),
+                    Decision::Prompt => format!("prompt\t{}", got.token),
+                };
+                if name == "ok.sh" {
+                    assert_eq!(text, "allow", "{argv:?}");
+                } else {
+                    assert!(text.starts_with("deny"), "{argv:?} {body:?} -> {text}");
+                }
+            }
+        }
     }
 
     /// A redirection writes a file, and so do `cp`, `ln` and `tee`.
