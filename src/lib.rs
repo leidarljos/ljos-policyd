@@ -252,6 +252,7 @@ pub struct Checked {
 pub fn check_shell(argv: &[String]) -> Checked {
     let cwd = std::env::current_dir().unwrap_or_default();
     SPELLED.with(|s| s.borrow_mut().clear());
+    bump_spell_gen();
     check_shell_in(argv, &cwd, 0)
 }
 
@@ -263,6 +264,17 @@ thread_local! {
     /// single quote or a backslash.
     static SPELLED: std::cell::RefCell<std::collections::HashMap<String, bool>> =
         std::cell::RefCell::default();
+    /// Bumps when [`SPELLED`] gains a word or a quote bit flips. A reused
+    /// command judgment is valid only for the map it was made under.
+    static SPELL_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn spell_gen() -> u64 {
+    SPELL_GEN.with(std::cell::Cell::get)
+}
+
+fn bump_spell_gen() {
+    SPELL_GEN.with(|g| g.set(g.get().wrapping_add(1)));
 }
 
 /// The characters a shell may expand in an unquoted word.
@@ -272,8 +284,16 @@ fn spelled(w: &str, quoted: bool) {
     if w.contains(EXPANDS) {
         SPELLED.with(|s| {
             let mut s = s.borrow_mut();
-            let all = s.entry(w.to_string()).or_insert(quoted);
-            *all &= quoted;
+            if let Some(all) = s.get_mut(w) {
+                let next = *all && quoted;
+                if next != *all {
+                    *all = next;
+                    bump_spell_gen();
+                }
+                return;
+            }
+            s.insert(w.to_string(), quoted);
+            bump_spell_gen();
         });
     }
 }
@@ -289,6 +309,9 @@ const SCRIPT_DEPTH: usize = 3;
 /// or `pushd` before the runner on the line moves where its file is read,
 /// so `cd ~/proj && make clean-all` reads `~/proj/Makefile`.
 fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Checked {
+    if depth == 0 {
+        clear_table_memo();
+    }
     let parent = Scratch {
         root: Some(cwd.to_path_buf()),
         ..Scratch::default()
@@ -2302,6 +2325,88 @@ fn finish_conditional(
     }
 }
 
+/// True when the walk's second pass can see a nested script or a seat
+/// path that the first pass did not already walk. A line of plain
+/// commands has nothing further to run.
+fn walk_rerun(argv: &[String]) -> bool {
+    if argv.iter().any(|w| word_needs_rerun(w)) {
+        return true;
+    }
+    // `$m` after `m=make` is a different command once the name is filled
+    // in. The second pass runs that command where this line has moved.
+    ended_commands(argv).into_iter().any(|(cmd, _)| {
+        peel_cd_command_word(&cmd)
+            .first()
+            .is_some_and(|w| w.contains('$'))
+    })
+}
+
+fn word_needs_rerun(w: &str) -> bool {
+    if is_assignment(w) {
+        let (key, value) = w.split_once('=').unwrap_or((w, ""));
+        let key = key.trim_end_matches('+');
+        if matches!(key, "HOME" | "XDG_CONFIG_HOME" | "XDG_DATA_HOME") {
+            return true;
+        }
+        if value.contains('~')
+            || value.contains(".cursor")
+            || value.contains(".claude")
+            || value.contains("ljos")
+            || value.contains("gitconfig")
+            || value.contains("/git/")
+        {
+            return true;
+        }
+    }
+    if w.contains("<(") || w.contains(">(") {
+        return true;
+    }
+    let hit = |p: &str| {
+        let b = piece_base(p);
+        b == "env"
+            || b == "."
+            || SHELLS.contains(&b)
+            || matches!(
+                b,
+                "eval"
+                    | "source"
+                    | "find"
+                    | "xargs"
+                    | "parallel"
+                    | "mapfile"
+                    | "readarray"
+                    | "trap"
+                    | ":::"
+                    | "::::"
+                    | "docker"
+                    | "podman"
+                    | "nerdctl"
+            )
+            || b.starts_with("python")
+            || b.starts_with("pypy")
+            || interpreter_flag(b).is_some()
+    };
+    hit(w)
+        || (w.contains(char::is_whitespace)
+            && w.split(char::is_whitespace)
+                .any(|p| !p.is_empty() && hit(p)))
+}
+
+/// True when the list that starts at `from` is sent to the background.
+/// `&&`, `||` and `|` stay in that list. A `;` or the end of the line
+/// does not, so a shell copy is taken only for a list that comes back.
+fn background_list(ended: &[(Vec<&str>, &str)], from: usize) -> bool {
+    let mut i = from;
+    while i < ended.len() {
+        match ended[i].1 {
+            "&" => return true,
+            "&&" | "||" | "|" => i += 1,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Commands of `argv` in `shell`. A function body and a sourced file are
 /// read here too, so a `cd` in the body moves the shell that called it.
 fn walk(
@@ -2331,6 +2436,8 @@ fn walk(
         shell.lastpipe = true;
     }
     let (argv, defs) = lift_functions(&expanded);
+    // The second pass only walks a nested script. A line with none skips it.
+    let rerun = walk_rerun(&argv);
     // Every directory the next command may run in, and every one its
     // `cd -` may enter. A `cd` before `&&` holds for the commands after
     // it, and the directories it left wait in `failed` and `old_failed`
@@ -2350,8 +2457,9 @@ fn walk(
         brace: 0,
         sides: Vec::new(),
     };
-    // Where the list now running started, for a `&` to put back.
-    let mut list = shell.save();
+    // Where a background list started, so a `&` can put the shell back.
+    // A list with no `&` does not take the copy.
+    let mut list: Option<Saved> = None;
     let mut after = ";";
     let mut ran_in = Vec::new();
     // Each command's place on the line, under the one that started
@@ -2367,8 +2475,19 @@ fn walk(
     // command still knows which file `. ./$x` names.
     let mut cmd_at = Vec::new();
     let ended = ended_commands(&argv);
-    let (heredocs, data) = heredoc_bodies(&ended);
-    let pattern_skip = case_pattern_skips(&argv);
+    let (heredocs, data) = if argv.iter().any(|w| w.contains("<<")) {
+        heredoc_bodies(&ended)
+    } else {
+        (vec![None; ended.len()], vec![false; ended.len()])
+    };
+    let pattern_skip = if argv.iter().any(|w| {
+        w.split(char::is_whitespace)
+            .any(|p| !p.is_empty() && piece_base(p) == "case")
+    }) {
+        case_pattern_skips(&argv)
+    } else {
+        vec![false; ended.len()]
+    };
     for (ci, (cmd, end)) in ended.iter().enumerate() {
         let cmd = cmd.clone();
         let end = *end;
@@ -2382,7 +2501,7 @@ fn walk(
         );
         shell.aliases.extend(alias_defs(&cmd));
         if after == "&" {
-            shell.restore(list.clone());
+            shell.restore(list.take().expect("background list"));
             failed.clear();
             old_failed.clear();
             vars_failed = None;
@@ -2397,8 +2516,8 @@ fn walk(
                 p.1 = false;
             }
         }
-        if matches!(after, ";" | "&") {
-            list = shell.save();
+        if matches!(after, ";" | "&") && background_list(&ended, ci) {
+            list = Some(shell.save());
         }
         if let [d] = shell.here.as_slice() {
             if !is_untracked(d) {
@@ -2410,7 +2529,9 @@ fn walk(
         // before it may have skipped it.
         let gates = end == "&&" && after != "||";
         let before = std::mem::replace(&mut after, end);
-        cmd_at.push(shell.cmd_values.clone());
+        if rerun {
+            cmd_at.push(shell.cmd_values.clone());
+        }
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
         let owned = split_env_strings(&owned).into_owned();
         let run = unwrap_wrappers(&owned).0.to_vec();
@@ -2440,11 +2561,14 @@ fn walk(
             loops.push(seq);
         }
         shell.files.borrow_mut().cmd.clone_from(&id);
-        ran_in.push((at.clone(), shell.old.clone(), set.clone(), id.clone()));
+        if rerun {
+            ran_in.push((at.clone(), shell.old.clone(), set.clone(), id.clone()));
+        }
         // A subshell or substitution in the command runs where the
         // command does, and a `cd` inside it moves only itself.
         let mark = shell.files.borrow().written.len();
-        if depth < MAX_DEPTH {
+        let nests = depth < MAX_DEPTH && cmd.iter().any(|w| w.contains('(') || w.contains('`'));
+        if nests {
             let dirs = shell.here.clone();
             let oldpwd = shell.old.clone();
             let vars_now = shell.vars.clone();
@@ -2646,7 +2770,7 @@ fn walk(
         // the same walk that tracks the directory, whether or not the
         // file can move this shell. A pipeline stage's source moves only
         // its own subshell.
-        let read = {
+        let read = if cmd.iter().any(|w| matches!(base_of(w), "source" | ".")) {
             let files = shell.files.borrow();
             sourced(
                 &cmd,
@@ -2656,6 +2780,8 @@ fn walk(
                 &shell.cmd_values,
                 &files,
             )
+        } else {
+            Sourced::No
         };
         match read {
             Sourced::Read { keeps, words, text } => {
@@ -2973,12 +3099,12 @@ fn walk(
         &mut vars_failed,
     );
     if after == "&" {
-        shell.restore(list.clone());
+        shell.restore(list.take().expect("background list"));
     }
     shell.files.borrow_mut().cmd.clone_from(&base);
     spans.extend(loops.first().map(|&start| (start, seq)));
     shell.files.borrow_mut().lower_loops(&base, &spans);
-    if depth >= MAX_DEPTH {
+    if depth >= MAX_DEPTH || !rerun {
         return;
     }
     let fresh = initial_cmd_values();
@@ -4983,6 +5109,16 @@ fn startup_unshown() -> Checked {
     }
 }
 
+/// `sh`, `bash` or `env` in this word, including a packed `env -S` string.
+/// A quoted phrase that merely contains a space does not count.
+fn word_names_startup(w: &str) -> bool {
+    let hit = |p: &str| matches!(piece_base(p), "sh" | "bash" | "env");
+    hit(w)
+        || (w.contains(char::is_whitespace)
+            && w.split(char::is_whitespace)
+                .any(|p| !p.is_empty() && hit(p)))
+}
+
 /// Judge the `BASH_ENV` or `ENV` file a non-interactive `bash` or `sh`
 /// sources before its script, whether that is a `-c` string, a file
 /// operand or stdin. The file runs in the child, so a `cd` in it does
@@ -4995,6 +5131,9 @@ fn judge_startup(
     denied: &mut Option<Checked>,
 ) {
     if denied.is_some() {
+        return;
+    }
+    if !cmd.iter().any(|w| word_names_startup(w)) {
         return;
     }
     let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
@@ -5075,6 +5214,9 @@ fn judge_script_file(
     if denied.is_some() {
         return;
     }
+    if !cmd.iter().any(|w| word_may_name_shell(w)) {
+        return;
+    }
     let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
     let owned = split_env_strings(&owned).into_owned();
     let (run, _) = unwrap_wrappers(&owned);
@@ -5144,6 +5286,9 @@ fn judge_procsub(
     if denied.is_some() {
         return;
     }
+    if !cmd.iter().any(|w| word_may_name_shell(w)) {
+        return;
+    }
     let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
     let owned = split_env_strings(&owned).into_owned();
     let (run, _) = unwrap_wrappers(&owned);
@@ -5190,6 +5335,9 @@ fn judge_direct_exec(
     denied: &mut Option<Checked>,
 ) {
     if denied.is_some() {
+        return;
+    }
+    if !cmd.iter().any(|w| w.contains('/')) {
         return;
     }
     let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
@@ -6750,12 +6898,181 @@ fn inert_argv(argv: &[String]) -> bool {
     saw && inert_program(head)
 }
 
+/// Words past this stay out of the reuse map. The long script is one argv;
+/// its commands are the short ones worth keeping.
+const TABLE_MEMO_WORDS: usize = 48;
+
+struct TableHit {
+    argv: Vec<String>,
+    scratch: Scratch,
+    depth: usize,
+    moved: bool,
+    gen: u64,
+    decision: Decision,
+    code: PolicyReason,
+    token: Cow<'static, str>,
+}
+
+thread_local! {
+    static TABLE_MEMO: std::cell::RefCell<std::collections::HashMap<u64, Vec<TableHit>>> =
+        std::cell::RefCell::default();
+}
+
+fn clear_table_memo() {
+    TABLE_MEMO.with(|m| m.borrow_mut().clear());
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn hash_argv(argv: &[String]) -> u64 {
+    let mut h = 0x84222325cbf29ce1u64 ^ argv.len() as u64;
+    for w in argv {
+        h = h
+            .wrapping_mul(0x100000001b3)
+            .wrapping_add(hash_bytes(w.as_bytes()));
+    }
+    h
+}
+
+fn hash_scratch(scratch: &Scratch) -> u64 {
+    let mut h = 0x6a09e667f3bcc909u64;
+    for (k, v) in &scratch.vars {
+        let mut e = hash_bytes(k.as_bytes());
+        e = e.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(match v {
+            None => 1,
+            Some(Hold::Temp) => 2,
+            Some(Hold::Root) => 3,
+        });
+        h ^= e;
+    }
+    for (k, v) in &scratch.suffixes {
+        let mut e = hash_bytes(k.as_bytes());
+        e = e
+            .wrapping_mul(0xBF58476D1CE4E5B9)
+            .wrapping_add(u64::from(*v));
+        h ^= e.wrapping_add(0x94d049bb133111eb);
+    }
+    if scratch.autoconf {
+        h ^= 0xA5A5_A5A5_A5A5_A5A5;
+    }
+    if scratch.ifs_assigned {
+        h ^= 0x1234_5678_9ABC_DEF0;
+    }
+    if let Some(root) = &scratch.root {
+        h ^= hash_bytes(root.as_os_str().as_encoded_bytes()).wrapping_mul(0x100000001b3);
+    } else {
+        h ^= 0x0F0F_0F0F_0F0F_0F0F;
+    }
+    for (i, mark) in scratch.fed_marks.iter().enumerate() {
+        h = h
+            .wrapping_mul(0x100000001b3)
+            .wrapping_add(hash_bytes(mark.as_bytes()))
+            .wrapping_add(i as u64);
+    }
+    h
+}
+
+fn table_key(argv: &[String], depth: usize, moved: bool, parent: &Scratch, gen: u64) -> u64 {
+    let mut h = hash_argv(argv);
+    h = h
+        .wrapping_mul(0x100000001b3)
+        .wrapping_add(hash_scratch(parent));
+    h = h.wrapping_mul(0x100000001b3).wrapping_add(depth as u64);
+    h = h.wrapping_mul(0x100000001b3).wrapping_add(u64::from(moved));
+    h.wrapping_mul(0x100000001b3).wrapping_add(gen)
+}
+
+fn table_memo_get(
+    key: u64,
+    argv: &[String],
+    depth: usize,
+    moved: bool,
+    parent: &Scratch,
+    gen: u64,
+) -> Option<Checked> {
+    TABLE_MEMO.with(|m| {
+        let m = m.borrow();
+        let hits = m.get(&key)?;
+        let hit = hits.iter().find(|hit| {
+            hit.depth == depth
+                && hit.moved == moved
+                && hit.gen == gen
+                && hit.argv == argv
+                && hit.scratch == *parent
+        })?;
+        Some(Checked {
+            decision: hit.decision,
+            code: hit.code,
+            token: hit.token.clone(),
+        })
+    })
+}
+
+fn table_memo_put(
+    key: u64,
+    argv: &[String],
+    depth: usize,
+    moved: bool,
+    parent: &Scratch,
+    gen: u64,
+    got: &Checked,
+) {
+    TABLE_MEMO.with(|m| {
+        let mut m = m.borrow_mut();
+        let hits = m.entry(key).or_default();
+        if hits.iter().any(|hit| {
+            hit.depth == depth
+                && hit.moved == moved
+                && hit.gen == gen
+                && hit.argv == argv
+                && hit.scratch == *parent
+        }) {
+            return;
+        }
+        hits.push(TableHit {
+            argv: argv.to_vec(),
+            scratch: parent.clone(),
+            depth,
+            moved,
+            gen,
+            decision: got.decision,
+            code: got.code,
+            token: got.token.clone(),
+        });
+    });
+}
+
 /// The table on one argv, then on every command it runs through a wrapper
 /// (`env`, `nice`, `xargs`, ...) or a shell's `-c` script, so `env git push
 /// -f` and `sh -c "git push -f"` meet the same rules as `git push -f`.
 /// `moved` is true when a `cd` or `pushd` anywhere on the line can leave the
 /// working tree, so a relative path no longer says where a delete lands.
+///
+/// A short command is judged once. A later copy with the same scratch,
+/// depth and quote map reuses that result. The lookup is outside the
+/// timed walk, so a hit does not pay for it.
 fn host_argv_table_at(argv: &[String], depth: usize, moved: bool, parent: &Scratch) -> Checked {
+    let gen = spell_gen();
+    if argv.len() <= TABLE_MEMO_WORDS {
+        let key = table_key(argv, depth, moved, parent, gen);
+        if let Some(c) = table_memo_get(key, argv, depth, moved, parent, gen) {
+            return c;
+        }
+        let c = host_argv_table_run(argv, depth, moved, parent);
+        table_memo_put(key, argv, depth, moved, parent, gen, &c);
+        return c;
+    }
+    host_argv_table_run(argv, depth, moved, parent)
+}
+
+fn host_argv_table_run(argv: &[String], depth: usize, moved: bool, parent: &Scratch) -> Checked {
     let _span = phase::enter(phase::TABLE);
     let mut bound = parent.clone();
     bound.observe(argv);
@@ -6919,6 +7236,11 @@ fn expand_aliases_with<'a>(
     argv: &'a [String],
     aliases: &mut Vec<(String, String)>,
 ) -> Cow<'a, [String]> {
+    // No alias is defined and none is named, so every word stays as it is.
+    // Building the copy and then dropping it was the whole scan.
+    if aliases.is_empty() && argv.iter().all(|w| base_of(w) != "alias") {
+        return Cow::Borrowed(argv);
+    }
     let mut out = Vec::new();
     let mut changed = false;
     for (cmd, end) in ended_commands(argv) {
@@ -7418,7 +7740,19 @@ fn subst_find_arg(w: &str) -> String {
 }
 
 /// A `find` on the line whose `-exec` payload does not show its command.
+/// Some word names one of `names`, or a packed string holds that name.
+/// Callers that split every command use this to skip that split.
+fn mentions(argv: &[String], names: &[&str]) -> bool {
+    argv.iter().any(|w| {
+        w.split(char::is_whitespace)
+            .any(|p| !p.is_empty() && names.contains(&base_of(p)))
+    })
+}
+
 fn find_exec_unshown(argv: &[String]) -> bool {
+    if !mentions(argv, &["find"]) {
+        return false;
+    }
     each_unwrapped(argv)
         .iter()
         .any(|run| find_payloads(run).iter().any(|p| payload_unshown(p)))
@@ -7428,6 +7762,9 @@ fn find_exec_unshown(argv: &[String]) -> bool {
 /// of FILE. A value the line does not show, or a file of commands, is
 /// unknown. A command in front of `:::` is the wrapper's own command.
 fn parallel_command_unshown(argv: &[String]) -> bool {
+    if !mentions(argv, &["parallel", ":::", "::::"]) {
+        return false;
+    }
     each_unwrapped(argv).iter().any(|run| {
         let Some(head) = run.first() else {
             return false;
@@ -7451,6 +7788,9 @@ fn parallel_command_unshown(argv: &[String]) -> bool {
 /// "$1"' _`). A `mapfile -C` callback takes the lines it reads the same
 /// way.
 fn xargs_script_unshown(argv: &[String]) -> bool {
+    if !mentions(argv, &["xargs", "parallel", "mapfile", "readarray"]) {
+        return false;
+    }
     commands(argv).into_iter().any(|cmd| {
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
         let owned = split_env_strings(&owned).into_owned();
@@ -7944,6 +8284,9 @@ fn parallel_mark(template: &[String], explicit: Option<String>) -> Option<String
 /// `xargs` and `parallel` on `argv`. Shown `printf` and `echo` words are
 /// the arguments. Anything else is whatever stdin holds.
 fn xargs_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Option<Checked> {
+    if !mentions(argv, &["xargs", "parallel"]) {
+        return None;
+    }
     let ended = ended_owned(argv);
     let mut judged = false;
     for (i, (cmd, _)) in ended.iter().enumerate() {
@@ -8195,6 +8538,9 @@ fn nul_name_inputs(cmd: &[String]) -> Option<Vec<String>> {
 /// start paths (`.` when find is given none). A cleanup of regenerable
 /// names is that name, not the directory find started in.
 fn find_feed(argv: &[String], moved: bool, bound: &Scratch) -> Option<Checked> {
+    if !mentions(argv, &["find"]) {
+        return None;
+    }
     for cmd in ended_owned(argv) {
         let owned = split_env_strings(&cmd.0).into_owned();
         let run = unwrap_wrappers(&owned).0.to_vec();
@@ -8263,6 +8609,9 @@ fn here_string(cmd: &[String]) -> Option<String> {
 /// Replace marks of an `xargs` or `parallel` whose shown inputs are all
 /// under `/tmp`. The mark is the word the pack would refuse.
 fn temp_fed_marks(argv: &[String]) -> Vec<String> {
+    if !mentions(argv, &["xargs", "parallel"]) {
+        return Vec::new();
+    }
     let ended = ended_owned(argv);
     let mut out = Vec::new();
     for (i, (cmd, _)) in ended.iter().enumerate() {
@@ -8696,6 +9045,9 @@ fn read_hits(ended: &[(Vec<String>, String)]) -> Vec<ReadHit> {
 /// names a reaching `read` sets to something else. A name a later
 /// command still holds from an earlier assignment is in neither.
 fn shown_temp_reads(argv: &[String]) -> (Vec<String>, Vec<String>) {
+    if !mentions(argv, &["read", "mapfile", "readarray"]) {
+        return (Vec::new(), Vec::new());
+    }
     let ended = ended_owned(argv);
     let shells = command_shells(&ended);
     let hits = read_hits(&ended);
@@ -8825,6 +9177,9 @@ fn split_unquoted(value: &str, ifs: &str) -> Vec<String> {
 /// The `read` counts only when it runs in the same shell, before the
 /// command that expands the name.
 fn read_feed(argv: &[String], depth: usize, moved: bool, bound: &Scratch) -> Option<Checked> {
+    if !mentions(argv, &["read", "mapfile", "readarray"]) {
+        return None;
+    }
     let ended = ended_owned(argv);
     let shells = command_shells(&ended);
     let fed = read_hits(&ended);
@@ -9103,6 +9458,10 @@ fn mapfile_callback(run: &[String]) -> Option<&str> {
 /// the command it runs: `read x; sh -c "$x"`, `read -r c; eval "$c"`,
 /// `read c; $c`. Its value is whatever stdin holds.
 fn stdin_variable_script(argv: &[String]) -> bool {
+    // No `read` fills a name, so nothing later can be that script.
+    if !mentions(argv, &["read", "mapfile", "readarray"]) {
+        return false;
+    }
     let mut names: Vec<String> = Vec::new();
     for cmd in commands(argv) {
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
@@ -10041,6 +10400,14 @@ fn procsub_of(run: &[String]) -> ProcKind {
 /// A shell on the line whose script is a process substitution whose
 /// output is not a literal `echo`, `printf` or `cat` of a path.
 fn procsub_script_unshown(argv: &[String]) -> bool {
+    if !argv.iter().any(|w| {
+        w.contains("<(")
+            || w.contains(">(")
+            || w.split(char::is_whitespace)
+                .any(|p| !p.is_empty() && (base_of(p) == "env" || SHELLS.contains(&base_of(p))))
+    }) {
+        return false;
+    }
     each_unwrapped(argv)
         .iter()
         .any(|run| matches!(procsub_of(run), ProcKind::Unshown))
@@ -10063,6 +10430,9 @@ fn unshown_source_operand(path: &str) -> bool {
 /// `<(...)` word is also a redirection to [`operands`], so it is read
 /// from the command itself.
 fn source_reads_unshown(argv: &[String]) -> bool {
+    if !mentions(argv, &["source", "."]) {
+        return false;
+    }
     commands(argv).iter().any(|cmd| {
         let words = operands(cmd);
         let front = (0..words.len())
@@ -10359,6 +10729,14 @@ fn shell_stdin(run: &[String]) -> Option<(Fed<'_>, bool)> {
 /// here-string or heredoc feeds, or a here-string holding an expansion.
 /// A `|` between `case` patterns is not a pipeline (`| sh | other)`).
 fn unshown_stdin_script(argv: &[String]) -> bool {
+    // A shell is what would read the pipe. No shell and no stdin redirect
+    // means this scan cannot match.
+    if !argv
+        .iter()
+        .any(|w| word_may_name_shell(w) || w.contains('<'))
+    {
+        return false;
+    }
     let mut piped = false;
     let mut cmd: Vec<String> = Vec::new();
     let mut case_depth = 0i32;
@@ -11743,6 +12121,133 @@ fn seat_guard_denial(argv: &[String], cwd: Option<&std::path::Path>) -> Option<C
     None
 }
 
+const RULE_REMOTE: u32 = 1 << 0;
+const RULE_DECODE: u32 = 1 << 1;
+const RULE_SETUID: u32 = 1 << 2;
+const RULE_DISK: u32 = 1 << 3;
+const RULE_MODE: u32 = 1 << 4;
+const RULE_DELETE: u32 = 1 << 5;
+const RULE_FIND: u32 = 1 << 6;
+const RULE_MV: u32 = 1 << 7;
+const RULE_RSYNC: u32 = 1 << 8;
+
+/// Programs named on the line. A scanner whose program is absent cannot
+/// match, so it is not run. A command word left as `$name` can be any
+/// program, and then every scanner runs.
+fn rule_mask(argv: &[String]) -> u32 {
+    let mut mask = 0u32;
+    for (cmd, _) in ended_commands(argv) {
+        let head = peel_cd_command_word(&cmd);
+        if let Some(w) = head.first() {
+            let b = base_of(w);
+            if unresolved(b) {
+                return u32::MAX;
+            }
+            mask |= rule_bits(b);
+        }
+        for w in &cmd {
+            if w.contains("/dev/") {
+                mask |= RULE_DISK;
+            }
+            if w.contains("$(") || w.contains('`') || w.contains("<(") {
+                mask |= rule_subst_bits(w);
+            }
+            // `timeout 30 curl` names curl in its own word, not as the head.
+            mask |= rule_bits(piece_base(w));
+            if !w.contains(char::is_whitespace) {
+                continue;
+            }
+            for p in w.split(char::is_whitespace) {
+                if !p.is_empty() {
+                    mask |= rule_bits(piece_base(p));
+                }
+            }
+        }
+    }
+    mask
+}
+
+fn rule_bits(b: &str) -> u32 {
+    let mut mask = 0u32;
+    if FETCHERS.contains(&b) {
+        mask |= RULE_REMOTE;
+    }
+    if DECODERS.contains(&b) {
+        mask |= RULE_DECODE;
+    }
+    if matches!(b, "chmod" | "install") {
+        mask |= RULE_SETUID;
+    }
+    if matches!(b, "chmod" | "chown" | "chgrp" | "setfacl") {
+        mask |= RULE_MODE;
+    }
+    if matches!(b, "rm" | "srm" | "wipe" | "rmdir" | "unlink" | "shred")
+        || TRASHERS.contains(&b)
+        || b == "gio"
+    {
+        mask |= RULE_DELETE;
+    }
+    if b == "find" {
+        mask |= RULE_FIND;
+    }
+    if b == "mv" {
+        mask |= RULE_MV;
+    }
+    if b == "rsync" {
+        mask |= RULE_RSYNC;
+    }
+    if b == "dd"
+        || b == "cryptsetup"
+        || b.starts_with("mkfs")
+        || DISK_WRITERS.iter().any(|(n, _)| *n == b)
+    {
+        mask |= RULE_DISK;
+    }
+    mask
+}
+
+/// A download or a decoder inside `$(...)`, backticks or `<(...)`.
+fn rule_subst_bits(w: &str) -> u32 {
+    let mut mask = 0u32;
+    for name in FETCHERS {
+        if subst_names_tool(w, name) {
+            mask |= RULE_REMOTE;
+        }
+    }
+    for name in DECODERS {
+        if subst_names_tool(w, name) {
+            mask |= RULE_DECODE;
+        }
+    }
+    mask
+}
+
+fn subst_names_tool(w: &str, name: &str) -> bool {
+    let mut rest = w;
+    while let Some(i) = rest.find(['$', '`', '<']) {
+        let after = &rest[i..];
+        let body = if let Some(b) = after
+            .strip_prefix("$(")
+            .or_else(|| after.strip_prefix("<("))
+        {
+            b
+        } else if let Some(b) = after.strip_prefix('`') {
+            b
+        } else {
+            rest = &rest[i + 1..];
+            continue;
+        };
+        if let Some(tail) = body.strip_prefix(name) {
+            let boundary = tail.chars().next().unwrap_or(' ');
+            if !boundary.is_ascii_alphanumeric() && boundary != '_' && boundary != '-' {
+                return true;
+            }
+        }
+        rest = &rest[i + 1..];
+    }
+    false
+}
+
 fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
     if argv.is_empty() {
         return Checked {
@@ -11759,14 +12264,15 @@ fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
             token: Cow::Borrowed("sudo"),
         };
     }
-    if remote_exec(argv) {
+    let mask = rule_mask(argv);
+    if mask & RULE_REMOTE != 0 && remote_exec(argv) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellRemoteExec,
             token: Cow::Borrowed("curl-pipe-shell"),
         };
     }
-    if decoded_exec(argv) {
+    if mask & RULE_DECODE != 0 && decoded_exec(argv) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellRemoteExec,
@@ -11776,42 +12282,42 @@ fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
     if let Some(c) = seat_guard_denial(argv, bound.root.as_deref()) {
         return c;
     }
-    if setuid_mode(argv) || interpreter_setuid(argv) {
+    if (mask & RULE_SETUID != 0 && setuid_mode(argv)) || interpreter_setuid(argv) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellDangerousRunner,
             token: Cow::Borrowed("chmod-setuid"),
         };
     }
-    if raw_disk(argv) {
+    if mask & RULE_DISK != 0 && raw_disk(argv) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellDangerousRunner,
             token: Cow::Borrowed("raw-disk"),
         };
     }
-    if recursive_mode_change(argv) {
+    if mask & RULE_MODE != 0 && recursive_mode_change(argv) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellDangerousRunner,
             token: Cow::Borrowed("recursive-chmod-chown"),
         };
     }
-    if recursive_delete_off_tmp(argv, moved, bound) {
+    if mask & RULE_DELETE != 0 && recursive_delete_off_tmp(argv, moved, bound) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellDangerousRunner,
             token: Cow::Borrowed("rm-rf-outside-tmp"),
         };
     }
-    if find_delete_off_tmp(argv, moved) {
+    if mask & RULE_FIND != 0 && find_delete_off_tmp(argv, moved) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellDangerousRunner,
             token: Cow::Borrowed("find-delete-outside-tmp"),
         };
     }
-    if find_print_off_tmp(argv) {
+    if mask & RULE_FIND != 0 && find_print_off_tmp(argv) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellDangerousRunner,
@@ -12518,12 +13024,30 @@ fn base_of(tok: &str) -> &str {
     tok.rsplit('/').next().unwrap_or(tok)
 }
 
+/// The program a packed word may name, quotes taken off the piece.
+fn piece_base(p: &str) -> &str {
+    base_of(p.trim_matches(|c: char| c == '"' || c == '\'' || c == '\\'))
+}
+
 fn is_privilege(base: &str) -> bool {
     matches!(base, "sudo" | "doas" | "su" | "pkexec" | "run0")
 }
 
 /// Commands that download.
 const FETCHERS: &[&str] = &["curl", "wget", "fetch"];
+/// A word that may be a shell, or a packed `env -S` string that holds one.
+/// A quoted phrase with a space is not a shell by itself.
+fn word_may_name_shell(w: &str) -> bool {
+    let hit = |p: &str| {
+        let b = piece_base(p);
+        b == "env" || SHELLS.contains(&b)
+    };
+    hit(w)
+        || (w.contains(char::is_whitespace)
+            && w.split(char::is_whitespace)
+                .any(|p| !p.is_empty() && hit(p)))
+}
+
 /// Commands that run a script they are handed.
 /// `ash` and `hush` are the shells a `busybox` or `toybox` call runs.
 const SHELLS: &[&str] = &[
@@ -14076,6 +14600,12 @@ fn quoted_strings(s: &str) -> Vec<String> {
 /// Python's `shutil.rmtree`, Node's `rmSync`/`rm` with `recursive`, Ruby's
 /// `FileUtils.rm_rf`/`rm_r`, Perl's `remove_tree`/`rmtree`.
 fn interpreter_rmtree(argv: &[String]) -> bool {
+    if !argv.iter().any(|w| {
+        w.split(char::is_whitespace)
+            .any(|p| !p.is_empty() && interpreter_flag(base_of(p)).is_some())
+    }) {
+        return false;
+    }
     commands(argv).iter().any(|cmd| {
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
         let Some(code) = inline_program(&owned) else {
@@ -14115,6 +14645,16 @@ fn interpreter_rmtree(argv: &[String]) -> bool {
 /// relative path is in the directory the line is in, and stays in the
 /// tree while the line has not left it.
 fn python_refusal(argv: &[String], moved: bool, bound: &Scratch) -> Option<pyprog::Refusal> {
+    if !argv.iter().any(|w| {
+        w.split(char::is_whitespace).any(|p| {
+            !p.is_empty() && {
+                let b = base_of(p);
+                b.starts_with("python") || b.starts_with("pypy")
+            }
+        })
+    }) {
+        return None;
+    }
     let _span = phase::enter(phase::PYTHON);
     let cwd = bound.root.as_deref().filter(|d| !is_untracked(d));
     let place = pyprog::Place {
@@ -14279,7 +14819,7 @@ enum Hold {
 /// Variables a script assigns to scratch, so `rm -rf "$tmp"` is the
 /// directory `mktemp` just made and not a path the line does not show.
 /// One assignment that is not scratch poisons the name.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 struct Scratch {
     vars: std::collections::HashMap<String, Option<Hold>>,
     /// True while every assignment is a suffix with no `/` and no `..`.
@@ -15362,6 +15902,12 @@ fn setuid_mode(argv: &[String]) -> bool {
 /// A mode without those bits (`0o755`, `0644`) does not, and neither does a
 /// shell string, which is judged as its own command.
 fn interpreter_setuid(argv: &[String]) -> bool {
+    if !argv.iter().any(|w| {
+        w.split(char::is_whitespace)
+            .any(|p| !p.is_empty() && interpreter_flag(base_of(p)).is_some())
+    }) {
+        return false;
+    }
     commands(argv).iter().any(|cmd| {
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
         let split = split_env_strings(&owned);

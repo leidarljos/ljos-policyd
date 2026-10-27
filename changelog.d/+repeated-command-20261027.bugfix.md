@@ -1,0 +1,1 @@
+The same short command was judged again, and a shell copy was kept on every command in case a later one was backgrounded. The first judgment is reused while the words, the scratch and the depth stay the same. A shell copy is kept only for a list that runs in the background. A script of about 240KB is allowed in about 384 ms.
