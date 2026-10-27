@@ -7022,6 +7022,48 @@ fn expand_assigned_params<'a>(script: &'a str, names: &[(String, String)]) -> Co
     }
 }
 
+/// `export`, `readonly`, `declare`, `typeset` and `local` store
+/// `NAME=value` in this shell, the same way a bare `NAME=value` does.
+/// A flag that does not store that text (`-n`, `-f`, `-a`, `-A`) leaves
+/// the name as it was. The plain flags are the ones [`set_vars`] stores.
+fn remember_declared(cmd: &[&str], names: &mut Vec<(String, String)>) {
+    let words = operands(cmd);
+    let front = (0..words.len())
+        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
+        .count();
+    let rest = peel_cd_command_word(&words[front..]);
+    let Some((head, args)) = rest.split_first() else {
+        return;
+    };
+    if !matches!(
+        base_of(head),
+        "export" | "readonly" | "declare" | "typeset" | "local"
+    ) {
+        return;
+    }
+    let plain =
+        |a: &&str| !a.starts_with(['-', '+']) || a[1..].chars().all(|c| "-gprx".contains(c));
+    if !args.iter().all(plain) {
+        return;
+    }
+    for a in args {
+        let Some((k, v, append)) = assignment_of(a) else {
+            continue;
+        };
+        let v = v.trim_matches(['"', '\'']);
+        let v = if append {
+            names
+                .iter()
+                .rev()
+                .find(|(n, _)| n == k)
+                .map_or(v.to_string(), |(_, was)| format!("{was}{v}"))
+        } else {
+            v.to_string()
+        };
+        names.push((k.to_string(), v));
+    }
+}
+
 /// [`inner_commands_at`] on a line whose aliases are already expanded.
 fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
     let mut out = Vec::new();
@@ -7046,6 +7088,7 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
             }
             continue;
         }
+        remember_declared(&cmd, &mut names);
         let mut owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
         if let Some(first) = owned.first_mut() {
             let body = quoted_body(first);
@@ -17665,6 +17708,78 @@ hash -r 2> /dev/null
         assert_eq!(c.decision, Decision::Allow, "{}", c.token);
         let c = at("cp ok.sh backup.sh; source ok.sh");
         assert_eq!(c.decision, Decision::Allow, "{}", c.token);
+    }
+
+    /// `export`, `readonly`, `declare`, `typeset` and `local` store
+    /// `cmd=rm` in this shell. A later `$cmd` is that rm, on the same
+    /// line and on the next one. An alias is the command it names.
+    #[test]
+    fn a_declaration_names_the_command_it_stores() {
+        let line = |s: &str| verdict(&shell_words(s));
+        let mut missed = Vec::new();
+        for s in [
+            "export cmd=rm; $cmd -rf /var/lib/x",
+            "export cmd=rm\n$cmd -rf /var/lib/x",
+            "readonly cmd=rm; $cmd -rf /var/lib/x",
+            "readonly cmd=rm\n$cmd -rf /var/lib/x",
+            "declare cmd=rm; $cmd -rf /var/lib/x",
+            "declare cmd=rm\n$cmd -rf /var/lib/x",
+            "declare -x cmd=rm; $cmd -rf /var/lib/x",
+            "typeset cmd=rm; $cmd -rf /var/lib/x",
+            "typeset cmd=rm\n$cmd -rf /var/lib/x",
+            "local cmd=rm; $cmd -rf /var/lib/x",
+            "local cmd=rm\n$cmd -rf /var/lib/x",
+            "export cmd='rm -rf /var/lib/x'; $cmd",
+            "readonly cmd='rm -rf /var/lib/x'\n$cmd",
+            "export cmd=rm; env $cmd -rf /var/lib/x",
+            "declare cmd=rm; sh -c \"$cmd -rf /var/lib/x\"",
+            "alias rm='rm -rf /var/lib/x'; rm /etc",
+            "alias rm='rm -rf /var/lib/x'\nrm /etc",
+        ] {
+            let got = line(s);
+            if !got.starts_with("deny") {
+                missed.push(format!("{s} -> {got}"));
+            }
+        }
+        assert!(missed.is_empty(), "{missed:#?}");
+        for s in [
+            "export cmd=echo; $cmd ok",
+            "readonly cmd=echo\n$cmd ok",
+            "declare cmd=echo; $cmd ok",
+            "typeset cmd=printf; $cmd '%s\\n' ok",
+            "local cmd=echo; $cmd ok",
+            "alias echo='printf %s\\n'; echo ok",
+        ] {
+            assert_eq!(line(s), "allow", "{s}");
+        }
+        let root = std::env::temp_dir().join(format!("policyd-lib-{}-declare", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for (name, body) in [
+            ("export.sh", "export cmd=rm\n$cmd -rf /var/lib/x\n"),
+            ("readonly.sh", "readonly cmd=rm\n$cmd -rf /var/lib/x\n"),
+            ("declare.sh", "declare cmd=rm\n$cmd -rf /var/lib/x\n"),
+            ("typeset.sh", "typeset cmd=rm\n$cmd -rf /var/lib/x\n"),
+            ("local.sh", "local cmd=rm\n$cmd -rf /var/lib/x\n"),
+            ("alias.sh", "alias rm='rm -rf /var/lib/x'\nrm /etc\n"),
+            ("ok.sh", "export cmd=echo\n$cmd ok\n"),
+        ] {
+            let path = root.join(name);
+            std::fs::write(&path, body).unwrap();
+            let rel = format!("./{name}");
+            let got = check_shell_in(&["sh".into(), rel], &root, 0);
+            let text = match got.decision {
+                Decision::Allow => "allow".to_string(),
+                Decision::Deny => format!("deny\t{}", got.token),
+                Decision::Prompt => format!("prompt\t{}", got.token),
+            };
+            if name == "ok.sh" {
+                assert_eq!(text, "allow", "{body}");
+            } else {
+                assert!(text.starts_with("deny"), "{name} {body:?} -> {text}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

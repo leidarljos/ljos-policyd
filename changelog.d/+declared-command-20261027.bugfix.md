@@ -1,0 +1,1 @@
+export, readonly, declare, typeset and local store NAME=value in this shell. A later $NAME is that command, so readonly cmd=rm and then $cmd -rf outside /tmp is refused, on the same line and on the next one.
