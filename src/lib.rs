@@ -12269,22 +12269,51 @@ fn seat_marker(w: &str) -> bool {
         .any(|s| s.eq_ignore_ascii_case(b"hookspath"))
 }
 
-fn may_touch_seat(argv: &[String]) -> bool {
+fn may_touch_seat(argv: &[String], cwd: Option<&str>) -> bool {
     let config = policyd_config();
-    let config_name = config
-        .as_deref()
-        .and_then(|p| p.rsplit('/').next())
-        .filter(|n| !n.is_empty());
     let mut writer = false;
     let mut marker = false;
     for w in argv {
         writer |= guard_writer(w);
-        marker |= seat_marker(w) || config_name.is_some_and(|n| w.contains(n));
+        marker |= seat_marker(w)
+            || config
+                .as_deref()
+                .is_some_and(|c| names_config(w, c, argv, cwd));
         if writer && marker {
             return true;
         }
     }
     false
+}
+
+/// Whether `w` may name the policyd config `config`. A word is placed
+/// against `cwd` and matched on the full path, or on the config dir. Only
+/// where the line can move or hide the path, by `cd`, a variable or a
+/// command, or from inside the config dir, does the file name alone count.
+fn names_config(w: &str, config: &str, argv: &[String], cwd: Option<&str>) -> bool {
+    let (dir, name) = config.rsplit_once('/').unwrap_or(("", config));
+    if name.is_empty() || !w.contains(name) {
+        return !dir.is_empty() && w.contains(dir);
+    }
+    if w.contains(config) || (!dir.is_empty() && w.contains(dir)) {
+        return true;
+    }
+    let unplaced = w.contains('~')
+        || cwd.is_none_or(|c| dir.is_empty() || c == dir || c.starts_with(&format!("{dir}/")))
+        || argv
+            .iter()
+            .any(|a| a.contains(['$', '`']) || matches!(base_of(a), "cd" | "pushd" | "popd"));
+    if unplaced {
+        return true;
+    }
+    let w = unquote(w);
+    [
+        w,
+        w.rsplit('=').next().unwrap_or(w),
+        w.trim_start_matches(|c: char| c.is_ascii_digit() || "<>&|".contains(c)),
+    ]
+    .into_iter()
+    .any(|p| landed(unquote(p), cwd).is_some_and(|p| p == config))
 }
 
 /// The config file `$LJOS_POLICYD_CONFIG` names, as an absolute path.
@@ -13423,7 +13452,7 @@ fn outside_content_write(
 /// `${HOME}` and the `XDG` directories are the path the shell opens,
 /// with `..` and a trailing slash taken off.
 fn seat_guard_denial(argv: &[String], cwd: Option<&std::path::Path>) -> Option<Checked> {
-    if !may_touch_seat(argv) {
+    if !may_touch_seat(argv, cwd.and_then(|p| p.to_str())) {
         return None;
     }
     written_path_denial(argv, cwd, None)

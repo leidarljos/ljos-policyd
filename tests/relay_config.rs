@@ -316,6 +316,43 @@ fn no_seat_writes_the_policyd_config() {
 }
 
 #[test]
+fn a_file_named_as_the_policyd_config_may_be_written() {
+    let base = std::env::temp_dir().join(format!("relay-name-{}", std::process::id()));
+    let dir = base.join("work");
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = base.join("conf/config.toml");
+    let c = config.display();
+    for seat in ["travel", "other", ""] {
+        for line in [
+            "cp x .cargo/config.toml",
+            "echo x > sub/config.toml",
+            "cp x \"$PWD\"/.cargo/config.toml",
+            "cd sub && cp x config.toml",
+        ] {
+            assert_eq!(
+                verdict(&dir, &config, seat, line),
+                "allow",
+                "{seat}: {line}"
+            );
+        }
+        for line in [
+            format!("cp x {c}"),
+            "cp x ../conf/config.toml".to_string(),
+            "cd ../conf && cp x config.toml".to_string(),
+            "echo x 2>../conf/config.toml".to_string(),
+            "dd if=x of=../conf/config.toml".to_string(),
+        ] {
+            let v = verdict(&dir, &config, seat, &line);
+            assert!(
+                v.starts_with("deny\tseat-guard-path:"),
+                "{seat}: {line}: {v}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn the_relay_line_refuses_unsigned_entries() {
     let base = std::env::temp_dir().join(format!("relay-signed-{}", std::process::id()));
     let dir = base.join("relay");
