@@ -880,7 +880,8 @@ impl LineFiles {
     }
 
     /// Take the bindings `cmd` makes. A literal assignment outside a loop
-    /// keeps its name fixed. `read`, `for`, `export`, a default, an
+    /// keeps its name fixed, and so does a `for` over literal words.
+    /// `read`, any other `for`, `export`, a default, an
     /// append, an array element, `unset`, a value with any expansion
     /// other than `$name`, and any assignment in a loop do not. `eval`
     /// may bind any name.
@@ -890,6 +891,9 @@ impl LineFiles {
             self.blind = true;
         }
         let mut out = opaque_bound(cmd);
+        if let Some((name, _)) = for_literal_list(cmd) {
+            out.retain(|n| *n != name);
+        }
         out.extend(default_bound(cmd));
         if name == "unset" {
             out.extend(args.into_iter().filter(|a| !a.starts_with('-')));
@@ -4100,6 +4104,27 @@ fn arith_targets(text: &str) -> Vec<String> {
     names
 }
 
+/// The name `for NAME in a b` binds, and the words it takes in turn,
+/// when each one is a literal the shell does not split, glob or expand.
+fn for_literal_list(cmd: &[&str]) -> Option<(String, Vec<String>)> {
+    let [head, name, kw, list @ ..] = cmd else {
+        return None;
+    };
+    let plain = |w: &&str| {
+        !w.is_empty()
+            && !w.contains(EXPANDS)
+            && !w.contains(['(', '"', '\''])
+            && !w.contains(char::is_whitespace)
+    };
+    let fits = *head == "for" && *kw == "in" && is_name(name);
+    (fits && !list.is_empty() && list.len() <= 8 && list.iter().all(plain)).then(|| {
+        (
+            name.to_string(),
+            list.iter().map(|w| w.to_string()).collect(),
+        )
+    })
+}
+
 /// Names this command binds other than by a plain `NAME=value`. The value
 /// is not what the line shows.
 fn opaque_bound(cmd: &[&str]) -> Vec<String> {
@@ -4345,6 +4370,9 @@ fn note_cmd_values(cmd: &[&str], shell: &mut Shell) {
     }
     for name in default_bound(cmd) {
         unknown(&mut shell.cmd_values, name);
+    }
+    if let Some((name, list)) = for_literal_list(cmd) {
+        shell.cmd_values.insert(fixed_key(&name), list);
     }
     let (_, head, args) = command_parts(cmd);
     if head == "unset" {
@@ -25084,6 +25112,34 @@ make -C safe test
             "echo $(23:04); sh foo/x.sh",
             "echo \"$(rm -rf /srv/example) (a)\"",
             "(cd /; rm -rf /srv/example)",
+        ] {
+            assert_eq!(at(line).decision, Decision::Deny, "{line}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A `for` over literal words binds its name to each of them, so a
+    /// write through it is placed, not read as any path at all.
+    #[test]
+    fn a_for_over_literal_words_places_its_name() {
+        let root = startup_root("forwords");
+        let at = |line: &str| {
+            let argv = ["bash", "-c", line].map(String::from);
+            check_shell_in(&argv, &root, 0)
+        };
+        for line in [
+            "for c in a.md b.md; do printf x > \"$c\"; done; sh foo/x.sh",
+            "for c in a.md b.md; do grep -c x \"$c\" > \"$c.n\"; done; sh foo/x.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for line in [
+            "for c in a.md foo/x.sh; do printf x > \"$c\"; done; sh foo/x.sh",
+            "for c in a foo; do printf x > \"$c/x.sh\"; done; sh foo/x.sh",
+            "for c in *.md; do printf x > \"$c\"; done; sh foo/x.sh",
+            "for c in a b; do c=$1; printf x > \"$c\"; done; sh foo/x.sh",
+            "for c in a.md; do :; done; c=$1; printf x > \"$c\"; sh foo/x.sh",
         ] {
             assert_eq!(at(line).decision, Decision::Deny, "{line}");
         }
