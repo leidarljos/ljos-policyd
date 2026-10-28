@@ -11805,7 +11805,9 @@ fn finish_word(
 /// Whether the commands on the line that opened a here-document only
 /// read it as text: each command word is a plain program name that is
 /// not a shell, an interpreter, `eval`, `source` or a runner that may
-/// hand its input to one.
+/// hand its input to one. `at`, `batch` and `crontab` run their input
+/// later, and `ssh` and `docker exec` run it on another host or in a
+/// container, so none of them reads it as text.
 fn heredoc_read_as_text(out: &[String]) -> bool {
     let sep = |w: &String| matches!(w.as_str(), ";" | "&&" | "||" | "|" | "&");
     let end = out.len() - usize::from(out.last().is_some_and(|w| w == ";"));
@@ -11819,14 +11821,26 @@ fn heredoc_read_as_text(out: &[String]) -> bool {
             .find(|w| !is_assignment(w) && !is_redirection(w))
             .map_or("", String::as_str);
         let b = base_of(head);
+        let in_container = matches!(b, "docker" | "podman") && cmd.iter().any(|w| w == "exec");
         !head.contains(['/', '$', '`', '('])
+            && !in_container
             && !word_may_name_shell(head)
             && stdin_interpreter(b).is_none()
             && !RUNNERS.iter().any(|(r, _)| *r == b)
             && !WRAPPERS.contains(&b)
             && !matches!(
                 b,
-                "eval" | "source" | "." | "exec" | "parallel" | "find" | "nimvault"
+                "eval"
+                    | "source"
+                    | "."
+                    | "exec"
+                    | "parallel"
+                    | "find"
+                    | "nimvault"
+                    | "at"
+                    | "batch"
+                    | "crontab"
+                    | "ssh"
             )
     })
 }
@@ -25910,6 +25924,52 @@ make -C safe test
         ] {
             let c = at(&prog);
             assert_eq!(c.decision, Decision::Allow, "{prog}: {}", c.token);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A quoted here-document handed to a program that runs it, now or
+    /// later, here or elsewhere, is a script and not text.
+    #[test]
+    fn a_quoted_here_document_a_runner_takes_is_read() {
+        let root = startup_root("heredocrun");
+        let at = |line: &str| {
+            SPELLED.with(|s| s.borrow_mut().clear());
+            let argv = ["bash", "-c", line].map(String::from);
+            check_shell_in(&argv, &root, 0)
+        };
+        let fed = |head: &str| {
+            format!(
+                "printf %s x > \"$_ljos_seen\"; {head} <<'EOF'\n\
+                 edited `foo/gf.py` and ran it\nEOF"
+            )
+        };
+        for head in [
+            "at now",
+            "batch",
+            "crontab -",
+            "crontab",
+            "ssh host",
+            "ssh -T host bash -s",
+            "docker exec -i box sh",
+            "podman exec -i box sh",
+        ] {
+            let c = at(&fed(head));
+            assert_eq!(c.decision, Decision::Deny, "{head}");
+            assert!(
+                c.token.starts_with("script-written-on-line:"),
+                "{head}: {}",
+                c.token
+            );
+        }
+        for head in [
+            "ljos note ab12 -",
+            "cat",
+            "docker logs box",
+            "ssh-keygen -lf -",
+        ] {
+            let c = at(&fed(head));
+            assert_eq!(c.decision, Decision::Allow, "{head}: {}", c.token);
         }
         let _ = std::fs::remove_dir_all(&root);
     }
