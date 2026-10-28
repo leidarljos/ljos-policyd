@@ -273,6 +273,9 @@ struct Read {
     values: HashMap<String, Vec<Tok>>,
     /// Literal paths the program writes a file at.
     written: Vec<String>,
+    /// Literals a `+` joins after a leading URL literal. They are parts
+    /// of that URL and name no file.
+    url_parts: Vec<String>,
     /// Names assigned a string built from codes or decoded, that the
     /// reader does not work out.
     opaque: HashSet<String>,
@@ -1087,16 +1090,24 @@ fn read(code: &str, depth: usize, out: &mut Read) -> Option<()> {
         }
     }
     let from = out.refs.len();
+    let tails = url_tails(&toks);
     for (i, t) in toks.iter().enumerate() {
         match t {
             Tok::Str(s) => {
+                let tail = tails.contains(&i);
                 out.strs.push(s.clone());
+                if tail {
+                    out.url_parts.push(s.clone());
+                }
                 if let Some(whole) = literal_run(&toks[i..]) {
                     if whole != *s {
+                        if tail {
+                            out.url_parts.push(whole.clone());
+                        }
                         out.strs.push(whole);
                     }
                 }
-                if s == "/" && rooted(&toks, i) {
+                if s == "/" && !tail && rooted(&toks, i) {
                     out.rooted = true;
                 }
             }
@@ -1469,6 +1480,60 @@ const STRING_METHODS: &[&str] = &[
 ];
 
 /// The string literals from `toks[0]` that python joins into one.
+/// Where the operand that starts at `toks[at]` ends: a run of literals,
+/// or a dotted name or bracket with the calls, subscripts and
+/// attributes after it.
+fn operand_end(toks: &[Tok], mut at: usize) -> usize {
+    if matches!(toks.get(at), Some(Tok::Str(_))) {
+        while matches!(toks.get(at), Some(Tok::Str(_))) {
+            at += 1;
+        }
+        return at;
+    }
+    match toks.get(at) {
+        Some(Tok::Name(_)) => at = dotted(toks, at).1,
+        Some(Tok::Mark('(' | '[' | '{')) => {}
+        _ => return at,
+    }
+    loop {
+        match (toks.get(at), toks.get(at + 1)) {
+            (Some(Tok::Mark('(' | '[' | '{')), _) => at = close(toks, at) + 1,
+            (Some(Tok::Mark('.')), Some(Tok::Name(_))) => at = dotted(toks, at + 1).1,
+            _ => return at,
+        }
+    }
+}
+
+/// The literals a `+` chain joins after a first part that is a literal
+/// with `://` in it. The chain is one URL, so they are its parts. A part
+/// with a `..` is left out: given to `open`, the chain is a relative
+/// path, and `..` may leave the tree.
+fn url_tails(toks: &[Tok]) -> HashSet<usize> {
+    let mut out = HashSet::new();
+    for (i, t) in toks.iter().enumerate() {
+        let Tok::Str(s) = t else { continue };
+        let joined = i.checked_sub(1).map(|p| &toks[p]) == Some(&Tok::Mark('+'))
+            || i.checked_sub(1)
+                .is_some_and(|p| matches!(toks[p], Tok::Str(_)));
+        if joined || !s.contains("://") {
+            continue;
+        }
+        let mut at = operand_end(toks, i);
+        while toks.get(at) == Some(&Tok::Mark('+')) {
+            let start = at + 1;
+            at = operand_end(toks, start);
+            if at == start {
+                break;
+            }
+            let part = |t: &Tok| matches!(t, Tok::Str(p) if !p.split('/').any(|c| c == ".."));
+            if toks[start..at].iter().all(part) {
+                out.extend(start..at);
+            }
+        }
+    }
+    out
+}
+
 fn literal_run(toks: &[Tok]) -> Option<String> {
     literal(&toks[..run_end(toks)])
 }
@@ -3402,7 +3467,13 @@ fn outside_write(r: &Read, place: Place) -> Option<Refusal> {
     if !inside(&lexical(cwd), place.work) {
         return out(&cwd.display().to_string());
     }
-    if let Some(s) = r.strs.iter().find(|s| outside_string(s, place)) {
+    let count = |v: &[String], s: &str| v.iter().filter(|t| *t == s).count();
+    let url_only = |s: &str| count(&r.url_parts, s) >= count(&r.strs, s);
+    if let Some(s) = r
+        .strs
+        .iter()
+        .find(|s| outside_string(s, place) && !url_only(s))
+    {
         return out(s);
     }
     if r.rooted {
@@ -3666,6 +3737,30 @@ mod tests {
             "print('/'.join(['a', 'b']))",
         ] {
             assert_eq!(refused_for(code), None, "{code}");
+        }
+    }
+
+    #[test]
+    fn a_url_tail_names_no_file() {
+        let send = "import urllib.request as u, os; k = os.environ['K']";
+        for code in [
+            format!("{send}; u.urlopen('https://example.org/bot' + k + '/send'); open('h.jsonl', 'a').write('x')"),
+            format!("{send}; u.urlopen('https://example.org' + '/a/' + k.strip() + '/send'); open('h', 'w')"),
+            format!("{send}; open('https://example.org' + '/etc/x', 'w')"),
+            "import urllib.request; urllib.request.urlopen('/etc/x')".to_string(),
+            "from urllib.request import urlopen; urlopen('/etc/x')".to_string(),
+            "import webbrowser; webbrowser.open('/etc/x')".to_string(),
+        ] {
+            assert_ne!(refused_for(&code).as_deref().map(|t| t.split(':').next()), Some(Some("python-writes-outside")), "{code}");
+        }
+        for code in [
+            "s = 'https://example.org' + '/etc/x'; open('/etc/x', 'w')",
+            "x = '/etc/x'; s = 'https://example.org' + x; open(x, 'w')",
+            "s = '/etc/x' + '/send'; open('h', 'w')",
+            "k = input(); open('https://a' + k + '/../../../../etc/x', 'w')",
+            "k = input(); s = 'https://example.org/bot' + k + '/send'; open('/etc/x', 'w')",
+        ] {
+            assert_eq!(class_of(code), "python-writes-outside", "{code}");
         }
     }
 
