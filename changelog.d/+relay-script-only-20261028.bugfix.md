@@ -1,0 +1,1 @@
+The relay line may no longer hand its secret to inline `python3 -c` code. Only `nimvault run --env SECRET ENTRY python3 SCRIPT.py [args]`, with a script the relay dir owns, reads the secret, so the code that sees it is a file on disk and not a string on the line. An inline relay line is refused as a credential read, as it is for any other seat.

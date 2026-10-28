@@ -1,4 +1,4 @@
-//! The one inline python that may read a secret, named in a config file
+//! The one python script that may read a secret, named in a config file
 //! the user owns and nowhere in this crate.
 //!
 //! ```toml
