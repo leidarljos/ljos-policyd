@@ -1969,7 +1969,7 @@ fn credential(r: &Read, place: Place) -> Option<Refusal> {
     refused(PolicyReason::PathSensitiveDeny, "reads-credential", s)
 }
 
-/// Calls whose output or side effect holds what they are given: the
+/// Calls whose output or side effect carries what they are given: the
 /// streams, logs, files and prompts a value is shown in.
 const SHOWS: &[&str] = &[
     "print",
@@ -3228,7 +3228,7 @@ fn inside(p: &Path, work: Option<&Path>) -> bool {
         || work.is_some_and(|w| p.starts_with(w))
 }
 
-/// Whether a write to the absolute path `p` lands out of the tree
+/// Whether a write to the absolute path `p` goes out of the tree
 /// `work`. Python and the shell writers both ask this, so the target
 /// decides and not the program that writes it.
 pub(crate) fn writes_outside(p: &Path, work: Option<&Path>) -> bool {

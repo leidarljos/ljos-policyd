@@ -12918,8 +12918,8 @@ fn awk_printed_files(args: &[&str]) -> Vec<String> {
     out
 }
 
-/// The first content write of `cmd` that lands out of `work`, with what
-/// writes it and where it lands. A target the line does not spell out,
+/// The first content write of `cmd` that goes out of `work`, with what
+/// writes it and the path it writes. A target the line does not spell out,
 /// or a relative one where the directory is not known, is not placed.
 fn outside_content_write(
     cmd: &[&str],
@@ -25297,7 +25297,7 @@ make -C safe test
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The table's verdict on `line` started in the tree `/w/proj`.
+    /// What the table says of `line` started in the tree `/w/proj`.
     fn in_tree(line: &str) -> Checked {
         let work = std::path::PathBuf::from("/w/proj");
         let at = Scratch {
