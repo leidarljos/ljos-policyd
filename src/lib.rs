@@ -574,11 +574,21 @@ struct LineFiles {
     ran: Vec<Run>,
     /// Variables whose value is the script being judged (`$0`).
     script_vars: std::collections::HashSet<String>,
+    /// Names some walked command binds other than to a literal once, or
+    /// inside a loop, with the names each literal assignment reads. A
+    /// path placed through one of them is not shown.
+    unfixed: std::collections::HashSet<String>,
+    reads: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Loops open around the command now read, across nested walks.
+    loops: usize,
+    /// A walk lost what its shell ran, which may have bound any name.
+    blind: bool,
 }
 
 /// A path a command may write, and its place on the line. A `loose`
 /// write is the directory a command the guard does not know runs in:
 /// it may have made any file under it.
+#[derive(Clone)]
 struct Written {
     path: Option<std::path::PathBuf>,
     id: Vec<usize>,
@@ -590,6 +600,8 @@ struct Written {
     /// The bytes are a filter of the script being judged, and the
     /// filter inserts no command.
     rewrite: bool,
+    /// The variables `word` was placed through.
+    via: Vec<String>,
 }
 
 /// How a file is run: by a shell (a script operand, `source`, a startup
@@ -612,6 +624,7 @@ type Run = (
     Vec<usize>,
     Ran,
     Vec<std::path::PathBuf>,
+    Vec<String>,
 );
 
 /// A script the line writes and then runs, with the text it writes:
@@ -640,6 +653,7 @@ impl LineFiles {
         id: &[usize],
         walked: bool,
         heredoc: Option<&str>,
+        values: &Values,
     ) {
         self.cmd = id.to_vec();
         let heredoc = match heredoc {
@@ -662,7 +676,7 @@ impl LineFiles {
             if configure_scratch_word(w) {
                 continue;
             }
-            self.wrote(w, here, home, false);
+            self.wrote(w, here, home, false, values);
         }
         let text = written_text(owned, heredoc.as_deref());
         for w in &mut self.written[from..] {
@@ -675,11 +689,11 @@ impl LineFiles {
                 .any(|p| p.is_dir())
         };
         for w in program_writes(run, &is_dir) {
-            self.wrote(&w, at, home, false);
+            self.wrote(&w, at, home, false, values);
         }
         if !walked && !self.data && may_write_anywhere(run, at, home) {
             let from = self.written.len();
-            self.wrote(".", at, home, true);
+            self.wrote(".", at, home, true, values);
             let name = command_word(run).unwrap_or_default();
             for w in &mut self.written[from..] {
                 w.word = name.to_string();
@@ -703,7 +717,7 @@ impl LineFiles {
             } else {
                 Ran::Shell
             };
-            self.ran_from(w, at, home, how);
+            self.ran_from(w, at, home, how, values);
         }
     }
 
@@ -727,8 +741,16 @@ impl LineFiles {
         }
     }
 
-    fn wrote(&mut self, w: &str, dirs: &[std::path::PathBuf], home: Option<&str>, loose: bool) {
-        for path in placed(w, dirs, home) {
+    fn wrote(
+        &mut self,
+        w: &str,
+        dirs: &[std::path::PathBuf],
+        home: Option<&str>,
+        loose: bool,
+        values: &Values,
+    ) {
+        let (paths, via) = placed_via(w, dirs, home, values);
+        for path in paths {
             self.written.push(Written {
                 path,
                 id: self.cmd.clone(),
@@ -736,14 +758,23 @@ impl LineFiles {
                 text: None,
                 word: w.to_string(),
                 rewrite: false,
+                via: via.clone(),
             });
         }
     }
 
     /// Take the script `w`, as read from each of `dirs`, as run by the
     /// command now read.
-    fn ran_from(&mut self, w: &str, dirs: &[std::path::PathBuf], home: Option<&str>, how: Ran) {
-        for p in placed(w, dirs, home) {
+    fn ran_from(
+        &mut self,
+        w: &str,
+        dirs: &[std::path::PathBuf],
+        home: Option<&str>,
+        how: Ran,
+        values: &Values,
+    ) {
+        let (paths, via) = placed_via(w, dirs, home, values);
+        for p in paths {
             let how = match &p {
                 Some(path)
                     if how == Ran::Exec && matches!(read_script(path), ScriptText::Binary) =>
@@ -753,8 +784,14 @@ impl LineFiles {
                 _ if how == Ran::Exec => Ran::Shell,
                 _ => how,
             };
-            self.ran
-                .push((p, w.to_string(), self.cmd.clone(), how, dirs.to_vec()));
+            self.ran.push((
+                p,
+                w.to_string(),
+                self.cmd.clone(),
+                how,
+                dirs.to_vec(),
+                via.clone(),
+            ));
         }
     }
 
@@ -767,15 +804,31 @@ impl LineFiles {
     /// for one its own command runs.
     fn written_then_run(&self) -> Result<Vec<Rejudged>, String> {
         let mut texts = Vec::new();
-        for (r, run_word, rid, how, dirs) in &self.ran {
+        let unfixed = self.unfixed_names();
+        let settle = |p: &Option<std::path::PathBuf>, via: &[String]| {
+            if via.is_empty() || (!self.blind && !via.iter().any(|v| unfixed.contains(v))) {
+                p.clone()
+            } else {
+                None
+            }
+        };
+        let written: Vec<Written> = self
+            .written
+            .iter()
+            .map(|w| Written {
+                path: settle(&w.path, &w.via),
+                ..w.clone()
+            })
+            .collect();
+        for (r, run_word, rid, how, dirs, via) in &self.ran {
+            let r = &settle(r, via);
             let shown = |p: &Option<std::path::PathBuf>| {
                 p.as_ref().map_or_else(
                     || "a script the line does not show".into(),
                     |p| p.display().to_string(),
                 )
             };
-            let mut hits = self
-                .written
+            let mut hits = written
                 .iter()
                 .filter(|w| &w.id <= rid && !(w.loose && rid.starts_with(&w.id)))
                 .filter(|w| !w.loose || (*how == Ran::Shell && r.is_some()))
@@ -803,6 +856,56 @@ impl LineFiles {
             }
         }
         Ok(texts)
+    }
+
+    /// The names a walked command bound other than to a literal once,
+    /// and each name whose literal reads one of those.
+    fn unfixed_names(&self) -> std::collections::HashSet<String> {
+        let mut out = self.unfixed.clone();
+        loop {
+            let before = out.len();
+            for (name, reads) in &self.reads {
+                if reads.iter().any(|r| out.contains(r)) {
+                    out.insert(name.clone());
+                }
+            }
+            if out.len() == before {
+                return out;
+            }
+        }
+    }
+
+    /// Take the bindings `cmd` makes. A literal assignment outside a loop
+    /// keeps its name fixed. `read`, `for`, `export`, a default, an
+    /// append, an array element, `unset`, a value with any expansion
+    /// other than `$name`, and any assignment in a loop do not. `eval`
+    /// may bind any name.
+    fn note_bindings(&mut self, cmd: &[&str]) {
+        let (prefixes, name, args) = command_parts(cmd);
+        if name == "eval" {
+            self.blind = true;
+        }
+        let mut out = opaque_bound(cmd);
+        out.extend(default_bound(cmd));
+        if name == "unset" {
+            out.extend(args.into_iter().filter(|a| !a.starts_with('-')));
+        }
+        for w in &prefixes {
+            let Some((n, v, append)) = assignment_of(w) else {
+                continue;
+            };
+            match literal_pieces(v) {
+                Some(pieces) if !append && !w[n.len()..].starts_with('[') && self.loops == 0 => {
+                    let reads = pieces.into_iter().filter_map(|p| match p {
+                        SourcePart::Var(r) => Some(r),
+                        SourcePart::Lit(_) => None,
+                    });
+                    self.reads.entry(n.to_string()).or_default().extend(reads);
+                }
+                _ => out.push(n.to_string()),
+            }
+        }
+        self.unfixed.extend(out);
     }
 
     /// Whether `w` is scratch this run creates in the tracked directory
@@ -1492,6 +1595,138 @@ fn placed(
         .collect()
 }
 
+/// The values each variable may hold where a command runs, as
+/// [`note_cmd_values`] records them. `\0` is a value the line does not
+/// show. Under [`fixed_key`], what the assignment expanded to.
+type Values = std::collections::HashMap<String, Vec<String>>;
+
+/// Where the literal value of `name` is kept in [`Values`]. A real name
+/// cannot start with `\0`.
+fn fixed_key(name: &str) -> String {
+    format!("\0{name}")
+}
+
+/// [`placed`] with each `$name` in `w` written as the literal the line
+/// assigned it, and the names read. A word with no such name, or one
+/// that has a value the line does not show, is [`placed`] as written.
+fn placed_via(
+    w: &str,
+    dirs: &[std::path::PathBuf],
+    home: Option<&str>,
+    values: &Values,
+) -> (Vec<Option<std::path::PathBuf>>, Vec<String>) {
+    if w.contains('$') {
+        if let Some((words, names)) = literal_pieces(w).and_then(|p| expand_pieces(p, values)) {
+            if !names.is_empty() && words.iter().all(|s| !s.is_empty()) {
+                let paths = words.iter().flat_map(|s| placed(s, dirs, home)).collect();
+                return (paths, names);
+            }
+        }
+    }
+    (placed(w, dirs, home), Vec::new())
+}
+
+/// The literal text and the `$name` or `${name}` of a word or an
+/// assigned value, with its quotes taken off. None for any other
+/// expansion, a backtick, or a glob, `~` or brace the shell may expand.
+fn literal_pieces(w: &str) -> Option<Vec<SourcePart>> {
+    let chars: Vec<char> = w.chars().collect();
+    let mut parts = Vec::new();
+    let mut lit = String::new();
+    let (mut single, mut double) = (false, false);
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
+        match c {
+            '\'' if !double => single = !single,
+            _ if single => lit.push(c),
+            '"' => double = !double,
+            '\\' => {
+                let n = *chars.get(i)?;
+                i += 1;
+                if double && !matches!(n, '$' | '`' | '"' | '\\') {
+                    lit.push('\\');
+                }
+                lit.push(n);
+            }
+            '$' => {
+                let name: String = if chars.get(i) == Some(&'{') {
+                    let end = i + chars[i..].iter().position(|&c| c == '}')?;
+                    let n = chars[i + 1..end].iter().collect();
+                    i = end + 1;
+                    n
+                } else {
+                    let n: String = chars[i..]
+                        .iter()
+                        .take_while(|c| c.is_ascii_alphanumeric() || **c == '_')
+                        .collect();
+                    i += n.len();
+                    n
+                };
+                if !is_name(&name) {
+                    return None;
+                }
+                if !lit.is_empty() {
+                    parts.push(SourcePart::Lit(std::mem::take(&mut lit)));
+                }
+                parts.push(SourcePart::Var(name));
+            }
+            '`' => return None,
+            '*' | '?' | '[' | '~' | '{' | '}' if !double => return None,
+            _ => lit.push(c),
+        }
+    }
+    if single || double {
+        return None;
+    }
+    if !lit.is_empty() {
+        parts.push(SourcePart::Lit(lit));
+    }
+    Some(parts)
+}
+
+/// Every text `parts` may expand to, from the literal values `values`
+/// keeps for each name, and the names read. None when a name has none,
+/// may hold a value the line does not show, or is one [`Vars`] tracks,
+/// or when a text could split, glob or quote. At most eight.
+fn expand_pieces(parts: Vec<SourcePart>, values: &Values) -> Option<(Vec<String>, Vec<String>)> {
+    let mut acc = vec![String::new()];
+    let mut names = Vec::new();
+    for part in parts {
+        match part {
+            SourcePart::Lit(s) => {
+                for a in &mut acc {
+                    a.push_str(&s);
+                }
+            }
+            SourcePart::Var(name) => {
+                if VAR_NAMES.contains(&name.as_str()) {
+                    return None;
+                }
+                let vals = values.get(&fixed_key(&name))?;
+                if vals.is_empty() || vals.iter().any(|v| v == "\0") {
+                    return None;
+                }
+                let mut next = Vec::new();
+                for a in &acc {
+                    for v in vals {
+                        if next.len() == 8 {
+                            return None;
+                        }
+                        next.push(format!("{a}{v}"));
+                    }
+                }
+                acc = next;
+                names.push(name);
+            }
+        }
+    }
+    let plain =
+        |s: &String| !s.contains(|c: char| c.is_whitespace() || "\"'\\$`*?[]{}~\0".contains(c));
+    acc.iter().all(plain).then_some((acc, names))
+}
+
 /// How many function calls deep the walk follows. Past this, or when a
 /// call is already on the stack, the body may move the shell and the walk
 /// cannot see where it stops, so the line is not followed.
@@ -1614,6 +1849,7 @@ impl Shell {
 
     /// The directory, the stack and `HOME` / `CDPATH` are no longer known.
     fn lose(&mut self) {
+        self.files.borrow_mut().blind = true;
         self.here = vec![UNTRACKED.into()];
         self.old = vec![UNTRACKED.into()];
         self.pushed.clear();
@@ -2496,6 +2732,8 @@ fn walk(
     // Values each command's expansions see, so a later walk of that
     // command still knows which file `. ./$x` names.
     let mut cmd_at = Vec::new();
+    // Loops around this walk: a function called in a loop runs again.
+    let outer_loops = shell.files.borrow().loops;
     let ended = ended_commands(&argv);
     let (heredocs, data) = if argv.iter().any(|w| w.contains("<<")) {
         heredoc_bodies(&ended)
@@ -2582,6 +2820,7 @@ fn walk(
         if !data[ci] && !pat && starts_loop(&cmd) {
             loops.push(seq);
         }
+        shell.files.borrow_mut().loops = outer_loops + loops.len();
         shell.files.borrow_mut().cmd.clone_from(&id);
         if rerun {
             ran_in.push((at.clone(), shell.old.clone(), set.clone(), id.clone()));
@@ -2679,7 +2918,9 @@ fn walk(
             &id,
             walked,
             heredocs[ci].as_deref(),
+            &shell.cmd_values,
         );
+        shell.files.borrow_mut().note_bindings(&cmd);
         if cmd.first() == Some(&"done") {
             if let Some(start) = loops.pop().filter(|_| loops.is_empty()) {
                 spans.push((start, seq));
@@ -3129,6 +3370,7 @@ fn walk(
     shell.files.borrow_mut().cmd.clone_from(&base);
     spans.extend(loops.first().map(|&start| (start, seq)));
     shell.files.borrow_mut().lower_loops(&base, &spans);
+    shell.files.borrow_mut().loops = outer_loops;
     if depth >= MAX_DEPTH || !rerun {
         return;
     }
@@ -3951,21 +4193,37 @@ fn note_cmd_values(cmd: &[&str], shell: &mut Shell) {
     while i < words.len() && (is_assignment(words[i]) || keyword_at(&words, i)) {
         i += 1;
     }
+    let unknown = |values: &mut Values, name: String| {
+        values.insert(fixed_key(&name), vec!["\0".into()]);
+        values.insert(name, vec!["\0".into()]);
+    };
     if i == words.len() {
         for w in words {
             if let Some((name, value)) = assign_sides(w) {
+                // The shell expands the value once, here, with the values
+                // the names it reads hold now.
+                let fixed = literal_pieces(&value)
+                    .and_then(|p| expand_pieces(p, &shell.cmd_values))
+                    .map_or_else(|| vec!["\0".into()], |(texts, _)| texts);
+                shell.cmd_values.insert(fixed_key(&name), fixed);
                 shell.cmd_values.insert(name, vec![value]);
             } else if let Some(name) = w.split(['+', '[', '=']).next().filter(|n| !n.is_empty()) {
                 // `NAME+=x` and `NAME[i]=x` do not show the whole value.
-                shell.cmd_values.insert(name.to_string(), vec!["\0".into()]);
+                unknown(&mut shell.cmd_values, name.to_string());
             }
         }
     }
     for name in opaque_bound(cmd) {
-        shell.cmd_values.insert(name, vec!["\0".into()]);
+        unknown(&mut shell.cmd_values, name);
     }
     for name in default_bound(cmd) {
-        shell.cmd_values.insert(name, vec!["\0".into()]);
+        unknown(&mut shell.cmd_values, name);
+    }
+    let (_, head, args) = command_parts(cmd);
+    if head == "unset" {
+        for a in args.iter().filter(|a| !a.starts_with('-')) {
+            shell.cmd_values.insert(fixed_key(a), vec!["\0".into()]);
+        }
     }
     // `eval` can assign any name, including `IFS`.
     if command_parts(cmd).1 == "eval" {
@@ -5190,10 +5448,13 @@ fn judge_startup(
     if value == "/dev/null" {
         return;
     }
-    shell
-        .files
-        .borrow_mut()
-        .ran_from(&value, &shell.here, shell.vars.home.as_deref(), Ran::Shell);
+    shell.files.borrow_mut().ran_from(
+        &value,
+        &shell.here,
+        shell.vars.home.as_deref(),
+        Ran::Shell,
+        &Values::new(),
+    );
     let path = std::path::Path::new(&value);
     let full = if path.is_absolute() {
         path.to_path_buf()
@@ -5327,6 +5588,7 @@ fn judge_procsub(
             &shell.here,
             shell.vars.home.as_deref(),
             Ran::Shell,
+            &Values::new(),
         );
         let Some(part) = read_shown_file(path, shell) else {
             *denied = Some(procsub_unshown_denial());

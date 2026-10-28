@@ -76,3 +76,107 @@ fn a_substitution_the_shell_runs_is_still_read() {
     assert!(v.starts_with("deny\t"), "{v}");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A variable the script assigns only from literals is that path. The
+/// tunnel script writes its log under `$D` and then runs a program the
+/// guard cannot read.
+#[test]
+fn a_literal_variable_is_the_path_it_names() {
+    let d = scratch("literal");
+    let conf = d.join("tunnel");
+    let tunnel = format!(
+        "#!/bin/sh\nBIN=/usr/local/bin/tunneld\nD={}\nmkdir -p \"$D\"\n\
+         pkill -f tunneld || true\nsleep 1\n\
+         nohup $BIN -c $D/tunnel.conf >>$D/tunnel.log 2>&1 &\n\
+         sleep 2\n/usr/local/libexec/ljos-test/check-tunnel\n",
+        conf.display(),
+    );
+    std::fs::write(d.join("tunnel.sh"), &tunnel).unwrap();
+    assert_eq!(verdict(&d, &["bash", "tunnel.sh"]), "allow");
+    let run = format!("{}/bin/check", d.display());
+    for line in [
+        "D={d}/w; echo x >> $D/wp.log; {run}",
+        "D={d}/w; echo x >> ${D}/wp.log; {run}",
+        "D={d}/w; L=\"$D/logs\"; echo x >> \"$L/wp.log\"; {run}",
+        "D='{d}/w'; F=wp; echo x >> $D/$F.log; {run}",
+        "if true; then D={d}/a; else D={d}/b; fi; echo x >> $D/wp.log; {run}",
+    ] {
+        let line = line
+            .replace("{d}", &d.to_string_lossy())
+            .replace("{run}", &run);
+        assert_eq!(sh(&d, &line), "allow", "{line}");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A name the line does not pin to one literal still refuses: a
+/// positional, the environment, `read`, a reassignment after the
+/// literal, a branch that leaves it unset or unknown, a loop, `unset`
+/// and `eval`. A literal that reads such a name is not pinned either.
+#[test]
+fn an_unpinned_variable_still_refuses() {
+    let d = scratch("unpinned");
+    let run = format!("{}/bin/check", d.display());
+    for line in [
+        "D=$1; echo x >> $D/wp.log; {run}",
+        "echo x >> $LJOS_TEST_UNSET/wp.log; {run}",
+        "echo x >> $HOME/wp.log; D=$HOME; echo x >> $D/wp.log; {run}",
+        "read D; echo x >> $D/wp.log; {run}",
+        "D={d}/w; D=$1; echo x >> $D/wp.log; {run}",
+        "D={d}/w; echo x >> $D/wp.log; D=$(cat f); {run}",
+        "D={d}/w; echo x >> $D/wp.log; read D; {run}",
+        "D={d}/w; if c; then D=$X; fi; echo x >> $D/wp.log; {run}",
+        "if c; then D={d}/w; fi; echo x >> $D/wp.log; {run}",
+        "D={d}/w; for i in 1 2; do echo x >> $D/l; D={d}/v; done; {run}",
+        "D={d}/w; unset D; echo x >> $D/wp.log; {run}",
+        "D={d}/w; eval \"$2\"; echo x >> $D/wp.log; {run}",
+        "B=$D/x; D={d}/w; echo x >> $B; {run}",
+        "D={d}/w; B=$D/x; D=$1; echo x >> $B; {run}",
+        "D=\"{d}/a b\"; echo x > $D/l; {run}",
+        "D={d}/*; echo x > $D/l; {run}",
+    ] {
+        let line = line
+            .replace("{d}", &d.to_string_lossy())
+            .replace("{run}", &run);
+        let v = sh(&d, &line);
+        assert!(
+            v.starts_with("deny\tscript-written-on-line: "),
+            "{line}: {v}"
+        );
+    }
+    let v = verdict(
+        &d,
+        &[
+            "bash",
+            "-c",
+            "D=$1; echo x >> $D/wp.log; /usr/local/bin/x",
+            "sh",
+            "/tmp",
+        ],
+    );
+    assert!(v.starts_with("deny\t"), "{v}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The path a literal variable names is judged as the line spells it:
+/// a script written there and run is read as that text.
+#[test]
+fn a_literal_variable_script_is_judged_on_its_text() {
+    let d = scratch("text");
+    let p = d.join("run.sh");
+    let line = format!(
+        "D={}; echo 'rm -rf ~/' > $D/run.sh; sh {}",
+        d.display(),
+        p.display()
+    );
+    let v = sh(&d, &line);
+    assert!(v.starts_with("deny\tscript-written-on-line: "), "{v}");
+    assert!(v.contains("rm-rf"), "{v}");
+    let line = format!(
+        "D={}; echo 'echo ok' > $D/run.sh; sh {}",
+        d.display(),
+        p.display()
+    );
+    assert_eq!(sh(&d, &line), "allow");
+    let _ = std::fs::remove_dir_all(&d);
+}
