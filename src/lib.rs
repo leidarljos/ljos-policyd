@@ -254,7 +254,7 @@ pub struct Checked {
 pub fn check_shell(argv: &[String]) -> Checked {
     let cwd = std::env::current_dir().unwrap_or_default();
     SPELLED.with(|s| s.borrow_mut().clear());
-    start_line();
+    start_line(argv);
     ARGV_WORDS.with(|s| {
         let mut s = s.borrow_mut();
         s.clear();
@@ -284,14 +284,45 @@ thread_local! {
     /// as written (a quoted delimiter, or nothing to expand), and that
     /// body.
     static HEREDOC_RAW: std::cell::RefCell<Vec<HeredocRaw>> = std::cell::RefCell::default();
+    /// Each word of the argv, or that [`shell_words`] made during a
+    /// check, that holds a `{`, and whether one of those stood outside
+    /// quotes in some place the word was split from. An argv word is
+    /// passed as it is. Bash brace-expands only a word with a bare `{`.
+    static BRACED: std::cell::RefCell<std::collections::HashMap<String, bool>> =
+        std::cell::RefCell::default();
 }
 
 /// A here-document body as [`HEREDOC_RAW`] keeps it.
 type HeredocRaw = (String, Vec<String>, bool, String);
 
-/// Forget the here-documents of the last check on this thread.
-fn start_line() {
+/// Forget the here-documents and braces of the last check on this
+/// thread, and take each word of `argv` as passed.
+fn start_line(argv: &[String]) {
     HEREDOC_RAW.with(|s| s.borrow_mut().clear());
+    BRACED.with(|s| s.borrow_mut().clear());
+    for w in argv {
+        braced(w, false);
+    }
+}
+
+fn braced(w: &str, bare: bool) {
+    if !w.contains('{') {
+        return;
+    }
+    BRACED.with(|s| {
+        let mut s = s.borrow_mut();
+        let was = s.get(w).copied();
+        if was != Some(true) && was != Some(bare) {
+            s.insert(w.to_string(), was.unwrap_or(false) || bare);
+            bump_spell_gen();
+        }
+    });
+}
+
+/// Whether bash leaves every `{` in `w` as it is: each was quoted
+/// wherever [`shell_words`] split the word.
+fn braces_quoted(w: &str) -> bool {
+    BRACED.with(|s| s.borrow().get(w) == Some(&false))
 }
 
 /// The text of the literal here-document closed by `delim` whose body
@@ -7372,6 +7403,10 @@ fn expanded_command(cmd: &[&str]) -> Result<Option<Vec<String>>, ()> {
     let mut out = Vec::new();
     let mut changed = false;
     for w in cmd {
+        if braces_quoted(w) {
+            out.push((*w).to_string());
+            continue;
+        }
         let parts = expand_word(w)?;
         if parts.len() != 1 || parts.first().map(String::as_str) != Some(*w) {
             changed = true;
@@ -11944,6 +11979,9 @@ fn shell_words(script: &str) -> Vec<String> {
     let mut dq_dollar = false;
     // The word has a character the shell may expand where it stands.
     let mut bare = false;
+    // The word has a `{` outside quotes and outside a substitution,
+    // which bash may brace-expand.
+    let mut bare_brace = false;
     let mut i = 0;
     // Here-documents opened on the command just finished, read from the
     // next line. A body is not the script that follows it: a quote in
@@ -12037,6 +12075,7 @@ fn shell_words(script: &str) -> Vec<String> {
             c if !single && !double && (c.is_whitespace() || matches!(c, ';' | '|' | '&')) => {
                 if word {
                     spelled(&cur, !std::mem::take(&mut bare));
+                    braced(&cur, std::mem::take(&mut bare_brace));
                     finish_word(
                         std::mem::take(&mut cur),
                         std::mem::take(&mut quoted),
@@ -12069,6 +12108,7 @@ fn shell_words(script: &str) -> Vec<String> {
                 {
                     bare = true;
                 }
+                bare_brace |= c == '{' && !single && !double;
                 cur.push(c);
                 word = true;
             }
@@ -12076,6 +12116,7 @@ fn shell_words(script: &str) -> Vec<String> {
     }
     if word {
         spelled(&cur, !bare);
+        braced(&cur, bare_brace);
         finish_word(cur, quoted, &mut out, &mut pending, &mut want_delim);
     }
     take_heredoc_bodies(&chars, &mut i, &mut out, &mut pending);
@@ -12225,6 +12266,7 @@ fn take_heredoc_bodies(
                 let mut words = Vec::new();
                 for line in body.lines().map(str::trim).filter(|l| !l.is_empty()) {
                     spelled(line, true);
+                    braced(line, false);
                     words.push(line.to_string());
                     words.push(";".to_string());
                 }
@@ -14493,7 +14535,7 @@ fn check_shell_phronesis(argv: &[String], cwd: &std::path::Path) -> Checked {
             .name("phronesis".into())
             .spawn(move || {
                 for (argv, cwd, reply) in rx {
-                    start_line();
+                    start_line(&argv);
                     let parent = Scratch {
                         root: Some(cwd),
                         ..Scratch::default()
@@ -21422,6 +21464,53 @@ hash -r 2> /dev/null
         let c = at("bash -c 'echo {a,b}'");
         assert_eq!(c.decision, Decision::Allow, "{}", c.token);
         assert_everyday_allowed(&root);
+    }
+
+    /// Bash brace-expands only a `{` outside quotes and outside a
+    /// substitution, so a jq object in a quoted program, a quoted
+    /// here-document or `$(...)` is one word. A bare `{a,b}` or `{1..40}`
+    /// still is the words it makes.
+    #[test]
+    fn a_quoted_brace_is_not_expanded() {
+        let root = startup_root("bracequote");
+        let at = |line: &str| {
+            let argv = ["bash", "-c", line].map(String::from);
+            start_line(&argv);
+            check_shell_in(&argv, &root, 0)
+        };
+        let wide = "{a:1,b:2,c:3,d:4,e:5,f:6} + {g:1,h:2,i:3,j:4,k:5,l:6}";
+        for line in [
+            format!("jq -n '{wide}'"),
+            format!("jq -n \"{wide}\""),
+            format!("x=$(jq -n '{wide}')"),
+            format!("cat > x.jq <<'EOF'\n{wide}\nEOF"),
+            "jq -r '.[] | {key:(\"commit:\\(.sha):\\($f|join(\",\"))\"), sha:.sha[0:12], flags:$f, pr:$url}'"
+                .to_string(),
+            "jq '($prs | map({key:\"\\(.fork):\\(.ref)\", value:.url}) | from_entries) as $head | $head'"
+                .to_string(),
+            "echo '{1..40}' \\{1..40\\}".to_string(),
+        ] {
+            let c = at(&line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for (line, want) in [
+            ("rm -rf ~/{.cursor,x}", "rm-rf-outside-tmp"),
+            ("bash -c 'rm -rf ~/{.cursor,x}'", "rm-rf-outside-tmp"),
+            ("git {push,-f}", "git-force-push"),
+            ("echo {1..40}", "brace-expansion-unshown"),
+            ("echo {a,b}'{1..40}'", "brace-expansion-unshown"),
+            ("x=$(echo {1..40})", "brace-expansion-unshown"),
+            ("x=$(rm -rf ~/{.cursor,x})", "rm-rf-outside-tmp"),
+            ("echo $(true){1..40}", "brace-expansion-unshown"),
+            (
+                "cat <<'EOF' | sh\necho {1..40}\nEOF",
+                "brace-expansion-unshown",
+            ),
+        ] {
+            let c = at(line);
+            assert!(c.token.contains(want), "{line}: {}", c.token);
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A `case` arm runs the command after its pattern.

@@ -637,3 +637,41 @@ fn a_quoted_here_document_script_is_judged_as_written() {
     }
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A read-only audit script whose only `{a,b}` text is jq objects in
+/// single-quoted programs. Bash expands none of those, so the script
+/// runs as written. A bare brace that reaches a hook dir still refuses.
+const AUDIT: &str = r#"#!/bin/bash
+set -euo pipefail
+W=$(mktemp -d)
+url=https://example.org/pr/1
+f='["a","b"]'
+gh api repos/example/r/commits | jq -r --argjson f "$f" --arg url "$url" '.[] | {key:("commit:\(.sha):\($f|join(","))"), sha:.sha[0:12], flags:$f, pr:$url}'
+prs=$(gh api repos/example/r/pulls)
+jq --argjson prs "$prs" -n '($prs | map({key:"\(.fork):\(.ref)", value:.url}) | from_entries) as $head | $head'
+br=1; bp=2; bu=3; runs=4; pushes=5; tl=6; commits=7
+jq -n --argjson br "$br" --argjson bp "$bp" --argjson bu "$bu" --argjson runs "$runs" --argjson pushes "$pushes" --argjson tl "$tl" --argjson commits "$commits" '{baseline:{runs:$br, pushes:$bp, unverified:$bu}, items:{runs:$runs, pushes:$pushes, timeline:$tl, commits:$commits}} + {a:1,b:2,c:3,d:4,e:5,f:6} + {g:1,h:2,i:3,j:4,k:5,l:6}' >"$W/new.json"
+cat "$W/new.json"
+"#;
+
+#[test]
+fn a_jq_object_in_quotes_is_no_brace_expansion() {
+    let d = scratch("audit");
+    let audit = d.join("audit.sh");
+    std::fs::write(&audit, AUDIT).unwrap();
+    std::fs::set_permissions(&audit, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::fs::write(d.join("ENV"), "export A=1\n").unwrap();
+    let a = audit.display();
+    for line in [
+        format!(". ENV; export LJOS_SEAT=example; {a}"),
+        format!("{SEEN}. ENV; export LJOS_SEAT=example; bash {a}"),
+    ] {
+        assert_eq!(hook_verdict(&d, "example", &line), "allow", "{line}");
+    }
+    std::fs::write(&audit, format!("{AUDIT}rm -rf ~/{{.cursor,x}}\n")).unwrap();
+    let v = hook_verdict(&d, "example", &format!("{SEEN}bash {a}"));
+    assert!(v.starts_with("deny\t"), "{v}");
+    let v = hook_verdict(&d, "example", &format!("{SEEN}rm -rf ~/{{.cursor,x}}"));
+    assert!(v.starts_with("deny\trm-rf"), "{v}");
+    let _ = std::fs::remove_dir_all(&d);
+}
