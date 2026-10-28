@@ -788,7 +788,6 @@ impl LineFiles {
                 {
                     Ran::Program
                 }
-                _ if how == Ran::Exec => Ran::Shell,
                 _ => how,
             };
             self.ran.push((
@@ -838,7 +837,7 @@ impl LineFiles {
             let mut hits = written
                 .iter()
                 .filter(|w| &w.id <= rid && !(w.loose && rid.starts_with(&w.id)))
-                .filter(|w| !w.loose || (*how == Ran::Shell && r.is_some()))
+                .filter(|w| !w.loose || (matches!(how, Ran::Shell | Ran::Exec) && r.is_some()))
                 .filter(|w| match (r, &w.path) {
                     (Some(r), Some(w)) => r.starts_with(w),
                     _ => true,
@@ -849,13 +848,19 @@ impl LineFiles {
                 continue;
             }
             // A shell script or a python program whose every write the
-            // line spells out is judged on that text instead.
+            // line spells out is judged on that text instead. A write to
+            // a path the line does not show, with all of its text shown,
+            // leaves that text if it is the script a shell or python reads.
             for w in hits {
+                let it = r.is_some() && (w.path == *r || (w.path.is_none() && !w.loose));
                 match &w.text {
-                    Some(t) if *how == Ran::Shell && r.is_some() && w.path == *r => {
-                        texts.push(Rejudged::Shell(shown(r), t.clone()))
+                    Some(t)
+                        if (*how == Ran::Shell && it)
+                            || (*how == Ran::Exec && r.is_some() && w.path == *r) =>
+                    {
+                        texts.push(Rejudged::Shell(shown(r), t.clone()));
                     }
-                    Some(t) if *how == Ran::Python && r.is_some() && w.path == *r => {
+                    Some(t) if *how == Ran::Python && it => {
                         texts.push(Rejudged::Python(shown(r), t.clone(), dirs.clone()))
                     }
                     _ => return Err(written_reason(&shown(r), w)),
@@ -22739,7 +22744,7 @@ hash -r 2> /dev/null
             "cd sub && echo 'git push -f' > ok.sh; cd .. && source sub/ok.sh",
             "cd sub && echo 'git push -f' > ok.sh; source ok.sh",
             "echo 'git push -f' > sub/../x.sh; source x.sh",
-            "echo x > \"$OUT\"; source ok.sh",
+            "cat in > \"$OUT\"; source ok.sh",
             "echo 'git push -f' > x.sh & source x.sh",
             "(echo 'git push -f' > x.sh); source x.sh",
             "bash -c \"echo 'git push -f' > x.sh\"; source x.sh",
@@ -22765,9 +22770,28 @@ hash -r 2> /dev/null
             "./configure > config.log && make",
             "echo x > /dev/null; source ok.sh",
             "(cd sub && echo x > ok.sh); source ok.sh",
+            "echo x > \"$OUT\"; source ok.sh",
+            "printf %s x > \"$_ljos_seen\"; . ./ok.sh; python3 ok.py",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for (line, want) in [
+            (
+                "echo 'git push -f' > \"$OUT\"; source ok.sh",
+                "ok.sh: git-force-push",
+            ),
+            (
+                "printf x >> \"$OUT\"; source ok.sh",
+                "may name it; write to a literal path",
+            ),
+            (
+                "printf x > \"$OUT\"; ./ok.sh",
+                "may name it; write to a literal path",
+            ),
+        ] {
+            let c = at(line);
+            assert!(c.token.ends_with(want), "{line}: {}", c.token);
         }
         assert_everyday_allowed(&root);
     }
@@ -24354,7 +24378,7 @@ hash -r 2> /dev/null
         let root = startup_root("unshownw");
         std::fs::write(root.join("configure"), "echo configured\n").unwrap();
         let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
-        let c = at("echo start > \"$LOG\"; sh ./configure");
+        let c = at("cat in > \"$LOG\"; sh ./configure");
         assert_eq!(c.decision, Decision::Deny, "{}", c.token);
         assert!(
             c.token
@@ -24390,7 +24414,7 @@ hash -r 2> /dev/null
         assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         for line in [
             "echo 'git push -f' > $x; sh $x",
-            "echo start > \"$LOG\"; sh ./configure",
+            "cat in > \"$LOG\"; sh ./configure",
             "sed 's/ok/git push -f/' <$0 >$as_me.lineno\n. \"./$as_me.lineno\"\n",
             "echo 'git push -f' > conf$$.file; sh conf$$.file",
         ] {
@@ -24935,7 +24959,7 @@ sed 's/[$]LINENO.*/&-/' <$as_myself >$as_me.lineno
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
-        let c = at("echo start > \"$LOG\"; sh ./configure");
+        let c = at("cat in > \"$LOG\"; sh ./configure");
         assert_eq!(c.decision, Decision::Deny, "{}", c.token);
         assert!(c.token.contains("write to a literal path"), "{}", c.token);
     }
@@ -25259,8 +25283,8 @@ make -C safe test
         for line in [
             "echo 'git push -f' > conftest.in; sh conftest.in",
             "echo 'git push -f' > run.sh; sh run.sh",
-            "echo 'int x;' >\"$OUT\"; sh ./configure",
-            "echo x >../conftest.$ac_ext; sh ./configure",
+            "cat in >\"$OUT\"; sh ./configure",
+            "cat in >../conftest.$ac_ext; sh ./configure",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
@@ -26757,8 +26781,8 @@ make -C safe test
             "for c in a.md foo/x.sh; do printf x > \"$c\"; done; sh foo/x.sh",
             "for c in a foo; do printf x > \"$c/x.sh\"; done; sh foo/x.sh",
             "for c in *.md; do printf x > \"$c\"; done; sh foo/x.sh",
-            "for c in a b; do c=$1; printf x > \"$c\"; done; sh foo/x.sh",
-            "for c in a.md; do :; done; c=$1; printf x > \"$c\"; sh foo/x.sh",
+            "for c in a b; do c=$1; cat in > \"$c\"; done; sh foo/x.sh",
+            "for c in a.md; do :; done; c=$1; cat in > \"$c\"; sh foo/x.sh",
         ] {
             assert_eq!(at(line).decision, Decision::Deny, "{line}");
         }
