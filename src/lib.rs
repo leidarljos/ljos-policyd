@@ -1731,8 +1731,6 @@ fn fixed_key(name: &str) -> String {
     format!("\0{name}")
 }
 
-const SET_POSITIONALS_KEY: &str = "\0set-positionals";
-
 /// [`placed`] with each `$name` in `w` written as the literal the line
 /// assigned it, and the names read. A word with no such name, or one
 /// that has a value the line does not show, is [`placed`] as written.
@@ -4556,11 +4554,6 @@ fn note_cmd_values(cmd: &[&str], shell: &mut Shell) {
         shell.cmd_values.insert(fixed_key(&name), list);
     }
     let (_, head, args) = command_parts(cmd);
-    if head == "set" {
-        if let Some(list) = set_positionals_from_args(&args) {
-            shell.cmd_values.insert(SET_POSITIONALS_KEY.into(), list);
-        }
-    }
     if head == "unset" {
         for a in args.iter().filter(|a| !a.starts_with('-')) {
             shell.cmd_values.insert(fixed_key(a), vec!["\0".into()]);
@@ -10925,13 +10918,26 @@ fn set_positionals_from_args(args: &[String]) -> Option<Vec<String>> {
         if a == "--" {
             return Some(args[i + 1..].to_vec());
         }
-        if a.starts_with('-') || a.starts_with('+') {
+        if a == "-" || a == "+" {
+            return Some(args[i + 1..].to_vec());
+        }
+        if matches!(a.as_str(), "-o" | "+o" | "-O" | "+O") {
+            i += 2;
+            continue;
+        }
+        if a.starts_with("-o")
+            || a.starts_with("+o")
+            || a.starts_with("-O")
+            || a.starts_with("+O")
+            || a.starts_with('-')
+            || a.starts_with('+')
+        {
             i += 1;
             continue;
         }
         return Some(args[i..].to_vec());
     }
-    None
+    Some(Vec::new())
 }
 
 fn set_positionals(cmd: &[String]) -> Option<Vec<String>> {
@@ -10960,6 +10966,100 @@ fn hidden_set_positional_head(head: &str, words: &[String]) -> bool {
         }
         _ => false,
     }
+}
+
+fn hidden_positional_or_array_head(w: &str) -> bool {
+    if positional(w) {
+        return true;
+    }
+    let body = quoted_body(w);
+    let Some(inner) = body.strip_prefix("${").and_then(|s| s.strip_suffix('}')) else {
+        return false;
+    };
+    let Some((name, tail)) = inner.split_once('[') else {
+        return false;
+    };
+    is_name(name) && matches!(tail, "@]" | "*]")
+}
+
+fn function_hidden_head(body: &[String]) -> bool {
+    commands(body).iter().any(|cmd| {
+        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        let run = unwrap_wrappers(&owned).0;
+        run.first()
+            .is_some_and(|head| hidden_positional_or_array_head(head))
+    })
+}
+
+fn note_functions_with_hidden_head(
+    words: &[String],
+    hidden: &mut std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        if let Some((name, body, next)) = function_at(words, i) {
+            if function_hidden_head(&body) {
+                hidden.insert(name);
+            }
+            i = next;
+            continue;
+        }
+        out.push(words[i].clone());
+        i += 1;
+    }
+    out
+}
+
+fn shifts_set_positionals(cmd: &[String], words: &mut Option<Vec<String>>) {
+    let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    let (_, head, args) = command_parts(&refs);
+    if head != "shift" {
+        return;
+    }
+    let Some(list) = words.as_mut() else {
+        return;
+    };
+    if args.is_empty() {
+        list.drain(..1.min(list.len()));
+        return;
+    }
+    let Some(n) = args[0].parse::<usize>().ok() else {
+        *words = None;
+        return;
+    };
+    if n >= list.len() {
+        list.clear();
+        return;
+    }
+    list.drain(..n);
+}
+
+fn nimvault_sensitive_at(words: &[String], i: usize) -> bool {
+    let w = words[i].as_str();
+    if base_of(w) != "nimvault" && !nimvault_on_disk(w) {
+        return false;
+    }
+    match nimvault_subcommand(words, i) {
+        Some((sub, _)) => NIMVAULT_SHOWS.contains(&sub) || NIMVAULT_HANDS_KEYS.contains(&sub),
+        None => true,
+    }
+}
+
+fn nimvault_sensitive_text(words: &[String]) -> bool {
+    let scrubbed: String = words
+        .join(" ")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | ':') {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let tokens: Vec<String> = scrubbed.split_whitespace().map(str::to_string).collect();
+    (0..tokens.len()).any(|i| nimvault_sensitive_at(&tokens, i))
 }
 
 /// The subcommands nimvault's `dispatchMulti` names, each as cligen's
@@ -11127,18 +11227,33 @@ fn nimvault_shown_denial(argv: &[String]) -> Option<Checked> {
 }
 
 fn nimvault_unshown_head_denial(argv: &[String]) -> Option<Checked> {
+    let mut saw_sensitive_nimvault = nimvault_sensitive_text(argv);
+    let mut saw_hidden_source = false;
     let mut set_words: Option<Vec<String>> = None;
-    commands(argv).iter().find_map(|cmd| {
-        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
-        if let Some(words) = set_positionals(&owned) {
-            set_words = Some(words);
-            return None;
+    let mut hidden_functions = std::collections::HashSet::new();
+    for cmd in inner_commands(argv) {
+        let words = note_functions_with_hidden_head(&cmd, &mut hidden_functions);
+        saw_sensitive_nimvault |= (0..words.len()).any(|i| nimvault_sensitive_at(&words, i))
+            || nimvault_sensitive_text(&words);
+        if let Some(words_set) = set_positionals(&words) {
+            set_words = Some(words_set);
+        } else {
+            shifts_set_positionals(&words, &mut set_words);
         }
-        let head = owned.len() - unwrap_wrappers(&owned).0.len();
-        let h = owned.get(head)?;
-        if set_words
-            .as_deref()
-            .is_some_and(|words| hidden_set_positional_head(h, words))
+        let run = unwrap_wrappers(&words).0;
+        if let Some(head) = run.first() {
+            if hidden_positional_or_array_head(head)
+                || hidden_functions.contains(head.as_str())
+                || set_words
+                    .as_deref()
+                    .is_some_and(|set| hidden_set_positional_head(head, set))
+            {
+                saw_hidden_source = true;
+            }
+        }
+        if run
+            .get(1)
+            .is_some_and(|n| run.first().is_some_and(|h| hides_head_word(h)) && hides_next_word(n))
         {
             return Some(Checked {
                 decision: Decision::Deny,
@@ -11146,12 +11261,11 @@ fn nimvault_unshown_head_denial(argv: &[String]) -> Option<Checked> {
                 token: Cow::Borrowed("nimvault-subcommand-unshown"),
             });
         }
-        let n = owned.get(head + 1)?;
-        (hides_head_word(h) && hides_next_word(n)).then_some(Checked {
-            decision: Decision::Deny,
-            code: PolicyReason::SecretExportDenied,
-            token: Cow::Borrowed("nimvault-subcommand-unshown"),
-        })
+    }
+    (saw_sensitive_nimvault && saw_hidden_source).then_some(Checked {
+        decision: Decision::Deny,
+        code: PolicyReason::SecretExportDenied,
+        token: Cow::Borrowed("nimvault-subcommand-unshown"),
     })
 }
 
@@ -27640,6 +27754,15 @@ make -C safe test
         for line in [
             "set -- nimvault get e; \"$@\"",
             "set -- nimvault get e; $1 $2 $3",
+            "set -o pipefail -- nimvault get e; \"$@\"",
+            "set +o x -- nimvault get e; \"$@\"",
+            "set -- skip nimvault get e; shift; \"$@\"",
+            "set -- skip nimvault get e; shift 1; \"$@\"",
+            "set -- skip nimvault get e; shift; ${@:2}",
+            "a=(nimvault get e); \"${a[@]}\"",
+            "f(){ \"$@\"; }; f nimvault get e",
+            "set -- env nimvault get e; \"$@\"",
+            "eval 'set -- nimvault get e'; \"$@\"",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Deny, "{line}");
@@ -27651,6 +27774,8 @@ make -C safe test
         let nv = root.join("nv");
         let c = at(&format!("{} ge e", nv.display()));
         assert_eq!(c.token, "nimvault-shows: get");
+        let c = at(&format!("set -- {} get e; \"$@\"", nv.display()));
+        assert_eq!(c.decision, Decision::Deny, "symlink set positional");
         for line in [
             "nimvault run -e T e -- date",
             "nimvault list",
@@ -27662,7 +27787,10 @@ make -C safe test
             "kubectl -n \"$NS\" get pods",
             "\"$EDITOR\" get.txt",
             "echo \"$@\"",
+            "set -o pipefail; cargo test",
             "set -- a b; echo \"$@\"",
+            "for x in \"$@\"; do echo \"$x\"; done",
+            "\"${cmd[@]}\"",
             "echo \"$S\"",
             "cargo \"$CMD\"",
             &format!("{} list", nv.display()),
