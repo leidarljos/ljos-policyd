@@ -45,7 +45,7 @@ fn the_configured_relay_reads_its_secret_from_the_vault() {
         let p = dir.join("send.py");
         std::fs::write(&p, code).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
-        "nimvault run --env EXAMPLE_TOKEN relay/token python3 send.py".to_string()
+        "nimvault run --env EXAMPLE_TOKEN relay/token python3 -I send.py".to_string()
     };
 
     let refused = |dir: &Path, config: &Path, seat: &str, line: &str| {
@@ -82,7 +82,7 @@ fn the_configured_relay_reads_its_secret_from_the_vault() {
         format!("cd . && {used}"),
         format!("python3 -c '{read}; print(len(t))'"),
         format!(". ./env && python3 -c '{read}; print(len(t))'"),
-        used.replace("python3 send.py", "/usr/bin/python3 send.py"),
+        used.replace("python3 -I", "/usr/bin/python3 -I"),
         inline.replace("EXAMPLE_TOKEN", "OTHER_TOKEN"),
     ] {
         refused(&dir, &config, "relay", &line);
@@ -119,44 +119,51 @@ fn the_configured_relay_runs_a_script_it_owns() {
         url = f\"https://example.org/bot{token}/sendMessage\"\n\
         with urllib.request.urlopen(url, data=data, timeout=20) as r:\n    r.read()\n";
     let script = |name: &str, code: &str, mode: u32| {
+        for e in std::fs::read_dir(&dir).unwrap().flatten() {
+            if e.path().extension().is_some_and(|x| x == "py") {
+                std::fs::remove_file(e.path()).unwrap();
+            }
+        }
         let p = dir.join(name);
         std::fs::write(&p, code).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
     };
+    std::fs::write(base.join("out.py"), send).unwrap();
+    let run =
+        |s: &str| format!("nimvault run --env EXAMPLE_TOKEN relay/token python3 -I {s} msg.txt 42");
+    let v = |seat: &str, config: &Path, line: &str| verdict(&dir, config, seat, line);
+
     script("send.py", send, 0o600);
+    assert_eq!(v("relay", &config, &run("send.py")), "allow");
+    let dashed = run("send.py").replace("token python3", "token -- python3");
+    assert_eq!(v("relay", &config, &dashed), "allow");
+    for (seat, config) in [("other", config.clone()), ("relay", base.join("none.toml"))] {
+        let d = v(seat, &config, &run("send.py"));
+        assert!(d.starts_with("deny"), "{seat}: {d}");
+    }
+    std::os::unix::fs::symlink(dir.join("send.py"), dir.join("link.py")).unwrap();
+    let d = v("relay", &config, &run("link.py"));
+    assert!(d.starts_with("deny"), "link.py: {d}");
     script(
         "show.py",
         "import os\nprint(os.environ[\"EXAMPLE_TOKEN\"])\n",
         0o600,
     );
-    script("far.py", &send.replace("example.org", "example.net"), 0o600);
-    script("open.py", send, 0o620);
-    std::os::unix::fs::symlink(dir.join("send.py"), dir.join("link.py")).unwrap();
-    std::fs::write(base.join("out.py"), send).unwrap();
-    let run =
-        |s: &str| format!("nimvault run --env EXAMPLE_TOKEN relay/token python3 {s} msg.txt 42");
-    let v = |seat: &str, config: &Path, line: &str| verdict(&dir, config, seat, line);
-
-    assert_eq!(v("relay", &config, &run("send.py")), "allow");
-    let dashed = run("send.py").replace("token python3", "token -- python3");
-    assert_eq!(v("relay", &config, &dashed), "allow");
     let shown = v("relay", &config, &run("show.py"));
     assert!(
         shown.starts_with("deny") && shown.contains("shows-secret"),
         "{shown}"
     );
+    script("far.py", &send.replace("example.org", "example.net"), 0o600);
     let far = v("relay", &config, &run("far.py"));
     assert!(
         far.starts_with("deny") && far.contains("sends-secret"),
         "{far}"
     );
-    for s in ["open.py", "link.py", "../out.py", "missing.py"] {
+    script("open.py", send, 0o620);
+    for s in ["open.py", "../out.py", "missing.py"] {
         let d = v("relay", &config, &run(s));
         assert!(d.starts_with("deny"), "{s}: {d}");
-    }
-    for (seat, config) in [("other", config.clone()), ("relay", base.join("none.toml"))] {
-        let d = v(seat, &config, &run("send.py"));
-        assert!(d.starts_with("deny"), "{seat}: {d}");
     }
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -216,7 +223,7 @@ fn the_relay_send_script_runs_as_written() {
         std::fs::write(&p, code).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
         let line = format!(
-            "nimvault run --env EXAMPLE_TOKEN {}/env python3 {name} /tmp/m.txt t1",
+            "nimvault run --env EXAMPLE_TOKEN {}/env python3 -I {name} /tmp/m.txt t1",
             dir.display()
         );
         let v = verdict(&dir, &config, "relay", &line);
@@ -225,11 +232,46 @@ fn the_relay_send_script_runs_as_written() {
         } else {
             assert!(v.starts_with("deny") && v.contains(want), "{name}: {v}");
         }
+        std::fs::remove_file(&p).unwrap();
     }
     let line = format!(
-        "nimvault run --env EXAMPLE_TOKEN {}/env python3 send.py /tmp/m.txt t1",
+        "nimvault run --env EXAMPLE_TOKEN {}/env python3 -I send.py /tmp/m.txt t1",
         dir.display()
     );
     assert!(verdict(&dir, &config, "other", &line).starts_with("deny"));
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn the_relay_script_runs_isolated_and_alone() {
+    let base = std::env::temp_dir().join(format!("relay-alone-{}", std::process::id()));
+    let dir = base.join("relay");
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = base.join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[relay]\nseat = \"relay\"\ndir = \"{}\"\nsecret = \"EXAMPLE_TOKEN\"\nhost = \"example.org\"\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let send = dir.join("send.py");
+    std::fs::write(&send, include_str!("fixtures/relay-send.py")).unwrap();
+    std::fs::set_permissions(&send, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let line = "nimvault run --env EXAMPLE_TOKEN relay/token python3 -I send.py /tmp/m.txt t1";
+    assert_eq!(verdict(&dir, &config, "relay", line), "allow");
+    let bare = line.replace("python3 -I", "python3");
+    let v = verdict(&dir, &config, "relay", &bare);
+    assert!(v.starts_with("deny"), "{v}");
+    for shadow in ["json.py", "usercustomize.py", "sitecustomize.py"] {
+        let p = dir.join(shadow);
+        std::fs::write(&p, "").unwrap();
+        let v = verdict(&dir, &config, "relay", line);
+        assert!(v.starts_with("deny"), "{shadow}: {v}");
+        std::fs::remove_file(&p).unwrap();
+    }
+    assert_eq!(verdict(&dir, &config, "relay", line), "allow");
     let _ = std::fs::remove_dir_all(&base);
 }

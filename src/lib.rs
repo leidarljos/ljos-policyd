@@ -15613,22 +15613,58 @@ fn relay_secret(cmds: &[Vec<&str>], moved: bool, bound: &Scratch) -> Option<&'st
 }
 
 /// Whether `argv` has the shape of the python a relay line runs: a bare
-/// `python3 SCRIPT.py [ARG...]`. Inline code is never the relay.
+/// `python3 -I SCRIPT.py [ARG...]`. Inline code is never the relay, and
+/// `-I` keeps the environment, the user site and the script's directory
+/// out of what python imports.
 fn is_relay_run(argv: &[String]) -> bool {
     match argv {
-        [py, script, ..] => py == "python3" && !script.starts_with('-') && script.ends_with(".py"),
+        [py, isolated, script, ..] => {
+            py == "python3"
+                && isolated == "-I"
+                && !script.starts_with('-')
+                && script.ends_with(".py")
+        }
         _ => false,
     }
 }
 
-/// The relay's script, for a run of `python3 SCRIPT.py [ARG...]`: a file
+/// Whether `script` is the only `.py` under the relay directory. Any
+/// other one, such as `json.py`, `sitecustomize.py` or a package, could
+/// be imported in place of the module the script names. A directory
+/// that cannot be read counts as holding one.
+fn relay_script_alone(dir: &std::path::Path, script: &std::path::Path) -> bool {
+    let mut todo = vec![(dir.to_path_buf(), 0)];
+    while let Some((d, depth)) = todo.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            return false;
+        };
+        for e in entries {
+            let Ok(e) = e else {
+                return false;
+            };
+            let path = e.path();
+            if path.extension().is_some_and(|x| x == "py") && path != script {
+                return false;
+            }
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                if depth >= 8 {
+                    return false;
+                }
+                todo.push((path, depth + 1));
+            }
+        }
+    }
+    true
+}
+
+/// The relay's script, for a run of `python3 -I SCRIPT.py [ARG...]`: a file
 /// in the relay directory, named by a plain path with no `..`, reached
 /// through no symlink, that [`relay::owned_file`] accepts.
 fn relay_script(run: &[String], relay: &relay::Relay) -> Option<std::path::PathBuf> {
     if !is_relay_run(run) {
         return None;
     }
-    let word = &run[1];
+    let word = &run[2];
     if !word
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
@@ -15721,10 +15757,11 @@ fn python_refusal_with(
 /// The secret the line may read, when it is the relay the config file
 /// names: the relay's seat, in the relay's directory with no change of
 /// directory, running nothing but `nimvault run --env SECRET ENTRY
-/// python3 SCRIPT.py [ARG...]` with a script [`relay_script`] accepts,
-/// with a bare `nimvault` and a bare `python3`. The secret comes from
-/// the vault as the program starts, and what the script's text may do
-/// with it is judged as for any sealed secret.
+/// python3 -I SCRIPT.py [ARG...]` with a script [`relay_script`] accepts
+/// and no other `.py` beside it, with a bare `nimvault` and a bare
+/// `python3`. The secret comes from the vault as the program starts,
+/// and what the script's text may do with it is judged as for any
+/// sealed secret.
 fn relay_command<'a>(
     cmds: &[Vec<&str>],
     moved: bool,
@@ -15744,7 +15781,8 @@ fn relay_command<'a>(
     }
     let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
     let (name, at) = nimvault_run_at(&owned, 0)?;
-    (name == Some(relay.secret.as_str()) && relay_script(&owned[at..], relay).is_some())
+    let script = relay_script(&owned[at..], relay)?;
+    (name == Some(relay.secret.as_str()) && relay_script_alone(&relay.dir, &script))
         .then_some(relay.secret.as_str())
 }
 
@@ -25694,7 +25732,7 @@ make -C safe test
         let p = dir.join("send.py");
         std::fs::write(&p, code).unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
-        "nimvault run --env EXAMPLE_TOKEN relay/token python3 send.py".to_string()
+        "nimvault run --env EXAMPLE_TOKEN relay/token python3 -I send.py".to_string()
     }
 
     #[test]
@@ -25829,22 +25867,32 @@ with urllib.request.urlopen(url, data=data, timeout=20) as r:
             std::fs::write(&p, text).unwrap();
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
         };
+        let only = |name: &str, text: &str, mode: u32| {
+            for d in [dir.clone(), dir.join("sub")] {
+                for e in std::fs::read_dir(d).unwrap().flatten() {
+                    if e.path().extension().is_some_and(|x| x == "py") {
+                        std::fs::remove_file(e.path()).unwrap();
+                    }
+                }
+            }
+            write(name, text, mode);
+        };
         let line = |script: &str| {
-            format!("nimvault run --env EXAMPLE_TOKEN relay/token python3 {script} msg.txt 42")
+            format!("nimvault run --env EXAMPLE_TOKEN relay/token python3 -I {script} msg.txt 42")
         };
         let at = |script: &str| relay_refusal("relay", &dir, Some(&relay), &line(script));
-        write("send.py", RELAY_SEND, 0o600);
+        only("send.py", RELAY_SEND, 0o600);
         assert_eq!(at("send.py"), None);
         assert_eq!(at(&dir.join("send.py").display().to_string()), None);
-        write("sub/send.py", RELAY_SEND, 0o644);
+        only("sub/send.py", RELAY_SEND, 0o644);
         assert_eq!(at("sub/send.py"), None);
-        write("show.py", &format!("{RELAY_SEND}print(token)\n"), 0o600);
+        only("show.py", &format!("{RELAY_SEND}print(token)\n"), 0o600);
         let t = at("show.py");
         assert!(
             t.as_deref().is_some_and(|t| t.contains("shows-secret")),
             "{t:?}"
         );
-        write(
+        only(
             "far.py",
             &RELAY_SEND.replace("example.org", "example.net"),
             0o600,
@@ -25854,12 +25902,14 @@ with urllib.request.urlopen(url, data=data, timeout=20) as r:
             t.as_deref().is_some_and(|t| t.contains("sends-secret")),
             "{t:?}"
         );
+        write("send.py", RELAY_SEND, 0o600);
+        write("sub/send.py", RELAY_SEND, 0o644);
         write("open.py", RELAY_SEND, 0o620);
         write("world.py", RELAY_SEND, 0o602);
         std::os::unix::fs::symlink(dir.join("send.py"), dir.join("link.py")).unwrap();
         std::os::unix::fs::symlink(dir.join("sub"), dir.join("via")).unwrap();
         let script = |w: &str| {
-            let run: Vec<String> = ["python3", w, "msg.txt"].map(String::from).to_vec();
+            let run: Vec<String> = ["python3", "-I", w, "msg.txt"].map(String::from).to_vec();
             relay_script(&run, &relay)
         };
         assert!(script("send.py").is_some());
@@ -25875,7 +25925,7 @@ with urllib.request.urlopen(url, data=data, timeout=20) as r:
             "\"send.py\"",
             "$S.py",
             "send.txt",
-            "-I",
+            "-c",
         ] {
             assert!(script(w).is_none(), "{w}");
         }
@@ -25884,6 +25934,55 @@ with urllib.request.urlopen(url, data=data, timeout=20) as r:
             other, None,
             "not the relay: the script is judged by the shell rules"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The relay line runs its script under `python3 -I`, and only when
+    /// no other `.py` in the relay directory could be imported in place
+    /// of a module the script names.
+    #[test]
+    fn the_relay_runs_isolated_with_no_module_beside_it() {
+        let dir = std::env::temp_dir().join(format!("relay-alone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let relay = relay::Relay {
+            seat: "relay".into(),
+            dir: dir.clone(),
+            secret: "EXAMPLE_TOKEN".into(),
+            host: "example.org".into(),
+        };
+        let line = relay_line(&dir, RELAY_SEND);
+        let secret = |line: &str| {
+            let words = shell_words(line);
+            relay_command(
+                &commands(&words),
+                false,
+                Some(&dir),
+                Some("relay"),
+                Some(&relay),
+            )
+        };
+        std::fs::write(dir.join("msg.txt"), "hi").unwrap();
+        std::fs::create_dir_all(dir.join("state")).unwrap();
+        std::fs::write(dir.join("state/history.jsonl"), "").unwrap();
+        assert_eq!(secret(&line), Some("EXAMPLE_TOKEN"));
+        assert_eq!(secret(&line.replace("python3 -I ", "python3 ")), None);
+        assert_eq!(secret(&line.replace("-I", "-E")), None);
+        assert_eq!(secret(&line.replace("-I", "-I -c")), None);
+        for shadow in [
+            "json.py",
+            "usercustomize.py",
+            "sitecustomize.py",
+            "state/urllib.py",
+            "json/__init__.py",
+        ] {
+            let p = dir.join(shadow);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "").unwrap();
+            assert_eq!(secret(&line), None, "{shadow}");
+            std::fs::remove_file(&p).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(dir.join("json"));
+        assert_eq!(secret(&line), Some("EXAMPLE_TOKEN"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
