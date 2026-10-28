@@ -14707,6 +14707,7 @@ fn fetched_paths(cmd: &[String]) -> Vec<String> {
         (WGET_VALUED, 'O')
     };
     let mut named: Vec<String> = Vec::new();
+    let mut dir: Option<String> = None;
     let mut remote = tool == "wget";
     let mut i = 0;
     while i < args.len() {
@@ -14731,6 +14732,20 @@ fn fetched_paths(cmd: &[String]) -> Vec<String> {
         }
         if tool == "curl" && matches!(a, "--remote-name" | "--remote-name-all") {
             remote = true;
+            continue;
+        }
+        let long_dir = if tool == "curl" {
+            "--output-dir"
+        } else {
+            "--directory-prefix"
+        };
+        if a == long_dir {
+            dir = next.map(str::to_string);
+            i += 1;
+            continue;
+        }
+        if let Some(d) = a.strip_prefix(long_dir).and_then(|r| r.strip_prefix('=')) {
+            dir = Some(d.to_string());
             continue;
         }
         let Some(flags) = a
@@ -14758,20 +14773,33 @@ fn fetched_paths(cmd: &[String]) -> Vec<String> {
                 if let Some(f) = value.filter(|_| c == out_flag) {
                     named.push(f.to_string());
                 }
+                if tool == "wget" && c == 'P' {
+                    dir = value.map(str::to_string);
+                }
                 break;
             }
         }
     }
     // `wget -O FILE` (or `-O -`) saves nothing under the URL's own name.
     let wget_named = tool == "wget" && !named.is_empty();
-    if remote && !wget_named {
-        named.extend(
-            args.iter()
-                .filter(|a| a.contains("://"))
-                .filter_map(|u| url_file_name(u)),
-        );
-    }
     named.retain(|f| !matches!(f.as_str(), "" | "-" | "/dev/null" | "/dev/stdout"));
+    // `curl --output-dir` puts every relative name in DIR. `wget -P`
+    // puts the names it takes from URLs there, and `-O` ignores it.
+    let under = |f: String| match &dir {
+        Some(d) if !f.starts_with('/') => format!("{}/{f}", d.trim_end_matches('/')),
+        _ => f,
+    };
+    if tool == "curl" {
+        named = named.into_iter().map(under).collect();
+    }
+    if remote && !wget_named {
+        let urls = args.iter().filter(|a| a.contains("://"));
+        named.extend(urls.filter_map(|u| {
+            url_file_name(u)
+                .or_else(|| (tool == "wget").then(|| "index.html".to_string()))
+                .map(under)
+        }));
+    }
     named
 }
 
@@ -26075,6 +26103,73 @@ make -C safe test
             "node -e 'require(\"fs\").writeFileSync(\"out.txt\", \"/\")'",
             "ruby -e 'File.write(\".state/run.json\", \"{}\")'",
             "ruby -e 'puts File.read(\"/etc/hostname\")'",
+        ] {
+            let c = in_tree(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+    }
+
+    /// `curl --output-dir` and `wget -P` put what they save in a
+    /// directory, and that is where the write is placed.
+    #[test]
+    fn a_download_dir_places_what_it_saves() {
+        let t = "/srv/example/state/run.json";
+        for (by, line) in [
+            (
+                "curl",
+                "curl --output-dir /srv/example/state -o run.json https://example.org/a",
+            ),
+            (
+                "curl",
+                "curl --output-dir=/srv/example/state -O https://example.org/run.json",
+            ),
+            (
+                "curl",
+                "curl -O --output-dir /srv/example/state https://example.org/run.json",
+            ),
+            (
+                "wget",
+                "wget -P /srv/example/state https://example.org/run.json",
+            ),
+            (
+                "wget",
+                "wget -qP/srv/example/state https://example.org/run.json",
+            ),
+            (
+                "wget",
+                "wget --directory-prefix /srv/example/state https://example.org/run.json",
+            ),
+            (
+                "wget",
+                "wget --directory-prefix=/srv/example/state https://example.org/run.json",
+            ),
+        ] {
+            let c = in_tree(line);
+            assert_eq!(c.token, format!("writes-outside: {by} with {t}"), "{line}");
+        }
+        let c = in_tree("wget -P /srv/example/state https://example.org/");
+        assert_eq!(
+            c.token,
+            "writes-outside: wget with /srv/example/state/index.html"
+        );
+        for line in [
+            "curl --output-dir ~/.config/ljos -O https://example.org/hooks.json",
+            "wget -P ~/.config/ljos-policyd https://example.org/config.toml",
+        ] {
+            let c = in_tree(line);
+            assert!(
+                c.token.starts_with("seat-guard-path:"),
+                "{line}: {}",
+                c.token
+            );
+        }
+        for line in [
+            "curl --output-dir .state -O https://example.org/run.json",
+            "curl --output-dir /srv/example -o /tmp/run.json https://example.org/a",
+            "wget -P .state https://example.org/run.json",
+            "wget -P /tmp/dl https://example.org/run.json",
+            "wget -P /srv/example -O .state/run.json https://example.org/a",
+            "curl --output-dir /srv/example https://example.org/a",
         ] {
             let c = in_tree(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
