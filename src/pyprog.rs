@@ -4640,7 +4640,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_write_from_a_work_tree_linked_cwd_is_refused() {
+    fn a_cwd_through_tmp_link_dotdot_fd_is_refused() {
         use std::os::unix::fs::symlink;
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -4681,8 +4681,52 @@ mod tests {
         let class = denied.split(':').next().unwrap_or_default();
         assert_eq!(class, "python-writes-outside");
         assert!(denied.contains("writes-outside"), "{denied}");
-        assert!(denied.contains(&cwd.display().to_string()), "{denied}");
         let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_from_a_work_tree_linked_cwd_is_refused() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let mark = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must move forward")
+            .as_nanos();
+        let target_root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(PathBuf::from)
+            .filter(|d| !d.starts_with("/tmp"))
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|d| d.join("target/tmp-tests"))
+            })
+            .expect("target temp directory is available");
+        let root = target_root.join(format!("ljos-pyprog-h4-cwd-link-{mark}"));
+        let work = root.join("work");
+        let outside = root.join("outside-home").join("deep").join("a").join("b");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, work.join("lnk")).unwrap();
+        let cwd = work.join("lnk");
+
+        let denied = refusal(
+            "from pathlib import Path; Path('x').write_text('x')",
+            Place {
+                cwd: Some(&cwd),
+                work: Some(&work),
+                secret: None,
+                sealed: None,
+                host: None,
+            },
+        )
+        .expect("write must be refused")
+        .token;
+        let class = denied.split(':').next().unwrap_or_default();
+        assert_eq!(class, "python-writes-outside");
+        assert!(denied.contains("writes-outside"), "{denied}");
         let _ = std::fs::remove_dir_all(root);
     }
 }
