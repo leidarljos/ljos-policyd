@@ -3727,14 +3727,19 @@ fn heredoc_bodies(cmds: &[(Vec<&str>, &str)]) -> (Vec<Option<String>>, Vec<bool>
         else {
             continue;
         };
-        let body = &cmds[i + 1..i + 1 + len];
+        let after: Vec<&[&str]> = cmds[i + 1..i + 1 + len]
+            .iter()
+            .map(|(c, _)| c.as_slice())
+            .collect();
+        let from = heredoc_body_start(delim, &after);
+        let body = &cmds[i + 1 + from..i + 1 + len];
         let words: Vec<&str> = body.iter().flat_map(|(c, _)| c.iter().copied()).collect();
         let raw = literal_heredoc_raw(delim, &words);
         let to_shell = cmd
             .iter()
             .find(|w| !is_assignment(w))
             .is_some_and(|w| SHELLS.contains(&base_of(w)));
-        for d in &mut data[i + 1..=i + 1 + len] {
+        for d in &mut data[i + 1 + from..=i + 1 + len] {
             *d |= !to_shell;
         }
         if raw.is_some() {
@@ -11995,6 +12000,8 @@ fn shell_words(script: &str) -> Vec<String> {
     // The word has a quote or a backslash in it, as a here-document
     // delimiter that turns expansion off in its body does.
     let mut quoted = false;
+    // Where the words of the line now being read start.
+    let mut line_start = 0;
     while i < chars.len() {
         let c = chars[i];
         i += 1;
@@ -12090,7 +12097,8 @@ fn shell_words(script: &str) -> Vec<String> {
                 }
                 if matches!(c, '\n' | '\r') {
                     out.push(";".to_string());
-                    take_heredoc_bodies(&chars, &mut i, &mut out, &mut pending);
+                    take_heredoc_bodies(&chars, &mut i, &mut out, &mut pending, line_start);
+                    line_start = out.len();
                     continue;
                 }
                 if matches!(c, ';' | '|' | '&') {
@@ -12122,7 +12130,7 @@ fn shell_words(script: &str) -> Vec<String> {
         braced(&cur, bare_brace);
         finish_word(cur, quoted, &mut out, &mut pending, &mut want_delim);
     }
-    take_heredoc_bodies(&chars, &mut i, &mut out, &mut pending);
+    take_heredoc_bodies(&chars, &mut i, &mut out, &mut pending, line_start);
     out
 }
 
@@ -12158,15 +12166,21 @@ fn finish_word(
 /// not a shell, an interpreter, `eval`, `source` or a runner that may
 /// hand its input to one. `at`, `batch` and `crontab` run their input
 /// later, and `ssh` and `docker exec` run it on another host or in a
-/// container, so none of them reads it as text.
-fn heredoc_read_as_text(out: &[String]) -> bool {
-    let sep = |w: &String| matches!(w.as_str(), ";" | "&&" | "||" | "|" | "&");
-    let end = out.len() - usize::from(out.last().is_some_and(|w| w == ";"));
-    let start = out[..end]
+/// container, so none of them reads it as text. Only a pipeline that
+/// has a `<<` takes a body: a command after `&&` or `;` on that line
+/// reads nothing from it.
+fn heredoc_read_as_text(line: &[String]) -> bool {
+    let list = |w: &String| matches!(w.as_str(), ";" | "&&" | "||" | "&");
+    let opens = |w: &String| heredoc_operator(w).is_some();
+    let lists: Vec<&[String]> = line.split(list).filter(|p| !p.is_empty()).collect();
+    let holding: Vec<&[String]> = lists
         .iter()
-        .rposition(|w| w == ";")
-        .map_or(0, |i| i + 1);
-    out[start..end].split(sep).all(|cmd| {
+        .copied()
+        .filter(|p| p.iter().any(opens))
+        .collect();
+    let lists = if holding.is_empty() { lists } else { holding };
+    let mut stages = lists.iter().flat_map(|p| p.split(|w| w == "|"));
+    stages.all(|cmd| {
         let head = cmd
             .iter()
             .find(|w| !is_assignment(w) && !is_redirection(w))
@@ -12261,8 +12275,9 @@ fn take_heredoc_bodies(
     i: &mut usize,
     out: &mut Vec<String>,
     pending: &mut std::collections::VecDeque<(String, bool, bool)>,
+    line_start: usize,
 ) {
-    let text = !pending.is_empty() && heredoc_read_as_text(out);
+    let text = !pending.is_empty() && heredoc_read_as_text(&out[line_start.min(out.len())..]);
     while let Some((delim, tabs, quoted)) = pending.pop_front() {
         let mut body = String::new();
         loop {
@@ -12328,10 +12343,33 @@ fn take_heredoc_bodies(
             if open {
                 out.push(";".to_string());
             }
+        } else {
+            HEREDOC_RAW.with(|s| {
+                s.borrow_mut()
+                    .push((delim.clone(), Vec::new(), true, String::new()));
+            });
         }
         out.push(delim);
         out.push(";".to_string());
     }
+}
+
+/// Where the body of a here-document closed by `delim` starts among
+/// `after`, the commands from the one that opens it to its delimiter.
+/// A command on the opening line, past `&&` or `;`, is no line of the
+/// body. The body is the commands whose words [`HEREDOC_RAW`] kept for
+/// it. With no such record, the body is all of `after`.
+fn heredoc_body_start(delim: &str, after: &[&[&str]]) -> usize {
+    HEREDOC_RAW.with(|s| {
+        let s = s.borrow();
+        (0..=after.len())
+            .find(|&k| {
+                let words = || after[k..].iter().flat_map(|c| c.iter().copied());
+                s.iter()
+                    .any(|(d, w, _, _)| d == delim && w.iter().map(String::as_str).eq(words()))
+            })
+            .unwrap_or(0)
+    })
 }
 
 /// A word [`shell_words`] closes. A bare separator is a word of its own,
