@@ -339,6 +339,7 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
     let parent = Scratch {
         root: Some(cwd.to_path_buf()),
         work: Some(cwd.to_path_buf()),
+        placed: true,
         ..Scratch::default()
     };
     let table = host_argv_table_at(argv, 0, leaves_tree(argv, 0), &parent);
@@ -7487,6 +7488,9 @@ fn hash_scratch(scratch: &Scratch) -> u64 {
     if let Some(work) = &scratch.work {
         h ^= hash_bytes(work.as_os_str().as_encoded_bytes()).wrapping_mul(0xC2B2AE3D27D4EB4F);
     }
+    if scratch.placed {
+        h ^= 0x5A5A_5A5A_5A5A_5A5A;
+    }
     for (i, mark) in scratch.fed_marks.iter().enumerate() {
         h = h
             .wrapping_mul(0x100000001b3)
@@ -7651,13 +7655,13 @@ fn host_argv_table_run(argv: &[String], depth: usize, moved: bool, parent: &Scra
     // A later command runs where `cd` left it. Judging the `rm` on its
     // own from the starting directory would see the wrong parent.
     if depth < MAX_DEPTH {
-        let (roots, inners) = {
-            let _span = phase::enter(phase::INNER);
-            let expanded = expand_aliases(argv);
-            let roots = command_roots(&expanded, bound.root.clone());
-            let inners = inner_commands_expanded(&expanded);
-            (roots, inners)
-        };
+        let span = phase::enter(phase::INNER);
+        let expanded = expand_aliases(argv);
+        let roots = command_roots(&expanded, bound.root.clone());
+        let inners = inner_commands_expanded(&expanded);
+        drop(span);
+        let cmds = commands(&expanded);
+        let hidden = hidden_moves(&cmds, &inners);
         for (i, inner) in inners {
             if inner.as_slice() == argv {
                 continue;
@@ -7666,6 +7670,7 @@ fn host_argv_table_run(argv: &[String], depth: usize, moved: bool, parent: &Scra
             if let Some(root) = roots.get(i) {
                 next.root = root.clone();
             }
+            next.placed = bound.placed && (!hidden || runs_fresh(cmds.get(i), &inner));
             let c = host_argv_table_at(&inner, depth + 1, moved, &next);
             if c.decision != Decision::Allow {
                 return c;
@@ -13714,6 +13719,7 @@ impl Seat {
             if let Some(root) = roots.get(i) {
                 next.root = root.clone();
             }
+            next.placed = false;
             // The mark belongs to the feeder. A later command on the line
             // is not that command, so its copy of the same word stays.
             if !command_is_feeder(&expanded, i) {
@@ -15487,11 +15493,32 @@ fn python_refusal(argv: &[String], moved: bool, bound: &Scratch) -> Option<pypro
     }
     let _span = phase::enter(phase::PYTHON);
     let cwd = bound.root.as_deref().filter(|d| !is_untracked(d));
-    let place = pyprog::Place {
-        cwd,
-        work: cwd.filter(|_| !moved),
-    };
-    commands(argv).iter().find_map(|cmd| {
+    let cmds = commands(argv);
+    // With every `cd` on the line followed, a command runs where the
+    // shell's writes are placed, and the tree is the one the line began in.
+    let work = bound.work.as_deref().filter(|w| !is_untracked(w));
+    let roots = (bound.placed && work.is_some() && !hidden_moves(&cmds, &inner_commands_at(argv)))
+        .then(|| {
+            let place = Place {
+                strict: true,
+                ..Place::new(bound.root.clone())
+            };
+            command_roots_with(argv, place)
+        });
+    cmds.iter().enumerate().find_map(|(i, cmd)| {
+        let at = roots
+            .as_ref()
+            .map(|r| r.get(i).cloned().flatten().filter(|d| !is_untracked(d)));
+        let place = match &at {
+            Some(at) => pyprog::Place {
+                cwd: at.as_deref(),
+                work,
+            },
+            None => pyprog::Place {
+                cwd,
+                work: cwd.filter(|_| !moved),
+            },
+        };
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
         let run = peeled(&owned);
         python_program(run).and_then(|code| pyprog::refusal(code, place))
@@ -15664,6 +15691,9 @@ struct Scratch {
     /// The tree the line was started in. Set for the line's own words,
     /// and `None` for a script file it runs, whose writes are its own.
     work: Option<std::path::PathBuf>,
+    /// `root` is where these words run: no `cd` the walk does not follow
+    /// came before them on the line.
+    placed: bool,
     /// `IFS` was assigned or `eval` ran. A variable suffix can split.
     ifs_assigned: bool,
     /// An `xargs -I` mark whose shown inputs are all under `/tmp`. The
@@ -16164,6 +16194,10 @@ struct Place {
     root: Option<std::path::PathBuf>,
     made: Vec<std::path::PathBuf>,
     open: bool,
+    /// A `cd` to a path that is not there, and that the line did not
+    /// make, leaves the directory unknown: it may be made in a way the
+    /// walk does not read.
+    strict: bool,
 }
 
 impl Place {
@@ -16172,6 +16206,7 @@ impl Place {
             root,
             made: Vec::new(),
             open: false,
+            strict: false,
         }
     }
 
@@ -16233,7 +16268,10 @@ impl Place {
             Ok(m) if m.file_type().is_symlink() => self.root = None,
             Ok(m) if m.is_dir() => self.root = Some(next),
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !self.strict => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && self.made.contains(&next) => {
+                self.root = Some(next);
+            }
             Err(_) => self.root = None,
         }
     }
@@ -16267,13 +16305,38 @@ impl Place {
     }
 }
 
+/// Whether a `cd`, `pushd` or `popd` the line runs is not one of the
+/// commands [`command_roots`] follows, as in a subshell or a function.
+fn hidden_moves(cmds: &[Vec<&str>], inners: &[(usize, Vec<String>)]) -> bool {
+    let moves = |w: Option<&str>| w.is_some_and(|w| matches!(base_of(w), "cd" | "pushd" | "popd"));
+    let shown = cmds.iter().filter(|c| moves(c.first().copied())).count();
+    let all = inners
+        .iter()
+        .filter(|(_, c)| moves(c.first().map(String::as_str)))
+        .count();
+    all != shown
+}
+
+/// Whether `inner` is the whole script a shell's `-c` runs for `cmd`. It
+/// starts where `cmd` does, whatever `cd` the script itself runs.
+fn runs_fresh(cmd: Option<&Vec<&str>>, inner: &[String]) -> bool {
+    let Some(cmd) = cmd else {
+        return false;
+    };
+    let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+    shell_script(peeled(&owned)).is_some_and(|s| shell_words(s) == inner)
+}
+
 /// Where each command of `argv` runs, in order. The entry is the directory
 /// before that command, so a `cd` moves the ones after it.
 fn command_roots(
     argv: &[String],
     start: Option<std::path::PathBuf>,
 ) -> Vec<Option<std::path::PathBuf>> {
-    let mut place = Place::new(start);
+    command_roots_with(argv, Place::new(start))
+}
+
+fn command_roots_with(argv: &[String], mut place: Place) -> Vec<Option<std::path::PathBuf>> {
     let mut prev = "";
     let mut roots = Vec::new();
     for (cmd, end) in ended_commands(argv) {
@@ -25194,6 +25257,59 @@ make -C safe test
             assert_eq!(at(line).decision, Decision::Deny, "{line}");
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Python's writes are placed where the shell's are: in the directory
+    /// each command runs in, against the tree the line began in.
+    #[test]
+    fn python_writes_are_placed_as_the_shell_writes() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("placed-{}", std::process::id()));
+        let root = base.join("proj");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(root.join(".state")).unwrap();
+        let state = format!("cd {}/.state && ", root.display());
+        let at = |line: &str| {
+            let argv = ["bash", "-c", line].map(String::from);
+            check_shell_in(&argv, &root, 0)
+        };
+        let py = |cd: &str, path: &str| {
+            format!("{cd}python3 -c 'open(\"{path}\", \"w\").write(\"{{}}\")'")
+        };
+        let sh = |cd: &str, path: &str| format!("{cd}echo x > {path}");
+        for (cd, path) in [
+            (state.as_str(), "run.json"),
+            ("cd sub && ", "../.state/run.json"),
+            ("cd /tmp && ", "run.json"),
+            ("mkdir -p new && cd new && ", "run.json"),
+            ("", ".state/run.json"),
+        ] {
+            for line in [py(cd, path), sh(cd, path)] {
+                let c = at(&line);
+                assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+            }
+        }
+        for (cd, path) in [
+            ("cd /srv/example && ", "run.json"),
+            ("cd sub && ", "../../run.json"),
+            ("", "/srv/example/run.json"),
+        ] {
+            for line in [py(cd, path), sh(cd, path)] {
+                let c = at(&line);
+                assert_eq!(c.decision, Decision::Deny, "{line}");
+                assert_eq!(c.code, PolicyReason::PathOutsideWorkspace, "{line}");
+            }
+        }
+        for line in [
+            format!("({})", py("cd /srv/example; ", "run.json")),
+            py("f() { cd /srv/example; }; f; ", "run.json"),
+            py("cd $D && ", "run.json"),
+            format!("bash -c {:?}", py("cd /srv/example; ", "run.json")),
+        ] {
+            assert_eq!(at(&line).decision, Decision::Deny, "{line}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A `for` over literal words binds its name to each of them, so a

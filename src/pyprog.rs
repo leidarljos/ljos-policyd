@@ -3076,7 +3076,7 @@ fn outside_write(r: &Read, place: Place) -> Option<Refusal> {
     let Some(cwd) = place.cwd else {
         return out("a directory the line does not show");
     };
-    if !inside(cwd, place.work) {
+    if !inside(&lexical(cwd), place.work) {
         return out(&cwd.display().to_string());
     }
     if let Some(s) = r.strs.iter().find(|s| outside_string(s, place)) {
