@@ -13271,7 +13271,7 @@ fn inline_written_paths(code: &str) -> Vec<String> {
     if !INLINE_WRITE_CALLS.iter().any(|c| code.contains(c)) {
         return Vec::new();
     }
-    quoted_strings(code)
+    program_literals(code)
         .into_iter()
         .map(|s| {
             s.trim_start_matches(['+', '<', '>', '|'])
@@ -13283,6 +13283,84 @@ fn inline_written_paths(code: &str) -> Vec<String> {
                 || s.split('/').any(|p| p == "..")
         })
         .collect()
+}
+
+/// The string literals an inline program spells: each quoted string, and
+/// the body of a perl `q`, `qq` or `qw` or a ruby `%q`, `%Q`, `%w` or
+/// `%W`, with any delimiter. A paired delimiter such as `{}` nests. A
+/// `qw` or `%w` list gives each of its words.
+fn program_literals(code: &str) -> Vec<String> {
+    let mut out = quoted_strings(code);
+    let chars: Vec<char> = code.chars().collect();
+    let word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '$' | '@' | '%' | '&');
+    let mut i = 0;
+    while i < chars.len() {
+        if i > 0 && word(chars[i - 1]) {
+            i += 1;
+            continue;
+        }
+        let rest: String = chars[i..chars.len().min(i + 2)].iter().collect();
+        let (len, words, spaced) = if rest == "qq" {
+            (2, false, true)
+        } else if rest == "qw" {
+            (2, true, true)
+        } else if rest.starts_with('q') {
+            (1, false, true)
+        } else if matches!(rest.as_str(), "%q" | "%Q") {
+            (2, false, false)
+        } else if matches!(rest.as_str(), "%w" | "%W") {
+            (2, true, false)
+        } else {
+            i += 1;
+            continue;
+        };
+        let mut j = i + len;
+        while spaced && chars.get(j).is_some_and(|c| *c == ' ') {
+            j += 1;
+        }
+        let Some(&open) = chars.get(j) else {
+            break;
+        };
+        if open.is_alphanumeric() || open.is_whitespace() || "_,;=)]}>".contains(open) {
+            i += 1;
+            continue;
+        }
+        let close = match open {
+            '(' => ')',
+            '[' => ']',
+            '{' => '}',
+            '<' => '>',
+            c => c,
+        };
+        let mut depth = 0;
+        let mut body = String::new();
+        let mut k = j + 1;
+        while k < chars.len() {
+            let c = chars[k];
+            if c == '\\' && k + 1 < chars.len() {
+                body.push(chars[k + 1]);
+                k += 2;
+                continue;
+            }
+            if c == close && depth == 0 {
+                break;
+            }
+            if open != close && c == open {
+                depth += 1;
+            } else if open != close && c == close {
+                depth -= 1;
+            }
+            body.push(c);
+            k += 1;
+        }
+        if words {
+            out.extend(body.split_whitespace().map(str::to_string));
+        } else {
+            out.push(body);
+        }
+        i = k + 1;
+    }
+    out
 }
 
 /// The literal files an awk program prints into: `print > "f"` and
@@ -16053,7 +16131,7 @@ fn credential_read(argv: &[String]) -> Option<(String, String)> {
             continue;
         }
         if let Some(code) = inline_program(&owned) {
-            if let Some(p) = quoted_strings(code).iter().find_map(|s| named(s)) {
+            if let Some(p) = program_literals(code).iter().find_map(|s| named(s)) {
                 return Some((head.to_string(), p));
             }
         }
@@ -26176,6 +26254,44 @@ make -C safe test
         }
     }
 
+    /// A perl `q{}` or `qq{}` and a ruby `%q()` or `%Q()` spell a path as
+    /// a quoted string does, with any delimiter.
+    #[test]
+    fn an_inline_program_quotes_paths_any_way() {
+        let t = "/srv/example/state/run.json";
+        for (by, line) in [
+            ("perl", format!("perl -e 'open(F, q{{>{t}}}); print F 1'")),
+            ("perl", format!("perl -e 'open(F, qq(>>{t})); print F 1'")),
+            ("perl", format!("perl -e 'open(my $f, q[>], q {{{t}}})'")),
+            ("perl", format!("perl -e 'open(F, qq|>{t}|)'")),
+            ("perl", format!("perl -e 'unlink qw(a.json {t})'")),
+            ("ruby", format!("ruby -e 'File.write(%q({t}), \"x\")'")),
+            ("ruby", format!("ruby -e 'File.write(%Q{{{t}}}, \"x\")'")),
+            ("ruby", format!("ruby -e 'File.open(%q[{t}], \"w\")'")),
+            (
+                "ruby",
+                format!("ruby -rfileutils -e 'FileUtils.rm(%w[a.json {t}])'"),
+            ),
+        ] {
+            let c = in_tree(&line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+            assert_eq!(c.token, format!("writes-outside: {by} with {t}"), "{line}");
+        }
+        for line in [
+            "perl -e 'open(F, q{>.state/run.json}); print F 1'",
+            "perl -e 'open(F, qq(>/tmp/run.json))'",
+            "perl -e 'open(F, q{>a/{b}.json})'",
+            "perl -e 'print 1 if $a eq ($b); open(F, \">x\")'",
+            "perl -e 'my @s = seq(1); open(F, \">out.txt\")'",
+            "ruby -e 'File.write(%q(.state/run.json), \"x\")'",
+            "ruby -e 'File.write(%Q{/tmp/run.json}, \"x\")'",
+            "ruby -e 'x = 5 % q; File.write(\"out.txt\", x)'",
+        ] {
+            let c = in_tree(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+    }
+
     /// A download, a link, a sync, a truncate or a tar extract is a write
     /// where its target lands, judged as a redirect to that path is.
     #[test]
@@ -26511,6 +26627,8 @@ make -C safe test
             "perl -e 'open(F, \"<\", \"$ENV{HOME}/.secrets/x\"); print <F>'",
             "node -e 'console.log(require(\"fs\").readFileSync(\"/home/u/.secrets/x\", \"utf8\"))'",
             "ruby -e 'puts File.read(Dir.home + \"/.secrets/x\")'",
+            "perl -e 'open(F, q{/home/u/.secrets/x}); print <F>'",
+            "ruby -e 'puts File.read(%q(/home/u/.secrets/x))'",
             "python3 -c 'print(open(\"/home/u/.secrets/x\").read())'",
         ] {
             let c = at(line);
