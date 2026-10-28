@@ -395,6 +395,68 @@ fn the_relay_line_refuses_unsigned_entries() {
 }
 
 #[test]
+fn no_seat_gets_or_unseals_an_entry() {
+    let base = std::env::temp_dir().join(format!("relay-shows-{}", std::process::id()));
+    let dir = base.join("relay");
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = base.join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[relay]\nseat = \"relay\"\ndir = \"{}\"\nsecret = \"EXAMPLE_TOKEN\"\nhost = \"example.org\"\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let send = dir.join("send.py");
+    std::fs::write(&send, include_str!("fixtures/relay-send.py")).unwrap();
+    std::fs::set_permissions(&send, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let relay = "nimvault run --env EXAMPLE_TOKEN relay/token python3 -I send.py /tmp/m.txt t1";
+    assert_eq!(verdict(&dir, &config, "relay", relay), "allow");
+    for seat in ["relay", "other", ""] {
+        for line in [
+            "nimvault get relay/token".to_string(),
+            "nimvault gEt relay/token".to_string(),
+            "nimvault ge relay/token".to_string(),
+            "nimvault -- get relay/token".to_string(),
+            "nimvault unseal".to_string(),
+            "nimvault un_seal relay/token".to_string(),
+            "nimvault u".to_string(),
+            "env nimvault get relay/token".to_string(),
+            "sh -c 'nimvault get relay/token'".to_string(),
+            "find . -exec nimvault unseal \\;".to_string(),
+            format!("{relay}; nimvault get relay/token"),
+            format!("{relay} && nimvault unseal"),
+            relay.replace("python3 -I send.py", "nimvault get relay/token"),
+            relay.replace("python3 -I send.py", "-- nimvault u"),
+        ] {
+            let v = verdict(&dir, &config, seat, &line);
+            assert!(
+                v.starts_with("deny\tnimvault-shows: "),
+                "{seat}: {line}: {v}"
+            );
+        }
+        let fed = verdict(
+            &dir,
+            &config,
+            seat,
+            "printf 'get relay/token' | xargs nimvault",
+        );
+        assert_eq!(fed, "deny\tnimvault-subcommand-unshown", "{seat}");
+    }
+    let shown = include_str!("fixtures/relay-send.py").replacen(
+        "import os",
+        "import subprocess; subprocess.run([\"nimvault\", \"get\", \"relay/token\"], env={})\nimport os",
+        1,
+    );
+    std::fs::write(&send, shown).unwrap();
+    let v = verdict(&dir, &config, "relay", relay);
+    assert!(v.starts_with("deny"), "{v}");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn the_relay_may_still_source_its_env_file() {
     let base = std::env::temp_dir().join(format!("relay-envfile-{}", std::process::id()));
     let dir = base.join("relay");

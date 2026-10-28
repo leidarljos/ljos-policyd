@@ -10968,6 +10968,73 @@ fn nimvault_option_denial(argv: &[String]) -> Option<Checked> {
     })
 }
 
+/// The nimvault subcommands that show a seat a secret: `get` writes an
+/// entry's plaintext to stdout, and `unseal` writes it to the entry's
+/// path on disk. A seat uses a secret only through `nimvault run`.
+const NIMVAULT_SHOWS: &[&str] = &["get", "unseal"];
+
+/// A `nimvault` anywhere in a command that runs a subcommand in
+/// [`NIMVAULT_SHOWS`], in any spelling [`nimvault_subcommand`] reads.
+/// One that `xargs` or `parallel` hands its subcommand may run any of
+/// them, so it is refused too. A command word the shell fills in, or a
+/// link on disk to `nimvault`, counts as `nimvault` when one of those
+/// subcommands follows it.
+fn nimvault_shown_denial(argv: &[String]) -> Option<Checked> {
+    commands(argv).iter().find_map(|cmd| {
+        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        let shows = |i: usize| {
+            nimvault_subcommand(&owned, i)
+                .map(|(sub, _)| sub)
+                .filter(|sub| NIMVAULT_SHOWS.contains(sub))
+        };
+        let head = owned.len() - unwrap_wrappers(&owned).0.len();
+        (0..owned.len()).find_map(|i| {
+            let w = owned[i].as_str();
+            let token = if base_of(w) == "nimvault" {
+                match nimvault_subcommand(&owned, i) {
+                    Some(_) => format!("nimvault-shows: {}", shows(i)?),
+                    None => {
+                        let at = i + 1 + usize::from(owned.get(i + 1).is_some_and(|w| w == "--"));
+                        let fed = owned[..i]
+                            .iter()
+                            .any(|w| matches!(base_of(w), "xargs" | "parallel"));
+                        (fed && owned.get(at).is_none_or(|w| w.starts_with(":::")))
+                            .then(|| "nimvault-subcommand-unshown".to_string())?
+                    }
+                }
+            } else if i == head {
+                let sub = shows(i)?;
+                (expands_at_run(w) || nimvault_on_disk(w))
+                    .then(|| format!("nimvault-shows: {sub}"))?
+            } else {
+                return None;
+            };
+            Some(Checked {
+                decision: Decision::Deny,
+                code: PolicyReason::SecretExportDenied,
+                token: Cow::Owned(token),
+            })
+        })
+    })
+}
+
+/// Whether the command word `w`, as a path or found on `PATH`, is a
+/// link to a file named `nimvault`.
+fn nimvault_on_disk(w: &str) -> bool {
+    let found = if w.contains('/') {
+        Some(std::path::PathBuf::from(w))
+    } else {
+        std::env::var_os("PATH").and_then(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join(w))
+                .find(|p| p.is_file())
+        })
+    };
+    found
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .is_some_and(|p| p.file_name().is_some_and(|n| n == "nimvault"))
+}
+
 /// Each `nimvault run --env NAME` in `cmd`, with NAME and the program it
 /// runs.
 fn sealed_runs(cmd: &[String]) -> Vec<(&str, &[String])> {
@@ -14239,6 +14306,9 @@ fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
         return c;
     }
     if let Some(c) = nimvault_option_denial(argv) {
+        return c;
+    }
+    if let Some(c) = nimvault_shown_denial(argv) {
         return c;
     }
     if let Some(c) =
@@ -27286,12 +27356,98 @@ make -C safe test
         ] {
             assert_eq!(at(line), token, "{line}");
         }
+        assert_eq!(at("nimvault run --env X e -- ls"), "allow");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `nimvault get` prints an entry's plaintext and `unseal` writes it
+    /// to disk, so neither runs in any spelling cligen reads, behind any
+    /// wrapper, or as the program `nimvault run` runs.
+    #[test]
+    fn nimvault_get_and_unseal_are_refused() {
+        let root = startup_root("nimvaultshows");
+        let at = |line: &str| {
+            let argv = ["bash", "-c", line].map(String::from);
+            check_shell_in(&argv, &root, 0)
+        };
+        let spelled = [
+            ("get", "get", "e"),
+            ("get", "get", "--allow-unsigned e"),
+            ("get", "get", "--vault ~/v e"),
+            ("get", "gEt", "e"),
+            ("get", "g_e_t", "e"),
+            ("get", "g-et", "e"),
+            ("get", "ge", "e"),
+            ("get", "-- get", "e"),
+            ("get", "-- ge", "e"),
+            ("unseal", "unseal", ""),
+            ("unseal", "unseal", "e"),
+            ("unseal", "uNSEAL", ""),
+            ("unseal", "un_seal", "e"),
+            ("unseal", "un-seal", ""),
+            ("unseal", "uns", ""),
+            ("unseal", "u", "e"),
+            ("unseal", "-- unseal", ""),
+            ("unseal", "-- u", ""),
+        ];
+        for (sub, word, rest) in spelled {
+            let l = format!("nimvault {word} {rest}");
+            for line in [
+                l.clone(),
+                format!("/usr/local/bin/{l}"),
+                format!("env {l}"),
+                format!("env -i PATH=/usr/bin {l}"),
+                format!("timeout 5 {l}"),
+                format!("nice nohup {l}"),
+                format!("command {l}"),
+                format!("sh -c '{l}'"),
+                format!("env sh -c '{l}'"),
+                format!("find . -name x -exec {l} \\;"),
+                format!("find . -exec sh -c '{l}' \\;"),
+                format!("xargs {l}"),
+                format!("{l} | tee /tmp/x"),
+                format!("echo $({l})"),
+                format!("true; {l}"),
+                format!("python3 -c 'import os; os.system(\"{l}\")'"),
+                format!("nimvault run -e T e -- {l}"),
+                format!("\"$NV\" {word} {rest}"),
+            ] {
+                let c = at(&line);
+                assert_eq!(c.decision, Decision::Deny, "{line}");
+                assert_eq!(c.token, format!("nimvault-shows: {sub}"), "{line}");
+            }
+        }
         for line in [
-            "nimvault get e",
-            "nimvault run --env X e -- ls",
-            "nimvault unseal",
+            "printf 'get e' | xargs nimvault",
+            "echo unseal | xargs -n1 nimvault",
+            "xargs nimvault --",
+            "parallel nimvault ::: get",
         ] {
-            assert_eq!(at(line), "allow", "{line}");
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+            assert_eq!(c.token, "nimvault-subcommand-unshown", "{line}");
+        }
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("nimvault"), "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink(bin.join("nimvault"), root.join("nv")).unwrap();
+        let nv = root.join("nv");
+        let c = at(&format!("{} ge e", nv.display()));
+        assert_eq!(c.token, "nimvault-shows: get");
+        for line in [
+            "nimvault run -e T e -- date",
+            "nimvault list",
+            "nimvault help get",
+            "nimvault r e",
+            "xargs nimvault list",
+            "command -v nimvault",
+            "go get example.org/x",
+            "kubectl -n \"$NS\" get pods",
+            "\"$EDITOR\" get.txt",
+            &format!("{} list", nv.display()),
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -27988,9 +28144,8 @@ with urllib.request.urlopen(url, data=data, timeout=20) as r:
         }
         for line in [
             "nimvault run -e T e -- date",
-            "nimvault get e",
+            "nimvault list",
             "nimvault re e",
-            "nimvault unseal",
             "nimvault r e",
         ] {
             let c = at(line);
