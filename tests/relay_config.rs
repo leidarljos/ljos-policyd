@@ -430,6 +430,11 @@ fn no_seat_gets_or_unseals_an_entry() {
             format!("{relay} && nimvault unseal"),
             relay.replace("python3 -I send.py", "nimvault get relay/token"),
             relay.replace("python3 -I send.py", "-- nimvault u"),
+            "nimvault st".to_string(),
+            "nimvault rotate".to_string(),
+            "nimvault seal --force --recipient K".to_string(),
+            "NIMVAULT_GPG_RECIPIENT=K nimvault add relay/x".to_string(),
+            format!("{relay}; nimvault mv relay/token /tmp/t"),
         ] {
             let v = verdict(&dir, &config, seat, &line);
             assert!(

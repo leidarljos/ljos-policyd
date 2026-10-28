@@ -10973,19 +10973,30 @@ fn nimvault_option_denial(argv: &[String]) -> Option<Checked> {
 /// path on disk. A seat uses a secret only through `nimvault run`.
 const NIMVAULT_SHOWS: &[&str] = &["get", "unseal"];
 
+/// The nimvault subcommands that may hand over plaintext or a data key
+/// another way. `status` decrypts an entry with no recorded hash into a
+/// work directory the seat's user can read, and `mv` moves the plaintext
+/// file. `seal`, `add`, `adddir`, `rm`, `remove`, `mv` and `rotate` wrap
+/// every data key to the recipient `--recipient` or
+/// `NIMVAULT_GPG_RECIPIENT` names, and `init` names the recipient later
+/// commands wrap them to.
+const NIMVAULT_HANDS_KEYS: &[&str] = &[
+    "status", "seal", "add", "adddir", "rm", "remove", "mv", "rotate", "init",
+];
+
 /// A `nimvault` anywhere in a command that runs a subcommand in
-/// [`NIMVAULT_SHOWS`], in any spelling [`nimvault_subcommand`] reads.
-/// One that `xargs` or `parallel` hands its subcommand may run any of
-/// them, so it is refused too. A command word the shell fills in, or a
-/// link on disk to `nimvault`, counts as `nimvault` when one of those
-/// subcommands follows it.
+/// [`NIMVAULT_SHOWS`] or [`NIMVAULT_HANDS_KEYS`], in any spelling
+/// [`nimvault_subcommand`] reads. One that `xargs` or `parallel` hands
+/// its subcommand may run any of them, so it is refused too. A link on
+/// disk to `nimvault` counts as `nimvault`, and so does a command word
+/// the shell fills in when `get` or `unseal` follows it.
 fn nimvault_shown_denial(argv: &[String]) -> Option<Checked> {
     commands(argv).iter().find_map(|cmd| {
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
         let shows = |i: usize| {
             nimvault_subcommand(&owned, i)
                 .map(|(sub, _)| sub)
-                .filter(|sub| NIMVAULT_SHOWS.contains(sub))
+                .filter(|sub| NIMVAULT_SHOWS.contains(sub) || NIMVAULT_HANDS_KEYS.contains(sub))
         };
         let head = owned.len() - unwrap_wrappers(&owned).0.len();
         (0..owned.len()).find_map(|i| {
@@ -11004,7 +11015,7 @@ fn nimvault_shown_denial(argv: &[String]) -> Option<Checked> {
                 }
             } else if i == head {
                 let sub = shows(i)?;
-                (expands_at_run(w) || nimvault_on_disk(w))
+                ((expands_at_run(w) && NIMVAULT_SHOWS.contains(&sub)) || nimvault_on_disk(w))
                     .then(|| format!("nimvault-shows: {sub}"))?
             } else {
                 return None;
@@ -27452,6 +27463,79 @@ make -C safe test
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// `status` may decrypt into a work directory the seat can read and
+    /// `mv` moves the plaintext. The commands that write the vault wrap
+    /// each data key to whatever recipient the line or the environment
+    /// names, and `init` names it. None of them runs. The ones that only
+    /// read the manifest or print help still run.
+    #[test]
+    fn nimvault_commands_that_hand_over_a_key_are_refused() {
+        let root = startup_root("nimvaultkeys");
+        let at = |line: &str| {
+            let argv = ["bash", "-c", line].map(String::from);
+            check_shell_in(&argv, &root, 0)
+        };
+        for (sub, l) in [
+            ("status", "status"),
+            ("status", "st"),
+            ("status", "sTATUS"),
+            ("seal", "seal"),
+            ("seal", "seal --force --recipient K"),
+            ("seal", "se"),
+            ("add", "add f"),
+            ("add", "add --recipient K f"),
+            ("adddir", "add-dir d"),
+            ("adddir", "add_dir d"),
+            ("adddir", "addd d"),
+            ("rm", "rm e"),
+            ("remove", "remove e"),
+            ("remove", "re e"),
+            ("mv", "mv a b"),
+            ("mv", "m a b"),
+            ("rotate", "rotate"),
+            ("rotate", "ro --rekey"),
+            ("init", "init --recipient K"),
+            ("init", "i"),
+            ("rotate", "-- rotate"),
+        ] {
+            for line in [
+                format!("nimvault {l}"),
+                format!("env NIMVAULT_GPG_RECIPIENT=K nimvault {l}"),
+                format!("sh -c 'nimvault {l}'"),
+                format!("xargs nimvault {l}"),
+                format!("nimvault run -e T e -- nimvault {l}"),
+            ] {
+                let c = at(&line);
+                assert_eq!(c.decision, Decision::Deny, "{line}");
+                assert_eq!(c.token, format!("nimvault-shows: {sub}"), "{line}");
+            }
+        }
+        for line in [
+            "nimvault list",
+            "nimvault check",
+            "nimvault who",
+            "nimvault doctor",
+            "nimvault scan .",
+            "nimvault gc --dry-run",
+            "nimvault lock",
+            "nimvault hook",
+            "nimvault help",
+            "nimvault version",
+            "nimvault --version",
+            "nimvault s",
+            "nimvault a f",
+            "git status",
+            "git add .",
+            "\"$GIT\" status",
+            "\"$GIT\" mv a b",
+            "npm init",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A program `nimvault run` hands a secret that may show it where
     /// the line cannot see does not run.
     #[test]
@@ -28145,7 +28229,7 @@ with urllib.request.urlopen(url, data=data, timeout=20) as r:
         for line in [
             "nimvault run -e T e -- date",
             "nimvault list",
-            "nimvault re e",
+            "nimvault who",
             "nimvault r e",
         ] {
             let c = at(line);
