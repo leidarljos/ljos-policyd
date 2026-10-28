@@ -10981,7 +10981,7 @@ const NIMVAULT_SHOWS: &[&str] = &["get", "unseal"];
 /// `NIMVAULT_GPG_RECIPIENT` names, and `init` names the recipient later
 /// commands wrap them to.
 const NIMVAULT_HANDS_KEYS: &[&str] = &[
-    "status", "seal", "add", "adddir", "rm", "remove", "mv", "rotate", "init",
+    "status", "seal", "add", "adddir", "rm", "remove", "mv", "rotate", "init", "hook",
 ];
 
 /// A `nimvault` anywhere in a command that runs a subcommand in
@@ -27487,6 +27487,11 @@ make -C safe test
             ("status", "status"),
             ("status", "st"),
             ("status", "sTATUS"),
+            ("hook", "hook"),
+            ("hook", "hOOk"),
+            ("hook", "ho_ok"),
+            ("hook", "ho-ok"),
+            ("hook", "hoo"),
             ("seal", "seal"),
             ("seal", "seal --force --recipient K"),
             ("seal", "se"),
@@ -27526,7 +27531,6 @@ make -C safe test
             "nimvault scan .",
             "nimvault gc --dry-run",
             "nimvault lock",
-            "nimvault hook",
             "nimvault help",
             "nimvault version",
             "nimvault --version",
