@@ -1,0 +1,1 @@
+A write out of the tree, or onto a seat file, through the name of a `for` loop over literal words was allowed, as in `for f in a.json /srv/example/a.json; do sed -i s/a/b/ "$f"; done`. The path walk now takes the name as each listed word in turn. It also finds the writer after a keyword such as `do`, `then` or `{`, and keeps an assignment made after one.

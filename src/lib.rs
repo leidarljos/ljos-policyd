@@ -4111,6 +4111,7 @@ fn for_literal_list(cmd: &[&str]) -> Option<(String, Vec<String>)> {
         return None;
     };
     let plain = |w: &&str| {
+        let w = w.strip_prefix("~/").unwrap_or(w);
         !w.is_empty()
             && !w.contains(EXPANDS)
             && !w.contains(['(', '"', '\''])
@@ -4123,6 +4124,47 @@ fn for_literal_list(cmd: &[&str]) -> Option<(String, Vec<String>)> {
             list.iter().map(|w| w.to_string()).collect(),
         )
     })
+}
+
+/// `names` with each `for` name in `each` that `cmd` reads bound to every
+/// word of its list in turn. Past 64 ways the names stay as they are.
+fn loop_variants(
+    names: &[(String, String)],
+    each: &[(String, Vec<String>)],
+    cmd: &[&str],
+) -> Vec<Vec<(String, String)>> {
+    let mut out = vec![names.to_vec()];
+    for (name, list) in each {
+        let (bare, braced) = (format!("${name}"), format!("${{{name}}}"));
+        if !cmd.iter().any(|w| w.contains(&bare) || w.contains(&braced)) {
+            continue;
+        }
+        out = out
+            .iter()
+            .flat_map(|v| {
+                list.iter().map(move |word| {
+                    let mut v = v.clone();
+                    v.push((name.clone(), word.clone()));
+                    v
+                })
+            })
+            .collect();
+        if out.len() > 64 {
+            return vec![names.to_vec()];
+        }
+    }
+    out
+}
+
+/// A `for` name that `cmd` binds again no longer takes its list.
+fn forget_loop_names(cmd: &[&str], each: &mut Vec<(String, Vec<String>)>) {
+    let mut bound = opaque_bound(cmd);
+    bound.extend(default_bound(cmd));
+    bound.extend(
+        cmd.iter()
+            .filter_map(|w| assignment_of(w).map(|(n, _, _)| n.to_string())),
+    );
+    each.retain(|(n, _)| !bound.contains(n));
 }
 
 /// Names this command binds other than by a plain `NAME=value`. The value
@@ -12235,7 +12277,7 @@ fn chmod_paths<'a>(args: &[&'a str]) -> Vec<&'a str> {
 fn cmd_head<'a>(cmd: &[&'a str]) -> Option<(&'a str, Vec<&'a str>)> {
     let words = operands(cmd);
     let mut i = 0;
-    while i < words.len() && is_assignment(words[i]) {
+    while i < words.len() && (is_assignment(words[i]) || keyword_at(&words, i)) {
         i += 1;
     }
     let head = *words.get(i)?;
@@ -12836,10 +12878,19 @@ fn written_path_denial(
         .filter(|p| p.starts_with('/'))
         .map(ToString::to_string);
     let mut links: Vec<(String, String)> = Vec::new();
+    let mut each: Vec<(String, Vec<String>)> = Vec::new();
     let mut prev = "";
     for (cmd, end) in ended_commands(argv) {
-        if cmd.iter().all(|w| is_assignment(w)) {
-            note_assignments(&cmd, &mut names, false);
+        let lead = cmd.iter().take_while(|w| KEYWORDS.contains(w)).count();
+        if cmd[lead..].iter().all(|w| is_assignment(w)) {
+            note_assignments(&cmd[lead..], &mut names, false);
+            forget_loop_names(&cmd, &mut each);
+            prev = end;
+            continue;
+        }
+        if let Some((name, list)) = for_literal_list(&cmd) {
+            each.retain(|(n, _)| *n != name);
+            each.push((name, list));
             prev = end;
             continue;
         }
@@ -12858,21 +12909,34 @@ fn written_path_denial(
         } else {
             None
         };
-        let seat_hit = command_guard_hit(&cmd, &look, &mut links);
-        if let Some(path) = seat_hit.filter(|_| work.is_none()) {
-            return Some(Checked {
-                decision: Decision::Deny,
-                code: PolicyReason::PathSensitiveDeny,
-                token: Cow::Owned(format!("seat-guard-path: {path}")),
-            });
+        for names in loop_variants(&names, &each, &cmd) {
+            let (home, cfg, data) = shell_dirs(&names, &real_home, &real_cfg, &real_data);
+            let look = GuardLook {
+                names: &names,
+                home: &home,
+                cfg: &cfg,
+                data: &data,
+                ..look
+            };
+            let seat_hit = command_guard_hit(&cmd, &look, &mut links);
+            if let Some(path) = seat_hit.filter(|_| work.is_none()) {
+                return Some(Checked {
+                    decision: Decision::Deny,
+                    code: PolicyReason::PathSensitiveDeny,
+                    token: Cow::Owned(format!("seat-guard-path: {path}")),
+                });
+            }
+            if let Some((by, path)) =
+                work.and_then(|w| outside_content_write(&cmd, &look, &links, w))
+            {
+                return Some(Checked {
+                    decision: Decision::Deny,
+                    code: PolicyReason::PathOutsideWorkspace,
+                    token: Cow::Owned(format!("writes-outside: {by} with {path}")),
+                });
+            }
         }
-        if let Some((by, path)) = work.and_then(|w| outside_content_write(&cmd, &look, &links, w)) {
-            return Some(Checked {
-                decision: Decision::Deny,
-                code: PolicyReason::PathOutsideWorkspace,
-                token: Cow::Owned(format!("writes-outside: {by} with {path}")),
-            });
-        }
+        forget_loop_names(&cmd, &mut each);
         note_assignments(&cmd, &mut names, true);
         remember_declared(&cmd, &mut names);
         if let Some(next) = moved {
@@ -25042,6 +25106,18 @@ make -C safe test
             (">", "echo x > ../../srv/example/state/run.json".into()),
             ("sed", format!("bash -c \"sed -i 's/a/b/' {t}\"")),
             ("sed", format!("env A=1 sed -i 's/a/b/' {t}")),
+            (
+                "sed",
+                format!("for f in a.json {t}; do sed -i 's/a/b/' \"$f\"; done"),
+            ),
+            (
+                "cp",
+                "for d in /srv/example/state; do cp in.json \"$d/run.json\"; done".into(),
+            ),
+            (
+                "tee",
+                format!("if true; then f={t}; echo x | tee \"$f\"; fi"),
+            ),
         ] {
             let c = in_tree(&line);
             assert_eq!(c.decision, Decision::Deny, "{line}");
@@ -25060,6 +25136,8 @@ make -C safe test
             "install -d /srv/example/state",
             "awk '$1 > 3' in.json",
             "ls *.json | xargs -I{} cp {} {}.bak",
+            "for f in a.json b.json; do sed -i 's/a/b/' \"$f\"; done",
+            "for f in /tmp/a /tmp/b; do echo x | tee \"$f\"; done",
         ] {
             assert_eq!(in_tree(line).decision, Decision::Allow, "{line}");
         }
