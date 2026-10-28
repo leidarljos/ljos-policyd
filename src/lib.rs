@@ -12859,6 +12859,8 @@ fn content_writer(w: &str) -> bool {
                 | "awk"
                 | "gawk"
                 | "mawk"
+                | "node"
+                | "ruby"
                 | "curl"
                 | "wget"
                 | "ln"
@@ -12872,8 +12874,9 @@ fn content_writer(w: &str) -> bool {
 /// redirection, `tee`, the target of `cp`, `mv`, `install` and `rsync`,
 /// `dd of=`, the files of `sed -i`, `perl -i` and `awk -i inplace`, a
 /// file an awk program prints into, what `curl` and `wget` save, the link
-/// `ln` makes, a file `truncate` sizes, and where `tar` extracts or the
-/// archive it creates.
+/// `ln` makes, a file `truncate` sizes, where `tar` extracts or the
+/// archive it creates, and the paths an inline `perl -e`, `node -e` or
+/// `ruby -e` program that writes files spells out.
 fn content_writes<'a>(cmd: &[&'a str]) -> Vec<(&'a str, String)> {
     let mut out: Vec<(&str, String)> = redirect_targets_of(cmd)
         .into_iter()
@@ -12925,6 +12928,15 @@ fn content_writes<'a>(cmd: &[&'a str]) -> Vec<(&'a str, String)> {
             let files = perl_files(&args);
             files.into_iter().skip(usize::from(!given)).collect()
         }
+        "perl" | "node" | "ruby" => {
+            let run: Vec<String> = std::iter::once(head)
+                .chain(args.iter().copied())
+                .map(str::to_string)
+                .collect();
+            inline_program(&run)
+                .map(|code| inline_written_paths(unquote(code)))
+                .unwrap_or_default()
+        }
         "awk" | "gawk" | "mawk" => {
             let mut t = if awk_inplace(&args) {
                 awk_files(&args)
@@ -12938,6 +12950,52 @@ fn content_writes<'a>(cmd: &[&'a str]) -> Vec<(&'a str, String)> {
     };
     out.extend(paths.into_iter().map(|p| (head, p)));
     out
+}
+
+/// Names in an inline perl, node or ruby program that may make, change
+/// or remove a file.
+const INLINE_WRITE_CALLS: &[&str] = &[
+    "open",
+    "rename",
+    "link",
+    "unlink",
+    "mkdir",
+    "rmdir",
+    "truncate",
+    "copy",
+    "move",
+    "chmod",
+    "utime",
+    "write",
+    "append",
+    "FileUtils",
+    "rm_",
+    "rmSync",
+    "cpSync",
+    "mkpath",
+    "make_path",
+];
+
+/// The paths an inline program spells when it may write files: each
+/// quoted string that, past a perl open mode such as `>` or `+<`, starts
+/// at `/` or `~` or climbs with `..`. A path the program builds is not
+/// placed, as for a shell write.
+fn inline_written_paths(code: &str) -> Vec<String> {
+    if !INLINE_WRITE_CALLS.iter().any(|c| code.contains(c)) {
+        return Vec::new();
+    }
+    quoted_strings(code)
+        .into_iter()
+        .map(|s| {
+            s.trim_start_matches(['+', '<', '>', '|'])
+                .trim()
+                .to_string()
+        })
+        .filter(|s| {
+            ((s.starts_with('/') || s.starts_with('~')) && s.chars().any(char::is_alphanumeric))
+                || s.split('/').any(|p| p == "..")
+        })
+        .collect()
 }
 
 /// The literal files an awk program prints into: `print > "f"` and
@@ -25542,6 +25600,53 @@ make -C safe test
             "for f in /tmp/a /tmp/b; do echo x | tee \"$f\"; done",
         ] {
             assert_eq!(in_tree(line).decision, Decision::Allow, "{line}");
+        }
+    }
+
+    /// An inline perl, node or ruby program that writes files is placed by
+    /// the paths it spells, as inline python is.
+    #[test]
+    fn an_inline_program_writes_where_its_paths_say() {
+        let t = "/srv/example/state/run.json";
+        for (by, line) in [
+            (
+                "perl",
+                format!("perl -e 'open(my $f, \">\", \"{t}\"); print $f 1'"),
+            ),
+            ("perl", format!("perl -e 'open(F, \">>{t}\"); print F 1'")),
+            ("perl", format!("perl -le 'rename \"in.json\", \"{t}\"'")),
+            (
+                "node",
+                format!("node -e 'require(\"fs\").writeFileSync(\"{t}\", \"{{}}\")'"),
+            ),
+            (
+                "node",
+                format!("node -e \"require('fs').appendFileSync('{t}', 'x')\""),
+            ),
+            ("ruby", format!("ruby -e 'File.write(\"{t}\", \"{{}}\")'")),
+            (
+                "ruby",
+                format!("ruby -rfileutils -e 'FileUtils.cp(\"in.json\", \"{t}\")'"),
+            ),
+        ] {
+            let c = in_tree(&line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+            assert_eq!(c.code, PolicyReason::PathOutsideWorkspace, "{line}");
+            assert_eq!(c.token, format!("writes-outside: {by} with {t}"), "{line}");
+        }
+        for line in [
+            "perl -e 'open(my $f, \">\", \".state/run.json\"); print $f 1'",
+            "perl -ne 'print if /x/' in.json",
+            "perl -e 'print \"/srv/example/state/run.json\"'",
+            "perl -e 'open(F, \">/tmp/run.json\")'",
+            "node -e 'require(\"fs\").writeFileSync(\".state/run.json\", \"x\")'",
+            "node -e 'console.log(require(\"fs\").readFileSync(\"/etc/hostname\", \"utf8\"))'",
+            "node -e 'require(\"fs\").writeFileSync(\"out.txt\", \"/\")'",
+            "ruby -e 'File.write(\".state/run.json\", \"{}\")'",
+            "ruby -e 'puts File.read(\"/etc/hostname\")'",
+        ] {
+            let c = in_tree(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
     }
 
