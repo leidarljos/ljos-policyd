@@ -10767,7 +10767,16 @@ fn nimvault_run_stray(cmd: &[String], i: usize) -> Option<&str> {
 }
 
 fn nimvault_run_walk(cmd: &[String], i: usize) -> Option<(Option<&str>, usize, Option<&str>)> {
-    let (sub, at) = nimvault_subcommand(cmd, i)?;
+    let (sub, at) = match nimvault_subcommand(cmd, i) {
+        Some(found) => found,
+        // A subcommand the shell fills in may be `run`.
+        None => {
+            let at = i + 1 + usize::from(cmd.get(i + 1).is_some_and(|w| w == "--"));
+            cmd.get(at)
+                .is_some_and(|w| expands_at_run(w))
+                .then_some(("run", at))?
+        }
+    };
     if sub != "run" {
         return None;
     }
@@ -10779,6 +10788,9 @@ fn nimvault_run_walk(cmd: &[String], i: usize) -> Option<(Option<&str>, usize, O
         (cmd[at] != "run").then_some(cmd[at].as_str())
     };
     let mut entry = false;
+    // With no `--`, cligen still reads the word the program starts at as
+    // one of its own, and a word the shell fills in may be an option.
+    let mut own = 0;
     while let Some(a) = cmd.get(j).map(String::as_str) {
         if a == "--" {
             j += 1 + usize::from(!entry);
@@ -10802,10 +10814,22 @@ fn nimvault_run_walk(cmd: &[String], i: usize) -> Option<(Option<&str>, usize, O
             entry = true;
             j += 1;
         } else {
+            own = 1;
             break;
         }
     }
-    Some((env, j.min(cmd.len()), stray))
+    let j = j.min(cmd.len());
+    if let Some(w) = cmd[at..j + own].iter().find(|w| expands_at_run(w)) {
+        stray = Some(w.as_str());
+    }
+    Some((env, j, stray))
+}
+
+/// A word the shell parse left for the shell to fill in or match when
+/// the line runs: a `$` or a backtick, a glob character, or a brace or
+/// quote the parse did not take off. nimvault would see some other word.
+fn expands_at_run(w: &str) -> bool {
+    w.contains(['$', '`', '*', '?', '[', '{', '}', '\'', '"'])
 }
 
 /// The subcommands nimvault's `dispatchMulti` names, each as cligen's
@@ -10889,7 +10913,8 @@ fn nimvault_run_option(a: &str) -> Option<(char, Option<&str>)> {
 
 /// A `nimvault run` given an option [`nimvault_run_option`] does not
 /// read, such as `--allow-unsigned`, `-a` or a prefix of either, or
-/// spelled other than as the word `run`, such as `rUn`, `r_un` or `ru`.
+/// spelled other than as the word `run`, such as `rUn`, `r_un` or `ru`,
+/// or with an entry or option word [`expands_at_run`].
 fn nimvault_option_denial(argv: &[String]) -> Option<Checked> {
     commands(argv).iter().find_map(|cmd| {
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
@@ -10899,7 +10924,9 @@ fn nimvault_option_denial(argv: &[String]) -> Option<Checked> {
             .map(|w| Checked {
                 decision: Decision::Deny,
                 code: PolicyReason::ShellDangerousRunner,
-                token: Cow::Owned(if w.starts_with('-') {
+                token: Cow::Owned(if expands_at_run(&w) {
+                    format!("nimvault-run-word: {w}")
+                } else if w.starts_with('-') {
                     format!("nimvault-run-option: {w}")
                 } else {
                     format!("nimvault-run-spelling: {w}")
@@ -27734,6 +27761,90 @@ with urllib.request.urlopen(url, data=data, timeout=20) as r:
         for sub in ["rUn", "r_un", "ru", "-- run"] {
             let spelled = line.replacen("run", sub, 1);
             assert_eq!(secret(&spelled), None, "{spelled}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shell fills in `$X`, `$(...)` and backticks and matches a
+    /// glob as the line runs, so a nimvault word holding one may become
+    /// `--allow-unsigned` or another entry. Such a word refuses the line
+    /// for every seat and on the relay line.
+    #[test]
+    fn a_nimvault_run_word_is_as_written() {
+        let at = |line: &str| check_shell_in(&shell_words(line), std::path::Path::new("/w"), 0);
+        for word in [
+            "\"$X\"",
+            "$X",
+            "${X}",
+            "\"$(printf %s --allow-unsigned)\"",
+            "$(printf %s --allow-unsigned)",
+            "`printf %s --allow-unsigned`",
+            "[-]-allow-unsigned",
+            "--allow-unsigne?",
+            "--allow-*",
+            "'{a,b}'",
+        ] {
+            for line in [
+                format!("nimvault run -e T {word} e -- make test"),
+                format!("nimvault run -e T e {word} -- make test"),
+                format!("nimvault run -e {word} e -- make test"),
+                format!("nimvault run --vault={word} -e T e -- make test"),
+                format!("nimvault {word} -e T e -- printenv T"),
+                format!("nimvault -- {word} -e T e -- printenv T"),
+            ] {
+                for line in [
+                    line.clone(),
+                    format!("bash -c '{}'", line.replace('\'', "")),
+                ] {
+                    let c = at(&line);
+                    assert_eq!(c.decision, Decision::Deny, "{line}");
+                    assert!(c.token.starts_with("nimvault-run-"), "{line}: {}", c.token);
+                }
+            }
+        }
+        let c = at("nimvault run --vault ~/v -e T e -- date");
+        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
+        let dir = std::env::temp_dir().join(format!("relay-word-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let relay = relay::Relay {
+            seat: "relay".into(),
+            dir: dir.clone(),
+            secret: "EXAMPLE_TOKEN".into(),
+            host: "example.org".into(),
+        };
+        let line = relay_line(&dir, RELAY_SEND);
+        let secret = |line: &str| {
+            relay_command(
+                &commands(&shell_words(line)),
+                false,
+                Some(&dir),
+                Some("relay"),
+                Some(&relay),
+            )
+        };
+        assert_eq!(secret(&line), Some("EXAMPLE_TOKEN"));
+        assert!(!at(&line).token.starts_with("nimvault-run-"));
+        for line in [
+            line.replace(
+                "relay/token",
+                "$(printf '%s %s' --allow-unsigned relay/token)",
+            ),
+            line.replace(
+                "relay/token",
+                "\"$(printf %s --allow-unsigned)\" relay/token",
+            ),
+            line.replace("relay/token", "`printf %s relay/token`"),
+            line.replace("relay/token", "\"$E\""),
+            line.replace("EXAMPLE_TOKEN", "\"$T\""),
+        ] {
+            assert_eq!(secret(&line), None, "{line}");
+            let c = at(&line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+            assert!(
+                c.token.starts_with("nimvault-run-word: "),
+                "{line}: {}",
+                c.token
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
