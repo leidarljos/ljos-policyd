@@ -10865,6 +10865,31 @@ fn expands_at_run(w: &str) -> bool {
     w.contains(['$', '`', '*', '?', '[', '{', '}', '\'', '"'])
 }
 
+fn hides_head_word(w: &str) -> bool {
+    let bytes = w.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            return true;
+        }
+        if bytes[i] != b'$' {
+            i += 1;
+            continue;
+        }
+        match bytes.get(i + 1).copied() {
+            Some(b'(') | Some(b'{') => return true,
+            Some(c) if c.is_ascii_alphanumeric() || c == b'_' => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+fn hides_next_word(w: &str) -> bool {
+    hides_head_word(w) || w.contains(['*', '?', '['])
+}
+
 /// The subcommands nimvault's `dispatchMulti` names, each as cligen's
 /// `optionNormalize` keys it.
 const NIMVAULT_SUBCOMMANDS: &[&str] = &[
@@ -11025,6 +11050,20 @@ fn nimvault_shown_denial(argv: &[String]) -> Option<Checked> {
                 code: PolicyReason::SecretExportDenied,
                 token: Cow::Owned(token),
             })
+        })
+    })
+}
+
+fn nimvault_unshown_head_denial(argv: &[String]) -> Option<Checked> {
+    commands(argv).iter().find_map(|cmd| {
+        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        let head = owned.len() - unwrap_wrappers(&owned).0.len();
+        let h = owned.get(head)?;
+        let n = owned.get(head + 1)?;
+        (hides_head_word(h) && hides_next_word(n)).then_some(Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::SecretExportDenied,
+            token: Cow::Borrowed("nimvault-subcommand-unshown"),
         })
     })
 }
@@ -14416,6 +14455,9 @@ fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
         }
     }
     if let Some(c) = outside_write_denial(argv, bound.root.as_deref(), bound.work.as_deref()) {
+        return c;
+    }
+    if let Some(c) = nimvault_unshown_head_denial(argv) {
         return c;
     }
     Checked {
@@ -27441,6 +27483,10 @@ make -C safe test
             "echo unseal | xargs -n1 nimvault",
             "xargs nimvault --",
             "parallel nimvault ::: get",
+            "\"$NV\" \"$S\" e",
+            "\"$X\" \"$S\" e",
+            "${V} $S",
+            "\"$(command -v nimvault)\" \"$S\" e",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Deny, "{line}");
@@ -27463,6 +27509,8 @@ make -C safe test
             "go get example.org/x",
             "kubectl -n \"$NS\" get pods",
             "\"$EDITOR\" get.txt",
+            "echo \"$S\"",
+            "cargo \"$CMD\"",
             &format!("{} list", nv.display()),
         ] {
             let c = at(line);
