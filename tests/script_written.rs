@@ -237,3 +237,34 @@ fn a_mktemp_variable_is_only_that_path() {
     }
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A checksum tool prints to stdout and writes no file, so a script the
+/// line sources after it, or again in a loop, is not one it wrote. A
+/// command the guard does not know still may have.
+#[test]
+fn a_checksum_writes_no_script() {
+    let d = scratch("sums");
+    std::fs::write(d.join("env.sh"), "export A=1\n").unwrap();
+    std::fs::write(d.join("f.txt"), "hi\n").unwrap();
+    for line in [
+        ". ./env.sh; sha256sum f.txt > SUMS",
+        "sha256sum f.txt > SUMS; . ./env.sh",
+        "for f in a b; do . ./env.sh; sha256sum f.txt > SUMS; done",
+        "f() { . ./env.sh; }; f; sha256sum f.txt > SUMS; f",
+        "md5sum f.txt > SUMS; sha512sum -c SUMS; b2sum f.txt; cksum f.txt; . ./env.sh",
+    ] {
+        assert_eq!(sh(&d, line), "allow", "{line}");
+    }
+    for line in [
+        "mytool f.txt > SUMS; . ./env.sh",
+        "for f in a b; do . ./env.sh; mytool f.txt > SUMS; done",
+        "sha256sum f.txt > env.sh; . ./env.sh",
+    ] {
+        let v = sh(&d, line);
+        assert!(
+            v.starts_with("deny\tscript-written-on-line: "),
+            "{line}: {v}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
