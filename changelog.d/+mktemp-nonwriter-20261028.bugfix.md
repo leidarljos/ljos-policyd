@@ -1,0 +1,1 @@
+A mail wrapper, run twice on a line from its own directory, was refused with "`mktemp` may write any file under" that directory, as if its first run's `mktemp` might have written the wrapper. `mktemp` makes one new empty file or directory and overwrites nothing, as `touch` and `mkdir` do, so it no longer counts as a writer. A command the guard does not know still does.

@@ -346,3 +346,67 @@ fn the_tunnel_script_runs_as_written() {
     assert!(v.starts_with("deny\tscript-written-on-line: "), "{v}");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// What the ljos hook asks about a shell line: `check -- bash -c LINE`
+/// from the payload's directory, stdin closed, with the seat set.
+fn hook_verdict(dir: &std::path::Path, seat: &str, line: &str) -> String {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ljos-policyd"))
+        .args(["check", "--", "bash", "-c", line])
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .env("PHRONESIS_STATE_DIR", dir.join("state"))
+        .env("LJOS_SEAT", seat)
+        .env("LJOS_IN_HOOK", "1")
+        .env_remove("PHRONESIS_WORKSPACE")
+        .env_remove("PHRONESIS_JANET_PACK")
+        .env_remove("PHRONESIS_PREFIX")
+        .env_remove("PHRONESIS_PACK_ROOT")
+        .env_remove("CDPATH")
+        .env_remove("BASH_ENV")
+        .env_remove("ENV")
+        .output()
+        .expect("spawn check");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A mail wrapper's spool and sent-copy lines, as written by hand,
+/// between a stub head that names the maildir and a stub mailer call.
+const SPOOL: &str = r#"tmp=$(mktemp /dev/shm/out.XXXXXX); out=$(mktemp /dev/shm/out.XXXXXX)
+trap 'rm -f "$tmp" "$out"' EXIT
+cat > "$tmp"
+"#;
+const SENT: &str = r#"printf '%s' "$add" > "$out"; cat "$tmp" >> "$out"
+if ! { cp "$out" "$sent/tmp/$f" && mv "$sent/tmp/$f" "$sent/cur/$f"; }; then
+  echo "mailwrap: could not file the sent copy" >&2
+fi
+"#;
+
+/// `mktemp` makes one new empty file or directory and writes no file
+/// that was there before, as `touch` and `mkdir` do. A wrapper run
+/// twice from its own directory is not one its first run wrote. A
+/// command the guard does not know may still write anything there.
+#[test]
+fn mktemp_writes_no_script() {
+    let d = scratch("mail-twice");
+    let wrapper = d.join("mailwrap");
+    let head = format!(
+        "#!/bin/bash\nsent={}/Maildir/.Sent; f=msg.eml; add='X-Example: 1'\n",
+        d.display()
+    );
+    let mailer = "/usr/local/libexec/ljos-test/deliver \"$@\" < \"$tmp\" || exit 1\n";
+    std::fs::write(&wrapper, format!("{head}{SPOOL}{mailer}{SENT}")).unwrap();
+    std::fs::write(d.join("ot.eml"), "To: ops@example.org\n\nhi\n").unwrap();
+    let w = wrapper.display();
+    for line in [
+        "./mailwrap -t < ot.eml".to_string(),
+        format!("{w} -t < ot.eml; {w} -t < ot.eml"),
+        format!("{w} -t < ot.eml && ./mailwrap -t < ot.eml"),
+    ] {
+        assert_eq!(hook_verdict(&d, "example", &line), "allow", "{line}");
+    }
+    let other = SPOOL.replace("cat > \"$tmp\"", "mytool");
+    std::fs::write(&wrapper, format!("{head}{other}{mailer}")).unwrap();
+    let v = hook_verdict(&d, "example", &format!("{w}; {w}"));
+    assert!(v.starts_with("deny\tscript-written-on-line: "), "{v}");
+    let _ = std::fs::remove_dir_all(&d);
+}

@@ -14032,7 +14032,7 @@ const NON_WRITERS: &str = "echo printf cat grep egrep fgrep rg ls test [ [[ true
     realpath readlink date id whoami uname hostname printenv seq expr mkdir rm \
     rmdir touch chmod { } ( ) ! then do else elif fi done esac trap for \
     select case emulate setopt print md5sum sha1sum sha224sum sha256sum sha384sum \
-    sha512sum b2sum cksum";
+    sha512sum b2sum cksum mktemp";
 
 /// Commands whose writes [`program_writes`] names, or that the walk
 /// reads into: a shell's script, `source`, `eval`.
