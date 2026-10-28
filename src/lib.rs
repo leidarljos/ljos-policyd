@@ -15781,9 +15781,10 @@ fn python_refusal_with(
 /// directory, running nothing but `nimvault run --env SECRET ENTRY
 /// python3 -I SCRIPT.py [ARG...]` with a script [`relay_script`] accepts
 /// and no other `.py` beside it, with a bare `nimvault` and a bare
-/// `python3`. The secret comes from the vault as the program starts,
-/// and what the script's text may do with it is judged as for any
-/// sealed secret.
+/// `python3`, and no `--allow-unsigned` that would take an entry the
+/// vault cannot vouch for. The secret comes from the vault as the
+/// program starts, and what the script's text may do with it is judged
+/// as for any sealed secret.
 fn relay_command<'a>(
     cmds: &[Vec<&str>],
     moved: bool,
@@ -15803,6 +15804,12 @@ fn relay_command<'a>(
     }
     let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
     let (name, at) = nimvault_run_at(&owned, 0)?;
+    if owned[..at]
+        .iter()
+        .any(|w| w == "--allow-unsigned" || w.starts_with("--allow-unsigned="))
+    {
+        return None;
+    }
     let script = relay_script(&owned[at..], relay)?;
     (name == Some(relay.secret.as_str()) && relay_script_alone(&relay.dir, &script))
         .then_some(relay.secret.as_str())
@@ -26011,6 +26018,40 @@ with urllib.request.urlopen(url, data=data, timeout=20) as r:
         }
         let _ = std::fs::remove_dir_all(dir.join("json"));
         assert_eq!(secret(&line), Some("EXAMPLE_TOKEN"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--allow-unsigned` lets nimvault hand over an entry it cannot
+    /// check the signature of, so the relay line may not carry it.
+    #[test]
+    fn the_relay_line_takes_signed_entries_only() {
+        let dir = std::env::temp_dir().join(format!("relay-signed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let relay = relay::Relay {
+            seat: "relay".into(),
+            dir: dir.clone(),
+            secret: "EXAMPLE_TOKEN".into(),
+            host: "example.org".into(),
+        };
+        let line = relay_line(&dir, RELAY_SEND);
+        let secret = |line: &str| {
+            let words = shell_words(line);
+            relay_command(
+                &commands(&words),
+                false,
+                Some(&dir),
+                Some("relay"),
+                Some(&relay),
+            )
+        };
+        assert_eq!(secret(&line), Some("EXAMPLE_TOKEN"));
+        let at = |opt: &str| line.replace("run --env", &format!("run {opt} --env"));
+        assert_eq!(secret(&at("--vault v")), Some("EXAMPLE_TOKEN"));
+        for opt in ["--allow-unsigned", "--allow-unsigned=1"] {
+            assert_eq!(secret(&at(opt)), None, "{opt}");
+        }
+        let after = line.replace("relay/token", "relay/token --allow-unsigned");
+        assert_eq!(secret(&after), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

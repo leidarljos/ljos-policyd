@@ -314,3 +314,29 @@ fn no_seat_writes_the_policyd_config() {
     }
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn the_relay_line_refuses_unsigned_entries() {
+    let base = std::env::temp_dir().join(format!("relay-signed-{}", std::process::id()));
+    let dir = base.join("relay");
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = base.join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[relay]\nseat = \"relay\"\ndir = \"{}\"\nsecret = \"EXAMPLE_TOKEN\"\nhost = \"example.org\"\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let send = dir.join("send.py");
+    std::fs::write(&send, include_str!("fixtures/relay-send.py")).unwrap();
+    std::fs::set_permissions(&send, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let line = "nimvault run --env EXAMPLE_TOKEN relay/token python3 -I send.py /tmp/m.txt t1";
+    assert_eq!(verdict(&dir, &config, "relay", line), "allow");
+    let unsigned = line.replace("run --env", "run --allow-unsigned --env");
+    let v = verdict(&dir, &config, "relay", &unsigned);
+    assert!(v.starts_with("deny"), "{v}");
+    let _ = std::fs::remove_dir_all(&base);
+}

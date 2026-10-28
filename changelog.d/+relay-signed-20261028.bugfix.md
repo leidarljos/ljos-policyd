@@ -1,0 +1,1 @@
+The relay line is refused when it passes `--allow-unsigned` to `nimvault run`, before or after the entry, so the secret the relay reads is always one the vault has checked the signature of. The same line without it is allowed as before.
