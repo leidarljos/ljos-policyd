@@ -894,6 +894,9 @@ impl LineFiles {
             let Some((n, v, append)) = assignment_of(w) else {
                 continue;
             };
+            if mktemp_value(v) && !append && !w[n.len()..].starts_with('[') && self.loops == 0 {
+                continue;
+            }
             match literal_pieces(v) {
                 Some(pieces) if !append && !w[n.len()..].starts_with('[') && self.loops == 0 => {
                     let reads = pieces.into_iter().filter_map(|p| match p {
@@ -1618,12 +1621,81 @@ fn placed_via(
     if w.contains('$') {
         if let Some((words, names)) = literal_pieces(w).and_then(|p| expand_pieces(p, values)) {
             if !names.is_empty() && words.iter().all(|s| !s.is_empty()) {
-                let paths = words.iter().flat_map(|s| placed(s, dirs, home)).collect();
+                let mut paths = Vec::new();
+                for s in &words {
+                    if s.contains(MKTEMP) {
+                        let Some(p) = fresh_path(s) else {
+                            return (placed(w, dirs, home), Vec::new());
+                        };
+                        paths.extend(dirs.iter().map(|d| (!is_untracked(d)).then(|| p.clone())));
+                    } else {
+                        paths.extend(placed(s, dirs, home));
+                    }
+                }
                 return (paths, names);
             }
         }
     }
     (placed(w, dirs, home), Vec::new())
+}
+
+/// Starts the value of a name set from `mktemp`, then the name. No
+/// literal the line writes holds it.
+const MKTEMP: char = '\u{1}';
+
+/// Whether `value` is only `$(mktemp)` or a backtick `mktemp`, with `-d`
+/// and one literal template at most. Each run makes a new private file
+/// or directory that no command before it could have written.
+fn mktemp_value(value: &str) -> bool {
+    let value = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(value);
+    let Some(body) = command_body(value) else {
+        return false;
+    };
+    let words = shell_words(body);
+    let Some((head, rest)) = words.split_first() else {
+        return false;
+    };
+    let mut templates = 0;
+    base_of(head) == "mktemp"
+        && rest.iter().all(|a| {
+            if a == "-d" {
+                return true;
+            }
+            templates += 1;
+            let plain = |p: &SourcePart| match p {
+                SourcePart::Lit(t) => t
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._/+-@%,:".contains(c)),
+                SourcePart::Var(_) => false,
+            };
+            !a.starts_with('-') && literal_pieces(a).is_some_and(|p| p.iter().all(plain))
+        })
+        && templates <= 1
+}
+
+/// The path a word from [`expand_pieces`] names when it starts with the
+/// value of a `mktemp` name: that file, or a path under it with no `..`.
+/// A name built around it (`x$tmp`, `$tmp.log`) is not the new file.
+fn fresh_path(s: &str) -> Option<std::path::PathBuf> {
+    let rest = s.strip_prefix(MKTEMP)?;
+    let end = rest
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .unwrap_or(rest.len());
+    let (name, under) = rest.split_at(end);
+    if !is_name(name) || !(under.is_empty() || under.starts_with('/')) || under.contains(MKTEMP) {
+        return None;
+    }
+    let under = std::path::Path::new(under.trim_start_matches('/'));
+    if under
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(std::path::Path::new(&format!("/$(mktemp)/{name}")).join(under))
 }
 
 /// The literal text and the `$name` or `${name}` of a word or an
@@ -1672,7 +1744,7 @@ fn literal_pieces(w: &str) -> Option<Vec<SourcePart>> {
                 }
                 parts.push(SourcePart::Var(name));
             }
-            '`' => return None,
+            '`' | MKTEMP => return None,
             '*' | '?' | '[' | '~' | '{' | '}' if !double => return None,
             _ => lit.push(c),
         }
@@ -4202,9 +4274,13 @@ fn note_cmd_values(cmd: &[&str], shell: &mut Shell) {
             if let Some((name, value)) = assign_sides(w) {
                 // The shell expands the value once, here, with the values
                 // the names it reads hold now.
-                let fixed = literal_pieces(&value)
-                    .and_then(|p| expand_pieces(p, &shell.cmd_values))
-                    .map_or_else(|| vec!["\0".into()], |(texts, _)| texts);
+                let fixed = if mktemp_value(&value) {
+                    vec![format!("{MKTEMP}{name}")]
+                } else {
+                    literal_pieces(&value)
+                        .and_then(|p| expand_pieces(p, &shell.cmd_values))
+                        .map_or_else(|| vec!["\0".into()], |(texts, _)| texts)
+                };
                 shell.cmd_values.insert(fixed_key(&name), fixed);
                 shell.cmd_values.insert(name, vec![value]);
             } else if let Some(name) = w.split(['+', '[', '=']).next().filter(|n| !n.is_empty()) {

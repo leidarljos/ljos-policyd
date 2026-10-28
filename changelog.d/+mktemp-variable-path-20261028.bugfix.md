@@ -1,0 +1,1 @@
+A mail wrapper that spools its message to `$tmp`, set only from `$(mktemp)`, was refused as a write to a path the line does not show. A name set only from `mktemp`, with `-d` and one literal template at most, is now a new private file, and a path under it is too. `$tmp.log`, `x$tmp`, `..` under it, `mktemp -u`, and a temp the line writes and then runs are judged as before.

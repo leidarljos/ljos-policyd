@@ -180,3 +180,60 @@ fn a_literal_variable_script_is_judged_on_its_text() {
     assert_eq!(sh(&d, &line), "allow");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A name set only from `mktemp` is a new private file or directory.
+/// A mail wrapper spools its message there and then runs a
+/// program the guard cannot read.
+#[test]
+fn a_mktemp_variable_is_a_fresh_path() {
+    let d = scratch("mktemp");
+    let wrapper = "#!/bin/sh\ntmp=$(mktemp)\ntrap 'rm -f \"$tmp\"' EXIT\ncat > \"$tmp\"\n\
+                   /usr/local/libexec/ljos-test/deliver -t < \"$tmp\"\n";
+    std::fs::write(d.join("mail.sh"), wrapper).unwrap();
+    assert_eq!(verdict(&d, &["sh", "mail.sh"]), "allow");
+    for line in [
+        "tmp=`mktemp`; cat > \"$tmp\"; /usr/local/libexec/x",
+        "tmp=\"$(mktemp)\"; cat > \"$tmp\"; /usr/local/libexec/x",
+        "tmp=$(mktemp -d); echo x > $tmp/a; /usr/local/libexec/x",
+        "tmp=$(mktemp /tmp/m.XXXXXX); echo x > $tmp; /usr/local/libexec/x",
+        "tmp=$(mktemp -d ./confXXXXXX); echo x > \"$tmp/a\"; /usr/local/libexec/x",
+        "tmp=$(mktemp -d); out=$tmp/o; echo x > $out; /usr/local/libexec/x",
+    ] {
+        assert_eq!(sh(&d, line), "allow", "{line}");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Only the new file itself, or a path under it, is fresh. A temp the
+/// line runs after writing it is still judged, and a name built around
+/// it, reset, read, or made by a `mktemp` that may print nothing or a
+/// path the line does not show still refuses.
+#[test]
+fn a_mktemp_variable_is_only_that_path() {
+    let d = scratch("mktemp-no");
+    let v = sh(
+        &d,
+        "tmp=$(mktemp); echo 'rm -rf ~/' > \"$tmp\"; sh \"$tmp\"",
+    );
+    assert!(v.starts_with("deny\t"), "{v}");
+    for line in [
+        "tmp=$(mktemp); echo x > $tmp.log; /usr/local/libexec/x",
+        "tmp=$(mktemp) && echo x > x$tmp; /usr/local/libexec/x",
+        "tmp=$(mktemp -d); echo x > $tmp/../a; /usr/local/libexec/x",
+        "tmp=$(mktemp -u); echo x > $tmp; /usr/local/libexec/x",
+        "tmp=$(mktemp -p /x); echo x > $tmp; /usr/local/libexec/x",
+        "tmp=$(mktemp $T); echo x > $tmp; /usr/local/libexec/x",
+        "tmp=$(mktemp >/dev/null); echo x > $tmp/run.sh; /run.sh",
+        "tmp=$(mktemp; echo /x); echo x > $tmp; /usr/local/libexec/x",
+        "tmp=$(mktemp); tmp=$1; echo x > $tmp; /usr/local/libexec/x",
+        "tmp=$(mktemp); echo x > $tmp; read tmp; /usr/local/libexec/x",
+        "for i in 1; do tmp=$(mktemp); done; echo x > $tmp; /usr/local/libexec/x",
+    ] {
+        let v = sh(&d, line);
+        assert!(
+            v.starts_with("deny\tscript-written-on-line: "),
+            "{line}: {v}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
