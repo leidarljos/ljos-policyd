@@ -1796,6 +1796,9 @@ pub(crate) struct Place<'a> {
     pub(crate) work: Option<&'a Path>,
     pub(crate) secret: Option<&'a str>,
     pub(crate) sealed: Option<&'a str>,
+    /// The one host the relay program may send its sealed secret to,
+    /// over https. `None` for every program but the relay's.
+    pub(crate) host: Option<&'a str>,
 }
 
 /// Why python must not run `code` at `place`, or `None`. A program
@@ -1824,7 +1827,8 @@ fn judge(code: &str, place: Place) -> Option<Refusal> {
     credential(&r, place)
         .or_else(|| place.sealed.and_then(|n| shows_secret(code, &r, n)))
         .or_else(|| hook_write(&r))
-        .or_else(|| network(&r))
+        .or_else(|| place.host.and_then(|h| relay_sends(code, &r, h)))
+        .or_else(|| network(&r, place.host.is_some()))
         .or_else(|| runs_written(&r))
         .or_else(|| git_write(&r))
         .or_else(|| unshown(&r))
@@ -2666,9 +2670,107 @@ const RUNNERS: &[&str] = &[
     "types.FunctionType",
 ];
 
+/// Calls that send a request to the URL their first argument names.
+const URL_REQUESTS: &[&str] = &[
+    "urllib.request.urlopen",
+    "urllib.request.Request",
+    "requests.get",
+    "requests.post",
+    "requests.put",
+    "requests.patch",
+    "requests.delete",
+    "requests.head",
+    "requests.options",
+    "httpx.get",
+    "httpx.post",
+    "httpx.put",
+    "httpx.patch",
+    "httpx.delete",
+    "httpx.head",
+    "httpx.options",
+];
+
+/// The relay's sends, which may only go to `host` over https. Each call
+/// that reaches the network must be one of [`URL_REQUESTS`] with a URL
+/// whose leading literal is `https://HOST/`, given in the call or
+/// through a name bound once and read once. A URL the program builds
+/// some other way, or any other network call, may name any host.
+fn relay_sends(code: &str, r: &Read, host: &str) -> Option<Refusal> {
+    let out = |what: &str| refused(PolicyReason::SecretExportDenied, "sends-secret", what);
+    let src: Vec<char> = code.chars().collect();
+    let mut toks = Vec::new();
+    if lex(&src, 0, &mut toks).is_none() {
+        return out("unread");
+    }
+    let uses = |v: &str| {
+        toks.iter()
+            .filter(|t| matches!(t, Tok::Name(n) if n == v))
+            .count()
+    };
+    let mut once: HashMap<String, Vec<Tok>> = HashMap::new();
+    for (stmt, _) in statements(&toks) {
+        if let [Tok::Name(v), Tok::Mark('='), rest @ ..] = stmt {
+            if rest.first() != Some(&Tok::Mark('=')) && uses(v) == 2 {
+                once.insert(v.clone(), rest.to_vec());
+            }
+        }
+    }
+    for c in r.refs.iter().filter(|c| c.args.is_some()) {
+        if !matches(&c.name, NETWORK) && !matches(&c.name, SERVERS) {
+            continue;
+        }
+        if !URL_REQUESTS.contains(&c.name.as_str()) {
+            return out(&format!("through {}", c.name));
+        }
+        let url = c.args.as_deref().and_then(|a| arg(a, 0, "url"));
+        match url.and_then(|a| url_host(bound_once(a, &once))) {
+            Some((true, h)) if h == host => {}
+            Some((_, h)) => return out(&format!("to {h}")),
+            None => return out(&format!("to a URL {} builds", c.name)),
+        }
+    }
+    None
+}
+
+/// `a`, or the value a name that is all of `a` was bound to once.
+fn bound_once<'a>(mut a: &'a [Tok], once: &'a HashMap<String, Vec<Tok>>) -> &'a [Tok] {
+    for _ in 0..DEPTH {
+        match a {
+            [Tok::Name(v)] if once.contains_key(v) => a = &once[v],
+            _ => break,
+        }
+    }
+    a
+}
+
+/// Whether the URL argument `a` is https, and its host, read from the
+/// literal it starts with. The host must be followed by `/`, `?`, `#`
+/// or the end of the literal that is the whole argument, so nothing
+/// joined on after it can change it.
+fn url_host(a: &[Tok]) -> Option<(bool, String)> {
+    let Some(Tok::Str(s)) = a.first() else {
+        return None;
+    };
+    let (scheme, rest) = s.split_once("://")?;
+    let end = rest.find(['/', '?', '#']);
+    if end.is_none() && a.len() > 1 {
+        return None;
+    }
+    let authority = &rest[..end.unwrap_or(rest.len())];
+    if authority.contains(['@', ':', '\\', FIELD]) || authority.is_empty() {
+        return Some((false, authority.to_string()));
+    }
+    Some((
+        scheme.eq_ignore_ascii_case("https"),
+        authority.to_ascii_lowercase(),
+    ))
+}
+
 /// A program that talks to another host and also runs code or a
-/// command, or reads local data, decodes a string or serves files.
-fn network(r: &Read) -> Option<Refusal> {
+/// command, or reads local data, decodes a string or serves files. For
+/// the relay, whose sends [`relay_sends`] pins to one host, local data
+/// it sends there is its use.
+fn network(r: &Read, relay: bool) -> Option<Refusal> {
     if let Some(s) = r.reaches(SERVERS) {
         return refused(PolicyReason::SecretExportDenied, "serves-local-data", s);
     }
@@ -2696,6 +2798,9 @@ fn network(r: &Read) -> Option<Refusal> {
         .or_else(|| r.reversed.then_some("[::-1]"))
         .or_else(|| r.reaches(SERVERS));
     let data = data?;
+    if relay && r.reaches(DECODERS).is_none() && !r.reversed {
+        return None;
+    }
     refused(
         PolicyReason::SecretExportDenied,
         "sends-local-data",
@@ -3352,6 +3457,7 @@ mod tests {
                 work: Some(Path::new("/w")),
                 secret: None,
                 sealed: None,
+                host: None,
             },
         )
         .map(|r| r.token)

@@ -6,25 +6,28 @@
 //! seat = "relay"
 //! dir = "/srv/relay"
 //! secret = "EXAMPLE_TOKEN"
+//! host = "example.org"
 //! ```
 //!
 //! The file is `$LJOS_POLICYD_CONFIG`, else
 //! `$XDG_CONFIG_HOME/ljos-policyd/config.toml`, else
 //! `~/.config/ljos-policyd/config.toml`. A file that is missing, not a
 //! regular file, owned by someone else, writable by group or world, or
-//! not exactly the three keys above names no relay.
+//! not exactly the four keys above names no relay.
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// The seat the relay runs for, the directory it runs in, and the
-/// variable `nimvault run --env` hands it.
+/// The seat the relay runs for, the directory it runs in, the variable
+/// `nimvault run --env` hands it, and the one host it may send that
+/// variable to.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Relay {
     pub(crate) seat: String,
     pub(crate) dir: PathBuf,
     pub(crate) secret: String,
+    pub(crate) host: String,
 }
 
 static CONFIG: OnceLock<Option<Relay>> = OnceLock::new();
@@ -58,22 +61,30 @@ fn config_path() -> Option<PathBuf> {
 }
 
 pub(crate) fn read(path: &Path) -> Option<Relay> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let uid = unsafe { libc::geteuid() };
-    if !meta.is_file() || meta.uid() != uid || meta.mode() & 0o022 != 0 {
+    if !owned_file(path) {
         return None;
     }
     parse(&std::fs::read_to_string(path).ok()?)
 }
 
+/// Whether `path` is a regular file, not a symlink, owned by the user
+/// this check runs as, that group and world may not write.
+pub(crate) fn owned_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    meta.is_file() && meta.uid() == uid && meta.mode() & 0o022 == 0
+}
+
 /// The relay a config text names. Other tables are left alone; inside
-/// `[relay]` each of `seat`, `dir` and `secret` must appear once, as a
+/// `[relay]` each of `seat`, `dir`, `secret` and `host` must appear once, as a
 /// plain double quoted string, and nothing else may.
 pub(crate) fn parse(text: &str) -> Option<Relay> {
     let mut in_relay = false;
     let mut seen = false;
-    let (mut seat, mut dir, mut secret) = (None, None, None);
+    let (mut seat, mut dir, mut secret, mut host) = (None, None, None, None);
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -98,13 +109,14 @@ pub(crate) fn parse(text: &str) -> Option<Relay> {
             "seat" => &mut seat,
             "dir" => &mut dir,
             "secret" => &mut secret,
+            "host" => &mut host,
             _ => return None,
         };
         if slot.replace(value.to_string()).is_some() {
             return None;
         }
     }
-    let (seat, dir, secret) = (seat?, dir?, secret?);
+    let (seat, dir, secret, host) = (seat?, dir?, secret?, host?);
     let word = |s: &str, ok: fn(char) -> bool| !s.is_empty() && s.chars().all(ok);
     let dir = dir
         .strip_suffix('/')
@@ -120,12 +132,27 @@ pub(crate) fn parse(text: &str) -> Option<Relay> {
             c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'
         })
         && !secret.starts_with(|c: char| c.is_ascii_digit())
-        && dir_ok;
+        && dir_ok
+        && host_name(&host);
     ok.then(|| Relay {
         seat,
         dir: PathBuf::from(dir),
         secret,
+        host: host.to_ascii_lowercase(),
     })
+}
+
+/// A DNS name: dot separated labels of letters, digits and inner `-`.
+/// No port, no user, no path, no address literal in brackets.
+fn host_name(h: &str) -> bool {
+    h.len() <= 253
+        && h.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+        })
 }
 
 #[cfg(test)]
@@ -133,13 +160,14 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    const TEXT: &str = "# relay\n[other]\nseat = \"x\"\n\n[relay]\nseat = \"relay\"\ndir = \"/srv/relay/\"\nsecret = \"EXAMPLE_TOKEN\"\n";
+    const TEXT: &str = "# relay\n[other]\nseat = \"x\"\n\n[relay]\nseat = \"relay\"\ndir = \"/srv/relay/\"\nsecret = \"EXAMPLE_TOKEN\"\nhost = \"example.org\"\n";
 
     fn example() -> Relay {
         Relay {
             seat: "relay".into(),
             dir: PathBuf::from("/srv/relay"),
             secret: "EXAMPLE_TOKEN".into(),
+            host: "example.org".into(),
         }
     }
 
@@ -161,6 +189,12 @@ mod tests {
             &TEXT.replace("EXAMPLE_TOKEN", "example token"),
             &TEXT.replace("\"relay\"", "relay"),
             &TEXT.replace("\"relay\"", "\"re\\\"lay\""),
+            &TEXT.replace("host = \"example.org\"\n", ""),
+            &TEXT.replace("example.org", "example.org:443"),
+            &TEXT.replace("example.org", "user@example.org"),
+            &TEXT.replace("example.org", "example.org/x"),
+            &TEXT.replace("example.org", "https://example.org"),
+            &TEXT.replace("example.org", "-example.org"),
         ] {
             assert_eq!(parse(text), None, "{text}");
         }
