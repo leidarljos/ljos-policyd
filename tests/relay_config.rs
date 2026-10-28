@@ -380,3 +380,31 @@ fn the_relay_may_still_source_its_env_file() {
     }
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn no_seat_reads_the_secrets_dir() {
+    let base = std::env::temp_dir().join(format!("relay-secrets-{}", std::process::id()));
+    let dir = base.join("work");
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = base.join("missing.toml");
+    for seat in ["bot", "relay", ""] {
+        for line in [
+            r#"python3 -c 'print(open("/home/u/.secrets/x").read())'"#,
+            "cat ~/.secrets/x",
+            "cat $HOME/.secrets/x",
+            "head -c 64 < ~/.secrets/x",
+            r#"perl -e 'open(F, "<", "/home/u/.secrets/x"); print <F>'"#,
+        ] {
+            let v = verdict(&dir, &config, seat, line);
+            assert!(v.contains("reads-credential"), "{seat}: {line}: {v}");
+        }
+        for line in ["cat notes/secrets.md", "ls ~/.secrets"] {
+            assert_eq!(
+                verdict(&dir, &config, seat, line),
+                "allow",
+                "{seat}: {line}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}

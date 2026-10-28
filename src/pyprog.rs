@@ -1979,12 +1979,13 @@ const CREDENTIAL_PARTS: &[&str] = &[
     ".pypirc",
     ".pgpass",
     ".vault-token",
+    ".secrets",
 ];
 const CREDENTIAL_PATHS: &[&str] = &[
     ".config/gh/",
     ".config/gcloud",
     ".config/hub",
-    ".config/ljos",
+    ".config/ljos/",
     ".cargo/credentials",
     ".local/share/keyrings",
     ".codex/auth.json",
@@ -1997,6 +1998,12 @@ const KEY_FILES: &[&str] = &["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"];
 
 /// Whether a string names a credential store, or a secret's variable.
 fn names_credential(s: &str) -> bool {
+    names_credential_path(s) || secret_variable(s)
+}
+
+/// Whether a path names a credential store: a part such as `.aws` or
+/// `.secrets`, a key file, or a known credential file.
+pub(crate) fn names_credential_path(s: &str) -> bool {
     let low = s.to_ascii_lowercase().replace('\\', "/");
     let parts: Vec<&str> = low.split('/').collect();
     parts.iter().any(|p| CREDENTIAL_PARTS.contains(p))
@@ -2004,8 +2011,8 @@ fn names_credential(s: &str) -> bool {
             .iter()
             .any(|p| KEY_FILES.iter().any(|k| p.starts_with(k)))
         || CREDENTIAL_PATHS.iter().any(|c| low.contains(c))
+        || low.ends_with(".config/ljos")
         || (low.starts_with("/proc/") && low.ends_with("/environ"))
-        || secret_variable(s)
 }
 
 /// `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`: a variable a secret is kept
@@ -3611,12 +3618,17 @@ mod tests {
             "print(open('/proc/self/environ').read())",
             "p = '~/.config/gh/' + 'hosts.yml'; print(open(p).read())",
             "print(open('\\x2fhome/u/\\x2essh/id_rsa').read())",
+            "print(open(\"/home/u/.secrets/x\").read())",
+            "import os; print(open(os.path.expanduser('~/.secrets/x')).read())",
+            "import os; print(open(os.environ['HOME'] + '/.secrets/x').read())",
         ] {
             let t = refused_for(code).unwrap_or_default();
             assert!(t.starts_with("python-reads-credential"), "{code}: {t}");
         }
         for code in [
             "print(open('data.csv').read())",
+            "print(open('notes/secrets.md').read())",
+            "print(open('.secrets.example').read())",
             "import os; print(os.environ.get('HOME'))",
             "import os; print(os.environ['GIT_AUTHOR_NAME'])",
             "print('tokens: 3')",

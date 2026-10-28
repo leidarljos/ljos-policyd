@@ -7602,6 +7602,13 @@ fn host_argv_table_run(argv: &[String], depth: usize, moved: bool, parent: &Scra
     let _span = phase::enter(phase::TABLE);
     let mut bound = parent.clone();
     bound.observe(argv);
+    if let Some((by, path)) = credential_read(argv) {
+        return Checked {
+            decision: Decision::Deny,
+            code: PolicyReason::PathSensitiveDeny,
+            token: Cow::Owned(format!("reads-credential: {by} with {path}")),
+        };
+    }
     // `touch` and `mkdir` write a path and still return here. The seat
     // files are checked first, so a plain `echo` does not pay for that.
     if inert_argv(argv) {
@@ -15657,6 +15664,149 @@ fn quoted_strings(s: &str) -> Vec<String> {
             i = j + 1;
         } else {
             i += 1;
+        }
+    }
+    out
+}
+
+/// Programs whose words name files they read out to the line.
+const FILE_READERS: &[&str] = &[
+    "cat",
+    "tac",
+    "head",
+    "tail",
+    "less",
+    "more",
+    "most",
+    "bat",
+    "batcat",
+    "nl",
+    "od",
+    "xxd",
+    "hexdump",
+    "strings",
+    "base64",
+    "base32",
+    "cp",
+    "scp",
+    "rsync",
+    "tar",
+    "zip",
+    "gzip",
+    "zcat",
+    "bzcat",
+    "xzcat",
+    "dd",
+    "install",
+    "diff",
+    "cmp",
+    "sort",
+    "uniq",
+    "cut",
+    "paste",
+    "wc",
+    "md5sum",
+    "sha1sum",
+    "sha256sum",
+    "sha512sum",
+    "b2sum",
+    "cksum",
+    "jq",
+    "yq",
+];
+
+/// A credential path the line reads, with what reads it: a file reader's
+/// word, an input redirect, or a string an inline perl, ruby or node
+/// program spells. Python is judged by [`pyprog`] with the same list.
+fn credential_read(argv: &[String]) -> Option<(String, String)> {
+    let named = |w: &str| pyprog::names_credential_path(w).then(|| w.to_string());
+    for cmd in commands(argv) {
+        let mut words = cmd.iter().copied().peekable();
+        while let Some(w) = words.next() {
+            let body = redirection_body(w);
+            if body.starts_with('<') && !body.starts_with("<<") {
+                let target = body.trim_start_matches(['<', '>']);
+                let target = if target.is_empty() {
+                    words.peek().copied().unwrap_or("")
+                } else {
+                    target
+                };
+                if let Some(p) = named(target) {
+                    return Some(("<".into(), p));
+                }
+            }
+        }
+        let Some(at) = cmd
+            .iter()
+            .position(|w| !is_assignment(w) && !is_redirection(w))
+        else {
+            continue;
+        };
+        let head = base_of(cmd[at]);
+        if FILE_READERS.contains(&head) {
+            if let Some(p) = read_sources(head, &cmd[at + 1..])
+                .into_iter()
+                .find_map(named)
+            {
+                return Some((head.to_string(), p));
+            }
+        }
+        let owned: Vec<String> = cmd[at..].iter().map(|s| (*s).to_string()).collect();
+        if head.starts_with("python") || head.starts_with("pypy") {
+            continue;
+        }
+        if let Some(code) = inline_program(&owned) {
+            if let Some(p) = quoted_strings(code).iter().find_map(|s| named(s)) {
+                return Some((head.to_string(), p));
+            }
+        }
+    }
+    None
+}
+
+/// The words of a [`FILE_READERS`] call that name what it reads. The
+/// place a copy, an archive or `dd` writes to is left to the write checks.
+fn read_sources<'a>(head: &str, args: &[&'a str]) -> Vec<&'a str> {
+    let mut out: Vec<&'a str> = Vec::new();
+    let mut skip_next = false;
+    for (i, w) in args.iter().copied().enumerate() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if is_redirection(w) {
+            continue;
+        }
+        let takes_value = match head {
+            "cp" | "install" | "rsync" | "scp" => matches!(w, "-t" | "--target-directory"),
+            "tar" => matches!(w, "-C" | "--directory"),
+            "sort" => matches!(w, "-o" | "--output"),
+            _ => false,
+        };
+        if takes_value {
+            skip_next = true;
+            continue;
+        }
+        let write_opt = w.starts_with("--target-directory=")
+            || w.starts_with("--directory=")
+            || w.starts_with("--output=")
+            || (head == "dd" && !w.starts_with("if="));
+        if !write_opt && !(i > 0 && is_redirection(args[i - 1])) {
+            out.push(w);
+        }
+    }
+    if matches!(head, "cp" | "install" | "rsync" | "scp")
+        && !args
+            .iter()
+            .any(|w| *w == "-t" || w.starts_with("--target-directory"))
+    {
+        if let Some(last) = out.iter().rposition(|w| !w.starts_with('-')) {
+            out.remove(last);
+        }
+    }
+    if head == "zip" {
+        if let Some(first) = out.iter().position(|w| !w.starts_with('-')) {
+            out.remove(first);
         }
     }
     out
@@ -25971,6 +26121,55 @@ make -C safe test
             let c = at(&fed(head));
             assert_eq!(c.decision, Decision::Allow, "{head}: {}", c.token);
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A shell reader, an input redirect or an inline perl, node or ruby
+    /// program that reads a credential path is refused, as python is.
+    #[test]
+    fn a_credential_read_by_any_reader_is_refused() {
+        let root = startup_root("credread");
+        let at = |line: &str| {
+            SPELLED.with(|s| s.borrow_mut().clear());
+            let argv = ["bash", "-c", line].map(String::from);
+            check_shell_in(&argv, &root, 0)
+        };
+        for line in [
+            "cat ~/.secrets/x",
+            "cat \"$HOME/.secrets/x\"",
+            "head -1 /home/u/.secrets/x",
+            "less ~/.secrets/x",
+            "cp ~/.secrets/x /tmp/x",
+            "dd if=/home/u/.secrets/x of=/tmp/x",
+            "wc -c < ~/.secrets/x",
+            "env tail ~/.secrets/x",
+            "bash -c 'cat ~/.secrets/x'",
+            "cat ~/.gnupg/secring.gpg",
+            "base64 ~/.aws/credentials",
+            "perl -e 'open(F, \"<\", \"$ENV{HOME}/.secrets/x\"); print <F>'",
+            "node -e 'console.log(require(\"fs\").readFileSync(\"/home/u/.secrets/x\", \"utf8\"))'",
+            "ruby -e 'puts File.read(Dir.home + \"/.secrets/x\")'",
+            "python3 -c 'print(open(\"/home/u/.secrets/x\").read())'",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+            assert!(c.token.contains("reads-credential"), "{line}: {}", c.token);
+        }
+        for line in [
+            "cat notes/secrets.md",
+            "cat .secrets.example",
+            "ls ~/.secrets",
+            "echo ~/.secrets",
+            "perl -e 'print 1'",
+            "node -e 'console.log(1)'",
+            "ruby -e 'puts 1'",
+            "wc -l < README.md",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        let c = at("cp /tmp/src ~/.config/ljos");
+        assert!(c.token.starts_with("seat-guard-path:"), "{}", c.token);
         let _ = std::fs::remove_dir_all(&root);
     }
 
