@@ -3731,7 +3731,7 @@ fn heredoc_bodies(cmds: &[(Vec<&str>, &str)]) -> (Vec<Option<String>>, Vec<bool>
             .iter()
             .map(|(c, _)| c.as_slice())
             .collect();
-        let from = heredoc_body_start(delim, &after);
+        let (from, _) = heredoc_body_start(delim, &after);
         let body = &cmds[i + 1 + from..i + 1 + len];
         let words: Vec<&str> = body.iter().flat_map(|(c, _)| c.iter().copied()).collect();
         let raw = literal_heredoc_raw(delim, &words);
@@ -8019,7 +8019,8 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
     // Set when an assignment can change where a later `~` or `$HOME`
     // lands, so that command is judged with the path the shell opens.
     let mut seat_names = false;
-    for (i, cmd) in commands(argv).into_iter().enumerate() {
+    let cmds = commands(argv);
+    for (i, cmd) in cmds.iter().cloned().enumerate() {
         if cmd.iter().all(|w| is_assignment(w)) {
             for w in &cmd {
                 if let Some((k, v)) = w.split_once('=') {
@@ -8108,6 +8109,11 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
         }
         if let Some(code) = python_program(run) {
             for s in pyprog::shell_commands(code) {
+                out.extend(script_lines(&s, 0).iter().map(|l| (i, shell_words(l))));
+            }
+        }
+        if let Some(Some(code)) = python_heredoc(&cmds, i) {
+            for s in pyprog::shell_commands(&code) {
                 out.extend(script_lines(&s, 0).iter().map(|l| (i, shell_words(l))));
             }
         }
@@ -12168,7 +12174,8 @@ fn finish_word(
 /// later, and `ssh` and `docker exec` run it on another host or in a
 /// container, so none of them reads it as text. Only a pipeline that
 /// has a `<<` takes a body: a command after `&&` or `;` on that line
-/// reads nothing from it.
+/// reads nothing from it. A python with no program that a `<<` feeds
+/// runs the body as python, which no shell splits.
 fn heredoc_read_as_text(line: &[String]) -> bool {
     let list = |w: &String| matches!(w.as_str(), ";" | "&&" | "||" | "&");
     let opens = |w: &String| heredoc_operator(w).is_some();
@@ -12181,6 +12188,9 @@ fn heredoc_read_as_text(line: &[String]) -> bool {
     let lists = if holding.is_empty() { lists } else { holding };
     let mut stages = lists.iter().flat_map(|p| p.split(|w| w == "|"));
     stages.all(|cmd| {
+        if cmd.iter().any(opens) && python_reads_stdin(cmd) {
+            return true;
+        }
         let head = cmd
             .iter()
             .find(|w| !is_assignment(w) && !is_redirection(w))
@@ -12358,18 +12368,60 @@ fn take_heredoc_bodies(
 /// `after`, the commands from the one that opens it to its delimiter.
 /// A command on the opening line, past `&&` or `;`, is no line of the
 /// body. The body is the commands whose words [`HEREDOC_RAW`] kept for
-/// it. With no such record, the body is all of `after`.
-fn heredoc_body_start(delim: &str, after: &[&[&str]]) -> usize {
+/// it, with whether it is written as it reads, and that text. With no
+/// such record, the body is all of `after`.
+fn heredoc_body_start(delim: &str, after: &[&[&str]]) -> (usize, Option<(bool, String)>) {
     HEREDOC_RAW.with(|s| {
         let s = s.borrow();
-        (0..=after.len())
-            .find(|&k| {
-                let words = || after[k..].iter().flat_map(|c| c.iter().copied());
-                s.iter()
-                    .any(|(d, w, _, _)| d == delim && w.iter().map(String::as_str).eq(words()))
-            })
-            .unwrap_or(0)
+        for k in 0..=after.len() {
+            let words = || after[k..].iter().flat_map(|c| c.iter().copied());
+            let hit = s
+                .iter()
+                .find(|(d, w, _, _)| d == delim && w.iter().map(String::as_str).eq(words()));
+            if let Some((_, _, literal, raw)) = hit {
+                return (k, Some((*literal, raw.clone())));
+            }
+        }
+        (0, None)
     })
+}
+
+/// Whether `cmd` is a python that reads its program from stdin: no
+/// `-c`, `-m` or script operand, or `-` in its place.
+fn python_reads_stdin(cmd: &[String]) -> bool {
+    let plain = without_redirections(cmd);
+    let run = unwrap_wrappers(&plain).0;
+    let Some(b) = run.first().map(|w| base_of(w)) else {
+        return false;
+    };
+    (b.starts_with("python") || b.starts_with("pypy"))
+        && program_word(&run[1..], "cm", "WX").is_none()
+}
+
+/// The program a python reading stdin at `cmds[i]` takes from the
+/// here-document it is fed: `Some(None)` where the line does not show
+/// that text, as with a body that expands something. `None` where
+/// `cmds[i]` is no such python, no `<<` feeds it, or `cmds` stops before
+/// the body: the whole line, which has it, is judged as well.
+fn python_heredoc(cmds: &[Vec<&str>], i: usize) -> Option<Option<String>> {
+    let cmd = cmds.get(i)?;
+    let owned: Vec<String> = cmd.iter().map(|w| (*w).to_string()).collect();
+    if !python_reads_stdin(&owned) {
+        return None;
+    }
+    let at = cmd.iter().position(|w| heredoc_operator(w).is_some())?;
+    let (named, _) = heredoc_operator(cmd[at])?;
+    let delim = if named.is_empty() {
+        heredoc_name(cmd.get(at + 1)?)
+    } else {
+        named
+    };
+    let len = cmds[i + 1..]
+        .iter()
+        .position(|c| c.as_slice() == [delim.as_str()])?;
+    let after: Vec<&[&str]> = cmds[i + 1..i + 1 + len].iter().map(Vec::as_slice).collect();
+    let (_, raw) = heredoc_body_start(&delim, &after);
+    Some(raw.and_then(|(literal, text)| literal.then_some(text)))
 }
 
 /// A word [`shell_words`] closes. A bare separator is a word of its own,
@@ -16593,6 +16645,16 @@ fn python_refusal_with(
         let run = peeled(&owned);
         if let Some(code) = python_program(run) {
             return pyprog::refusal(code, place);
+        }
+        match python_heredoc(&cmds, i) {
+            Some(Some(code)) => return pyprog::refusal(&code, place),
+            Some(None) => {
+                return Some(pyprog::Refusal {
+                    code: PolicyReason::ShellDangerousRunner,
+                    token: "python-stdin-unshown".to_string(),
+                });
+            }
+            None => {}
         }
         let script = secret.and(relay).and_then(|r| relay_script(run, r))?;
         match std::fs::read_to_string(&script) {
