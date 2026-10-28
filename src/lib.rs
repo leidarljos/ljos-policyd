@@ -10661,6 +10661,51 @@ fn nimvault_run_at(cmd: &[String], i: usize) -> Option<(Option<&str>, usize)> {
     Some((env, j.min(cmd.len())))
 }
 
+/// Each `nimvault run --env NAME` in `cmd`, with NAME and the program it
+/// runs.
+fn sealed_runs(cmd: &[String]) -> Vec<(&str, &[String])> {
+    (0..cmd.len())
+        .filter(|&i| base_of(&cmd[i]) == "nimvault")
+        .filter_map(|i| match nimvault_run_at(cmd, i)? {
+            (Some(name), at) => Some((name, &cmd[at..])),
+            (None, _) => None,
+        })
+        .collect()
+}
+
+/// Programs that print the environment they were given.
+const ENV_PRINTERS: &[&str] = &[
+    "env", "printenv", "set", "export", "declare", "typeset", "compgen",
+];
+
+/// A program `nimvault run` hands a secret that may show it where the
+/// line cannot see: one that prints its environment, a shell, a task
+/// runner, or an interpreter whose program is not on the line. Inline
+/// python is judged on its text instead.
+fn sealed_denial(argv: &[String]) -> Option<Checked> {
+    commands(argv).iter().find_map(|cmd| {
+        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        sealed_runs(&owned).into_iter().find_map(|(name, prog)| {
+            let run = peeled(prog);
+            let head = run.first().map_or("", |w| base_of(w));
+            let shows = (run.is_empty() && !prog.is_empty())
+                || ENV_PRINTERS.contains(&head)
+                || SHELLS.contains(&head)
+                || (stdin_interpreter(head).is_some() && python_program(run).is_none())
+                || scripts::runner(run)
+                || matches!(head, "xargs" | "find" | "parallel" | "watch");
+            shows.then(|| Checked {
+                decision: Decision::Deny,
+                code: PolicyReason::SecretExportDenied,
+                token: Cow::Owned(format!(
+                    "shows-secret: {} may show {name}",
+                    prog.first().map_or("", |w| base_of(w))
+                )),
+            })
+        })
+    })
+}
+
 /// Where [`wrapper_walk`] stops in a command.
 enum Walk<'a> {
     /// The command it runs starts at this word.
@@ -13159,6 +13204,9 @@ fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
     if let Some(c) = seat_guard_denial(argv, bound.root.as_deref()) {
         return c;
     }
+    if let Some(c) = sealed_denial(argv) {
+        return c;
+    }
     if (mask & RULE_SETUID != 0 && setuid_mode(argv)) || interpreter_setuid(argv) {
         return Checked {
             decision: Decision::Deny,
@@ -15555,6 +15603,7 @@ fn python_refusal(argv: &[String], moved: bool, bound: &Scratch) -> Option<pypro
         let at = roots
             .as_ref()
             .map(|r| r.get(i).cloned().flatten().filter(|d| !is_untracked(d)));
+        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
         let place = match &at {
             Some(at) => pyprog::Place {
                 cwd: at.as_deref(),
@@ -15565,7 +15614,6 @@ fn python_refusal(argv: &[String], moved: bool, bound: &Scratch) -> Option<pypro
                 work: cwd.filter(|_| !moved),
             },
         };
-        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
         let run = peeled(&owned);
         python_program(run).and_then(|code| pyprog::refusal(code, place))
     })
@@ -25374,7 +25422,7 @@ make -C safe test
             ),
             ("nimvault run -e X e git push --force", "git-force-push"),
             (
-                "nimvault run --env=X --vault ~/v e -- sh -c 'git push -f'",
+                "nimvault run --vault ~/v e -- sh -c 'git push -f'",
                 "git-force-push",
             ),
             ("nimvault run --env X e -- sudo id", "sudo"),
@@ -25387,6 +25435,35 @@ make -C safe test
             "nimvault unseal",
         ] {
             assert_eq!(at(line), "allow", "{line}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A program `nimvault run` hands a secret that may show it where
+    /// the line cannot see does not run.
+    #[test]
+    fn a_sealed_secret_is_not_handed_to_an_unread_program() {
+        let root = startup_root("sealed");
+        let at = |prog: &str| {
+            let line = format!("nimvault run --env EXAMPLE_VALUE e -- {prog}");
+            let argv = ["bash", "-c", line.as_str()].map(String::from);
+            check_shell_in(&argv, &root, 0)
+        };
+        for prog in [
+            "env",
+            "printenv EXAMPLE_VALUE",
+            "sh -c 'echo $EXAMPLE_VALUE'",
+            "make deploy",
+            "perl -e 'print $ENV{EXAMPLE_VALUE}'",
+            "python3 relay.py",
+            "find . -exec cat {} +",
+        ] {
+            let c = at(prog);
+            assert_eq!(c.decision, Decision::Deny, "{prog}");
+            assert!(c.token.starts_with("shows-secret: "), "{prog}: {}", c.token);
+        }
+        for prog in ["ls", "python3 -c 'print(1)'"] {
+            assert_eq!(at(prog).decision, Decision::Allow, "{prog}");
         }
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -1,0 +1,1 @@
+A program `nimvault run --env NAME` hands a secret may show it in ways the line cannot read. A program that prints its environment (`env`, `printenv`, `set`), a shell, a task runner, `find`, `xargs`, and an interpreter whose program is not on the line are now refused as `shows-secret` when they run under it.
