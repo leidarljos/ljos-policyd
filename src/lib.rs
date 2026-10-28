@@ -22472,6 +22472,43 @@ hash -r 2> /dev/null
         assert_eq!(v(&["find", ".", "-exec", "grep", "x", "{}", "+"]), "allow");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn tmp_links_are_judged_by_their_on_disk_target() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir().join(format!("policyd-under-tmp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let plain = base.join("plain-path");
+        let linked = base.join("home-link");
+        std::fs::create_dir_all(&plain).unwrap();
+        symlink("/home/u/.cargo/bin/missing-tool", &linked).unwrap();
+        let plain_s = plain.display().to_string();
+        let linked_s = linked.display().to_string();
+
+        assert_eq!(
+            v(&["find", &linked_s, "-delete"]),
+            "deny\tfind-delete-outside-tmp"
+        );
+        assert_eq!(v(&["rm", "-rf", &linked_s]), "deny\trm-rf-outside-tmp");
+        assert_eq!(
+            verdict(&shell_words(&format!(
+                "printf '%s\\n' {linked_s} | xargs rm -rf"
+            ))),
+            "deny\trm-rf-outside-tmp"
+        );
+
+        assert_eq!(v(&["find", &plain_s, "-delete"]), "allow");
+        assert_eq!(v(&["rm", "-rf", &plain_s]), "allow");
+        assert_eq!(
+            verdict(&shell_words(&format!(
+                "printf '%s\\n' {plain_s} | xargs rm -rf"
+            ))),
+            "allow"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// `-fprint`, `-fprint0`, `-fprintf` and `-fls` create or truncate the
     /// file they name. A path that is not under `/tmp` or `/var/tmp` is
     /// refused. The words of `-exec` are that command, not find predicates.
