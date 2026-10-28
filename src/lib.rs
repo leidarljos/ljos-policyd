@@ -16450,8 +16450,16 @@ fn git_dangerous(argv: &[String]) -> Option<&'static str> {
 
 /// A path that stays under `/tmp` or `/var/tmp`.
 fn under_tmp(p: &str) -> bool {
-    !climbs(p)
-        && (p == "/tmp" || p.starts_with("/tmp/") || p == "/var/tmp" || p.starts_with("/var/tmp/"))
+    if climbs(p) {
+        return false;
+    }
+    let lexical =
+        p == "/tmp" || p.starts_with("/tmp/") || p == "/var/tmp" || p.starts_with("/var/tmp/");
+    if !lexical {
+        return false;
+    }
+    let disk = pyprog::on_disk(std::path::Path::new(p));
+    disk.starts_with("/tmp") || disk.starts_with("/var/tmp")
 }
 
 /// `find -fprint`, `-fprint0`, `-fprintf` or `-fls` names a file that is

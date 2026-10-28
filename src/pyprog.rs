@@ -3471,6 +3471,14 @@ fn on_disk_at(p: &Path, depth: usize) -> PathBuf {
     lexical(p)
 }
 
+fn inside_lexical_and_disk(p: &Path, work: Option<&Path>) -> bool {
+    if !inside(&lexical(p), work) {
+        return false;
+    }
+    let tree = work.map(on_disk);
+    inside(&on_disk(p), tree.as_deref())
+}
+
 /// Whether a write to the absolute path `p` goes out of the tree
 /// `work`. Python and the shell writers both ask this, so the target
 /// decides and not the program that writes it. A temp or device path
@@ -3479,7 +3487,7 @@ fn on_disk_at(p: &Path, depth: usize) -> PathBuf {
 /// symlinked spelling of it does not start with, and a link in the tree
 /// can point out of it.
 pub(crate) fn writes_outside(p: &Path, work: Option<&Path>) -> bool {
-    if inside(&lexical(p), None) {
+    if inside_lexical_and_disk(p, None) {
         return false;
     }
     let tree = work.map(on_disk);
@@ -3545,7 +3553,7 @@ fn outside_write(r: &Read, place: Place) -> Option<Refusal> {
     let Some(cwd) = place.cwd else {
         return out("a directory the line does not show");
     };
-    if !inside(&lexical(cwd), place.work) {
+    if !inside_lexical_and_disk(cwd, place.work) {
         return out(&cwd.display().to_string());
     }
     let count = |v: &[String], s: &str| v.iter().filter(|t| *t == s).count();
@@ -4512,5 +4520,43 @@ mod tests {
         ] {
             assert!(writes_outside(Path::new(p), work), "{p}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tmp_spelling_must_stay_in_tmp_on_disk() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let mark = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must move forward")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ljos-pyprog-{mark}"));
+        let home_root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|d| d.join("target/tmp-tests"))
+            })
+            .expect("target temp directory is available");
+        let home = home_root.join(format!("ljos-pyprog-home-{mark}"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(home.join(".cargo/bin")).unwrap();
+        std::fs::create_dir_all(home.join(".local/bin")).unwrap();
+        std::fs::write(home.join(".bashrc"), "alias ll='ls -al'\n").unwrap();
+
+        symlink(home.join(".cargo/bin"), root.join("cargo")).unwrap();
+        symlink(home.join(".local/bin"), root.join("local")).unwrap();
+        symlink(home.join(".bashrc"), root.join("rc")).unwrap();
+
+        assert!(writes_outside(&root.join("cargo/ljos-policyd"), None));
+        assert!(writes_outside(&root.join("local/ljos"), None));
+        assert!(writes_outside(&root.join("rc"), None));
+        assert!(!writes_outside(&root.join("ordinary-tmp-write"), None));
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(home);
     }
 }
