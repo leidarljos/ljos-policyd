@@ -10767,12 +10767,17 @@ fn nimvault_run_stray(cmd: &[String], i: usize) -> Option<&str> {
 }
 
 fn nimvault_run_walk(cmd: &[String], i: usize) -> Option<(Option<&str>, usize, Option<&str>)> {
-    if cmd.get(i + 1).map(String::as_str) != Some("run") {
+    let (sub, at) = nimvault_subcommand(cmd, i)?;
+    if sub != "run" {
         return None;
     }
-    let mut j = i + 2;
+    let mut j = at + 1;
     let mut env = None;
-    let mut stray = None;
+    let mut stray = if at != i + 1 {
+        Some(cmd[i + 1].as_str())
+    } else {
+        (cmd[at] != "run").then_some(cmd[at].as_str())
+    };
     let mut entry = false;
     while let Some(a) = cmd.get(j).map(String::as_str) {
         if a == "--" {
@@ -10801,6 +10806,47 @@ fn nimvault_run_walk(cmd: &[String], i: usize) -> Option<(Option<&str>, usize, O
         }
     }
     Some((env, j.min(cmd.len()), stray))
+}
+
+/// The subcommands nimvault's `dispatchMulti` names, each as cligen's
+/// `optionNormalize` keys it.
+const NIMVAULT_SUBCOMMANDS: &[&str] = &[
+    "help", "seal", "unseal", "add", "adddir", "rm", "get", "mv", "list", "status", "check", "gc",
+    "rotate", "scan", "who", "lock", "init", "hook", "doctor", "remove", "version", "run",
+];
+
+/// cligen's `optionNormalize`: the first character as given, and in the
+/// rest `A` to `Z` lowered and `_` and `-` dropped.
+fn cligen_normalize(w: &str) -> String {
+    let mut chars = w.chars();
+    let first = chars.next().into_iter();
+    first
+        .chain(
+            chars
+                .filter(|c| !matches!(c, '_' | '-'))
+                .map(|c| c.to_ascii_lowercase()),
+        )
+        .collect()
+}
+
+/// The subcommand a `nimvault` at `cmd[i]` runs and the index of its
+/// word, read the way cligen's `dispatchMulti` reads it: one `--` may
+/// come first, the word is normalized, and a unique prefix of a name
+/// picks that name. An ambiguous or unknown word runs nothing.
+fn nimvault_subcommand(cmd: &[String], i: usize) -> Option<(&'static str, usize)> {
+    let at = i + 1 + usize::from(cmd.get(i + 1).is_some_and(|w| w == "--"));
+    let n = cligen_normalize(cmd.get(at)?);
+    if n.is_empty() {
+        return None;
+    }
+    if let Some(exact) = NIMVAULT_SUBCOMMANDS.iter().find(|s| **s == n) {
+        return Some((exact, at));
+    }
+    let mut hits = NIMVAULT_SUBCOMMANDS.iter().filter(|s| s.starts_with(&n));
+    match (hits.next(), hits.next()) {
+        (Some(only), None) => Some((only, at)),
+        _ => None,
+    }
 }
 
 /// The key and any value carried in the word of a `nimvault run` option
@@ -10842,17 +10888,22 @@ fn nimvault_run_option(a: &str) -> Option<(char, Option<&str>)> {
 }
 
 /// A `nimvault run` given an option [`nimvault_run_option`] does not
-/// read, such as `--allow-unsigned`, `-a` or a prefix of either.
+/// read, such as `--allow-unsigned`, `-a` or a prefix of either, or
+/// spelled other than as the word `run`, such as `rUn`, `r_un` or `ru`.
 fn nimvault_option_denial(argv: &[String]) -> Option<Checked> {
     commands(argv).iter().find_map(|cmd| {
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
         (0..owned.len())
             .filter(|&i| base_of(&owned[i]) == "nimvault")
             .find_map(|i| nimvault_run_stray(&owned, i).map(str::to_string))
-            .map(|opt| Checked {
+            .map(|w| Checked {
                 decision: Decision::Deny,
                 code: PolicyReason::ShellDangerousRunner,
-                token: Cow::Owned(format!("nimvault-run-option: {opt}")),
+                token: Cow::Owned(if w.starts_with('-') {
+                    format!("nimvault-run-option: {w}")
+                } else {
+                    format!("nimvault-run-spelling: {w}")
+                }),
             })
     })
 }
@@ -27628,5 +27679,62 @@ with urllib.request.urlopen(url, data=data, timeout=20) as r:
             "{}",
             late.token
         );
+    }
+
+    /// cligen reads a subcommand normalized and by a unique prefix, so
+    /// `rUn`, `r_un` and `ru` all run `run`, as does `run` after `--`.
+    /// Only the word `run` itself is read, and each other spelling is
+    /// refused for every seat.
+    #[test]
+    fn a_nimvault_run_is_spelled_run() {
+        let at = |line: &str| check_shell_in(&shell_words(line), std::path::Path::new("/w"), 0);
+        for sub in ["rUn", "r_un", "ru", "r-u-n", "rU", "-- run", "-- ru"] {
+            for rest in [
+                "--allow-unsigned -e T e -- printenv T",
+                "-e T e -- printenv T",
+                "-e T e -- date",
+            ] {
+                let line = format!("nimvault {sub} {rest}");
+                for line in [line.clone(), format!("bash -c '{line}'")] {
+                    let c = at(&line);
+                    assert_eq!(c.decision, Decision::Deny, "{line}");
+                    assert!(c.token.starts_with("nimvault-run-"), "{line}: {}", c.token);
+                }
+            }
+        }
+        for line in [
+            "nimvault run -e T e -- date",
+            "nimvault get e",
+            "nimvault re e",
+            "nimvault unseal",
+            "nimvault r e",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        let dir = std::env::temp_dir().join(format!("relay-spelled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let relay = relay::Relay {
+            seat: "relay".into(),
+            dir: dir.clone(),
+            secret: "EXAMPLE_TOKEN".into(),
+            host: "example.org".into(),
+        };
+        let line = relay_line(&dir, RELAY_SEND);
+        let secret = |line: &str| {
+            relay_command(
+                &commands(&shell_words(line)),
+                false,
+                Some(&dir),
+                Some("relay"),
+                Some(&relay),
+            )
+        };
+        assert_eq!(secret(&line), Some("EXAMPLE_TOKEN"));
+        for sub in ["rUn", "r_un", "ru", "-- run"] {
+            let spelled = line.replacen("run", sub, 1);
+            assert_eq!(secret(&spelled), None, "{spelled}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
