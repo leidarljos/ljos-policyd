@@ -4495,18 +4495,18 @@ mod tests {
     /// A tree compare takes whole parts, after `..` is taken off.
     #[test]
     fn a_tree_is_compared_by_its_parts() {
-        let work = Some(Path::new("/workspace"));
+        let work = Some(Path::new("/srv/tree"));
         for p in [
-            "/workspace/state/seen.json",
-            "/workspace/state/",
-            "/workspace/a/../state/x",
+            "/srv/tree/state/seen.json",
+            "/srv/tree/state/",
+            "/srv/tree/a/../state/x",
         ] {
             assert!(!writes_outside(Path::new(p), work), "{p}");
         }
         for p in [
-            "/workspace-evil/x",
-            "/workspace/../home/example/.secrets/x",
-            "/workspace/state/../../etc/x",
+            "/srv/tree-evil/x",
+            "/srv/tree/../home/example/.secrets/x",
+            "/srv/tree/state/../../etc/x",
             "/home/u/.cargo/bin/ljos",
             "/etc/x",
         ] {
