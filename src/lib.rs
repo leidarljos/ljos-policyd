@@ -16,9 +16,11 @@ pub mod policy_capnp;
 mod envelope;
 mod mail;
 mod pyprog;
+mod relay;
 mod scripts;
 
 pub use envelope::{check_mail_argv, check_mail_bytes, MailReason, MailVerdict, MAIL_MESSAGE_MAX};
+pub use relay::load_config;
 
 use std::borrow::Cow;
 
@@ -7491,6 +7493,9 @@ fn hash_scratch(scratch: &Scratch) -> u64 {
     if scratch.placed {
         h ^= 0x5A5A_5A5A_5A5A_5A5A;
     }
+    if let Some(name) = &scratch.relayed {
+        h ^= hash_bytes(name.as_bytes()).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
     for (i, mark) in scratch.fed_marks.iter().enumerate() {
         h = h
             .wrapping_mul(0x100000001b3)
@@ -7662,6 +7667,7 @@ fn host_argv_table_run(argv: &[String], depth: usize, moved: bool, parent: &Scra
         drop(span);
         let cmds = commands(&expanded);
         let hidden = hidden_moves(&cmds, &inners);
+        let relayed = relay_secret(&cmds, moved, &bound);
         for (i, inner) in inners {
             if inner.as_slice() == argv {
                 continue;
@@ -7671,6 +7677,7 @@ fn host_argv_table_run(argv: &[String], depth: usize, moved: bool, parent: &Scra
                 next.root = root.clone();
             }
             next.placed = bound.placed && (!hidden || runs_fresh(cmds.get(i), &inner));
+            next.relayed = relayed.filter(|_| is_relay_run(&inner)).map(str::to_string);
             let c = host_argv_table_at(&inner, depth + 1, moved, &next);
             if c.decision != Decision::Allow {
                 return c;
@@ -15586,8 +15593,40 @@ fn python_refusal(argv: &[String], moved: bool, bound: &Scratch) -> Option<pypro
         return None;
     }
     let _span = phase::enter(phase::PYTHON);
+    let seat = std::env::var("LJOS_SEAT").ok();
+    python_refusal_with(argv, moved, bound, seat.as_deref(), relay::relay())
+}
+
+/// The secret a relay line hands its python, for the seat this check
+/// runs for and the relay the config file names.
+fn relay_secret(cmds: &[Vec<&str>], moved: bool, bound: &Scratch) -> Option<&'static str> {
+    let seat = std::env::var("LJOS_SEAT").ok();
+    relay_command(
+        cmds,
+        moved,
+        bound.root.as_deref(),
+        seat.as_deref(),
+        relay::relay(),
+    )
+}
+
+/// Whether `argv` is the bare `python3 -c CODE` a relay line runs.
+fn is_relay_run(argv: &[String]) -> bool {
+    argv.len() == 3 && argv[0] == "python3" && argv[1] == "-c"
+}
+
+fn python_refusal_with(
+    argv: &[String],
+    moved: bool,
+    bound: &Scratch,
+    seat: Option<&str>,
+    relay: Option<&relay::Relay>,
+) -> Option<pyprog::Refusal> {
     let cwd = bound.root.as_deref().filter(|d| !is_untracked(d));
     let cmds = commands(argv);
+    let relayed = bound.relayed.as_deref().filter(|_| is_relay_run(argv));
+    let secret =
+        relayed.or_else(|| relay_command(&cmds, moved, bound.root.as_deref(), seat, relay));
     // With every `cd` on the line followed, a command runs where the
     // shell's writes are placed, and the tree is the one the line began in.
     let work = bound.work.as_deref().filter(|w| !is_untracked(w));
@@ -15604,22 +15643,57 @@ fn python_refusal(argv: &[String], moved: bool, bound: &Scratch) -> Option<pypro
             .as_ref()
             .map(|r| r.get(i).cloned().flatten().filter(|d| !is_untracked(d)));
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
-        let sealed = sealed_runs(&owned).into_iter().next().map(|(name, _)| name);
+        let sealed = sealed_runs(&owned)
+            .into_iter()
+            .next()
+            .map(|(name, _)| name)
+            .or(relayed);
         let place = match &at {
             Some(at) => pyprog::Place {
                 cwd: at.as_deref(),
                 work,
+                secret,
                 sealed,
             },
             None => pyprog::Place {
                 cwd,
                 work: cwd.filter(|_| !moved),
+                secret,
                 sealed,
             },
         };
         let run = peeled(&owned);
         python_program(run).and_then(|code| pyprog::refusal(code, place))
     })
+}
+
+/// The secret the line may read, when it is the relay the config file
+/// names: the relay's seat, in the relay's directory with no change of
+/// directory, running nothing but `nimvault run --env SECRET ENTRY
+/// python3 -c CODE` with a bare `nimvault` and a bare `python3`. The
+/// secret comes from the vault as the program starts, and what the
+/// program may do with it is judged as for any sealed secret.
+fn relay_command<'a>(
+    cmds: &[Vec<&str>],
+    moved: bool,
+    root: Option<&std::path::Path>,
+    seat: Option<&str>,
+    relay: Option<&'a relay::Relay>,
+) -> Option<&'a str> {
+    let relay = relay?;
+    if seat != Some(relay.seat.as_str()) || moved || root != Some(relay.dir.as_path()) {
+        return None;
+    }
+    let [cmd] = cmds else {
+        return None;
+    };
+    if cmd.first() != Some(&"nimvault") {
+        return None;
+    }
+    let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+    let (name, at) = nimvault_run_at(&owned, 0)?;
+    (name == Some(relay.secret.as_str()) && is_relay_run(&owned[at..]))
+        .then_some(relay.secret.as_str())
 }
 
 /// The program a python call runs inline.
@@ -15791,6 +15865,9 @@ struct Scratch {
     /// `root` is where these words run: no `cd` the walk does not follow
     /// came before them on the line.
     placed: bool,
+    /// The secret these words may read: they are the `python3 -c` the
+    /// relay line hands it.
+    relayed: Option<String>,
     /// `IFS` was assigned or `eval` ran. A variable suffix can split.
     ifs_assigned: bool,
     /// An `xargs -I` mark whose shown inputs are all under `/tmp`. The
@@ -25540,5 +25617,72 @@ make -C safe test
             assert_eq!(at(line).decision, Decision::Deny, "{line}");
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The python refusal for `line`, run by `seat` in `dir` with `relay`
+    /// as the config file names it.
+    fn relay_refusal(
+        seat: &str,
+        dir: &std::path::Path,
+        relay: Option<&relay::Relay>,
+        line: &str,
+    ) -> Option<String> {
+        let bound = Scratch {
+            root: Some(dir.to_path_buf()),
+            ..Scratch::default()
+        };
+        python_refusal_with(&shell_words(line), false, &bound, Some(seat), relay).map(|r| r.token)
+    }
+
+    #[test]
+    fn only_the_configured_relay_uses_its_secret() {
+        let dir = std::env::temp_dir().join(format!("relay-{}", std::process::id()));
+        let relay = relay::Relay {
+            seat: "relay".into(),
+            dir: dir.clone(),
+            secret: "EXAMPLE_TOKEN".into(),
+        };
+        let run = |code: &str| {
+            format!("nimvault run --env EXAMPLE_TOKEN relay/token python3 -c '{code}'")
+        };
+        let read = "import os; t = os.environ[\"EXAMPLE_TOKEN\"]";
+        let used = run(&format!("{read}; print(len(t))"));
+        assert_eq!(relay_refusal("relay", &dir, Some(&relay), &used), None);
+        let shown = |line: &str| {
+            relay_refusal("relay", &dir, Some(&relay), line)
+                .is_some_and(|t| t.contains("shows-secret"))
+        };
+        assert!(shown(&run(
+            "import os; print(os.environ[\"EXAMPLE_TOKEN\"])"
+        )));
+        assert!(shown(&run(&format!(
+            "{read}; open(\"t.txt\", \"w\").write(t)"
+        ))));
+        let refused =
+            |seat: &str, dir: &std::path::Path, relay: Option<&relay::Relay>, line: &str| {
+                relay_refusal(seat, dir, relay, line)
+                    .is_some_and(|t| t.contains("reads-credential"))
+            };
+        assert!(refused("relay", &dir, None, &used));
+        assert!(refused("other", &dir, Some(&relay), &used));
+        assert!(refused("relay", &dir.join("sub"), Some(&relay), &used));
+        for line in [
+            format!("cd . && {used}"),
+            format!("true && {used}"),
+            used.replace("python3 -c", "python -c"),
+            used.replace("nimvault run", "/tmp/nimvault run"),
+            format!("python3 -c '{read}; print(len(t))'"),
+        ] {
+            assert!(refused("relay", &dir, Some(&relay), &line), "{line}");
+        }
+        let env = format!(". ./env && python3 -c '{read}; print(len(t))'");
+        assert!(refused("relay", &dir, Some(&relay), &env));
+        let other = used.replace("EXAMPLE_TOKEN", "OTHER_TOKEN");
+        assert!(refused("relay", &dir, Some(&relay), &other));
+        let both = used.replace(
+            "print(len(t))",
+            "print(len(t), os.environ[\"GITHUB_TOKEN\"])",
+        );
+        assert!(refused("relay", &dir, Some(&relay), &both));
     }
 }

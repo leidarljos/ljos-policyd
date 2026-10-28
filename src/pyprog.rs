@@ -1786,13 +1786,15 @@ fn refused(code: PolicyReason, class: &str, what: &str) -> Option<Refusal> {
 
 /// Where a program runs. `cwd` is the directory a relative path is in,
 /// `None` when the line does not show one. `work` is the tree the line
-/// runs in, `None` once the line has left it. `sealed` is the variable
+/// runs in, `None` once the line has left it. `secret` is the one
+/// secret's variable the program may name. `sealed` is the variable
 /// `nimvault run` put the plaintext of an entry in, which the program
 /// may use but not show.
 #[derive(Clone, Copy)]
 pub(crate) struct Place<'a> {
     pub(crate) cwd: Option<&'a Path>,
     pub(crate) work: Option<&'a Path>,
+    pub(crate) secret: Option<&'a str>,
     pub(crate) sealed: Option<&'a str>,
 }
 
@@ -1819,7 +1821,7 @@ fn judge(code: &str, place: Place) -> Option<Refusal> {
     if read(code, 0, &mut r).is_none() {
         return refused(PolicyReason::ShellDangerousRunner, "unread", "");
     }
-    credential(&r)
+    credential(&r, place)
         .or_else(|| place.sealed.and_then(|n| shows_secret(code, &r, n)))
         .or_else(|| hook_write(&r))
         .or_else(|| network(&r))
@@ -1959,8 +1961,11 @@ fn secret_variable(s: &str) -> bool {
 }
 
 /// A program that names a credential store or a secret's variable.
-fn credential(r: &Read) -> Option<Refusal> {
-    let s = r.strs.iter().find(|s| names_credential(s))?;
+fn credential(r: &Read, place: Place) -> Option<Refusal> {
+    let s = r
+        .strs
+        .iter()
+        .find(|s| names_credential(s) && place.secret != Some(s.as_str()))?;
     refused(PolicyReason::PathSensitiveDeny, "reads-credential", s)
 }
 
@@ -3345,6 +3350,7 @@ mod tests {
             Place {
                 cwd: Some(Path::new("/w")),
                 work: Some(Path::new("/w")),
+                secret: None,
                 sealed: None,
             },
         )
