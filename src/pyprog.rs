@@ -3476,7 +3476,10 @@ fn inside_lexical_and_disk(p: &Path, work: Option<&Path>) -> bool {
     if !inside(&lexical, work) {
         return false;
     }
-    if skip_on_disk_check(&lexical) {
+    let has_parent = p
+        .components()
+        .any(|part| matches!(part, Component::ParentDir));
+    if !has_parent && skip_on_disk_check(&lexical) {
         return true;
     }
     let tree = work.map(on_disk);
@@ -3484,13 +3487,7 @@ fn inside_lexical_and_disk(p: &Path, work: Option<&Path>) -> bool {
 }
 
 fn skip_on_disk_check(p: &Path) -> bool {
-    let dev = [
-        "/dev/null",
-        "/dev/stdout",
-        "/dev/stderr",
-        "/dev/stdin",
-        "/dev/tty",
-    ];
+    let dev = ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"];
     dev.iter().any(|d| p == Path::new(d))
         || p.starts_with("/dev/fd")
         || p.starts_with("/proc/self/fd")
@@ -4610,6 +4607,34 @@ mod tests {
         assert_eq!(class_of(&code), "python-writes-outside", "{code}");
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(home_root.join(format!("ljos-pyprog-home-{mark}")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tmp_link_to_home_dotdot_dev_null_write_is_refused() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let mark = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must move forward")
+            .as_nanos();
+        let link = std::env::temp_dir().join(format!("ljos-pyprog-link-{mark}"));
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .expect("HOME is set")
+            .join(format!(".cache/ljos-pyprog-home-{mark}/deep/a/b"));
+        std::fs::create_dir_all(&home).unwrap();
+        symlink(&home, &link).unwrap();
+        let code = format!("open('{}/../../dev/null', 'w').write('x')", link.display());
+        assert_eq!(class_of(&code), "python-writes-outside", "{code}");
+        let _ = std::fs::remove_file(link);
+        let _ = std::fs::remove_dir_all(
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .expect("HOME is set")
+                .join(format!(".cache/ljos-pyprog-home-{mark}")),
+        );
     }
 
     #[cfg(unix)]
