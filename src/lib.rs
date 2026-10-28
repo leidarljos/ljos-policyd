@@ -788,6 +788,24 @@ impl LineFiles {
         }
     }
 
+    /// Take each file the `cat` in `run` writes to a python that runs its
+    /// stdin as run by that python, as `python3 FILE` runs it.
+    fn fed_to_python(
+        &mut self,
+        run: &[String],
+        at: &[std::path::PathBuf],
+        home: Option<&str>,
+        values: &Values,
+    ) {
+        let run = peeled(run);
+        if run.first().map(|w| base_of(w)) != Some("cat") {
+            return;
+        }
+        for w in run[1..].iter().filter(|w| !w.starts_with('-')) {
+            self.ran_from(w, at, home, Ran::Python, values);
+        }
+    }
+
     /// Put the writes from `from` on at `id`.
     fn lower(&mut self, from: std::ops::RangeFrom<usize>, id: &[usize]) {
         for w in &mut self.written[from] {
@@ -3124,6 +3142,18 @@ fn walk(
             heredocs[ci].as_deref(),
             &shell.cmd_values,
         );
+        if end == "|"
+            && ended
+                .get(ci + 1)
+                .is_some_and(|(next, _)| pipes_to_python(next))
+        {
+            shell.files.borrow_mut().fed_to_python(
+                &run,
+                &at,
+                shell.vars.home.as_deref(),
+                &shell.cmd_values,
+            );
+        }
         shell.files.borrow_mut().note_bindings(&cmd);
         if cmd.first() == Some(&"done") {
             if let Some(start) = loops.pop().filter(|_| loops.is_empty()) {
@@ -8045,6 +8075,7 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
     // lands, so that command is judged with the path the shell opens.
     let mut seat_names = false;
     let cmds = commands(argv);
+    let seps: Vec<&str> = ended_commands(argv).into_iter().map(|(_, s)| s).collect();
     for (i, cmd) in cmds.iter().cloned().enumerate() {
         if cmd.iter().all(|w| is_assignment(w)) {
             for w in &cmd {
@@ -8137,7 +8168,9 @@ fn inner_commands_expanded(argv: &[String]) -> Vec<(usize, Vec<String>)> {
                 out.extend(script_lines(&s, 0).iter().map(|l| (i, shell_words(l))));
             }
         }
-        if let Some(Some(code)) = python_heredoc(&cmds, i) {
+        if let Some(Some(code)) =
+            python_heredoc(&cmds, i).or_else(|| python_fed(&cmds, &seps, i, None))
+        {
             for s in pyprog::shell_commands(&code) {
                 out.extend(script_lines(&s, 0).iter().map(|l| (i, shell_words(l))));
             }
@@ -12512,6 +12545,83 @@ fn python_heredoc(cmds: &[Vec<&str>], i: usize) -> Option<Option<String>> {
     if !python_reads_stdin(&owned) {
         return None;
     }
+    heredoc_text(cmds, i)
+}
+
+/// Whether `cmd` is a python that runs what a pipe feeds it, with no
+/// here-document or here-string in place of the pipe.
+fn pipes_to_python(cmd: &[&str]) -> bool {
+    let owned: Vec<String> = cmd.iter().map(|w| (*w).to_string()).collect();
+    python_reads_stdin(&owned) && !owned.iter().any(|w| redirection_body(w).starts_with("<<"))
+}
+
+/// The program a python reading stdin at `cmds[i]` takes from a
+/// here-string, or from the stage before a `|` that `seps` shows: the
+/// text `echo` or `printf` writes, or what `cat` writes of the files it
+/// names below `cwd`, its here-document or its here-string. `Some(None)`
+/// where the line does not show that text. `None` where `cmds[i]` is
+/// no such python or neither feeds it.
+fn python_fed(
+    cmds: &[Vec<&str>],
+    seps: &[&str],
+    i: usize,
+    cwd: Option<&std::path::Path>,
+) -> Option<Option<String>> {
+    let owned: Vec<String> = cmds.get(i)?.iter().map(|w| (*w).to_string()).collect();
+    if !python_reads_stdin(&owned) {
+        return None;
+    }
+    if owned.iter().any(|w| redirection_body(w).starts_with("<<<")) {
+        return Some(here_string(&owned).map(|t| t + "\n"));
+    }
+    let p = i.checked_sub(1).filter(|&p| seps.get(p) == Some(&"|"))?;
+    let feed: Vec<String> = cmds[p].iter().map(|w| (*w).to_string()).collect();
+    Some(producer_text(&feed).or_else(|| cat_text(cmds, p, cwd)))
+}
+
+/// The text the `cat` at `cmds[i]` writes: the files it names, read
+/// from the disk below `cwd`, or with no file its here-document or its
+/// here-string. A file that is not there adds nothing. `None` for any
+/// other command, an option, a word the shell expands, or a file that
+/// cannot be read.
+fn cat_text(cmds: &[Vec<&str>], i: usize, cwd: Option<&std::path::Path>) -> Option<String> {
+    let owned: Vec<String> = cmds[i].iter().map(|w| (*w).to_string()).collect();
+    let plain = without_redirections(&owned);
+    let (head, files) = unwrap_wrappers(&plain).0.split_first()?;
+    if base_of(head) != "cat" {
+        return None;
+    }
+    if files.is_empty() {
+        return here_string(&owned)
+            .map(|t| t + "\n")
+            .or_else(|| heredoc_text(cmds, i).flatten());
+    }
+    let mut text = String::new();
+    for f in files {
+        if f.starts_with('-') || !literal_text(f) {
+            return None;
+        }
+        let path = std::path::Path::new(f.as_str());
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            cwd?.join(path)
+        };
+        match std::fs::read_to_string(path) {
+            Ok(t) => text.push_str(&t),
+            // `cat` writes nothing of a file that is not there.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    Some(text)
+}
+
+/// The text of the here-document `cmds[i]` opens: `Some(None)` where the
+/// line does not show it, as with a body that expands something. `None`
+/// where no `<<` opens one or `cmds` stops before the body.
+fn heredoc_text(cmds: &[Vec<&str>], i: usize) -> Option<Option<String>> {
+    let cmd = cmds.get(i)?;
     let at = cmd.iter().position(|w| heredoc_operator(w).is_some())?;
     let (named, _) = heredoc_operator(cmd[at])?;
     let delim = if named.is_empty() {
@@ -16814,6 +16924,7 @@ fn python_refusal_with(
 ) -> Option<pyprog::Refusal> {
     let cwd = bound.root.as_deref().filter(|d| !is_untracked(d));
     let cmds = commands(argv);
+    let seps: Vec<&str> = ended_commands(argv).into_iter().map(|(_, s)| s).collect();
     let relayed = bound.relayed.as_deref().filter(|_| is_relay_run(argv));
     let secret =
         relayed.or_else(|| relay_command(&cmds, moved, bound.root.as_deref(), seat, relay));
@@ -16859,7 +16970,7 @@ fn python_refusal_with(
         if let Some(code) = python_program(run) {
             return pyprog::refusal(code, place);
         }
-        match python_heredoc(&cmds, i) {
+        match python_heredoc(&cmds, i).or_else(|| python_fed(&cmds, &seps, i, place.cwd)) {
             Some(Some(code)) => return pyprog::refusal(&code, place),
             Some(None) => {
                 return Some(pyprog::Refusal {
