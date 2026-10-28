@@ -10878,6 +10878,7 @@ fn hides_head_word(w: &str) -> bool {
         }
         match bytes.get(i + 1).copied() {
             Some(b'(') | Some(b'{') => return true,
+            Some(b'@') | Some(b'*') => return true,
             Some(c) if c.is_ascii_alphanumeric() || c == b'_' => return true,
             _ => {}
         }
@@ -27499,7 +27500,13 @@ make -C safe test
             "xargs nimvault --",
             "parallel nimvault ::: get",
             "\"$NV\" \"$S\" e",
+            "\"$@\" \"$S\" e",
+            "\"$*\" \"$S\" e",
             "\"$X\" \"$S\" e",
+            "$@ $S",
+            "$* $S",
+            "$1 $S",
+            "${1} $S",
             "${V} $S",
             "\"$(command -v nimvault)\" \"$S\" e",
         ] {
@@ -27524,6 +27531,7 @@ make -C safe test
             "go get example.org/x",
             "kubectl -n \"$NS\" get pods",
             "\"$EDITOR\" get.txt",
+            "echo \"$@\"",
             "echo \"$S\"",
             "cargo \"$CMD\"",
             &format!("{} list", nv.display()),
