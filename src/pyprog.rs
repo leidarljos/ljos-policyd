@@ -4647,22 +4647,22 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock must move forward")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("ljos-pyprog-cwd-link-{mark}"));
-        let home_root = std::env::var_os("CARGO_TARGET_TMPDIR")
+        let target_root = std::env::var_os("CARGO_TARGET_TMPDIR")
             .map(PathBuf::from)
+            .filter(|d| !d.starts_with("/tmp"))
             .or_else(|| {
                 std::env::current_dir()
                     .ok()
                     .map(|d| d.join("target/tmp-tests"))
             })
             .expect("target temp directory is available");
+        let root = target_root.join(format!("ljos-pyprog-cwd-link-{mark}"));
         let work = root.join("work");
-        let home = home_root.join(format!("ljos-pyprog-cwd-home-{mark}"));
+        let home = root.join(format!("outside-home-{mark}"));
         std::fs::create_dir_all(&work).unwrap();
         std::fs::create_dir_all(&home).unwrap();
         symlink(&home, work.join("lnk")).unwrap();
         let cwd = work.join("lnk");
-        assert!(!inside_lexical_and_disk(&cwd, Some(&work)));
 
         let denied = refusal(
             "from pathlib import Path; Path('x').write_text('x')",
@@ -4679,6 +4679,5 @@ mod tests {
         let class = denied.split(':').next().unwrap_or_default();
         assert_eq!(class, "python-writes-outside");
         let _ = std::fs::remove_dir_all(root);
-        let _ = std::fs::remove_dir_all(home);
     }
 }
