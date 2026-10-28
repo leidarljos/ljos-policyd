@@ -4620,21 +4620,22 @@ mod tests {
             .expect("clock must move forward")
             .as_nanos();
         let link = std::env::temp_dir().join(format!("ljos-pyprog-link-{mark}"));
-        let home = std::env::var_os("HOME")
+        let target_root = std::env::var_os("CARGO_TARGET_TMPDIR")
             .map(PathBuf::from)
-            .expect("HOME is set")
-            .join(format!(".cache/ljos-pyprog-home-{mark}/deep/a/b"));
-        std::fs::create_dir_all(&home).unwrap();
-        symlink(&home, &link).unwrap();
+            .filter(|d| !d.starts_with("/tmp"))
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|d| d.join("target/tmp-tests"))
+            })
+            .expect("target temp directory is available");
+        let outside = target_root.join(format!("ljos-pyprog-dev-null-{mark}/deep/a/b"));
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, &link).unwrap();
         let code = format!("open('{}/../../dev/null', 'w').write('x')", link.display());
         assert_eq!(class_of(&code), "python-writes-outside", "{code}");
         let _ = std::fs::remove_file(link);
-        let _ = std::fs::remove_dir_all(
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .expect("HOME is set")
-                .join(format!(".cache/ljos-pyprog-home-{mark}")),
-        );
+        let _ = std::fs::remove_dir_all(target_root.join(format!("ljos-pyprog-dev-null-{mark}")));
     }
 
     #[cfg(unix)]
@@ -4658,11 +4659,12 @@ mod tests {
             .expect("target temp directory is available");
         let root = target_root.join(format!("ljos-pyprog-cwd-link-{mark}"));
         let work = root.join("work");
-        let home = root.join(format!("outside-home-{mark}"));
+        let outside = root.join(format!("outside-home-{mark}/deep/a/b"));
         std::fs::create_dir_all(&work).unwrap();
-        std::fs::create_dir_all(&home).unwrap();
-        symlink(&home, work.join("lnk")).unwrap();
-        let cwd = work.join("lnk");
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = std::env::temp_dir().join(format!("ljos-pyprog-cwd-link-{mark}"));
+        symlink(&outside, &link).unwrap();
+        let cwd = link.join("../../dev/fd");
 
         let denied = refusal(
             "from pathlib import Path; Path('x').write_text('x')",
@@ -4678,6 +4680,9 @@ mod tests {
         .token;
         let class = denied.split(':').next().unwrap_or_default();
         assert_eq!(class, "python-writes-outside");
+        assert!(denied.contains("writes-outside"), "{denied}");
+        assert!(denied.contains(&cwd.display().to_string()), "{denied}");
+        let _ = std::fs::remove_file(link);
         let _ = std::fs::remove_dir_all(root);
     }
 }
