@@ -1,0 +1,1 @@
+An `sftp -b -` here-document is read as a script, but a batch line that runs a local shell starts with `!`. That mark hid the command, so `!cat ~/.secrets/x` was allowed. The `!` is now dropped before the line is judged, after any `-` or `@` mark. A plain batch line such as `put` or `get` is still allowed.
