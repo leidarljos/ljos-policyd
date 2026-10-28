@@ -1,0 +1,1 @@
+A mail wrapper, run in a loop on the line, was refused with "`$tmp` may name it": its `tmp=$(mktemp ...)` counted as a binding inside that loop. A script file the line runs is a new process each time, so a loop around the run no longer reaches the bindings in the file. Its writes still count before the loop, and a loop inside the script still refuses.

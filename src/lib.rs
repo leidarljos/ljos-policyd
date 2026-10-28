@@ -2470,6 +2470,24 @@ fn replay_subshell(
     }
 }
 
+/// [`replay_subshell`] for a script file the command runs as its own
+/// process. Its names start fresh on each run, so a loop on the line
+/// around that run does not make a binding in the file a rebinding. The
+/// line's loop still lowers what the file writes to before the loop.
+fn replay_script_file(
+    body: &[String],
+    shell: &Shell,
+    depth: usize,
+    trust_argv0: bool,
+    argv0_file: bool,
+    out: &mut Vec<(Vec<String>, std::path::PathBuf, bool)>,
+    denied: &mut Option<Checked>,
+) {
+    let loops = std::mem::take(&mut shell.files.borrow_mut().loops);
+    replay_subshell(body, shell, depth, trust_argv0, argv0_file, out, denied);
+    shell.files.borrow_mut().loops = loops;
+}
+
 /// Whether `words` is a `cd`, `pushd` or `popd` that can leave the tree.
 fn command_leaves_tree(words: &[&str]) -> bool {
     let owned: Vec<String> = words.iter().copied().map(str::to_string).collect();
@@ -5678,7 +5696,7 @@ fn judge_script_file(
         }
         let mut aliases = shell.aliases.clone();
         let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
-        replay_subshell(
+        replay_script_file(
             &words,
             shell,
             depth + 1,
@@ -5812,7 +5830,7 @@ fn judge_direct_exec(
         }
         let mut aliases = shell.aliases.clone();
         let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
-        replay_subshell(
+        replay_script_file(
             &words,
             shell,
             depth + 1,

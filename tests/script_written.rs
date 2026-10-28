@@ -410,3 +410,45 @@ fn mktemp_writes_no_script() {
     assert!(v.starts_with("deny\tscript-written-on-line: "), "{v}");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A script the line runs is a new process each time, so a loop on the
+/// line around it does not make its one `mktemp` binding a rebinding.
+/// Its writes still count before the loop, and a loop inside the
+/// script, or a file it writes that the line runs, still refuses.
+#[test]
+fn a_wrapper_run_in_a_loop_keeps_its_temps() {
+    let d = scratch("mail");
+    let wrapper = d.join("mailwrap");
+    let head = format!(
+        "#!/bin/bash\nsent={}/Maildir/.Sent; f=msg.eml; add='X-Example: 1'\n",
+        d.display()
+    );
+    let mailer = "/usr/local/libexec/ljos-test/deliver \"$@\" < \"$tmp\" || exit 1\n";
+    std::fs::write(&wrapper, format!("{head}{SPOOL}{mailer}{SENT}")).unwrap();
+    std::fs::write(d.join("ot.eml"), "To: ops@example.org\n\nhi\n").unwrap();
+    let w = wrapper.display();
+    let eml = d.join("ot.eml");
+    let eml = eml.display();
+    for line in [
+        format!("{w} -t < {eml}"),
+        format!("for m in {eml} {eml}; do {w} -t < \"$m\"; done"),
+        format!("while read -r m; do {w} -t < \"$m\"; done < list"),
+    ] {
+        assert_eq!(hook_verdict(&d, "example", &line), "allow", "{line}");
+    }
+    let looped = "for i in 1 2; do tmp=$(mktemp); done\ncat > \"$tmp\"\n";
+    std::fs::write(&wrapper, format!("{head}{looped}{mailer}")).unwrap();
+    let v = hook_verdict(&d, "example", &format!("for i in 1 2; do {w}; done"));
+    assert!(v.starts_with("deny\tscript-written-on-line: "), "{v}");
+    let run = d.join("run.sh");
+    std::fs::write(
+        &wrapper,
+        format!("{head}echo 'rm -rf ~/' > {}\n", run.display()),
+    )
+    .unwrap();
+    let line = format!("for i in 1 2; do {w}; sh {}; done", run.display());
+    let v = hook_verdict(&d, "example", &line);
+    assert!(v.starts_with("deny\tscript-written-on-line: "), "{v}");
+    assert!(v.contains("rm-rf"), "{v}");
+    let _ = std::fs::remove_dir_all(&d);
+}
