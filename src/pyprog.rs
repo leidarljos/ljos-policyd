@@ -1786,11 +1786,14 @@ fn refused(code: PolicyReason, class: &str, what: &str) -> Option<Refusal> {
 
 /// Where a program runs. `cwd` is the directory a relative path is in,
 /// `None` when the line does not show one. `work` is the tree the line
-/// runs in, `None` once the line has left it.
+/// runs in, `None` once the line has left it. `sealed` is the variable
+/// `nimvault run` put the plaintext of an entry in, which the program
+/// may use but not show.
 #[derive(Clone, Copy)]
 pub(crate) struct Place<'a> {
     pub(crate) cwd: Option<&'a Path>,
     pub(crate) work: Option<&'a Path>,
+    pub(crate) sealed: Option<&'a str>,
 }
 
 /// Why python must not run `code` at `place`, or `None`. A program
@@ -1817,6 +1820,7 @@ fn judge(code: &str, place: Place) -> Option<Refusal> {
         return refused(PolicyReason::ShellDangerousRunner, "unread", "");
     }
     credential(&r)
+        .or_else(|| place.sealed.and_then(|n| shows_secret(code, &r, n)))
         .or_else(|| hook_write(&r))
         .or_else(|| network(&r))
         .or_else(|| runs_written(&r))
@@ -1958,6 +1962,215 @@ fn secret_variable(s: &str) -> bool {
 fn credential(r: &Read) -> Option<Refusal> {
     let s = r.strs.iter().find(|s| names_credential(s))?;
     refused(PolicyReason::PathSensitiveDeny, "reads-credential", s)
+}
+
+/// Calls whose output or side effect holds what they are given: the
+/// streams, logs, files and prompts a value is shown in.
+const SHOWS: &[&str] = &[
+    "print",
+    "pprint",
+    "pp",
+    "input",
+    "write",
+    "writelines",
+    "open",
+    "dump",
+    "log",
+    "debug",
+    "info",
+    "warning",
+    "warn",
+    "error",
+    "exception",
+    "critical",
+    "fatal",
+    "putenv",
+    "breakpoint",
+];
+
+/// Calls whose result does not hold what they are given: a request
+/// sends it and answers with something else.
+const SPENDS: &[&str] = &[
+    "urlopen",
+    "post",
+    "put",
+    "patch",
+    "delete",
+    "head",
+    "request",
+    "getresponse",
+    "len",
+    "bool",
+    "compare_digest",
+];
+
+/// The calls a token at `at` is an argument of, innermost first.
+fn callers(toks: &[Tok], at: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut nest = 0usize;
+    for i in (0..at).rev() {
+        match &toks[i] {
+            Tok::Mark(')' | ']' | '}') => nest += 1,
+            Tok::Mark('[' | '{') => nest = nest.saturating_sub(1),
+            Tok::Mark('(') if nest > 0 => nest -= 1,
+            Tok::Mark('(') => {
+                let named = |k: usize| matches!(toks.get(k), Some(Tok::Name(_)));
+                if i == 0 || !named(i - 1) {
+                    out.push(String::new());
+                    continue;
+                }
+                let mut s = i - 1;
+                while s >= 2 && toks[s - 1] == Tok::Mark('.') && named(s - 2) {
+                    s -= 2;
+                }
+                out.push(dotted(toks, s).0);
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether the call `name` hands on what it is given and not a reply.
+fn spends(name: &str) -> bool {
+    let last = name.rsplit('.').next().unwrap_or(name);
+    SPENDS.contains(&last)
+        || (last == "get"
+            && ["requests.", "httpx.", "session.", "client."]
+                .iter()
+                .any(|m| name.to_ascii_lowercase().contains(m)))
+}
+
+/// A program that may show the value of `name`, which `nimvault run`
+/// put in its environment: a call that prints, logs or writes it, or
+/// anything a child process could read it from.
+fn shows_secret(code: &str, r: &Read, name: &str) -> Option<Refusal> {
+    let out = |what: &str| refused(PolicyReason::SecretExportDenied, "shows-secret", what);
+    if let Some(run) = commands(r)
+        .next()
+        .map(|c| c.unwrap_or_else(|n| n))
+        .or_else(|| {
+            r.reaches(&process_names().collect::<Vec<_>>())
+                .map(str::to_string)
+        })
+        .or_else(|| r.reaches(EXEC_CALLS).map(str::to_string))
+    {
+        return out(&format!("{name} to {run}"));
+    }
+    let src: Vec<char> = code.chars().collect();
+    let mut toks = Vec::new();
+    if lex(&src, 0, &mut toks).is_none() {
+        return out("unread");
+    }
+    for (i, t) in toks.iter().enumerate() {
+        let Tok::Name(n) = t else { continue };
+        if !matches!(n.as_str(), "environ" | "environb") {
+            continue;
+        }
+        let key = |at: usize| matches!(toks.get(at), Some(Tok::Str(s)) if s == name);
+        let one = (toks.get(i + 1) == Some(&Tok::Mark('[')) && key(i + 2))
+            || (toks.get(i + 1) == Some(&Tok::Mark('.'))
+                && toks.get(i + 2) == Some(&Tok::Name("get".into()))
+                && toks.get(i + 3) == Some(&Tok::Mark('('))
+                && key(i + 4));
+        if !one {
+            return out(&format!("{name} with {n}"));
+        }
+    }
+    let mut held: HashSet<String> = HashSet::new();
+    let holds = |t: &Tok, held: &HashSet<String>| match t {
+        Tok::Str(s) => s == name,
+        Tok::Name(n) => held.contains(n),
+        _ => false,
+    };
+    let carried = |stmt: &[Tok], at: usize, stop: &dyn Fn(&str) -> bool| {
+        for c in callers(stmt, at) {
+            if spends(&c) {
+                return false;
+            }
+            if stop(&c) {
+                return true;
+            }
+        }
+        false
+    };
+    loop {
+        let before = held.len();
+        for (stmt, _) in statements(&toks) {
+            let Some((to, from)) = assignment(stmt) else {
+                continue;
+            };
+            let rhs = &stmt[from];
+            let takes = (0..rhs.len())
+                .any(|k| holds(&rhs[k], &held) && !callers(rhs, k).iter().any(|c| spends(c)));
+            if takes {
+                let lhs = &stmt[to];
+                for (k, t) in lhs.iter().enumerate() {
+                    if let Tok::Name(n) = t {
+                        if !keyword(t) && (k == 0 || lhs[k - 1] != Tok::Mark('.')) {
+                            held.insert(n.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if held.len() == before {
+            break;
+        }
+    }
+    for (stmt, _) in statements(&toks) {
+        let shown_by = |c: &str| SHOWS.contains(&c.rsplit('.').next().unwrap_or(c));
+        let lead = matches!(stmt.first(), Some(Tok::Name(k)) if k == "raise" || k == "assert");
+        for k in 0..stmt.len() {
+            if !holds(&stmt[k], &held) {
+                continue;
+            }
+            if lead && !callers(stmt, k).iter().any(|c| spends(c)) {
+                return out(&format!("{name} in an error"));
+            }
+            if carried(stmt, k, &shown_by) {
+                let by = callers(stmt, k).into_iter().find(|c| shown_by(c));
+                return out(&format!("{name} to {}", by.unwrap_or_default()));
+            }
+        }
+    }
+    None
+}
+
+/// The targets and the value of a binding statement: `a = b`, `a += b`,
+/// `for a in b` or `with b as a`. A `==`, `<=`, `>=` or `!=` is not one,
+/// and neither is a keyword argument inside brackets.
+fn assignment(stmt: &[Tok]) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    let mut nest = 0usize;
+    for (i, t) in stmt.iter().enumerate() {
+        match t {
+            Tok::Mark('(' | '[' | '{') => nest += 1,
+            Tok::Mark(')' | ']' | '}') => nest = nest.saturating_sub(1),
+            Tok::Mark('=') if nest == 0 => {
+                let prev = i.checked_sub(1).and_then(|p| stmt.get(p));
+                let next = stmt.get(i + 1);
+                if next != Some(&Tok::Mark('='))
+                    && !matches!(prev, Some(Tok::Mark('=' | '<' | '>' | '!')))
+                {
+                    return Some((0..i, i + 1..stmt.len()));
+                }
+            }
+            Tok::Name(n) if nest == 0 && n == "for" => {
+                let at = i + stmt[i..]
+                    .iter()
+                    .position(|t| *t == Tok::Name("in".into()))?;
+                return Some((i + 1..at, at + 1..stmt.len()));
+            }
+            Tok::Name(n) if nest == 0 && n == "with" => {
+                let at = i + stmt[i..]
+                    .iter()
+                    .position(|t| *t == Tok::Name("as".into()))?;
+                return Some((at + 1..stmt.len(), i + 1..at));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Files a tool runs or loads on its own: editor and runner hooks, git
@@ -3132,6 +3345,7 @@ mod tests {
             Place {
                 cwd: Some(Path::new("/w")),
                 work: Some(Path::new("/w")),
+                sealed: None,
             },
         )
         .map(|r| r.token)

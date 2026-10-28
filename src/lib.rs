@@ -15604,14 +15604,17 @@ fn python_refusal(argv: &[String], moved: bool, bound: &Scratch) -> Option<pypro
             .as_ref()
             .map(|r| r.get(i).cloned().flatten().filter(|d| !is_untracked(d)));
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        let sealed = sealed_runs(&owned).into_iter().next().map(|(name, _)| name);
         let place = match &at {
             Some(at) => pyprog::Place {
                 cwd: at.as_deref(),
                 work,
+                sealed,
             },
             None => pyprog::Place {
                 cwd,
                 work: cwd.filter(|_| !moved),
+                sealed,
             },
         };
         let run = peeled(&owned);
@@ -25464,6 +25467,49 @@ make -C safe test
         }
         for prog in ["ls", "python3 -c 'print(1)'"] {
             assert_eq!(at(prog).decision, Decision::Allow, "{prog}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Inline python `nimvault run` hands a secret may use it but not
+    /// show it.
+    #[test]
+    fn a_sealed_secret_is_used_not_shown() {
+        let root = startup_root("sealedpy");
+        let at = |prog: &str| {
+            let line = format!("nimvault run --env EXAMPLE_VALUE e -- {prog}");
+            let argv = ["bash", "-c", line.as_str()].map(String::from);
+            check_shell_in(&argv, &root, 0)
+        };
+        let py = |code: &str| format!("python3 -c '{code}'");
+        let read = "import os; t = os.environ[\"EXAMPLE_VALUE\"]";
+        for prog in [
+            py("import os; print(os.environ[\"EXAMPLE_VALUE\"])"),
+            py(&format!("{read}; m = f\"tok {{t}}\"; print(m)")),
+            py("import os, sys; sys.stdout.write(os.getenv(\"EXAMPLE_VALUE\"))"),
+            py("import os, logging; logging.info(os.environ.get(\"EXAMPLE_VALUE\"))"),
+            py(&format!("{read}; open(\"o.txt\", \"w\").write(t)")),
+            py(&format!(
+                "{read}\nwith open(\"o.txt\", \"w\") as f:\n    f.write(t)"
+            )),
+            py(&format!(
+                "import json; {read}; print(json.dumps({{\"k\": t}}))"
+            )),
+            py(&format!("{read}; raise SystemExit(t)")),
+            py("import os; print(os.environ)"),
+            py("import subprocess; subprocess.run([\"ls\"])"),
+        ] {
+            let c = at(&prog);
+            assert_eq!(c.decision, Decision::Deny, "{prog}");
+            assert!(c.token.contains("shows-secret"), "{prog}: {}", c.token);
+        }
+        for prog in [
+            "ls".to_string(),
+            py(&format!("{read}; print(len(t))")),
+            py(&format!("{read}; print(\"ready\")")),
+        ] {
+            let c = at(&prog);
+            assert_eq!(c.decision, Decision::Allow, "{prog}: {}", c.token);
         }
         let _ = std::fs::remove_dir_all(&root);
     }
