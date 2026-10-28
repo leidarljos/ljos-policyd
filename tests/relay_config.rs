@@ -335,9 +335,25 @@ fn the_relay_line_refuses_unsigned_entries() {
     std::fs::set_permissions(&send, std::fs::Permissions::from_mode(0o600)).unwrap();
     let line = "nimvault run --env EXAMPLE_TOKEN relay/token python3 -I send.py /tmp/m.txt t1";
     assert_eq!(verdict(&dir, &config, "relay", line), "allow");
-    let unsigned = line.replace("run --env", "run --allow-unsigned --env");
-    let v = verdict(&dir, &config, "relay", &unsigned);
-    assert!(v.starts_with("deny"), "{v}");
+    for opt in [
+        "--allow-unsigned",
+        "-a",
+        "--allow",
+        "--allowunsigned",
+        "--allow_Unsigned",
+        "--allow-unsigned=true",
+    ] {
+        let unsigned = line.replace("run --env", &format!("run {opt} --env"));
+        for seat in ["relay", "other"] {
+            let v = verdict(&dir, &config, seat, &unsigned);
+            assert!(
+                v.starts_with("deny\tnimvault-run-option:"),
+                "{seat}: {opt}: {v}"
+            );
+        }
+    }
+    let signed = line.replace("run --env", "run --vault=. --env");
+    assert_eq!(verdict(&dir, &config, "relay", &signed), "allow");
     let _ = std::fs::remove_dir_all(&base);
 }
 

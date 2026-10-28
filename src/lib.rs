@@ -10643,28 +10643,42 @@ fn unwrap_wrappers(cmd: &[String]) -> (&[String], Option<&str>) {
 /// the program it runs starts. `nimvault run [opts] ENTRY [--] PROGRAM`
 /// sets the entry's plaintext as that variable and execs the program.
 fn nimvault_run_at(cmd: &[String], i: usize) -> Option<(Option<&str>, usize)> {
+    nimvault_run_walk(cmd, i).map(|(env, at, _)| (env, at))
+}
+
+/// The first option a `nimvault run` at `cmd[i]` takes that is not one
+/// [`nimvault_run_option`] reads.
+fn nimvault_run_stray(cmd: &[String], i: usize) -> Option<&str> {
+    nimvault_run_walk(cmd, i).and_then(|(_, _, stray)| stray)
+}
+
+fn nimvault_run_walk(cmd: &[String], i: usize) -> Option<(Option<&str>, usize, Option<&str>)> {
     if cmd.get(i + 1).map(String::as_str) != Some("run") {
         return None;
     }
     let mut j = i + 2;
     let mut env = None;
+    let mut stray = None;
     let mut entry = false;
     while let Some(a) = cmd.get(j).map(String::as_str) {
         if a == "--" {
             j += 1 + usize::from(!entry);
             break;
         }
-        let long = |n: &str| a.strip_prefix(n).and_then(|r| r.strip_prefix(['=', ':']));
-        if let Some(v) = long("--env").or_else(|| long("-e")) {
-            env = Some(v);
-            j += 1;
-        } else if matches!(a, "--env" | "-e") {
-            env = cmd.get(j + 1).map(String::as_str);
-            j += 2;
-        } else if matches!(a, "--vault" | "-v" | "--recipient" | "-r") {
-            j += 2;
-        } else if a.starts_with('-') && a.len() > 1 {
-            j += 1;
+        if a.starts_with('-') && a.len() > 1 {
+            match nimvault_run_option(a) {
+                Some((key, glued)) => {
+                    let value = glued.or_else(|| cmd.get(j + 1).map(String::as_str));
+                    if key == 'e' {
+                        env = value;
+                    }
+                    j += if glued.is_some() { 1 } else { 2 };
+                }
+                None => {
+                    stray.get_or_insert(a);
+                    j += 1;
+                }
+            }
         } else if !entry {
             entry = true;
             j += 1;
@@ -10672,7 +10686,61 @@ fn nimvault_run_at(cmd: &[String], i: usize) -> Option<(Option<&str>, usize)> {
             break;
         }
     }
-    Some((env, j.min(cmd.len())))
+    Some((env, j.min(cmd.len()), stray))
+}
+
+/// The key and any value carried in the word of a `nimvault run` option
+/// the line may give: `--env`/`-e`, `--vault`/`-v` or `--recipient`/`-r`,
+/// in the forms cligen reads: `--env NAME`, `--env=NAME`, `--env:NAME`,
+/// `-e NAME`, `-eNAME`, `-e=NAME` and `-e:NAME`. cligen also takes a
+/// unique prefix, another case or spacing of the name, and an operator
+/// such as `+=`. None of those is read here, so the line is refused.
+fn nimvault_run_option(a: &str) -> Option<(char, Option<&str>)> {
+    const OP: &[char] = &[
+        '+', '-', '*', '/', '%', '@', ',', '.', '&', '|', '~', '^', '$', '#', '<', '>', '?',
+    ];
+    for (long, key) in [("--env", 'e'), ("--vault", 'v'), ("--recipient", 'r')] {
+        if a == long {
+            return Some((key, None));
+        }
+        if let Some(v) = a
+            .strip_prefix(long)
+            .and_then(|r| r.strip_prefix(['=', ':']))
+        {
+            return Some((key, Some(v)));
+        }
+        let Some(rest) = a.strip_prefix(&long[1..3]) else {
+            continue;
+        };
+        if rest.is_empty() {
+            return Some((key, None));
+        }
+        if let Some(v) = rest.strip_prefix(['=', ':']) {
+            return Some((key, Some(v)));
+        }
+        let op = rest.trim_start_matches(OP);
+        if op.len() < rest.len() && op.starts_with(['=', ':']) {
+            return None;
+        }
+        return Some((key, Some(rest)));
+    }
+    None
+}
+
+/// A `nimvault run` given an option [`nimvault_run_option`] does not
+/// read, such as `--allow-unsigned`, `-a` or a prefix of either.
+fn nimvault_option_denial(argv: &[String]) -> Option<Checked> {
+    commands(argv).iter().find_map(|cmd| {
+        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        (0..owned.len())
+            .filter(|&i| base_of(&owned[i]) == "nimvault")
+            .find_map(|i| nimvault_run_stray(&owned, i).map(str::to_string))
+            .map(|opt| Checked {
+                decision: Decision::Deny,
+                code: PolicyReason::ShellDangerousRunner,
+                token: Cow::Owned(format!("nimvault-run-option: {opt}")),
+            })
+    })
 }
 
 /// Each `nimvault run --env NAME` in `cmd`, with NAME and the program it
@@ -13343,6 +13411,9 @@ fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
         };
     }
     if let Some(c) = seat_guard_denial(argv, bound.root.as_deref()) {
+        return c;
+    }
+    if let Some(c) = nimvault_option_denial(argv) {
         return c;
     }
     if let Some(c) =
@@ -16036,8 +16107,9 @@ fn python_refusal_with(
 /// directory, running nothing but `nimvault run --env SECRET ENTRY
 /// python3 -I SCRIPT.py [ARG...]` with a script [`relay_script`] accepts
 /// and no other `.py` beside it, with a bare `nimvault` and a bare
-/// `python3`, and no `--allow-unsigned` that would take an entry the
-/// vault cannot vouch for. The secret comes from the vault as the
+/// `python3`, and no option but those [`nimvault_run_option`] reads, so
+/// no `--allow-unsigned` in any spelling takes an entry the vault
+/// cannot vouch for. The secret comes from the vault as the
 /// program starts, and what the script's text may do with it is judged
 /// as for any sealed secret.
 fn relay_command<'a>(
@@ -16059,10 +16131,7 @@ fn relay_command<'a>(
     }
     let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
     let (name, at) = nimvault_run_at(&owned, 0)?;
-    if owned[..at]
-        .iter()
-        .any(|w| w == "--allow-unsigned" || w.starts_with("--allow-unsigned="))
-    {
+    if nimvault_run_stray(&owned, 0).is_some() {
         return None;
     }
     let script = relay_script(&owned[at..], relay)?;
@@ -26503,12 +26572,90 @@ with urllib.request.urlopen(url, data=data, timeout=20) as r:
         };
         assert_eq!(secret(&line), Some("EXAMPLE_TOKEN"));
         let at = |opt: &str| line.replace("run --env", &format!("run {opt} --env"));
-        assert_eq!(secret(&at("--vault v")), Some("EXAMPLE_TOKEN"));
-        for opt in ["--allow-unsigned", "--allow-unsigned=1"] {
+        for opt in [
+            "--vault v",
+            "--vault=v",
+            "-v v",
+            "-vv",
+            "--recipient=k",
+            "-r:k",
+        ] {
+            assert_eq!(secret(&at(opt)), Some("EXAMPLE_TOKEN"), "{opt}");
+        }
+        for opt in [
+            "--allow-unsigned",
+            "--allow-unsigned=1",
+            "--allow-unsigned=true",
+            "-a",
+            "--allow",
+            "--allowunsigned",
+            "--allow_Unsigned",
+            "-av v",
+        ] {
             assert_eq!(secret(&at(opt)), None, "{opt}");
         }
-        let after = line.replace("relay/token", "relay/token --allow-unsigned");
+        let after = line.replace("relay/token", "relay/token -a");
         assert_eq!(secret(&after), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `nimvault run` is a cligen command, so it reads unique prefixes,
+    /// other spellings of an option, short letters and operators. Only
+    /// `--env`, `--vault` and `--recipient` and their value forms are
+    /// read, and any other option refuses the line for every seat.
+    #[test]
+    fn a_nimvault_run_takes_only_the_options_it_names() {
+        let run = |opts: &str| {
+            let line = format!("nimvault run {opts} vault/entry -- date");
+            check_shell_in(&shell_words(&line), std::path::Path::new("/w"), 0)
+        };
+        for opts in [
+            "--env EXAMPLE_TOKEN",
+            "--env=EXAMPLE_TOKEN",
+            "--env:EXAMPLE_TOKEN",
+            "-e EXAMPLE_TOKEN",
+            "-eEXAMPLE_TOKEN",
+            "-e=EXAMPLE_TOKEN",
+            "-e EXAMPLE_TOKEN --vault /srv/v -r k",
+            "-e EXAMPLE_TOKEN --recipient:k -v./v",
+        ] {
+            let c = run(opts);
+            assert_eq!(c.decision, Decision::Allow, "{opts}: {}", c.token);
+        }
+        for opts in [
+            "-a",
+            "--allow",
+            "--allowunsigned",
+            "--allow_Unsigned",
+            "--allow-unsigned",
+            "--allow-unsigned=true",
+            "-e EXAMPLE_TOKEN -a",
+            "-ae EXAMPLE_TOKEN",
+            "--en EXAMPLE_TOKEN",
+            "--Env EXAMPLE_TOKEN",
+            "--env+=X",
+            "-e+=X",
+            "-h",
+        ] {
+            let c = run(opts);
+            assert_eq!(c.decision, Decision::Deny, "{opts}");
+            assert!(
+                c.token.starts_with("nimvault-run-option: -"),
+                "{opts}: {}",
+                c.token
+            );
+        }
+        let c = run("-e EXAMPLE_TOKEN");
+        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
+        let late = check_shell_in(
+            &shell_words("nimvault run -e EXAMPLE_TOKEN vault/entry --allow -- make test"),
+            std::path::Path::new("/w"),
+            0,
+        );
+        assert!(
+            late.token.starts_with("nimvault-run-option: --allow"),
+            "{}",
+            late.token
+        );
     }
 }
