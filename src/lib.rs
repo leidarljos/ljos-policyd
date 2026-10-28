@@ -3492,6 +3492,14 @@ fn walk(
             // these values, and this walk must see the same file.
             let same = peeled.get(i).is_some_and(|r| r == &inner);
             let own = source_operand(&refs).is_some_and(|p| p.contains('$')) && same;
+            // `$BIN -c x >> $D/log` with `$BIN` filled in is still this
+            // command: this shell expands its words and opens its
+            // redirections, so `$D` holds what it held here.
+            let named = !same
+                && peeled
+                    .get(i)
+                    .zip(cmd_at.get(i))
+                    .is_some_and(|(r, v)| named_run(r, &inner, v));
             // The loop above already walked this command. Walking it
             // again only repeats that work, and on a long script the
             // repeat walks every function body the call already walked.
@@ -3501,14 +3509,14 @@ fn walk(
             if same && !own {
                 continue;
             }
-            let values = if own {
+            let values = if own || named {
                 cmd_at.get(i).unwrap_or(&fresh)
             } else {
                 &fresh
             };
             // A re-walk of this command is still this script. A nested
             // `-c` or `eval` is not, so `$0` is not the file there.
-            let trust = same && shell.trust_argv0;
+            let trust = (same || named) && shell.trust_argv0;
             for dir in dirs {
                 shell.files.borrow_mut().cmd.clone_from(id);
                 shell.files.borrow_mut().data = was || data.get(i).copied().unwrap_or(false);
@@ -3523,7 +3531,7 @@ fn walk(
                     known: shell.known.clone(),
                     script_cwd_moved: shell.script_cwd_moved,
                     trust_argv0: trust,
-                    argv0_file: same && shell.argv0_file,
+                    argv0_file: (same || named) && shell.argv0_file,
                     cmd_values: values,
                 };
                 runner_commands(&inner, &inn, depth + 1, out, denied);
@@ -5024,6 +5032,28 @@ fn assigned_command_keeps(
 /// Whether the command word of `cmd` is `$0` alone.
 fn runs_argv0(cmd: &[&str]) -> bool {
     head_word(cmd).is_some_and(|w| matches!(quoted_body(&w), "$0" | "${0}"))
+}
+
+/// Whether `inner` is `run` with its `$name` command word replaced by a
+/// value `values` holds for that name, and nothing else changed.
+fn named_run(
+    run: &[String],
+    inner: &[String],
+    values: &std::collections::HashMap<String, Vec<String>>,
+) -> bool {
+    let Some((head, args)) = run.split_first() else {
+        return false;
+    };
+    let Some(got) = var_command_name(head).and_then(|n| values.get(n)) else {
+        return false;
+    };
+    got.iter().filter(|v| !v.contains('\0')).any(|v| {
+        let words = shell_words(v.trim_matches(['"', '\'']));
+        !words.is_empty()
+            && inner.len() == words.len() + args.len()
+            && inner.starts_with(&words)
+            && inner.ends_with(args)
+    })
 }
 
 fn command_values_keep(

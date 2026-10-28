@@ -300,3 +300,49 @@ fn argv0_by_path_binds_nothing_here() {
     }
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A tunnel script as written by hand. It joins its assignments
+/// with `;`, writes its log in a `case` arm under `nohup ... &` through
+/// `$BIN` and `$D`, and runs itself again with `"$0"`.
+const TUNNEL: &str = r#"#!/bin/bash
+# On-demand egress through a userspace SOCKS5 proxy
+D=/srv/example/conf; BIN=/srv/example/.local/bin/tunneld; P=127.0.0.1:1080
+pid(){ pgrep -f "$BIN -c $D/tunnel.conf"; }
+case "$1" in
+ on) pid >/dev/null && { echo "already on"; exit 0; }
+     nohup $BIN -c $D/tunnel.conf >>$D/tunnel.log 2>&1 & sleep 3; pid >/dev/null && echo "on (socks5 $P)" || { echo "failed; see $D/tunnel.log"; exit 1; };;
+ off) pkill -f "$BIN -c $D/tunnel.conf" && echo off || echo "not running";;
+ status) if pid >/dev/null; then echo "on pid $(pid)"; echo "exit IP: $(curl -s -m 10 --socks5-hostname $P https://example.org/ip)"; else echo off; fi;;
+ run) shift; pid >/dev/null || "$0" on >/dev/null || exit 1
+     U=socks5h://$P; exec env ALL_PROXY=$U all_proxy=$U HTTPS_PROXY=$U https_proxy=$U HTTP_PROXY=$U http_proxy=$U NO_PROXY=localhost,127.0.0.1,::1 no_proxy=localhost,127.0.0.1,::1 \
+       GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.proxy GIT_CONFIG_VALUE_0=$U "$@";;
+ *) echo "usage: tunnel on|off|status|run CMD..."; exit 2;;
+esac
+"#;
+
+/// A `$BIN` command word filled in from a literal is still the command
+/// this shell runs: its redirection is placed through `$D` there too.
+/// A `-c` script it hands over is a new shell and does not see `$D`.
+#[test]
+fn the_tunnel_script_runs_as_written() {
+    let d = scratch("tunnel");
+    let tunnel = d.join("tunnel");
+    std::fs::write(&tunnel, TUNNEL).unwrap();
+    let path = tunnel.to_str().unwrap();
+    for args in [&["on"][..], &["off"], &["status"], &["run", "git", "fetch"]] {
+        let argv: Vec<&str> = std::iter::once(path).chain(args.iter().copied()).collect();
+        assert_eq!(verdict(&d, &argv), "allow", "{args:?}");
+    }
+    assert_eq!(sh(&d, &format!("{path} on")), "allow");
+    let w = d.join("w");
+    let run = format!("{}/bin/x", d.display());
+    let line = format!("D={}; BIN={run}; $BIN -c x >>$D/wp.log 2>&1", w.display());
+    assert_eq!(sh(&d, &line), "allow");
+    let line = format!(
+        "D={}; X=sh; $X -c 'echo y >> $D/wp.log; {run}'",
+        w.display()
+    );
+    let v = sh(&d, &line);
+    assert!(v.starts_with("deny\tscript-written-on-line: "), "{v}");
+    let _ = std::fs::remove_dir_all(&d);
+}
