@@ -1731,6 +1731,8 @@ fn fixed_key(name: &str) -> String {
     format!("\0{name}")
 }
 
+const SET_POSITIONALS_KEY: &str = "\0set-positionals";
+
 /// [`placed`] with each `$name` in `w` written as the literal the line
 /// assigned it, and the names read. A word with no such name, or one
 /// that has a value the line does not show, is [`placed`] as written.
@@ -4554,6 +4556,11 @@ fn note_cmd_values(cmd: &[&str], shell: &mut Shell) {
         shell.cmd_values.insert(fixed_key(&name), list);
     }
     let (_, head, args) = command_parts(cmd);
+    if head == "set" {
+        if let Some(list) = set_positionals_from_args(&args) {
+            shell.cmd_values.insert(SET_POSITIONALS_KEY.into(), list);
+        }
+    }
     if head == "unset" {
         for a in args.iter().filter(|a| !a.starts_with('-')) {
             shell.cmd_values.insert(fixed_key(a), vec!["\0".into()]);
@@ -10891,6 +10898,70 @@ fn hides_next_word(w: &str) -> bool {
     hides_head_word(w) || w.contains(['*', '?', '['])
 }
 
+enum PositionalHead {
+    All,
+    Index(usize),
+}
+
+fn positional_head(w: &str) -> Option<PositionalHead> {
+    let body = quoted_body(w);
+    match body {
+        "$@" | "$*" | "${@}" | "${*}" => return Some(PositionalHead::All),
+        _ => {}
+    }
+    let digits = if let Some(rest) = body.strip_prefix("${") {
+        rest.strip_suffix('}')?
+    } else {
+        body.strip_prefix('$')?
+    };
+    let n = digits.parse::<usize>().ok()?;
+    (n > 0).then_some(PositionalHead::Index(n))
+}
+
+fn set_positionals_from_args(args: &[String]) -> Option<Vec<String>> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--" {
+            return Some(args[i + 1..].to_vec());
+        }
+        if a.starts_with('-') || a.starts_with('+') {
+            i += 1;
+            continue;
+        }
+        return Some(args[i..].to_vec());
+    }
+    None
+}
+
+fn set_positionals(cmd: &[String]) -> Option<Vec<String>> {
+    let refs: Vec<&str> = cmd.iter().map(String::as_str).collect();
+    let (_, head, args) = command_parts(&refs);
+    (head == "set")
+        .then_some(())
+        .and_then(|_| set_positionals_from_args(&args))
+}
+
+fn set_positional_nimvault(words: &[String]) -> bool {
+    if words.first().is_none_or(|w| base_of(w) != "nimvault") {
+        return false;
+    }
+    match nimvault_subcommand(words, 0) {
+        Some((sub, _)) => NIMVAULT_SHOWS.contains(&sub) || NIMVAULT_HANDS_KEYS.contains(&sub),
+        None => true,
+    }
+}
+
+fn hidden_set_positional_head(head: &str, words: &[String]) -> bool {
+    match positional_head(head) {
+        Some(PositionalHead::All) => set_positional_nimvault(words),
+        Some(PositionalHead::Index(i)) if i <= words.len() => {
+            set_positional_nimvault(&words[i - 1..])
+        }
+        _ => false,
+    }
+}
+
 /// The subcommands nimvault's `dispatchMulti` names, each as cligen's
 /// `optionNormalize` keys it.
 const NIMVAULT_SUBCOMMANDS: &[&str] = &[
@@ -11056,10 +11127,25 @@ fn nimvault_shown_denial(argv: &[String]) -> Option<Checked> {
 }
 
 fn nimvault_unshown_head_denial(argv: &[String]) -> Option<Checked> {
+    let mut set_words: Option<Vec<String>> = None;
     commands(argv).iter().find_map(|cmd| {
         let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        if let Some(words) = set_positionals(&owned) {
+            set_words = Some(words);
+            return None;
+        }
         let head = owned.len() - unwrap_wrappers(&owned).0.len();
         let h = owned.get(head)?;
+        if set_words
+            .as_deref()
+            .is_some_and(|words| hidden_set_positional_head(h, words))
+        {
+            return Some(Checked {
+                decision: Decision::Deny,
+                code: PolicyReason::SecretExportDenied,
+                token: Cow::Borrowed("nimvault-subcommand-unshown"),
+            });
+        }
         let n = owned.get(head + 1)?;
         (hides_head_word(h) && hides_next_word(n)).then_some(Checked {
             decision: Decision::Deny,
@@ -27551,6 +27637,13 @@ make -C safe test
             assert_eq!(c.decision, Decision::Deny, "{line}");
             assert_eq!(c.token, "nimvault-subcommand-unshown", "{line}");
         }
+        for line in [
+            "set -- nimvault get e; \"$@\"",
+            "set -- nimvault get e; $1 $2 $3",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+        }
         let bin = root.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(bin.join("nimvault"), "#!/bin/sh\n").unwrap();
@@ -27569,6 +27662,7 @@ make -C safe test
             "kubectl -n \"$NS\" get pods",
             "\"$EDITOR\" get.txt",
             "echo \"$@\"",
+            "set -- a b; echo \"$@\"",
             "echo \"$S\"",
             "cargo \"$CMD\"",
             &format!("{} list", nv.display()),
