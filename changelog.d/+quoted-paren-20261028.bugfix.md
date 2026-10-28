@@ -1,0 +1,1 @@
+A clock time in quoted prose, as in `echo "(23:04) done"`, was read as a subshell running `23:04`, an unknown program that may write any file, so a script run later on the line was refused. A parenthesis inside quotes now opens nothing. An unquoted subshell and a `$(...)` or backtick substitution are read as before.

@@ -263,7 +263,7 @@ pub fn check_shell(argv: &[String]) -> Checked {
 
 thread_local! {
     /// Each word [`shell_words`] made during a check that holds a glob,
-    /// `~`, `$`, a backtick or a newline, and whether the shell reads
+    /// `~`, `$`, a backtick, `(` or a newline, and whether the shell reads
     /// every one of those as itself in every place the word was split
     /// from. Glob and tilde characters need a quote, `$` and backtick a
     /// single quote or a backslash.
@@ -281,13 +281,15 @@ thread_local! {
 /// Whether the `$` and backticks in `w` run nothing: each one was quoted
 /// wherever [`shell_words`] split the word, or `w` is a word of the argv
 /// itself. A real substitution or subshell is never quoted that way. A
-/// shell's `-c` script in the argv is still read as its own line.
+/// shell's `-c` script in the argv is still read as its own line. A
+/// quoted `(`, as in a clock time `"(23:04)"` in prose, opens nothing.
 fn expands_nothing(w: &str) -> bool {
-    if !w.contains(['$', '`']) {
+    if !w.contains(['$', '`', '(']) {
         return false;
     }
     SPELLED.with(|m| m.borrow().get(w) == Some(&true))
         || (!SPELLED.with(|m| m.borrow().contains_key(w))
+            && w.contains(['$', '`'])
             && ARGV_WORDS.with(|s| s.borrow().contains(w)))
 }
 
@@ -303,7 +305,7 @@ fn bump_spell_gen() {
 const EXPANDS: [char; 7] = ['$', '`', '*', '?', '[', '~', '\n'];
 
 fn spelled(w: &str, quoted: bool) {
-    if w.contains(EXPANDS) {
+    if w.contains(EXPANDS) || w.contains('(') {
         SPELLED.with(|s| {
             let mut s = s.borrow_mut();
             if let Some(all) = s.get_mut(w) {
@@ -11585,7 +11587,9 @@ fn shell_words(script: &str) -> Vec<String> {
                 if double && c == '$' {
                     dq_dollar = true;
                 }
-                if !single && (matches!(c, '$' | '`') || (!double && EXPANDS.contains(&c))) {
+                if !single
+                    && (matches!(c, '$' | '`') || (!double && (EXPANDS.contains(&c) || c == '(')))
+                {
                     bare = true;
                 }
                 cur.push(c);
@@ -25053,6 +25057,33 @@ make -C safe test
              edited `foo/gf.py` and ran it\nEOF",
             "cat <<'EOF' | bash\nrm -rf /srv/example\nEOF",
             "bash <<'EOF'\necho $(rm -rf /)\nEOF",
+        ] {
+            assert_eq!(at(line).decision, Decision::Deny, "{line}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A clock time in quoted prose is text, not a subshell that runs it.
+    #[test]
+    fn a_quoted_parenthesis_opens_nothing() {
+        let root = startup_root("quotedparen");
+        let at = |line: &str| {
+            SPELLED.with(|s| s.borrow_mut().clear());
+            let argv = ["bash", "-c", line].map(String::from);
+            check_shell_in(&argv, &root, 0)
+        };
+        for line in [
+            "echo \"(23:04) done\"; sh foo/x.sh",
+            "printf '%s\\n' 'at (23:04)'; sh foo/x.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for line in [
+            "echo \"at `23:04`\"; sh foo/x.sh",
+            "echo $(23:04); sh foo/x.sh",
+            "echo \"$(rm -rf /srv/example) (a)\"",
+            "(cd /; rm -rf /srv/example)",
         ] {
             assert_eq!(at(line).decision, Decision::Deny, "{line}");
         }
