@@ -3445,11 +3445,45 @@ fn inside(p: &Path, work: Option<&Path>) -> bool {
         || work.is_some_and(|w| p.starts_with(w))
 }
 
+/// `p` as the kernel opens it: the longest part that exists is read
+/// from the disk, with each link followed before a `..` after it, and
+/// the rest as spelled. A link that points at nothing yet is followed
+/// too, since a write makes its target.
+fn on_disk(p: &Path) -> PathBuf {
+    on_disk_at(p, 0)
+}
+
+fn on_disk_at(p: &Path, depth: usize) -> PathBuf {
+    let parts: Vec<Component> = p.components().collect();
+    for k in (1..=parts.len()).rev() {
+        let head: PathBuf = parts[..k].iter().collect();
+        let rest = parts[k..].iter();
+        if let Ok(real) = head.canonicalize() {
+            return lexical(&rest.fold(real, |a, c| a.join(c)));
+        }
+        if let Ok(to) = std::fs::read_link(&head) {
+            if depth < 40 {
+                let to = head.parent().map_or(to.clone(), |d| d.join(&to));
+                return on_disk_at(&rest.fold(to, |a, c| a.join(c)), depth + 1);
+            }
+        }
+    }
+    lexical(p)
+}
+
 /// Whether a write to the absolute path `p` goes out of the tree
 /// `work`. Python and the shell writers both ask this, so the target
-/// decides and not the program that writes it.
+/// decides and not the program that writes it. A temp or device path
+/// as spelled is inside. Otherwise both the path and the tree are read
+/// from the disk: the tree is the directory the line runs in, which a
+/// symlinked spelling of it does not start with, and a link in the tree
+/// can point out of it.
 pub(crate) fn writes_outside(p: &Path, work: Option<&Path>) -> bool {
-    !inside(&lexical(p), work)
+    if inside(&lexical(p), None) {
+        return false;
+    }
+    let tree = work.map(on_disk);
+    !inside(&on_disk(p), tree.as_deref())
 }
 
 /// A string the program spells that names a place out of the tree.
@@ -4455,6 +4489,28 @@ mod tests {
             "import gc; gc.collect(); print(gc.isenabled())",
         ] {
             assert_eq!(refused_for(code), None, "{code}");
+        }
+    }
+
+    /// A tree compare takes whole parts, after `..` is taken off.
+    #[test]
+    fn a_tree_is_compared_by_its_parts() {
+        let work = Some(Path::new("/workspace"));
+        for p in [
+            "/workspace/state/seen.json",
+            "/workspace/state/",
+            "/workspace/a/../state/x",
+        ] {
+            assert!(!writes_outside(Path::new(p), work), "{p}");
+        }
+        for p in [
+            "/workspace-evil/x",
+            "/workspace/../home/example/.secrets/x",
+            "/workspace/state/../../etc/x",
+            "/home/u/.cargo/bin/ljos",
+            "/etc/x",
+        ] {
+            assert!(writes_outside(Path::new(p), work), "{p}");
         }
     }
 }

@@ -26846,6 +26846,88 @@ make -C safe test
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// The tree is the directory the line runs in as the disk names it.
+    /// A state file spelled through a link to that tree is in it, and a
+    /// link in the tree that points out of it is not.
+    #[test]
+    fn a_state_write_is_placed_on_the_disk() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        let home = base.join("home");
+        std::fs::create_dir_all(real.join("state")).unwrap();
+        std::fs::create_dir_all(home.join(".cursor")).unwrap();
+        std::fs::create_dir_all(base.join("real-evil")).unwrap();
+        let ws = base.join("ws");
+        std::os::unix::fs::symlink(&real, &ws).unwrap();
+        std::os::unix::fs::symlink(home.join(".cursor"), real.join("lnk")).unwrap();
+        std::os::unix::fs::symlink(home.join(".cursor/new"), real.join("dangling")).unwrap();
+        let at = |line: &str| {
+            let argv = ["bash", "-c", line].map(String::from);
+            check_shell_in(&argv, &real, 0)
+        };
+        let py = |code: &str| format!("python3 -c '{code}'");
+        for tree in [real.display().to_string(), ws.display().to_string()] {
+            for code in [
+                format!("import json\njson.dump([], open(\"{tree}/state/seen.json\", \"w\"))"),
+                format!(
+                    "import json, os\nname = \"resets.json\"\n\
+                     with open(os.path.join(\"{tree}/state\", name), \"w\") as f:\n    \
+                     json.dump([], f)"
+                ),
+                format!(
+                    "import json\nfrom pathlib import Path\nname = \"seen.json\"\n\
+                     (Path(\"{tree}/state\") / name).write_text(json.dumps([]))"
+                ),
+            ] {
+                let c = at(&py(&code));
+                assert_eq!(c.decision, Decision::Allow, "{code}: {}", c.token);
+            }
+            let c = at(&format!("echo x > {tree}/state/seen.json"));
+            assert_eq!(c.decision, Decision::Allow, "{tree}: {}", c.token);
+        }
+        let r = real.display();
+        let b = base.display();
+        for path in [
+            format!("{b}/real-evil/x"),
+            format!("{r}/../home/example/.secrets/x"),
+            format!("{b}/ws/../home/x"),
+            format!("{r}/lnk/x"),
+            format!("{b}/ws/lnk/x"),
+            format!("{r}/dangling"),
+            "/home/u/.cargo/bin/ljos".to_string(),
+            "/etc/x".to_string(),
+        ] {
+            let (dir, name) = path.rsplit_once('/').unwrap();
+            let mut lines = vec![
+                py(&format!("open(\"{path}\", \"w\").write(\"x\")")),
+                format!("echo x > {path}"),
+            ];
+            if !path.ends_with("dangling") {
+                lines.push(py(&format!(
+                    "import os\nname = \"{name}\"\nopen(os.path.join(\"{dir}\", name), \"w\")"
+                )));
+            }
+            for line in lines {
+                let c = at(&line);
+                assert_eq!(c.decision, Decision::Deny, "{line}");
+                assert!(
+                    matches!(
+                        c.code,
+                        PolicyReason::PathOutsideWorkspace | PolicyReason::PathSensitiveDeny
+                    ),
+                    "{line}: {}",
+                    c.token
+                );
+            }
+        }
+        let c = at("echo x > lnk/x");
+        assert_eq!(c.code, PolicyReason::PathOutsideWorkspace, "{}", c.token);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// `nimvault run` execs the program after its entry, which is judged
     /// as if the line ran it.
     #[test]
