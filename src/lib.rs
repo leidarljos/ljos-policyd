@@ -10282,8 +10282,50 @@ fn substitutions(script: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut double = false;
     let mut i = 0;
+    // Here-documents the current line opens, and where that line starts.
+    let mut pending: Vec<(String, bool, bool)> = Vec::new();
+    let mut line_at = 0;
     while i < n {
         match chars[i] {
+            '<' if !double
+                && chars.get(i + 1) == Some(&'<')
+                && chars.get(i + 2) != Some(&'<')
+                && (i == 0 || chars[i - 1] != '<') =>
+            {
+                let (doc, end) = heredoc_at(&chars, i + 2);
+                pending.extend(doc);
+                i = end;
+            }
+            '\n' if !double && !pending.is_empty() => {
+                let line: String = chars[line_at..i].iter().collect();
+                let text = heredoc_read_as_text(&shell_words(&line));
+                i += 1;
+                // A body the shell expands, or one a shell or a program
+                // may run, is read on as script text.
+                for (delim, tabs, quoted) in std::mem::take(&mut pending) {
+                    if !(quoted && text) {
+                        break;
+                    }
+                    while i < n {
+                        let eol = (i..n).find(|k| chars[*k] == '\n').unwrap_or(n);
+                        let raw: String = chars[i..eol].iter().collect();
+                        i = (eol + 1).min(n);
+                        if (if tabs {
+                            raw.trim_start_matches('\t')
+                        } else {
+                            &raw
+                        }) == delim
+                        {
+                            break;
+                        }
+                    }
+                }
+                line_at = i;
+            }
+            '\n' if !double => {
+                i += 1;
+                line_at = i;
+            }
             '\\' => i += 2,
             '#' if !double && starts_comment(&chars, i) => {
                 while i < n && !matches!(chars[i], '\n' | '\r') {
@@ -10325,6 +10367,44 @@ fn substitutions(script: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// The here-document a `<<` opens, read from just past it: its
+/// delimiter, whether `<<-` strips tabs, and whether the delimiter is
+/// quoted. With where the delimiter word ends.
+fn heredoc_at(chars: &[char], mut i: usize) -> (Option<(String, bool, bool)>, usize) {
+    let tabs = chars.get(i) == Some(&'-');
+    if tabs {
+        i += 1;
+    }
+    while chars.get(i).is_some_and(|c| *c == ' ' || *c == '\t') {
+        i += 1;
+    }
+    let mut name = String::new();
+    let mut quoted = false;
+    let mut quote: Option<char> = None;
+    while let Some(&c) = chars.get(i) {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => name.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                quoted = true;
+            }
+            (None, '\\') => {
+                quoted = true;
+                if let Some(&n) = chars.get(i + 1) {
+                    name.push(n);
+                    i += 1;
+                }
+            }
+            (None, c) if c.is_whitespace() || ";&|<>()".contains(c) => break,
+            (None, c) => name.push(c),
+        }
+        i += 1;
+    }
+    let doc = (!name.is_empty()).then_some((name, tabs, quoted));
+    (doc, i)
 }
 
 /// A `NAME=value` or `NAME+=value` word, where NAME may be an array
@@ -11389,8 +11469,12 @@ fn shell_words(script: &str) -> Vec<String> {
     // Here-documents opened on the command just finished, read from the
     // next line. A body is not the script that follows it: a quote in
     // help text would otherwise swallow the rest of the file.
-    let mut pending: std::collections::VecDeque<(String, bool)> = std::collections::VecDeque::new();
+    let mut pending: std::collections::VecDeque<(String, bool, bool)> =
+        std::collections::VecDeque::new();
     let mut want_delim: Option<bool> = None;
+    // The word has a quote or a backslash in it, as a here-document
+    // delimiter that turns expansion off in its body does.
+    let mut quoted = false;
     while i < chars.len() {
         let c = chars[i];
         i += 1;
@@ -11408,20 +11492,24 @@ fn shell_words(script: &str) -> Vec<String> {
                 i += 1;
                 decode_ansi_c_quoted(&chars, &mut i, &mut cur);
                 word = true;
+                quoted = true;
             }
             '\\' if !single && chars.get(i) == Some(&'\n') => i += 1,
             '\\' if !single => {
                 if let Some(n) = chars.get(i) {
                     cur.push(*n);
                     word = true;
+                    quoted = true;
                     i += 1;
                 }
             }
             '\'' if !double => {
                 single = !single;
                 word = true;
+                quoted = true;
             }
             '"' if !single => {
+                quoted = true;
                 if double {
                     double = false;
                     // Only a quoted `$name` or `${name}` keeps its quotes.
@@ -11472,6 +11560,7 @@ fn shell_words(script: &str) -> Vec<String> {
                     spelled(&cur, !std::mem::take(&mut bare));
                     finish_word(
                         std::mem::take(&mut cur),
+                        std::mem::take(&mut quoted),
                         &mut out,
                         &mut pending,
                         &mut want_delim,
@@ -11506,7 +11595,7 @@ fn shell_words(script: &str) -> Vec<String> {
     }
     if word {
         spelled(&cur, !bare);
-        finish_word(cur, &mut out, &mut pending, &mut want_delim);
+        finish_word(cur, quoted, &mut out, &mut pending, &mut want_delim);
     }
     take_heredoc_bodies(&chars, &mut i, &mut out, &mut pending);
     out
@@ -11514,16 +11603,18 @@ fn shell_words(script: &str) -> Vec<String> {
 
 /// Record a finished word, and a here-document it opens. `<<WORD` names
 /// the delimiter. `<<` and `<<-` alone take the next word as the name.
+/// `quoted` is whether the word had a quote or a backslash in it.
 fn finish_word(
     w: String,
+    quoted: bool,
     out: &mut Vec<String>,
-    pending: &mut std::collections::VecDeque<(String, bool)>,
+    pending: &mut std::collections::VecDeque<(String, bool, bool)>,
     want_delim: &mut Option<bool>,
 ) {
     let w = closed_word(w);
     if let Some(tabs) = want_delim.take() {
         let name = heredoc_name(&w);
-        pending.push_back((name, tabs));
+        pending.push_back((name, tabs, quoted));
         out.push(w);
         return;
     }
@@ -11531,10 +11622,36 @@ fn finish_word(
         if delim.is_empty() {
             *want_delim = Some(tabs);
         } else {
-            pending.push_back((delim, tabs));
+            pending.push_back((delim, tabs, quoted));
         }
     }
     out.push(w);
+}
+
+/// Whether the commands on the line that opened a here-document only
+/// read it as text: each command word is a plain program name that is
+/// not a shell, an interpreter, `eval`, `source` or a runner that may
+/// hand its input to one.
+fn heredoc_read_as_text(out: &[String]) -> bool {
+    let sep = |w: &String| matches!(w.as_str(), ";" | "&&" | "||" | "|" | "&");
+    let end = out.len() - usize::from(out.last().is_some_and(|w| w == ";"));
+    let start = out[..end]
+        .iter()
+        .rposition(|w| w == ";")
+        .map_or(0, |i| i + 1);
+    out[start..end].split(sep).all(|cmd| {
+        let head = cmd
+            .iter()
+            .find(|w| !is_assignment(w) && !is_redirection(w))
+            .map_or("", String::as_str);
+        let b = base_of(head);
+        !head.contains(['/', '$', '`', '('])
+            && !word_may_name_shell(head)
+            && stdin_interpreter(b).is_none()
+            && !RUNNERS.iter().any(|(r, _)| *r == b)
+            && !WRAPPERS.contains(&b)
+            && !matches!(b, "eval" | "source" | "." | "exec" | "parallel" | "find")
+    })
 }
 
 /// The delimiter `<<` / `<<-` names, and whether a leading tab is
@@ -11562,9 +11679,10 @@ fn take_heredoc_bodies(
     chars: &[char],
     i: &mut usize,
     out: &mut Vec<String>,
-    pending: &mut std::collections::VecDeque<(String, bool)>,
+    pending: &mut std::collections::VecDeque<(String, bool, bool)>,
 ) {
-    while let Some((delim, tabs)) = pending.pop_front() {
+    let text = !pending.is_empty() && heredoc_read_as_text(out);
+    while let Some((delim, tabs, quoted)) = pending.pop_front() {
         let mut body = String::new();
         loop {
             if *i >= chars.len() {
@@ -11594,7 +11712,20 @@ fn take_heredoc_bodies(
             body.push('\n');
         }
         if !body.is_empty() {
-            let words = shell_words(&body);
+            // A quoted delimiter expands nothing, so a `$` or a backtick
+            // in a body only text reads is a character, as if escaped.
+            let words = if quoted && text {
+                let mut escaped = String::with_capacity(body.len());
+                for c in body.chars() {
+                    if matches!(c, '$' | '`' | '\\') {
+                        escaped.push('\\');
+                    }
+                    escaped.push(c);
+                }
+                shell_words(&escaped)
+            } else {
+                shell_words(&body)
+            };
             let open = words
                 .last()
                 .is_none_or(|w| !matches!(w.as_str(), ";" | "&&" | "||" | "|" | "&"));
@@ -24900,5 +25031,31 @@ make -C safe test
         ] {
             assert_eq!(in_tree(line).decision, Decision::Allow, "{line}");
         }
+    }
+
+    /// A quoted here-document fed to a program that only reads it is
+    /// text, so a script named in its prose is not a script the line runs.
+    #[test]
+    fn a_quoted_here_document_to_a_reader_is_text() {
+        let root = startup_root("heredoctext");
+        let at = |line: &str| {
+            let argv = ["bash", "-c", line].map(String::from);
+            check_shell_in(&argv, &root, 0)
+        };
+        let note = "printf %s x > \"$_ljos_seen\"; ljos note ab12 - <<'EOF'\n\
+                    edited `foo/gf.py` and ran it\nEOF";
+        assert_eq!(at(note).decision, Decision::Allow, "{}", at(note).token);
+        let lesson = "printf %s x > \"$_ljos_seen\"; \
+                      ljos finish --lesson \"$(cat <<'EOF'\nrun `foo/gf.py` first\nEOF\n)\"";
+        assert_eq!(at(lesson).decision, Decision::Allow, "{}", at(lesson).token);
+        for line in [
+            "printf %s x > \"$_ljos_seen\"; ljos note ab12 - <<EOF\n\
+             edited `foo/gf.py` and ran it\nEOF",
+            "cat <<'EOF' | bash\nrm -rf /srv/example\nEOF",
+            "bash <<'EOF'\necho $(rm -rf /)\nEOF",
+        ] {
+            assert_eq!(at(line).decision, Decision::Deny, "{line}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
