@@ -87,3 +87,67 @@ fn the_configured_relay_reads_its_secret_from_the_vault() {
     refused(&dir, &config, "relay", &used);
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn the_configured_relay_runs_a_script_it_owns() {
+    let base = std::env::temp_dir().join(format!("relay-script-{}", std::process::id()));
+    let dir = base.join("relay");
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = base.join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[relay]\nseat = \"relay\"\ndir = \"{}\"\nsecret = \"EXAMPLE_TOKEN\"\nhost = \"example.org\"\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let send = "import os, sys, urllib.parse, urllib.request\n\
+        token = os.environ[\"EXAMPLE_TOKEN\"]\n\
+        text = open(sys.argv[1]).read()\n\
+        data = urllib.parse.urlencode({\"chat_id\": sys.argv[2], \"text\": text}).encode()\n\
+        url = f\"https://example.org/bot{token}/sendMessage\"\n\
+        with urllib.request.urlopen(url, data=data, timeout=20) as r:\n    r.read()\n";
+    let script = |name: &str, code: &str, mode: u32| {
+        let p = dir.join(name);
+        std::fs::write(&p, code).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    script("send.py", send, 0o600);
+    script(
+        "show.py",
+        "import os\nprint(os.environ[\"EXAMPLE_TOKEN\"])\n",
+        0o600,
+    );
+    script("far.py", &send.replace("example.org", "example.net"), 0o600);
+    script("open.py", send, 0o620);
+    std::os::unix::fs::symlink(dir.join("send.py"), dir.join("link.py")).unwrap();
+    std::fs::write(base.join("out.py"), send).unwrap();
+    let run =
+        |s: &str| format!("nimvault run --env EXAMPLE_TOKEN relay/token python3 {s} msg.txt 42");
+    let v = |seat: &str, config: &Path, line: &str| verdict(&dir, config, seat, line);
+
+    assert_eq!(v("relay", &config, &run("send.py")), "allow");
+    let dashed = run("send.py").replace("token python3", "token -- python3");
+    assert_eq!(v("relay", &config, &dashed), "allow");
+    let shown = v("relay", &config, &run("show.py"));
+    assert!(
+        shown.starts_with("deny") && shown.contains("shows-secret"),
+        "{shown}"
+    );
+    let far = v("relay", &config, &run("far.py"));
+    assert!(
+        far.starts_with("deny") && far.contains("sends-secret"),
+        "{far}"
+    );
+    for s in ["open.py", "link.py", "../out.py", "missing.py"] {
+        let d = v("relay", &config, &run(s));
+        assert!(d.starts_with("deny"), "{s}: {d}");
+    }
+    for (seat, config) in [("other", config.clone()), ("relay", base.join("none.toml"))] {
+        let d = v(seat, &config, &run("send.py"));
+        assert!(d.starts_with("deny"), "{seat}: {d}");
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
