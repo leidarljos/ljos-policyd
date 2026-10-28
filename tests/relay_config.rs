@@ -408,3 +408,42 @@ fn no_seat_reads_the_secrets_dir() {
     }
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn no_seat_writes_the_policyd_config_from_python() {
+    let base = std::env::temp_dir().join(format!("relay-pyconf-{}", std::process::id()));
+    let dir = base.join("work");
+    std::fs::create_dir_all(dir.join("conf")).unwrap();
+    for config in [base.join("conf/relay.toml"), dir.join("conf/relay.toml")] {
+        let c = config.display();
+        let d = config.parent().unwrap().display();
+        for seat in ["relay", "other", ""] {
+            for line in [
+                format!("python3 -c 'open(\"{c}\", \"w\").write(\"x\")'"),
+                format!("python3 -c 'open(\"{d}/other.toml\", \"w\").write(\"x\")'"),
+                format!("python3 -c 'import shutil; shutil.rmtree(\"{d}\")'"),
+                "python3 -c 'open(\"/home/u/.config/ljos-policyd/x.toml\", \"w\").write(\"x\")'"
+                    .to_string(),
+            ] {
+                let v = verdict(&dir, &config, seat, &line);
+                let want = if line.contains("ljos-policyd") {
+                    "deny"
+                } else {
+                    "deny\tpython-writes-policyd-config"
+                };
+                assert!(v.starts_with(want), "{seat}: {line}: {v}");
+            }
+            for line in [
+                format!("python3 -c 'print(open(\"{c}\").read())'"),
+                "python3 -c 'open(\"out.txt\", \"w\").write(\"x\")'".to_string(),
+            ] {
+                assert_eq!(
+                    verdict(&dir, &config, seat, &line),
+                    "allow",
+                    "{seat}: {line}"
+                );
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}

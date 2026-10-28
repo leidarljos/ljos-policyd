@@ -1892,6 +1892,7 @@ fn judge(code: &str, place: Place) -> Option<Refusal> {
     credential(&r, place)
         .or_else(|| place.sealed.and_then(|n| shows_secret(code, &r, n)))
         .or_else(|| hook_write(&r))
+        .or_else(|| config_write(&r, place, crate::policyd_config().as_deref()))
         .or_else(|| place.host.and_then(|h| relay_sends(code, &r, h)))
         .or_else(|| network(&r, place.host.is_some()))
         .or_else(|| runs_written(&r))
@@ -2310,6 +2311,45 @@ fn hook_write(r: &Read) -> Option<Refusal> {
     writes(r)?;
     let s = r.strs.iter().find(|s| names_hook(s))?;
     refused(PolicyReason::PathSensitiveDeny, "writes-hook", s)
+}
+
+/// A program that may write files and names the policyd config file
+/// `$LJOS_POLICYD_CONFIG`, wherever it is, or its directory.
+fn config_write(r: &Read, place: Place, config: Option<&str>) -> Option<Refusal> {
+    let config = Path::new(config?);
+    writes(r)?;
+    let s = r.strs.iter().find(|s| names_config(s, place, config))?;
+    refused(PolicyReason::PathSensitiveDeny, "writes-policyd-config", s)
+}
+
+/// Whether the path `s` spells is the config file, its directory, or a
+/// file in that directory. When the directory is the tree or above it,
+/// only the file and the directory itself count, so the tree stays
+/// writable.
+fn names_config(s: &str, place: Place, config: &Path) -> bool {
+    let s = s.split(FIELD).next().unwrap_or_default();
+    if s.is_empty() || s.contains(['\n', '\0']) {
+        return false;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let at = match s.strip_prefix("~/") {
+        Some(rest) if !home.is_empty() => Path::new(&home).join(rest),
+        _ if s.starts_with('/') => PathBuf::from(s),
+        _ if s.starts_with('~') => return false,
+        _ => match place.cwd {
+            Some(c) => c.join(s),
+            None => return false,
+        },
+    };
+    let at = lexical(&at);
+    let Some(dir) = config.parent().filter(|d| *d != Path::new("/")) else {
+        return at == config;
+    };
+    let over_tree = [place.work, place.cwd]
+        .into_iter()
+        .flatten()
+        .any(|w| lexical(w).starts_with(dir));
+    at == config || at == dir || (!over_tree && at.starts_with(dir))
 }
 
 /// Calls that may make, change or remove a file whatever their mode.
@@ -3634,6 +3674,69 @@ mod tests {
             "print('tokens: 3')",
         ] {
             assert_eq!(refused_for(code), None, "{code}");
+        }
+    }
+
+    /// A write to the file `$LJOS_POLICYD_CONFIG` names, or into its
+    /// directory, is refused wherever that file is, even in the tree.
+    #[test]
+    fn a_write_to_the_policyd_config_is_refused() {
+        let at = |code: &str, config: &str| {
+            let mut r = Read::default();
+            read(code, 0, &mut r).unwrap();
+            let place = Place {
+                cwd: Some(Path::new("/w")),
+                work: Some(Path::new("/w")),
+                secret: None,
+                sealed: None,
+                host: None,
+            };
+            config_write(&r, place, Some(config)).map(|r| r.token)
+        };
+        for (code, config) in [
+            (
+                "open('/srv/conf/relay.toml', 'w').write('x')",
+                "/srv/conf/relay.toml",
+            ),
+            (
+                "open('/srv/conf/other.toml', 'w').write('x')",
+                "/srv/conf/relay.toml",
+            ),
+            (
+                "import shutil; shutil.rmtree('/srv/conf')",
+                "/srv/conf/relay.toml",
+            ),
+            (
+                "open('/tmp/conf/relay.toml', 'a').write('x')",
+                "/tmp/conf/relay.toml",
+            ),
+            (
+                "open('conf/relay.toml', 'w').write('x')",
+                "/w/conf/relay.toml",
+            ),
+            ("open('../w/conf/x', 'w').write('x')", "/w/conf/relay.toml"),
+            (
+                "import os; os.replace('n.toml', 'relay.toml')",
+                "/w/relay.toml",
+            ),
+            ("import os; os.rename('/w', '/w2')", "/w/relay.toml"),
+        ] {
+            let t = at(code, config).unwrap_or_default();
+            assert!(t.contains("writes-policyd-config"), "{code}: {t}");
+        }
+        for (code, config) in [
+            (
+                "print(open('/srv/conf/relay.toml').read())",
+                "/srv/conf/relay.toml",
+            ),
+            (
+                "open('/srv/other/x', 'w').write('x')",
+                "/srv/conf/relay.toml",
+            ),
+            ("open('out.txt', 'w').write('x')", "/w/relay.toml"),
+            ("open('sub/x', 'w').write('x')", "/w/relay.toml"),
+        ] {
+            assert_eq!(at(code, config), None, "{code}");
         }
     }
 
