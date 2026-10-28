@@ -825,3 +825,33 @@ fn a_python_heredoc_is_judged_as_its_program() {
     }
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A script the line writes and then runs by its path picks its program
+/// with its `#!` line. One that names python is judged as python, so a
+/// read of a secret in it still refuses.
+#[test]
+fn a_python_script_run_by_path_is_judged_as_python() {
+    let d = scratch("shebang-py");
+    let w = d.display();
+    for head in ["#!/usr/bin/env python3", "#!/usr/bin/python3 -u"] {
+        for (body, ok) in [("print(1)", true), (SECRET_PY, false)] {
+            for line in [
+                format!(
+                    "cat > {w}/s.py <<'EOF' && chmod +x {w}/s.py && {w}/s.py\n{head}\n{body}\nEOF"
+                ),
+                format!(
+                    "cat > {w}/s.py <<'EOF'\n{head}\n{body}\nEOF\nchmod +x {w}/s.py && {w}/s.py"
+                ),
+            ] {
+                let line = format!("{SEEN}{line}");
+                let v = hook_verdict(&d, "travel", &line);
+                if ok {
+                    assert_eq!(v, "allow", "{line}");
+                } else {
+                    assert!(v.contains("python-reads-credential"), "{line}: {v}");
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}

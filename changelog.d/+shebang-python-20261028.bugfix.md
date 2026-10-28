@@ -1,0 +1,1 @@
+A script the line writes and then runs by its own path is judged on its text. That text was judged as a shell script, whatever its `#!` line named. A python script run that way could read a secret and be allowed. A text whose `#!` line names python, directly or through `env`, is now judged as python. Any other text is judged as before.

@@ -911,10 +911,19 @@ impl LineFiles {
             // line spells out is judged on that text instead. A write to
             // a path the line does not show, with all of its text shown,
             // leaves that text if it is the script a shell or python reads.
-            // A command word runs a text with no `#!` line in a shell.
+            // A command word runs a text with no `#!` line in a shell, and
+            // a placed text whose `#!` line names python in python.
             for w in hits {
                 let it = r.is_some() && (w.path == *r || (w.path.is_none() && !w.loose));
                 match &w.text {
+                    Some(t)
+                        if *how == Ran::Exec
+                            && it
+                            && w.path.is_some()
+                            && shebang_names_python(t) =>
+                    {
+                        texts.push(Rejudged::Python(shown(r), t.clone(), dirs.clone()));
+                    }
                     Some(t)
                         if (*how == Ran::Shell && it)
                             || (*how == Ran::Exec
@@ -1024,6 +1033,22 @@ impl LineFiles {
         // line deletes is treated as gone.
         !shape_overlaps(&w.word, run)
     }
+}
+
+/// Whether the `#!` line of `text` runs it with python, directly or
+/// through `env`.
+fn shebang_names_python(text: &str) -> bool {
+    let Some(line) = text.lines().next().and_then(|l| l.strip_prefix("#!")) else {
+        return false;
+    };
+    let mut words = line.split_whitespace();
+    let mut prog = words.next().map(base_of);
+    if prog == Some("env") {
+        prog = words
+            .find(|w| !w.starts_with('-') && !w.contains('='))
+            .map(base_of);
+    }
+    prog.is_some_and(|p| p.starts_with("python") || p.starts_with("pypy"))
 }
 
 /// Why the script `script` counts as written by `w`: a path the line
