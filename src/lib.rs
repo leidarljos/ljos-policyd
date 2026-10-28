@@ -10625,6 +10625,42 @@ fn unwrap_wrappers(cmd: &[String]) -> (&[String], Option<&str>) {
     }
 }
 
+/// For a `nimvault run` at `cmd[i]`, the variable `--env` names and where
+/// the program it runs starts. `nimvault run [opts] ENTRY [--] PROGRAM`
+/// sets the entry's plaintext as that variable and execs the program.
+fn nimvault_run_at(cmd: &[String], i: usize) -> Option<(Option<&str>, usize)> {
+    if cmd.get(i + 1).map(String::as_str) != Some("run") {
+        return None;
+    }
+    let mut j = i + 2;
+    let mut env = None;
+    let mut entry = false;
+    while let Some(a) = cmd.get(j).map(String::as_str) {
+        if a == "--" {
+            j += 1 + usize::from(!entry);
+            break;
+        }
+        let long = |n: &str| a.strip_prefix(n).and_then(|r| r.strip_prefix(['=', ':']));
+        if let Some(v) = long("--env").or_else(|| long("-e")) {
+            env = Some(v);
+            j += 1;
+        } else if matches!(a, "--env" | "-e") {
+            env = cmd.get(j + 1).map(String::as_str);
+            j += 2;
+        } else if matches!(a, "--vault" | "-v" | "--recipient" | "-r") {
+            j += 2;
+        } else if a.starts_with('-') && a.len() > 1 {
+            j += 1;
+        } else if !entry {
+            entry = true;
+            j += 1;
+        } else {
+            break;
+        }
+    }
+    Some((env, j.min(cmd.len())))
+}
+
 /// Where [`wrapper_walk`] stops in a command.
 enum Walk<'a> {
     /// The command it runs starts at this word.
@@ -10655,6 +10691,13 @@ fn wrapper_walk(cmd: &[String]) -> Walk<'_> {
             // `f() { git push -f; }`: the body is what runs when `f` is
             // called, so it is judged as written.
             i += head;
+            continue;
+        }
+        if base_of(w) == "nimvault" {
+            let Some((_, at)) = nimvault_run_at(cmd, i) else {
+                break;
+            };
+            i = at;
             continue;
         }
         let Some((name, valued)) = RUNNERS.iter().find(|(n, _)| *n == base_of(w)) else {
@@ -11729,7 +11772,10 @@ fn heredoc_read_as_text(out: &[String]) -> bool {
             && stdin_interpreter(b).is_none()
             && !RUNNERS.iter().any(|(r, _)| *r == b)
             && !WRAPPERS.contains(&b)
-            && !matches!(b, "eval" | "source" | "." | "exec" | "parallel" | "find")
+            && !matches!(
+                b,
+                "eval" | "source" | "." | "exec" | "parallel" | "find" | "nimvault"
+            )
     })
 }
 
@@ -25310,6 +25356,39 @@ make -C safe test
             assert_eq!(at(&line).decision, Decision::Deny, "{line}");
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `nimvault run` execs the program after its entry, which is judged
+    /// as if the line ran it.
+    #[test]
+    fn nimvault_run_runs_its_program() {
+        let root = startup_root("nimvaultrun");
+        let at = |line: &str| {
+            let argv = ["bash", "-c", line].map(String::from);
+            check_shell_in(&argv, &root, 0).token.into_owned()
+        };
+        for (line, token) in [
+            (
+                "nimvault run --env X e -- rm -rf /srv/example",
+                "rm-rf-outside-tmp",
+            ),
+            ("nimvault run -e X e git push --force", "git-force-push"),
+            (
+                "nimvault run --env=X --vault ~/v e -- sh -c 'git push -f'",
+                "git-force-push",
+            ),
+            ("nimvault run --env X e -- sudo id", "sudo"),
+        ] {
+            assert_eq!(at(line), token, "{line}");
+        }
+        for line in [
+            "nimvault get e",
+            "nimvault run --env X e -- ls",
+            "nimvault unseal",
+        ] {
+            assert_eq!(at(line), "allow", "{line}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A `for` over literal words binds its name to each of them, so a
