@@ -3010,6 +3010,13 @@ fn inside(p: &Path, work: Option<&Path>) -> bool {
         || work.is_some_and(|w| p.starts_with(w))
 }
 
+/// Whether a write to the absolute path `p` lands out of the tree
+/// `work`. Python and the shell writers both ask this, so the target
+/// decides and not the program that writes it.
+pub(crate) fn writes_outside(p: &Path, work: Option<&Path>) -> bool {
+    !inside(&lexical(p), work)
+}
+
 /// A string the program spells that names a place out of the tree.
 fn outside_string(s: &str, place: Place) -> bool {
     let s = s.split(FIELD).next().unwrap_or_default();
@@ -3020,12 +3027,12 @@ fn outside_string(s: &str, place: Place) -> bool {
         return true;
     }
     if s.starts_with('/') {
-        return s.chars().any(char::is_alphanumeric) && !inside(&lexical(Path::new(s)), place.work);
+        return s.chars().any(char::is_alphanumeric) && writes_outside(Path::new(s), place.work);
     }
     if s.split('/').any(|p| p == "..") {
         return place
             .cwd
-            .is_none_or(|c| !inside(&lexical(&c.join(s)), place.work));
+            .is_none_or(|c| writes_outside(&c.join(s), place.work));
     }
     false
 }

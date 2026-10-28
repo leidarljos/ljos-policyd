@@ -336,6 +336,7 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
     }
     let parent = Scratch {
         root: Some(cwd.to_path_buf()),
+        work: Some(cwd.to_path_buf()),
         ..Scratch::default()
     };
     let table = host_argv_table_at(argv, 0, leaves_tree(argv, 0), &parent);
@@ -7411,6 +7412,9 @@ fn hash_scratch(scratch: &Scratch) -> u64 {
     } else {
         h ^= 0x0F0F_0F0F_0F0F_0F0F;
     }
+    if let Some(work) = &scratch.work {
+        h ^= hash_bytes(work.as_os_str().as_encoded_bytes()).wrapping_mul(0xC2B2AE3D27D4EB4F);
+    }
     for (i, mark) in scratch.fed_marks.iter().enumerate() {
         h = h
             .wrapping_mul(0x100000001b3)
@@ -8919,8 +8923,14 @@ const FED_TAILS: &[&[&str]] = &[
     &["--delete", "/", "/"],
 ];
 
+/// A stand-in operand is no path the line writes, so a write out of the
+/// tree it would make is not a refusal the missing word decides.
 fn rules_deny(cmd: &[String], moved: bool, bound: &Scratch) -> Option<Checked> {
-    benign_denial(cmd, &[], moved, bound)
+    let probe = Scratch {
+        work: None,
+        ..bound.clone()
+    };
+    benign_denial(cmd, &[], moved, &probe)
 }
 
 /// `true` when some stand-in for the missing operand is refused.
@@ -12503,6 +12513,123 @@ fn command_guard_hit(
     None
 }
 
+/// A word that may write a file's content: a redirection, or a program
+/// [`content_writes`] names the targets of.
+fn content_writer(w: &str) -> bool {
+    w.contains('>')
+        || matches!(
+            base_of(w),
+            "tee" | "cp" | "mv" | "install" | "dd" | "sed" | "perl" | "awk" | "gawk" | "mawk"
+        )
+}
+
+/// The files `cmd` writes the content of, each with what writes it: a
+/// redirection, `tee`, the target of `cp`, `mv` and `install`, `dd of=`,
+/// the files of `sed -i`, `perl -i` and `awk -i inplace`, and a file an
+/// awk program prints into.
+fn content_writes<'a>(cmd: &[&'a str]) -> Vec<(&'a str, String)> {
+    let mut out: Vec<(&str, String)> = redirect_targets_of(cmd)
+        .into_iter()
+        .map(|t| (">", t.to_string()))
+        .collect();
+    let Some((head, args)) = cmd_head(cmd) else {
+        return out;
+    };
+    let paths = match head {
+        "tee" => bare_words(&args, "", &[])
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        "cp" | "install" | "mv" => copy_target(&args, false, &|_| false),
+        "dd" => args
+            .iter()
+            .filter_map(|a| a.strip_prefix("of="))
+            .map(str::to_string)
+            .collect(),
+        "sed" if sed_in_place(&args) => {
+            let given = args.iter().any(|a| {
+                matches!(*a, "--expression" | "--file")
+                    || a.starts_with("--expression=")
+                    || a.starts_with("--file=")
+                    || a.strip_prefix('-')
+                        .filter(|f| !f.starts_with('-'))
+                        .and_then(|f| f.chars().find(|c| matches!(c, 'e' | 'f' | 'l')))
+                        .is_some_and(|c| c != 'l')
+            });
+            let files = sed_files(&args);
+            files.into_iter().skip(usize::from(!given)).collect()
+        }
+        "perl" if perl_in_place(&args) => {
+            let given = args.iter().any(|a| {
+                a.strip_prefix('-')
+                    .filter(|f| !f.starts_with('-'))
+                    .is_some_and(|f| perl_cluster(f).1)
+            });
+            let files = perl_files(&args);
+            files.into_iter().skip(usize::from(!given)).collect()
+        }
+        "awk" | "gawk" | "mawk" => {
+            let mut t = if awk_inplace(&args) {
+                awk_files(&args)
+            } else {
+                Vec::new()
+            };
+            t.extend(awk_printed_files(&args));
+            t
+        }
+        _ => Vec::new(),
+    };
+    out.extend(paths.into_iter().map(|p| (head, p)));
+    out
+}
+
+/// The literal files an awk program prints into: `print > "f"` and
+/// `printf ... >> "f"`. A `>` before a string is read as one even where
+/// it compares, so a program never hides a write as a comparison.
+fn awk_printed_files(args: &[&str]) -> Vec<String> {
+    let program = args
+        .iter()
+        .position(|a| matches!(*a, "-e" | "--source"))
+        .and_then(|i| args.get(i + 1))
+        .or_else(|| args.iter().find(|a| !a.starts_with('-')));
+    let Some(program) = program else {
+        return Vec::new();
+    };
+    let program = unquote(program);
+    let mut out = Vec::new();
+    let mut rest = program;
+    while let Some(i) = rest.find('>') {
+        let after = rest[i + 1..].trim_start_matches('>').trim_start();
+        rest = &rest[i + 1..];
+        if let Some(body) = after.strip_prefix('"') {
+            if let Some(end) = body.find('"') {
+                out.push(body[..end].to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The first content write of `cmd` that lands out of `work`, with what
+/// writes it and where it lands. A target the line does not spell out,
+/// or a relative one where the directory is not known, is not placed.
+fn outside_content_write(
+    cmd: &[&str],
+    look: &GuardLook<'_>,
+    links: &[(String, String)],
+    work: &std::path::Path,
+) -> Option<(String, String)> {
+    content_writes(cmd).into_iter().find_map(|(by, word)| {
+        let expanded = expand_guard(&word, look.names, look.home, look.cfg, look.data);
+        if expanded.starts_with('~') {
+            return Some((by.to_string(), expanded));
+        }
+        let abs = follow_links(&landed(&expanded, look.cwd)?, links);
+        pyprog::writes_outside(std::path::Path::new(&abs), Some(work))
+            .then(|| (by.to_string(), abs))
+    })
+}
+
 /// A write onto a file the seat keeps for itself: the hook files,
 /// the ljos config directory, the global git hooks directory, and the
 /// global git config. The shell hook only sees the top-level command,
@@ -12513,12 +12640,35 @@ fn seat_guard_denial(argv: &[String], cwd: Option<&std::path::Path>) -> Option<C
     if !may_touch_seat(argv) {
         return None;
     }
+    written_path_denial(argv, cwd, None)
+}
+
+/// A write the line shows onto a path out of the tree `work`. The path
+/// is placed the way [`seat_guard_denial`] places a seat file, so each
+/// writer that reaches it is refused the same way.
+fn outside_write_denial(
+    argv: &[String],
+    cwd: Option<&std::path::Path>,
+    work: Option<&std::path::Path>,
+) -> Option<Checked> {
+    let work = work.filter(|_| argv.iter().any(|w| content_writer(w)))?;
+    written_path_denial(argv, cwd, Some(work))
+}
+
+/// The path walk: with no `work`, a write onto a seat file, and with
+/// one, a content write out of that tree.
+fn written_path_denial(
+    argv: &[String],
+    cwd: Option<&std::path::Path>,
+    work: Option<&std::path::Path>,
+) -> Option<Checked> {
     let guards = GuardSet::real();
     let real_home = process_home();
     let real_cfg = process_xdg("XDG_CONFIG_HOME", &real_home, ".config");
     let real_data = process_xdg("XDG_DATA_HOME", &real_home, ".local/share");
     let mut names: Vec<(String, String)> = Vec::new();
     let mut cwd = cwd
+        .filter(|p| !is_untracked(p))
         .and_then(|p| p.to_str())
         .filter(|p| p.starts_with('/'))
         .map(ToString::to_string);
@@ -12545,11 +12695,19 @@ fn seat_guard_denial(argv: &[String], cwd: Option<&std::path::Path>) -> Option<C
         } else {
             None
         };
-        if let Some(path) = command_guard_hit(&cmd, &look, &mut links) {
+        let seat_hit = command_guard_hit(&cmd, &look, &mut links);
+        if let Some(path) = seat_hit.filter(|_| work.is_none()) {
             return Some(Checked {
                 decision: Decision::Deny,
                 code: PolicyReason::PathSensitiveDeny,
                 token: Cow::Owned(format!("seat-guard-path: {path}")),
+            });
+        }
+        if let Some((by, path)) = work.and_then(|w| outside_content_write(&cmd, &look, &links, w)) {
+            return Some(Checked {
+                decision: Decision::Deny,
+                code: PolicyReason::PathOutsideWorkspace,
+                token: Cow::Owned(format!("writes-outside: {by} with {path}")),
             });
         }
         note_assignments(&cmd, &mut names, true);
@@ -12810,6 +12968,9 @@ fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
                 token: Cow::Borrowed(token),
             };
         }
+    }
+    if let Some(c) = outside_write_denial(argv, bound.root.as_deref(), bound.work.as_deref()) {
+        return c;
     }
     Checked {
         decision: Decision::Allow,
@@ -15273,6 +15434,9 @@ struct Scratch {
     /// directory is not a single tracked one: a symlink there would be
     /// followed, so the name is refused.
     root: Option<std::path::PathBuf>,
+    /// The tree the line was started in. Set for the line's own words,
+    /// and `None` for a script file it runs, whose writes are its own.
+    work: Option<std::path::PathBuf>,
     /// `IFS` was assigned or `eval` ran. A variable suffix can split.
     ifs_assigned: bool,
     /// An `xargs -I` mark whose shown inputs are all under `/tmp`. The
@@ -24667,5 +24831,74 @@ make -C safe test
         let c = check_shell_in(&shell_words("echo x > notes.txt"), &root, 0);
         assert_eq!(c.decision, Decision::Allow, "{}", c.token);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The table's verdict on `line` started in the tree `/w/proj`.
+    fn in_tree(line: &str) -> Checked {
+        let work = std::path::PathBuf::from("/w/proj");
+        let at = Scratch {
+            root: Some(work.clone()),
+            work: Some(work),
+            ..Scratch::default()
+        };
+        let argv = shell_words(line);
+        host_argv_table_at(&argv, 0, leaves_tree(&argv, 0), &at)
+    }
+
+    /// A target python is refused for is refused the same way for each
+    /// shell writer the line shows, however it spells the path.
+    #[test]
+    fn the_written_path_decides_not_the_writer() {
+        let t = "/srv/example/state/run.json";
+        let py = in_tree(&format!("python3 -c 'open(\"{t}\", \"w\").write(\"x\")'"));
+        assert_eq!(py.decision, Decision::Deny);
+        assert_eq!(py.code, PolicyReason::PathOutsideWorkspace);
+        assert_eq!(py.token, format!("python-writes-outside: open with {t}"));
+        for (by, line) in [
+            ("sed", format!("sed -i 's/a/b/' {t}")),
+            ("sed", format!("sed -i -e 's/a/b/' {t}")),
+            ("perl", format!("perl -pi -e 's/a/b/' {t}")),
+            ("perl", format!("perl -i.bak -pe 's/a/b/' {t}")),
+            (">", format!("awk '{{print}}' in.json > {t}")),
+            ("awk", format!("awk '{{print > \"{t}\"}}' in.json")),
+            ("gawk", format!("gawk -i inplace '{{print}}' {t}")),
+            ("tee", format!("echo x | tee {t}")),
+            ("tee", format!("echo x | tee -a {t}")),
+            ("cp", format!("cp in.json {t}")),
+            ("mv", format!("mv in.json {t}")),
+            ("dd", format!("dd if=in.json of={t}")),
+            (">", format!("echo x > {t}")),
+            (">", format!("echo x >> {t}")),
+            (">", format!("cat in.json 1>{t}")),
+            ("install", format!("install -m 644 in.json {t}")),
+            ("sed", format!("f={t}; sed -i 's/a/b/' \"$f\"")),
+            (
+                "sed",
+                "cd /srv/example/state && sed -i 's/a/b/' run.json".into(),
+            ),
+            (">", "echo x > ../../srv/example/state/run.json".into()),
+            ("sed", format!("bash -c \"sed -i 's/a/b/' {t}\"")),
+            ("sed", format!("env A=1 sed -i 's/a/b/' {t}")),
+        ] {
+            let c = in_tree(&line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+            assert_eq!(c.code, py.code, "{line}");
+            assert_eq!(c.token, format!("writes-outside: {by} with {t}"), "{line}");
+        }
+        for line in [
+            "sed -i 's/a/b/' .state/run.json",
+            "sed -i /old/d .state/run.json",
+            "echo x > /w/proj/.state/run.json",
+            "cd .state && echo x | tee run.json",
+            "echo x > /tmp/run.json",
+            "echo x 2>&1 >/dev/null",
+            "cp /srv/example/in.json .state/run.json",
+            "mv /srv/example/in.json .",
+            "install -d /srv/example/state",
+            "awk '$1 > 3' in.json",
+            "ls *.json | xargs -I{} cp {} {}.bak",
+        ] {
+            assert_eq!(in_tree(line).decision, Decision::Allow, "{line}");
+        }
     }
 }

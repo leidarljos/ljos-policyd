@@ -139,8 +139,9 @@ fn an_unpinned_variable_still_refuses() {
             .replace("{d}", &d.to_string_lossy())
             .replace("{run}", &run);
         let v = sh(&d, &line);
+        let home = line.contains("$HOME") && v.starts_with("deny\twrites-outside: ");
         assert!(
-            v.starts_with("deny\tscript-written-on-line: "),
+            home || v.starts_with("deny\tscript-written-on-line: "),
             "{line}: {v}"
         );
     }
