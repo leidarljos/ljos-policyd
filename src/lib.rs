@@ -15368,11 +15368,35 @@ fn may_write_anywhere(run: &[String], at: &[std::path::PathBuf], home: Option<&s
         // a word with a glob in the place of a command is a case arm.
         _ if word.starts_with('(') || marker_index(word).is_some() => false,
         _ if word.contains(['*', '?', '[']) => false,
+        _ if email_address(word) => false,
         _ if word.contains('/') => placed(word, at, home)
             .into_iter()
             .any(|p| p.is_none_or(|p| matches!(read_script(&p), ScriptText::Binary))),
         _ => true,
     }
+}
+
+/// A word shaped as a mail address, `name@host.tld`. It names no
+/// program on `PATH`, so the shell finds no command for it: the
+/// `` `me@example.org` `` a mail text puts in an unquoted heredoc.
+fn email_address(word: &str) -> bool {
+    let Some((name, host)) = word.split_once('@') else {
+        return false;
+    };
+    let labels: Vec<&str> = host.split('.').collect();
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '%' | '+' | '-'))
+        && labels.len() >= 2
+        && labels.iter().all(|l| {
+            !l.is_empty()
+                && !l.starts_with('-')
+                && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+        && labels
+            .last()
+            .is_some_and(|t| t.len() >= 2 && t.chars().all(|c| c.is_ascii_alphabetic()))
 }
 
 fn listed(list: &str, word: &str) -> bool {
