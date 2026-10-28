@@ -372,6 +372,7 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
         known: None,
         script_cwd_moved: false,
         trust_argv0: false,
+        argv0_file: false,
         cmd_values: &cmd_values,
     };
     runner_commands(argv, &inn, 0, &mut runs, &mut denied);
@@ -1859,6 +1860,10 @@ struct Shell {
     trust_argv0: bool,
     /// `trust_argv0` was dropped and stays dropped for this walk.
     trust_dropped: bool,
+    /// `$0` is the path with a `/` this walk's file was started by, so
+    /// `"$0"` as a command word runs a file in a child and never a
+    /// function or builtin of this shell. Dropped where `trust_argv0` is.
+    argv0_file: bool,
 }
 
 /// One `if` or `case`, so a variable set in every branch can be read as
@@ -1957,6 +1962,8 @@ struct ShellIn<'a> {
     /// `$0` names the file this walk was started on. A `-c` script and a
     /// sourced file do not get that.
     trust_argv0: bool,
+    /// See [`Shell::argv0_file`].
+    argv0_file: bool,
     /// Values a `$name` in this walk may hold. A nested script starts
     /// from the environment. A re-walk of a command in this shell keeps
     /// the values that command saw.
@@ -2433,6 +2440,7 @@ fn replay_subshell(
     shell: &Shell,
     depth: usize,
     trust_argv0: bool,
+    argv0_file: bool,
     out: &mut Vec<(Vec<String>, std::path::PathBuf, bool)>,
     denied: &mut Option<Checked>,
 ) {
@@ -2452,6 +2460,7 @@ fn replay_subshell(
             known: shell.known.clone(),
             script_cwd_moved: shell.script_cwd_moved,
             trust_argv0,
+            argv0_file,
             cmd_values: &shell.cmd_values,
         };
         runner_commands(body, &inn, depth, out, denied);
@@ -2519,6 +2528,7 @@ fn runner_commands(
         script_cwd_moved: inn.script_cwd_moved,
         trust_argv0: inn.trust_argv0,
         trust_dropped: false,
+        argv0_file: inn.argv0_file,
     };
     walk(argv, &mut shell, depth, out, denied);
 }
@@ -2933,6 +2943,7 @@ fn walk(
                             known: shell.known.clone(),
                             script_cwd_moved: shell.script_cwd_moved,
                             trust_argv0: shell.trust_argv0,
+                            argv0_file: shell.argv0_file,
                             cmd_values: &shell.cmd_values,
                         };
                         runner_commands(&words, &inn, depth + 1, out, denied);
@@ -3172,7 +3183,7 @@ fn walk(
                     }
                     shell.lose();
                 } else if keeps {
-                    replay_subshell(&words, shell, depth, false, out, denied);
+                    replay_subshell(&words, shell, depth, false, shell.argv0_file, out, denied);
                     if denied.is_some() {
                         return;
                     }
@@ -3184,7 +3195,7 @@ fn walk(
                         *denied = Some(c);
                         return;
                     }
-                    replay_subshell(words, shell, depth, false, out, denied);
+                    replay_subshell(words, shell, depth, false, shell.argv0_file, out, denied);
                     if denied.is_some() {
                         return;
                     }
@@ -3201,6 +3212,7 @@ fn walk(
                 if in_shell
                     && shell.follow_unseen
                     && (bare_unseen(&cmd) || blinds_functions(&cmd))
+                    && !(shell.argv0_file && runs_argv0(&cmd))
                     && !assigned_command_keeps(&cmd, &shell.cmd_values)
                     && !shown_eval_keeps(&cmd, &shell.cmd_values, &shell.names, 0)
                 {
@@ -3240,7 +3252,15 @@ fn walk(
                 }
                 let fork = !in_shell || body.subshell;
                 if fork {
-                    replay_subshell(&body.words, shell, depth, shell.trust_argv0, out, denied);
+                    replay_subshell(
+                        &body.words,
+                        shell,
+                        depth,
+                        shell.trust_argv0,
+                        shell.argv0_file,
+                        out,
+                        denied,
+                    );
                 } else if shell.fn_depth >= FUNC_DEPTH || shell.stack.contains(&name) {
                     shell.lose();
                 } else {
@@ -3503,6 +3523,7 @@ fn walk(
                     known: shell.known.clone(),
                     script_cwd_moved: shell.script_cwd_moved,
                     trust_argv0: trust,
+                    argv0_file: same && shell.argv0_file,
                     cmd_values: values,
                 };
                 runner_commands(&inner, &inn, depth + 1, out, denied);
@@ -4213,6 +4234,7 @@ fn note_argv0_trust(cmd: &[&str], shell: &mut Shell) {
     if drops_argv0(cmd) {
         shell.trust_argv0 = false;
         shell.trust_dropped = true;
+        shell.argv0_file = false;
         shell.files.borrow_mut().script_vars.clear();
     }
 }
@@ -4999,6 +5021,11 @@ fn assigned_command_keeps(
         .is_some_and(|got| command_values_keep(got, values, 0))
 }
 
+/// Whether the command word of `cmd` is `$0` alone.
+fn runs_argv0(cmd: &[&str]) -> bool {
+    head_word(cmd).is_some_and(|w| matches!(quoted_body(&w), "$0" | "${0}"))
+}
+
 fn command_values_keep(
     values: &[String],
     map: &std::collections::HashMap<String, Vec<String>>,
@@ -5559,7 +5586,7 @@ fn judge_startup(
     }
     let mut aliases = shell.aliases.clone();
     let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
-    replay_subshell(&words, shell, depth + 1, false, out, denied);
+    replay_subshell(&words, shell, depth + 1, false, false, out, denied);
 }
 
 /// Judge the file a shell runs as its script (`bash ok.sh`), or the file
@@ -5592,6 +5619,7 @@ fn judge_script_file(
     if op.starts_with(['<', '>']) || op == "-" || is_stdin_source(op) {
         return;
     }
+    let argv0_file = shell_file_operand(run) == Some(op) && op.contains('/');
     let wrappers = &owned[..owned.len() - run.len()];
     let dirs: Vec<_> = shell
         .here
@@ -5625,6 +5653,7 @@ fn judge_script_file(
             shell,
             depth + 1,
             generated_by_autoconf(&text),
+            argv0_file,
             out,
             denied,
         );
@@ -5681,7 +5710,7 @@ fn judge_procsub(
     }
     let mut aliases = shell.aliases.clone();
     let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
-    replay_subshell(&words, shell, depth, false, out, denied);
+    replay_subshell(&words, shell, depth, false, false, out, denied);
 }
 
 /// Judge a file the command runs by its path (`./build.sh`, `exec sub/x`,
@@ -5758,6 +5787,7 @@ fn judge_direct_exec(
             shell,
             depth + 1,
             generated_by_autoconf(&text),
+            true,
             out,
             denied,
         );
@@ -5806,7 +5836,7 @@ fn judge_produced_command(
         }
         let mut aliases = shell.aliases.clone();
         let words = expand_aliases_with(&shell_words(&text), &mut aliases).into_owned();
-        replay_subshell(&words, shell, depth + 1, false, out, denied);
+        replay_subshell(&words, shell, depth + 1, false, false, out, denied);
         if denied.is_some() {
             return;
         }
@@ -18765,6 +18795,7 @@ hash -r 2> /dev/null
                 known: None,
                 script_cwd_moved: false,
                 trust_argv0: false,
+                argv0_file: false,
                 cmd_values: &cmd_values,
             };
             runner_commands(&shell_words(line), &inn, 0, &mut runs, &mut denied);

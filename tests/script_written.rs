@@ -268,3 +268,35 @@ fn a_checksum_writes_no_script() {
     }
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// `"$0"` in a script started by a path with a `/` runs that file in a
+/// child, so it binds no name in this shell and the tunnel's log write
+/// stays placed. Started as `bash tunnel`, `$0` has no `/` and may name a
+/// function. `"$1"`, and `"$0"` after `eval`, may run anything.
+#[test]
+fn argv0_by_path_binds_nothing_here() {
+    let d = scratch("argv0");
+    let tunnel = d.join("tunnel");
+    let body = |run: &str| {
+        format!(
+            "#!/bin/sh\nD={d}/w\nnohup {d}/bin/wp >>$D/wp.log 2>&1 &\n\
+             case \"$1\" in\n run) {run} on >/dev/null || exit 1;;\nesac\n",
+            d = d.display()
+        )
+    };
+    std::fs::write(&tunnel, body("\"$0\"")).unwrap();
+    let path = tunnel.to_str().unwrap();
+    assert_eq!(verdict(&d, &[path, "on"]), "allow");
+    assert_eq!(verdict(&d, &["bash", path, "run"]), "allow");
+    let v = verdict(&d, &["bash", "tunnel", "on"]);
+    assert!(v.starts_with("deny\tscript-written-on-line: "), "{v}");
+    for run in ["\"$1\"", "eval \"$2\"; \"$0\""] {
+        std::fs::write(&tunnel, body(run)).unwrap();
+        let v = verdict(&d, &[path, "on"]);
+        assert!(
+            v.starts_with("deny\tscript-written-on-line: "),
+            "{run}: {v}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
