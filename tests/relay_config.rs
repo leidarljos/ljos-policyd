@@ -340,3 +340,43 @@ fn the_relay_line_refuses_unsigned_entries() {
     assert!(v.starts_with("deny"), "{v}");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn the_relay_may_still_source_its_env_file() {
+    let base = std::env::temp_dir().join(format!("relay-envfile-{}", std::process::id()));
+    let dir = base.join("relay");
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = base.join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[relay]\nseat = \"relay\"\ndir = \"{}\"\nsecret = \"EXAMPLE_TOKEN\"\nhost = \"example.org\"\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let send = dir.join("send.py");
+    std::fs::write(&send, include_str!("fixtures/relay-send.py")).unwrap();
+    std::fs::set_permissions(&send, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(dir.join("env"), "EXAMPLE_TOKEN=placeholder\n").unwrap();
+    for line in [
+        ". ./env && python3 -I send.py /tmp/m.txt t1",
+        "set -a; . ./env; set +a; python3 -I send.py /tmp/m.txt t1",
+        "source ./env && python3 send.py /tmp/m.txt t1",
+    ] {
+        for seat in ["relay", "other"] {
+            assert_eq!(
+                verdict(&dir, &config, seat, line),
+                "allow",
+                "{seat}: {line}"
+            );
+        }
+    }
+    let shown = ". ./env && python3 -c 'import os; print(os.environ[\"EXAMPLE_TOKEN\"])'";
+    for seat in ["relay", "other"] {
+        let v = verdict(&dir, &config, seat, shown);
+        assert!(v.starts_with("deny"), "{seat}: {v}");
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}

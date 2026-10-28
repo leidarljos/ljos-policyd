@@ -1,0 +1,1 @@
+A relay that sources its env file and then runs its script, as `. ./env && python3 -I send.py`, is still allowed for every seat. A test now covers this form, and also an inline program on that line that prints the secret, which is refused.
