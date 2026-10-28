@@ -27394,6 +27394,21 @@ make -C safe test
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    #[test]
+    fn stderr_and_fd_redirections_stay_allowed() {
+        let root = startup_root("fd-redir");
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "echo x >/dev/stderr",
+            "printf ok | tee /dev/stderr >/dev/null",
+            ">/dev/fd/2",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        assert_everyday_allowed(&root);
+    }
+
     /// `nimvault run` execs the program after its entry, which is judged
     /// as if the line ran it.
     #[test]

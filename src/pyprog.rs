@@ -3472,11 +3472,18 @@ fn on_disk_at(p: &Path, depth: usize) -> PathBuf {
 }
 
 fn inside_lexical_and_disk(p: &Path, work: Option<&Path>) -> bool {
-    if !inside(&lexical(p), work) {
+    let lexical = lexical(p);
+    if !inside(&lexical, work) {
         return false;
     }
+    let temp_root = ["/tmp", "/var/tmp", "/dev/shm"]
+        .iter()
+        .any(|t| lexical == Path::new(t) || lexical.starts_with(t));
+    if !temp_root {
+        return true;
+    }
     let tree = work.map(on_disk);
-    inside(&on_disk(p), tree.as_deref())
+    inside(&on_disk(&lexical), tree.as_deref())
 }
 
 /// Whether a write to the absolute path `p` goes out of the tree
@@ -4550,10 +4557,16 @@ mod tests {
         symlink(home.join(".cargo/bin"), root.join("cargo")).unwrap();
         symlink(home.join(".local/bin"), root.join("local")).unwrap();
         symlink(home.join(".bashrc"), root.join("rc")).unwrap();
+        symlink(
+            home.join(".cargo/bin/missing-tool"),
+            root.join("dangling-cargo-tool"),
+        )
+        .unwrap();
 
         assert!(writes_outside(&root.join("cargo/ljos-policyd"), None));
         assert!(writes_outside(&root.join("local/ljos"), None));
         assert!(writes_outside(&root.join("rc"), None));
+        assert!(writes_outside(&root.join("dangling-cargo-tool"), None));
         assert!(!writes_outside(&root.join("ordinary-tmp-write"), None));
 
         let _ = std::fs::remove_dir_all(root);
