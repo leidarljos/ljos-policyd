@@ -11983,16 +11983,34 @@ fn seat_marker(w: &str) -> bool {
 }
 
 fn may_touch_seat(argv: &[String]) -> bool {
+    let config = policyd_config();
+    let config_name = config
+        .as_deref()
+        .and_then(|p| p.rsplit('/').next())
+        .filter(|n| !n.is_empty());
     let mut writer = false;
     let mut marker = false;
     for w in argv {
         writer |= guard_writer(w);
-        marker |= seat_marker(w);
+        marker |= seat_marker(w) || config_name.is_some_and(|n| w.contains(n));
         if writer && marker {
             return true;
         }
     }
     false
+}
+
+/// The config file `$LJOS_POLICYD_CONFIG` names, as an absolute path.
+/// The relay is read from it, so no seat may write it.
+fn policyd_config() -> Option<String> {
+    let p = std::env::var("LJOS_POLICYD_CONFIG")
+        .ok()
+        .filter(|p| !p.is_empty())?;
+    if p.starts_with('/') {
+        return Some(lexical_norm(&p));
+    }
+    let cwd = std::env::current_dir().ok()?;
+    Some(lexical_norm(&cwd.join(p).to_string_lossy()))
 }
 
 fn process_home() -> String {
@@ -12061,7 +12079,8 @@ struct GuardSet {
 
 impl GuardSet {
     /// The seat files on this machine: hook files, the ljos config, the
-    /// global git hooks directory, and the global git config. `XDG_*`
+    /// policyd config that names the relay, the global git hooks
+    /// directory, and the global git config. `XDG_*`
     /// comes from the environment, or from `~/.config` and
     /// `~/.local/share` when it is unset.
     fn real() -> Self {
@@ -12075,11 +12094,14 @@ impl GuardSet {
             files.push(format!("{home}/.claude/settings.json"));
             files.push(format!("{home}/.claude/settings.local.json"));
             files.push(format!("{home}/.gitconfig"));
+            dirs.push(format!("{home}/.config/ljos-policyd"));
         }
         if !cfg.is_empty() {
             files.push(format!("{cfg}/git/config"));
             dirs.push(format!("{cfg}/ljos"));
+            dirs.push(format!("{cfg}/ljos-policyd"));
         }
+        files.extend(policyd_config());
         if !data.is_empty() {
             dirs.push(format!("{data}/ljos/git-hooks"));
         }
@@ -25242,6 +25264,10 @@ make -C safe test
             "~/.config/ljos/seats/a.toml",
             "~/.config/ljos/seats/../env",
             "$XDG_CONFIG_HOME/ljos/seats/a.toml",
+            "~/.config/ljos-policyd",
+            "~/.config/ljos-policyd/config.toml",
+            "$HOME/.config/ljos-policyd/config.toml",
+            "$XDG_CONFIG_HOME/ljos-policyd/config.toml",
             "~/.local/share/ljos/git-hooks",
             "~/.local/share/ljos/git-hooks/pre-push",
             "${XDG_DATA_HOME}/ljos/git-hooks/pre-push",
@@ -25349,6 +25375,8 @@ make -C safe test
         for s in [
             "cat ~/.cursor/hooks.json",
             "ls ~/.config/ljos",
+            "cat ~/.config/ljos-policyd/config.toml",
+            "touch ~/.config/ljos-policyd.toml",
             "grep x ~/.gitconfig",
             "git config --get core.hooksPath",
             "git config --global --get core.hooksPath",

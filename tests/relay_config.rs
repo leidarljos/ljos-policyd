@@ -275,3 +275,42 @@ fn the_relay_script_runs_isolated_and_alone() {
     assert_eq!(verdict(&dir, &config, "relay", line), "allow");
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn no_seat_writes_the_policyd_config() {
+    let base = std::env::temp_dir().join(format!("relay-guard-{}", std::process::id()));
+    let dir = base.join("work");
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = base.join("conf/relay.toml");
+    let c = config.display();
+    for seat in ["relay", "other", ""] {
+        for line in [
+            format!("echo x > {c}"),
+            format!("printf x | tee -a {c}"),
+            format!("cp /tmp/x {c}"),
+            format!("sed -i 's/a/b/' {c}"),
+            format!("rm -f {c}"),
+            format!("cd {} && echo x > relay.toml", base.join("conf").display()),
+            "echo x > ~/.config/ljos-policyd/config.toml".to_string(),
+            "mkdir -p ~/.config/ljos-policyd".to_string(),
+        ] {
+            let v = verdict(&dir, &config, seat, &line);
+            assert!(
+                v.starts_with("deny\tseat-guard-path:"),
+                "{seat}: {line}: {v}"
+            );
+        }
+        for line in [
+            format!("cat {c}"),
+            format!("echo x > {}", base.join("conf/other.toml").display()),
+            "cat ~/.config/ljos-policyd/config.toml".to_string(),
+        ] {
+            assert_eq!(
+                verdict(&dir, &config, seat, &line),
+                "allow",
+                "{seat}: {line}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
