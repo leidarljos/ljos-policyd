@@ -10937,7 +10937,7 @@ fn set_positionals_from_args(args: &[String]) -> Option<Vec<String>> {
         }
         return Some(args[i..].to_vec());
     }
-    Some(Vec::new())
+    None
 }
 
 fn set_positionals(cmd: &[String]) -> Option<Vec<String>> {
@@ -11047,8 +11047,14 @@ fn nimvault_sensitive_at(words: &[String], i: usize) -> bool {
 }
 
 fn nimvault_sensitive_text(words: &[String]) -> bool {
-    let scrubbed: String = words
-        .join(" ")
+    let text: String = words
+        .iter()
+        .filter(|w| !w.chars().any(char::is_whitespace))
+        .filter(|w| is_assignment(w) || quoted_body(w) == w.as_str())
+        .map(|w| quoted_body(w).to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let scrubbed: String = text
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | ':') {
@@ -11059,7 +11065,15 @@ fn nimvault_sensitive_text(words: &[String]) -> bool {
         })
         .collect();
     let tokens: Vec<String> = scrubbed.split_whitespace().map(str::to_string).collect();
-    (0..tokens.len()).any(|i| nimvault_sensitive_at(&tokens, i))
+    (0..tokens.len()).any(|i| {
+        let w = tokens[i].as_str();
+        if base_of(w) != "nimvault" && !nimvault_on_disk(w) {
+            return false;
+        }
+        nimvault_subcommand(&tokens, i).is_some_and(|(sub, _)| {
+            NIMVAULT_SHOWS.contains(&sub) || NIMVAULT_HANDS_KEYS.contains(&sub)
+        })
+    })
 }
 
 /// The subcommands nimvault's `dispatchMulti` names, each as cligen's
@@ -27756,10 +27770,14 @@ make -C safe test
             "set -- nimvault get e; $1 $2 $3",
             "set -o pipefail -- nimvault get e; \"$@\"",
             "set +o x -- nimvault get e; \"$@\"",
+            "set -- nimvault get e; set -o pipefail; \"$@\"",
+            "set -- nimvault get e; set +o xtrace; $1 $2 $3",
             "set -- skip nimvault get e; shift; \"$@\"",
             "set -- skip nimvault get e; shift 1; \"$@\"",
             "set -- skip nimvault get e; shift; ${@:2}",
+            "set -- x nimvault get e; \"${@:2}\"",
             "a=(nimvault get e); \"${a[@]}\"",
+            "a=(nimvault get e); \"${a[*]}\"",
             "f(){ \"$@\"; }; f nimvault get e",
             "set -- env nimvault get e; \"$@\"",
             "eval 'set -- nimvault get e'; \"$@\"",
@@ -27786,9 +27804,13 @@ make -C safe test
             "go get example.org/x",
             "kubectl -n \"$NS\" get pods",
             "\"$EDITOR\" get.txt",
+            "echo \"nimvault get is refused\"; \"$@\"",
+            "f(){ \"$@\"; }; f cargo test",
+            "a=(cargo test); \"${a[@]}\"",
             "echo \"$@\"",
             "set -o pipefail; cargo test",
             "set -- a b; echo \"$@\"",
+            "set -- a b; shift; echo \"$@\"",
             "for x in \"$@\"; do echo \"$x\"; done",
             "\"${cmd[@]}\"",
             "echo \"$S\"",
