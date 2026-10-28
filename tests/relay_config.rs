@@ -151,3 +151,76 @@ fn the_configured_relay_runs_a_script_it_owns() {
     }
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn the_relay_send_script_runs_as_written() {
+    let base = std::env::temp_dir().join(format!("relay-send-{}", std::process::id()));
+    let dir = base.join("relay");
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = base.join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[relay]\nseat = \"relay\"\ndir = \"{}\"\nsecret = \"EXAMPLE_TOKEN\"\nhost = \"example.org\"\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let send = include_str!("fixtures/relay-send.py");
+    let token = r#"os.environ["EXAMPLE_TOKEN"]"#;
+    let cases = [
+        ("send.py", send.to_string(), "allow"),
+        (
+            "shown.py",
+            send.replace(r#"print(r.get("ok"))"#, &format!("print({token})")),
+            "shows-secret",
+        ),
+        (
+            "logged.py",
+            send.replace("\"tag\":tag,", &format!("\"tag\":{token},")),
+            "shows-secret",
+        ),
+        (
+            "far.py",
+            send.replace("example.org", "example.net"),
+            "sends-secret",
+        ),
+        (
+            "plain.py",
+            send.replace("https://", "http://"),
+            "sends-secret",
+        ),
+        (
+            "etc.py",
+            send.replace("\"history.jsonl\"", "\"/etc/x\""),
+            "writes-outside",
+        ),
+        (
+            "tail.py",
+            send.replace("\"history.jsonl\"", "\"/sendMessage\""),
+            "writes-outside",
+        ),
+    ];
+    for (name, code, want) in &cases {
+        let p = dir.join(name);
+        std::fs::write(&p, code).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let line = format!(
+            "nimvault run --env EXAMPLE_TOKEN {}/env python3 {name} /tmp/m.txt t1",
+            dir.display()
+        );
+        let v = verdict(&dir, &config, "relay", &line);
+        if *want == "allow" {
+            assert_eq!(v, "allow", "{name}");
+        } else {
+            assert!(v.starts_with("deny") && v.contains(want), "{name}: {v}");
+        }
+    }
+    let line = format!(
+        "nimvault run --env EXAMPLE_TOKEN {}/env python3 send.py /tmp/m.txt t1",
+        dir.display()
+    );
+    assert!(verdict(&dir, &config, "other", &line).starts_with("deny"));
+    let _ = std::fs::remove_dir_all(&base);
+}
