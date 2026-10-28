@@ -61,7 +61,7 @@ fn quoted_prose_is_not_a_script_write() {
 #[test]
 fn a_substitution_the_shell_runs_is_still_read() {
     let d = scratch("subst");
-    let dq = "ljos file --body \"in `/srv/example/conf` and `printf x > \\\"$s\\\"`\"";
+    let dq = "ljos file --body \"in `/srv/example/conf` and `cat in > \\\"$s\\\"`\"";
     let v = sh(&d, dq);
     assert!(v.starts_with("deny\tscript-written-on-line: "), "{v}");
     for line in [
@@ -132,8 +132,8 @@ fn an_unpinned_variable_still_refuses() {
         "D={d}/w; eval \"$2\"; echo x >> $D/wp.log; {run}",
         "B=$D/x; D={d}/w; echo x >> $B; {run}",
         "D={d}/w; B=$D/x; D=$1; echo x >> $B; {run}",
-        "D=\"{d}/a b\"; echo x > $D/l; {run}",
-        "D={d}/*; echo x > $D/l; {run}",
+        "D=\"{d}/a b\"; cat in > $D/l; {run}",
+        "D={d}/*; cat in > $D/l; {run}",
     ] {
         let line = line
             .replace("{d}", &d.to_string_lossy())
@@ -218,17 +218,17 @@ fn a_mktemp_variable_is_only_that_path() {
     );
     assert!(v.starts_with("deny\t"), "{v}");
     for line in [
-        "tmp=$(mktemp); echo x > $tmp.log; /usr/local/libexec/x",
-        "tmp=$(mktemp) && echo x > x$tmp; /usr/local/libexec/x",
-        "tmp=$(mktemp -d); echo x > $tmp/../a; /usr/local/libexec/x",
-        "tmp=$(mktemp -u); echo x > $tmp; /usr/local/libexec/x",
-        "tmp=$(mktemp -p /x); echo x > $tmp; /usr/local/libexec/x",
-        "tmp=$(mktemp $T); echo x > $tmp; /usr/local/libexec/x",
-        "tmp=$(mktemp >/dev/null); echo x > $tmp/run.sh; /run.sh",
-        "tmp=$(mktemp; echo /x); echo x > $tmp; /usr/local/libexec/x",
-        "tmp=$(mktemp); tmp=$1; echo x > $tmp; /usr/local/libexec/x",
-        "tmp=$(mktemp); echo x > $tmp; read tmp; /usr/local/libexec/x",
-        "for i in 1; do tmp=$(mktemp); done; echo x > $tmp; /usr/local/libexec/x",
+        "tmp=$(mktemp); cat in > $tmp.log; /usr/local/libexec/x",
+        "tmp=$(mktemp) && cat in > x$tmp; /usr/local/libexec/x",
+        "tmp=$(mktemp -d); cat in > $tmp/../a; /usr/local/libexec/x",
+        "tmp=$(mktemp -u); cat in > $tmp; /usr/local/libexec/x",
+        "tmp=$(mktemp -p /x); cat in > $tmp; /usr/local/libexec/x",
+        "tmp=$(mktemp $T); cat in > $tmp; /usr/local/libexec/x",
+        "tmp=$(mktemp >/dev/null); cat in > $tmp/run.sh; /run.sh",
+        "tmp=$(mktemp; echo /x); cat in > $tmp; /usr/local/libexec/x",
+        "tmp=$(mktemp); tmp=$1; cat in > $tmp; /usr/local/libexec/x",
+        "tmp=$(mktemp); cat in > $tmp; read tmp; /usr/local/libexec/x",
+        "for i in 1; do tmp=$(mktemp); done; cat in > $tmp; /usr/local/libexec/x",
     ] {
         let v = sh(&d, line);
         assert!(
@@ -665,11 +665,12 @@ fn a_jq_object_in_quotes_is_no_brace_expansion() {
     for line in [
         format!(". ENV; export LJOS_SEAT=example; {a}"),
         format!("{SEEN}. ENV; export LJOS_SEAT=example; bash {a}"),
+        format!("{SEEN}. ENV; export LJOS_SEAT=example; {a}"),
     ] {
         assert_eq!(hook_verdict(&d, "example", &line), "allow", "{line}");
     }
     std::fs::write(&audit, format!("{AUDIT}rm -rf ~/{{.cursor,x}}\n")).unwrap();
-    let v = hook_verdict(&d, "example", &format!("{SEEN}bash {a}"));
+    let v = hook_verdict(&d, "example", &format!("{SEEN}{a}"));
     assert!(v.starts_with("deny\t"), "{v}");
     let v = hook_verdict(&d, "example", &format!("{SEEN}rm -rf ~/{{.cursor,x}}"));
     assert!(v.starts_with("deny\trm-rf"), "{v}");

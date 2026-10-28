@@ -911,12 +911,15 @@ impl LineFiles {
             // line spells out is judged on that text instead. A write to
             // a path the line does not show, with all of its text shown,
             // leaves that text if it is the script a shell or python reads.
+            // A command word runs a text with no `#!` line in a shell.
             for w in hits {
                 let it = r.is_some() && (w.path == *r || (w.path.is_none() && !w.loose));
                 match &w.text {
                     Some(t)
                         if (*how == Ran::Shell && it)
-                            || (*how == Ran::Exec && r.is_some() && w.path == *r) =>
+                            || (*how == Ran::Exec
+                                && it
+                                && (w.path.is_some() || !t.starts_with("#!"))) =>
                     {
                         texts.push(Rejudged::Shell(shown(r), t.clone()));
                     }
@@ -22908,6 +22911,7 @@ hash -r 2> /dev/null
             "(cd sub && echo x > ok.sh); source ok.sh",
             "echo x > \"$OUT\"; source ok.sh",
             "printf %s x > \"$_ljos_seen\"; . ./ok.sh; python3 ok.py",
+            "printf %s x > \"$_ljos_seen\"; ./ok.sh",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
@@ -22922,7 +22926,11 @@ hash -r 2> /dev/null
                 "may name it; write to a literal path",
             ),
             (
-                "printf x > \"$OUT\"; ./ok.sh",
+                "echo 'git push -f' > \"$OUT\"; ./ok.sh",
+                "ok.sh: git-force-push",
+            ),
+            (
+                "echo '#!/usr/bin/perl' > \"$OUT\"; ./ok.sh",
                 "may name it; write to a literal path",
             ),
         ] {
