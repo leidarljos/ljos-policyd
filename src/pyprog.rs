@@ -3476,14 +3476,24 @@ fn inside_lexical_and_disk(p: &Path, work: Option<&Path>) -> bool {
     if !inside(&lexical, work) {
         return false;
     }
-    let temp_root = ["/tmp", "/var/tmp", "/dev/shm"]
-        .iter()
-        .any(|t| lexical == Path::new(t) || lexical.starts_with(t));
-    if !temp_root {
+    if skip_on_disk_check(&lexical) {
         return true;
     }
     let tree = work.map(on_disk);
-    inside(&on_disk(&lexical), tree.as_deref())
+    inside(&on_disk(p), tree.as_deref())
+}
+
+fn skip_on_disk_check(p: &Path) -> bool {
+    let dev = [
+        "/dev/null",
+        "/dev/stdout",
+        "/dev/stderr",
+        "/dev/stdin",
+        "/dev/tty",
+    ];
+    dev.iter().any(|d| p == Path::new(d))
+        || p.starts_with("/dev/fd")
+        || p.starts_with("/proc/self/fd")
 }
 
 /// Whether a write to the absolute path `p` goes out of the tree
@@ -4569,6 +4579,80 @@ mod tests {
         assert!(writes_outside(&root.join("dangling-cargo-tool"), None));
         assert!(!writes_outside(&root.join("ordinary-tmp-write"), None));
 
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tmp_link_dotdot_write_is_refused() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let mark = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must move forward")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ljos-pyprog-dotdot-{mark}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let home_root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|d| d.join("target/tmp-tests"))
+            })
+            .expect("target temp directory is available");
+        let home = home_root.join(format!("ljos-pyprog-home-{mark}/sub"));
+        std::fs::create_dir_all(&home).unwrap();
+        symlink(&home, root.join("link")).unwrap();
+        let code = format!("open('{}/link/../x', 'w').write('x')", root.display());
+        assert_eq!(class_of(&code), "python-writes-outside", "{code}");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(home_root.join(format!("ljos-pyprog-home-{mark}")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_from_a_work_tree_linked_cwd_is_refused() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let mark = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock must move forward")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("ljos-pyprog-cwd-link-{mark}"));
+        let home_root = std::env::var_os("CARGO_TARGET_TMPDIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|d| d.join("target/tmp-tests"))
+            })
+            .expect("target temp directory is available");
+        let work = root.join("work");
+        let home = home_root.join(format!("ljos-pyprog-cwd-home-{mark}"));
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        symlink(&home, work.join("lnk")).unwrap();
+        let cwd = work.join("lnk");
+        assert!(!inside_lexical_and_disk(&cwd, Some(&work)));
+
+        let denied = refusal(
+            "from pathlib import Path; Path('x').write_text('x')",
+            Place {
+                cwd: Some(&cwd),
+                work: Some(&work),
+                secret: None,
+                sealed: None,
+                host: None,
+            },
+        )
+        .expect("write must be refused")
+        .token;
+        let class = denied.split(':').next().unwrap_or_default();
+        assert_eq!(class, "python-writes-outside");
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(home);
     }
