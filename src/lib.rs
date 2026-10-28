@@ -12849,14 +12849,31 @@ fn content_writer(w: &str) -> bool {
     w.contains('>')
         || matches!(
             base_of(w),
-            "tee" | "cp" | "mv" | "install" | "dd" | "sed" | "perl" | "awk" | "gawk" | "mawk"
+            "tee"
+                | "cp"
+                | "mv"
+                | "install"
+                | "dd"
+                | "sed"
+                | "perl"
+                | "awk"
+                | "gawk"
+                | "mawk"
+                | "curl"
+                | "wget"
+                | "ln"
+                | "rsync"
+                | "truncate"
+                | "tar"
         )
 }
 
 /// The files `cmd` writes the content of, each with what writes it: a
-/// redirection, `tee`, the target of `cp`, `mv` and `install`, `dd of=`,
-/// the files of `sed -i`, `perl -i` and `awk -i inplace`, and a file an
-/// awk program prints into.
+/// redirection, `tee`, the target of `cp`, `mv`, `install` and `rsync`,
+/// `dd of=`, the files of `sed -i`, `perl -i` and `awk -i inplace`, a
+/// file an awk program prints into, what `curl` and `wget` save, the link
+/// `ln` makes, a file `truncate` sizes, and where `tar` extracts or the
+/// archive it creates.
 fn content_writes<'a>(cmd: &[&'a str]) -> Vec<(&'a str, String)> {
     let mut out: Vec<(&str, String)> = redirect_targets_of(cmd)
         .into_iter()
@@ -12870,7 +12887,17 @@ fn content_writes<'a>(cmd: &[&'a str]) -> Vec<(&'a str, String)> {
             .into_iter()
             .map(str::to_string)
             .collect(),
-        "cp" | "install" | "mv" => copy_target(&args, false, &|_| false),
+        "cp" | "install" | "mv" | "rsync" => copy_target(&args, false, &|_| false),
+        "ln" => copy_target(&args, true, &|_| false),
+        "curl" | "wget" => {
+            let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+            fetched_paths(&owned)
+        }
+        "truncate" => bare_words(&args, "sr", &["size", "reference"])
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        "tar" => tar_paths(&args),
         "dd" => args
             .iter()
             .filter_map(|a| a.strip_prefix("of="))
@@ -12954,7 +12981,13 @@ fn outside_content_write(
         if expanded.starts_with('~') {
             return Some((by.to_string(), expanded));
         }
-        let abs = follow_links(&landed(&expanded, look.cwd)?, links);
+        let at = landed(&expanded, look.cwd)?;
+        // The link `ln` makes is the write, not the file it points at.
+        let abs = if by == "ln" {
+            at
+        } else {
+            follow_links(&at, links)
+        };
         pyprog::writes_outside(std::path::Path::new(&abs), Some(work))
             .then(|| (by.to_string(), abs))
     })
@@ -22798,12 +22831,19 @@ hash -r 2> /dev/null
             &["mv", "a.txt", "b.txt"],
             &["mv", "/dev/null", "x"],
             &["rsync", "-a", "--delete", "build/", "host:/var/www/"],
-            &["rsync", "-a", "--delete", "build/", "/mnt/backup/build/"],
-            &["rsync", "-a", "src/", "~/"],
             &["setfacl", "-R", "-m", "u:ci:rx", "./build"],
             &["setfacl", "-R", "-b", "/tmp/x"],
         ] {
             assert_eq!(v(argv), "allow", "{argv:?}");
+        }
+        for argv in [
+            &["rsync", "-a", "--delete", "build/", "/mnt/backup/build/"][..],
+            &["rsync", "-a", "src/", "~/"],
+        ] {
+            assert!(
+                v(argv).starts_with("deny\twrites-outside: rsync with "),
+                "{argv:?}"
+            );
         }
     }
 
@@ -25500,6 +25540,59 @@ make -C safe test
             "ls *.json | xargs -I{} cp {} {}.bak",
             "for f in a.json b.json; do sed -i 's/a/b/' \"$f\"; done",
             "for f in /tmp/a /tmp/b; do echo x | tee \"$f\"; done",
+        ] {
+            assert_eq!(in_tree(line).decision, Decision::Allow, "{line}");
+        }
+    }
+
+    /// A download, a link, a sync, a truncate or a tar extract is a write
+    /// where its target lands, judged as a redirect to that path is.
+    #[test]
+    fn the_file_tools_write_where_they_say() {
+        let t = "/srv/example/state/run.json";
+        for (by, line) in [
+            ("curl", format!("curl -o {t} https://example.org/a")),
+            (
+                "curl",
+                format!("curl -sS --output {t} https://example.org/a"),
+            ),
+            ("curl", format!("curl --output={t} https://example.org/a")),
+            ("wget", format!("wget -O {t} https://example.org/a")),
+            ("wget", format!("wget -qO {t} https://example.org/a")),
+            ("ln", format!("ln -sf in.json {t}")),
+            ("rsync", format!("rsync -a in.json {t}")),
+            ("truncate", format!("truncate -s 0 {t}")),
+            ("tar", format!("tar -czf {t} .state")),
+        ] {
+            let c = in_tree(&line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+            assert_eq!(c.code, PolicyReason::PathOutsideWorkspace, "{line}");
+            assert_eq!(c.token, format!("writes-outside: {by} with {t}"), "{line}");
+        }
+        for line in [
+            "tar -C /srv/example/state -xf a.tar",
+            "tar -xf a.tar -C /srv/example/state",
+            "tar --directory=/srv/example/state -xf a.tar",
+        ] {
+            let c = in_tree(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}");
+            assert_eq!(
+                c.token, "writes-outside: tar with /srv/example/state",
+                "{line}"
+            );
+        }
+        for line in [
+            "curl -o .state/run.json https://example.org/a",
+            "curl -O https://example.org/a.json",
+            "curl -sS https://example.org/a",
+            "wget -O - https://example.org/a",
+            "wget -O /tmp/run.json https://example.org/a",
+            "ln -s /srv/example/in.json .state/in.json",
+            "rsync -a /srv/example/in.json .state/",
+            "truncate -s 0 .state/run.json",
+            "tar -C .state -xf /srv/example/a.tar",
+            "tar -xf /srv/example/a.tar",
+            "tar -tf /srv/example/a.tar",
         ] {
             assert_eq!(in_tree(line).decision, Decision::Allow, "{line}");
         }
