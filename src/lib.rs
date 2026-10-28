@@ -11511,7 +11511,7 @@ fn unshown_stdin_script(argv: &[String]) -> bool {
     // means this scan cannot match.
     if !argv
         .iter()
-        .any(|w| word_may_name_shell(w) || w.contains('<'))
+        .any(|w| word_may_name_shell(w) || w.contains('<') || STDIN_RUNNERS.contains(&base_of(w)))
     {
         return false;
     }
@@ -11586,12 +11586,204 @@ fn stdin_hit(cmd: &[String], after_pipe: bool) -> bool {
     if cmd.is_empty() {
         return false;
     }
+    let plain = without_redirections(cmd);
+    let run = unwrap_wrappers(&plain).0;
+    if let Some(inner) = stdin_runner(run) {
+        let words: Vec<&str> = cmd.iter().map(String::as_str).collect();
+        let fed = after_pipe
+            || words.iter().enumerate().any(|(i, w)| {
+                let body = redirection_body(w);
+                body.starts_with("<<<") || stdin_redirect(w, words.get(i + 1).copied()).is_some()
+            });
+        let remote = run.first().is_some_and(|w| base_of(w) == "ssh");
+        return fed
+            && inner.is_none_or(|run| {
+                if remote {
+                    runs_stdin_script(&shell_words(&run.join(" ")))
+                } else {
+                    runs_stdin_script(run)
+                }
+            });
+    }
     match shell_stdin(unwrap_wrappers(cmd).0) {
         Some((Fed::Text(text), _)) => text.contains(['$', '`']),
         Some((Fed::File(file), _)) => file.starts_with(['<', '>']) || !literal_text(file),
         Some((Fed::Unshown, dash_s)) => after_pipe || dash_s,
         _ => false,
     }
+}
+
+/// Commands that hand their stdin to a command they run elsewhere: in a
+/// container, a namespace, another root, a unit or another host.
+const STDIN_RUNNERS: &[&str] = &[
+    "docker",
+    "podman",
+    "nerdctl",
+    "kubectl",
+    "nsenter",
+    "chroot",
+    "systemd-run",
+    "lxc",
+    "incus",
+    "ssh",
+    "sftp",
+];
+
+/// For a runner in [`STDIN_RUNNERS`] that takes stdin, the command it
+/// runs with it. `Some(None)` is no command: a login shell, the image's
+/// own command, or the batch `sftp -b -` reads from stdin. `None` is a
+/// call that does not pass stdin on.
+fn stdin_runner(run: &[String]) -> Option<Option<&[String]>> {
+    let (first, args) = run.split_first()?;
+    let head = base_of(first);
+    if !STDIN_RUNNERS.contains(&head) {
+        return None;
+    }
+    let interactive = |args: &[String]| {
+        args.iter().take_while(|w| *w != "--").any(|w| {
+            matches!(
+                w.as_str(),
+                "--interactive" | "--stdin" | "--interactive=true"
+            ) || (w.starts_with('-') && !w.starts_with("--") && w[1..].contains('i'))
+        })
+    };
+    let inner: &[String] = match head {
+        "docker" | "podman" | "nerdctl" => {
+            let sub = args.iter().position(|w| !w.starts_with('-'))?;
+            let rest = &args[sub + 1..];
+            match args[sub].as_str() {
+                "exec" if interactive(rest) => runner_command(rest, CONTAINER_VALUED, 1),
+                "run" | "create" if interactive(rest) => runner_command(rest, CONTAINER_VALUED, 1),
+                _ => return None,
+            }
+        }
+        "kubectl" => {
+            let sub = args.iter().position(|w| !w.starts_with('-'))?;
+            let rest = &args[sub + 1..];
+            if args[sub] != "exec" || !interactive(rest) {
+                return None;
+            }
+            runner_command(rest, &["-c", "--container", "-n", "--namespace"], 1)
+        }
+        "lxc" | "incus" => {
+            let sub = args.iter().position(|w| !w.starts_with('-'))?;
+            let rest = &args[sub + 1..];
+            if args[sub] != "exec" {
+                return None;
+            }
+            runner_command(rest, &["--env", "--cwd", "--user", "--group"], 1)
+        }
+        "nsenter" => runner_command(
+            args,
+            &["-t", "--target", "-S", "--setuid", "-G", "--setgid"],
+            0,
+        ),
+        "chroot" => runner_command(args, &["--userspec", "--groups", "--skip-chdir"], 1),
+        "systemd-run" => {
+            let piped = args.iter().any(|w| {
+                matches!(w.as_str(), "--pipe" | "--pty" | "--shell")
+                    || (w.starts_with('-')
+                        && !w.starts_with("--")
+                        && w[1..].contains(['P', 't', 'S']))
+            });
+            if !piped {
+                return None;
+            }
+            let valued = [
+                "-p",
+                "--property",
+                "-u",
+                "--unit",
+                "-E",
+                "--setenv",
+                "-M",
+                "--machine",
+                "-H",
+                "--host",
+                "--uid",
+                "--gid",
+                "--nice",
+                "-D",
+                "--description",
+                "--slice",
+                "--working-directory",
+            ];
+            runner_command(args, &valued, 0)
+        }
+        "ssh" => {
+            let valued = [
+                "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l", "-m", "-O", "-o",
+                "-p", "-Q", "-R", "-S", "-W", "-w",
+            ];
+            runner_command(args, &valued, 1)
+        }
+        "sftp" => {
+            let batch = args.iter().enumerate().any(|(i, w)| {
+                w == "-b-" || (w == "-b" && args.get(i + 1).is_some_and(|v| v == "-"))
+            });
+            return batch.then_some(None);
+        }
+        _ => return None,
+    };
+    Some((!inner.is_empty()).then_some(inner))
+}
+
+/// The command a runner runs: the words past `--`, or past the first
+/// `skip` operands, with each option in `valued` taking the next word.
+fn runner_command<'a>(args: &'a [String], valued: &[&str], skip: usize) -> &'a [String] {
+    if let Some(d) = args.iter().position(|w| w == "--") {
+        return &args[d + 1..];
+    }
+    let mut seen = 0;
+    let mut i = 0;
+    while i < args.len() {
+        let w = args[i].as_str();
+        if w.starts_with('-') && w.len() > 1 {
+            i += if valued.contains(&w) { 2 } else { 1 };
+            continue;
+        }
+        if seen == skip {
+            return &args[i..];
+        }
+        seen += 1;
+        i += 1;
+    }
+    &[]
+}
+
+/// The words of `cmd` past its redirections, with the target of each one
+/// whose operator is a word of its own (`< file`, `<<< text`, `2> log`).
+fn without_redirections(cmd: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = cmd.iter();
+    while let Some(w) = it.next() {
+        if is_redirection(w) {
+            let body = redirection_body(w);
+            if body
+                .trim_start_matches(['<', '>', '&', '|', '-'])
+                .is_empty()
+            {
+                it.next();
+            }
+            continue;
+        }
+        out.push(w.clone());
+    }
+    out
+}
+
+/// Whether a command a runner hands stdin to reads its script there: a
+/// shell with no script or file, or an interpreter with no program.
+fn runs_stdin_script(run: &[String]) -> bool {
+    let run = unwrap_wrappers(run).0;
+    let Some(head) = run.first() else {
+        return true;
+    };
+    let b = base_of(head);
+    matches!(shell_stdin(run), Some((Fed::Unshown, _)))
+        || (stdin_interpreter(b).is_some()
+            && inline_program(run).is_none()
+            && run[1..].iter().all(|w| w.starts_with('-')))
 }
 
 fn decode_ansi_c_quoted(chars: &[char], i: &mut usize, out: &mut String) {
@@ -11897,8 +12089,14 @@ fn heredoc_read_as_text(out: &[String]) -> bool {
             .map_or("", String::as_str);
         let b = base_of(head);
         let in_container = matches!(b, "docker" | "podman") && cmd.iter().any(|w| w == "exec");
+        let at = cmd
+            .iter()
+            .position(|w| !is_assignment(w) && !is_redirection(w))
+            .unwrap_or(cmd.len());
+        let plain = without_redirections(&cmd[at..]);
         !head.contains(['/', '$', '`', '('])
             && !in_container
+            && stdin_runner(unwrap_wrappers(&plain).0).is_none()
             && !word_may_name_shell(head)
             && stdin_interpreter(b).is_none()
             && !RUNNERS.iter().any(|(r, _)| *r == b)
@@ -26239,6 +26437,61 @@ make -C safe test
         }
         let c = at("cp /tmp/src ~/.config/ljos");
         assert!(c.token.starts_with("seat-guard-path:"), "{}", c.token);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A runner that hands stdin to a shell in a container, a namespace,
+    /// another root, a unit or a batch is fed a script: a heredoc to it is
+    /// read as one, and a pipe or here-string to it is not shown.
+    #[test]
+    fn a_runner_fed_stdin_takes_a_script() {
+        let root = startup_root("stdinrun");
+        let at = |line: &str| {
+            SPELLED.with(|s| s.borrow_mut().clear());
+            let argv = ["bash", "-c", line].map(String::from);
+            check_shell_in(&argv, &root, 0)
+        };
+        let runners = [
+            "docker run -i img sh",
+            "podman run --rm -i img",
+            "kubectl exec -i pod -- sh",
+            "kubectl exec --stdin pod -- bash -s",
+            "nsenter -t 1 -m sh",
+            "chroot /srv/root",
+            "systemd-run --pipe sh",
+            "lxc exec box -- sh",
+            "incus exec box -- sh",
+            "sftp -b - host",
+            "ssh host 'bash -s'",
+        ];
+        for head in runners {
+            let heredoc = format!(
+                "printf %s x > \"$_ljos_seen\"; {head} <<'EOF'\n\
+                 edited `foo/gf.py` and ran it\nEOF"
+            );
+            let c = at(&heredoc);
+            assert!(
+                c.token.starts_with("script-written-on-line:"),
+                "{head}: {}",
+                c.token
+            );
+            for line in [format!("echo ls | {head}"), format!("{head} <<< 'ls'")] {
+                let c = at(&line);
+                assert_eq!(c.token, "shell-stdin-unshown", "{line}");
+            }
+        }
+        for line in [
+            "echo ls | docker run --rm img sh",
+            "echo ls | kubectl exec pod -- sh",
+            "echo data | docker exec -i db psql",
+            "cat a.tar | kubectl exec -i pod -- tar xf -",
+            "echo ls | ssh host cat",
+            "echo ls | sftp host",
+            "echo ls | systemd-run sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
