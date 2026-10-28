@@ -3449,7 +3449,7 @@ fn inside(p: &Path, work: Option<&Path>) -> bool {
 /// from the disk, with each link followed before a `..` after it, and
 /// the rest as spelled. A link that points at nothing yet is followed
 /// too, since a write makes its target.
-fn on_disk(p: &Path) -> PathBuf {
+pub(crate) fn on_disk(p: &Path) -> PathBuf {
     on_disk_at(p, 0)
 }
 

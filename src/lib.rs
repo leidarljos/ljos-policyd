@@ -12607,7 +12607,51 @@ fn may_touch_seat(argv: &[String], cwd: Option<&str>) -> bool {
             return true;
         }
     }
-    false
+    writer && links_to_seat(argv, cwd)
+}
+
+/// Whether a path word of the line reaches a seat file through a link
+/// already on the disk, such as `/tmp/c/hooks.json` with `/tmp/c` a
+/// link to `~/.cursor` made on an earlier line. The text names no seat
+/// file, so [`seat_marker`] does not see it. A relative word is placed
+/// in `cwd` and in each absolute `cd` or `pushd` directory of the line.
+fn links_to_seat(argv: &[String], cwd: Option<&str>) -> bool {
+    let bases: Vec<&str> = cwd
+        .into_iter()
+        .chain(
+            argv.windows(2)
+                .filter(|p| matches!(base_of(&p[0]), "cd" | "pushd"))
+                .map(|p| unquote(&p[1])),
+        )
+        .filter(|d| d.starts_with('/'))
+        .collect();
+    let mut guards = None;
+    let mut reaches = |abs: String| {
+        let disk = disk_path(&abs);
+        disk != abs && guards.get_or_insert_with(GuardSet::real).near(&disk)
+    };
+    argv.iter().any(|w| {
+        let w = unquote(w);
+        if !w.contains('/') {
+            return false;
+        }
+        [
+            w,
+            w.rsplit('=').next().unwrap_or(w),
+            w.trim_start_matches(|c: char| c.is_ascii_digit() || "<>&|".contains(c)),
+        ]
+        .into_iter()
+        .map(unquote)
+        .any(|p| {
+            if p.starts_with('/') {
+                landed(p, None).is_some_and(&mut reaches)
+            } else {
+                bases
+                    .iter()
+                    .any(|b| landed(p, Some(b)).is_some_and(&mut reaches))
+            }
+        })
+    })
 }
 
 /// Whether `w` may name the policyd config `config`. A word is placed
@@ -12715,6 +12759,9 @@ fn unquote(w: &str) -> &str {
 struct GuardSet {
     files: Vec<String>,
     dirs: Vec<String>,
+    /// `files` and `dirs` as the disk names them, links followed.
+    disk_files: Vec<String>,
+    disk_dirs: Vec<String>,
 }
 
 impl GuardSet {
@@ -12745,20 +12792,59 @@ impl GuardSet {
         if !data.is_empty() {
             dirs.push(format!("{data}/ljos/git-hooks"));
         }
-        Self { files, dirs }
+        let disk = |v: &[String]| v.iter().map(|p| disk_path(p)).collect();
+        Self {
+            disk_files: disk(&files),
+            disk_dirs: disk(&dirs),
+            files,
+            dirs,
+        }
     }
 
+    /// Whether a write to the absolute `path` reaches a seat file. A
+    /// link already on the disk, such as `/tmp/c` made on an earlier
+    /// line to point at `~/.cursor`, is followed, so `/tmp/c/hooks.json`
+    /// is that hook file.
     fn hit(&self, path: &str) -> bool {
-        if self.files.iter().any(|f| f == path) {
+        if Self::under(&self.files, &self.dirs, path) {
             return true;
         }
-        self.dirs.iter().any(|d| {
+        let disk = disk_path(path);
+        Self::under(&self.files, &self.dirs, &disk)
+            || Self::under(&self.disk_files, &self.disk_dirs, &disk)
+    }
+
+    /// Whether `path` is a seat path, or a directory above or below one.
+    fn near(&self, path: &str) -> bool {
+        let within = |a: &str, b: &str| {
+            a == b || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
+        };
+        self.files
+            .iter()
+            .chain(&self.dirs)
+            .chain(&self.disk_files)
+            .chain(&self.disk_dirs)
+            .any(|g| within(path, g) || within(g, path))
+    }
+
+    fn under(files: &[String], dirs: &[String], path: &str) -> bool {
+        if files.iter().any(|f| f == path) {
+            return true;
+        }
+        dirs.iter().any(|d| {
             path == d
                 || path
                     .strip_prefix(d.as_str())
                     .is_some_and(|rest| rest.starts_with('/'))
         })
     }
+}
+
+/// The absolute `path` as the kernel would open it, see [`pyprog::on_disk`].
+fn disk_path(path: &str) -> String {
+    pyprog::on_disk(std::path::Path::new(path))
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn push_name(names: &mut Vec<(String, String)>, key: &str, value: &str, append: bool) {
@@ -26514,6 +26600,66 @@ make -C safe test
         let c = check_shell_in(&shell_words("echo x > notes.txt"), &root, 0);
         assert_eq!(c.decision, Decision::Allow, "{}", c.token);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A link under `/tmp` that an earlier line made to a seat directory
+    /// is followed on the disk, so a write through it is a write to the
+    /// seat file. So is a link the same line makes with `ln`. A write
+    /// through a link to anywhere else, and a plain `/tmp` write, pass.
+    #[test]
+    fn a_seat_guard_path_is_not_written_through_a_link() {
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty() {
+            return;
+        }
+        let line = |s: &str| verdict(&shell_words(s));
+        let base = std::env::temp_dir().join(format!("seat-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("plain")).unwrap();
+        let b = base.display().to_string();
+        for (name, to) in [
+            ("c", format!("{home}/.cursor")),
+            ("h", home.clone()),
+            ("l", format!("{home}/.config/ljos")),
+            ("g", format!("{home}/.gitconfig")),
+            ("ok", format!("{b}/plain")),
+        ] {
+            std::os::unix::fs::symlink(to, base.join(name)).unwrap();
+        }
+        let mut missed = Vec::new();
+        for s in [
+            format!("echo x > {b}/c/hooks.json"),
+            format!("echo x >{b}/c/hooks.json"),
+            format!("printf x | tee {b}/c/hooks.json"),
+            format!("cp /tmp/src {b}/c/hooks.json"),
+            format!("dd if=/dev/null of={b}/c/hooks.json"),
+            format!("touch {b}/c/hooks.json"),
+            format!("cd {b} && echo x > c/hooks.json"),
+            format!("cd {b}/c && echo x > hooks.json"),
+            format!("echo x > {b}/h/.cursor/hooks.json"),
+            format!("echo x > {b}/l/env"),
+            format!("mkdir -p {b}/l/seats"),
+            format!("echo x > {b}/g"),
+            format!("ln -s ~/.cursor {b}/new; echo x > {b}/new/hooks.json"),
+            format!("ln -s {home}/.cursor {b}/new && cp /tmp/src {b}/new/hooks.json"),
+        ] {
+            let got = line(&s);
+            if !got.starts_with("deny\tseat-guard-path:") {
+                missed.push(format!("{s} -> {got}"));
+            }
+        }
+        assert!(missed.is_empty(), "{missed:#?}");
+        for s in [
+            format!("echo x > {b}/ok/out"),
+            format!("cd {b} && echo x > ok/out"),
+            format!("cat {b}/c/hooks.json"),
+            format!("echo x > {b}/plain/out"),
+            "echo x > /tmp/out".to_string(),
+            "mkdir -p /tmp/seat-ok && touch /tmp/seat-ok/f".to_string(),
+        ] {
+            assert_eq!(line(&s), "allow", "{s}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// What the table says of `line` started in the tree `/w/proj`.
