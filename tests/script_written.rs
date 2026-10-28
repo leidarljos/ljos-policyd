@@ -347,6 +347,32 @@ fn the_tunnel_script_runs_as_written() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// `pgrep` and `pkill` read the process table and signal, as `kill`
+/// does, so the tunnel script run from the home its program lives
+/// under is not one that may have written it. A command the guard
+/// does not know in their place still may have.
+#[test]
+fn pgrep_writes_no_program() {
+    let d = scratch("tunnel-home");
+    let home = d.to_str().unwrap();
+    std::fs::create_dir_all(d.join("bin")).unwrap();
+    std::fs::create_dir_all(d.join(".local/bin")).unwrap();
+    let tunnel = d.join("bin/tunnel");
+    std::fs::write(&tunnel, TUNNEL.replace("/srv/example", home)).unwrap();
+    let path = tunnel.to_str().unwrap();
+    for args in ["on", "off", "status", "run git fetch"] {
+        let line = format!("{path} {args}");
+        assert_eq!(hook_verdict(&d, "example", &line), "allow", "{line}");
+    }
+    let other = TUNNEL
+        .replace("/srv/example", home)
+        .replace("pgrep", "mytool");
+    std::fs::write(&tunnel, other).unwrap();
+    let v = hook_verdict(&d, "example", &format!("{path} on"));
+    assert!(v.starts_with("deny\tscript-written-on-line: "), "{v}");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// What the ljos hook asks about a shell line: `check -- bash -c LINE`
 /// from the payload's directory, stdin closed, with the seat set.
 fn hook_verdict(dir: &std::path::Path, seat: &str, line: &str) -> String {

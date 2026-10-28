@@ -14045,7 +14045,7 @@ fn tee_paths(cmd: &[String]) -> Vec<&str> {
 const NON_WRITERS: &str = "echo printf cat grep egrep fgrep rg ls test [ [[ true false : cd \
     pushd popd dirs pwd which type hash read mapfile readarray export \
     unset set shopt shift local declare typeset readonly alias unalias \
-    exit return break continue wait jobs umask ulimit getopts let kill \
+    exit return break continue wait jobs umask ulimit getopts let kill pgrep pkill \
     sleep wc head tail cut tr diff cmp stat file basename dirname \
     realpath readlink date id whoami uname hostname printenv seq expr mkdir rm \
     rmdir touch chmod { } ( ) ! then do else elif fi done esac trap for \
