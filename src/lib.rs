@@ -252,6 +252,11 @@ pub struct Checked {
 pub fn check_shell(argv: &[String]) -> Checked {
     let cwd = std::env::current_dir().unwrap_or_default();
     SPELLED.with(|s| s.borrow_mut().clear());
+    ARGV_WORDS.with(|s| {
+        let mut s = s.borrow_mut();
+        s.clear();
+        s.extend(argv.iter().filter(|w| w.contains(['$', '`'])).cloned());
+    });
     bump_spell_gen();
     check_shell_in(argv, &cwd, 0)
 }
@@ -267,6 +272,23 @@ thread_local! {
     /// Bumps when [`SPELLED`] gains a word or a quote bit flips. A reused
     /// command judgment is valid only for the map it was made under.
     static SPELL_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// The words of the argv being checked that hold `$` or a backtick.
+    /// The program gets them as they are. No shell expands them.
+    static ARGV_WORDS: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::default();
+}
+
+/// Whether the `$` and backticks in `w` run nothing: each one was quoted
+/// wherever [`shell_words`] split the word, or `w` is a word of the argv
+/// itself. A real substitution or subshell is never quoted that way. A
+/// shell's `-c` script in the argv is still read as its own line.
+fn expands_nothing(w: &str) -> bool {
+    if !w.contains(['$', '`']) {
+        return false;
+    }
+    SPELLED.with(|m| m.borrow().get(w) == Some(&true))
+        || (!SPELLED.with(|m| m.borrow().contains_key(w))
+            && ARGV_WORDS.with(|s| s.borrow().contains(w)))
 }
 
 fn spell_gen() -> u64 {
@@ -2581,6 +2603,9 @@ fn walk(
                 // subshell. An unquoted body still expands `$(...)` and
                 // backticks, and those run.
                 if (data[ci] || pat) && !w.contains("$(") && !w.contains('`') {
+                    continue;
+                }
+                if expands_nothing(w) {
                     continue;
                 }
                 for body in substitutions(w) {
