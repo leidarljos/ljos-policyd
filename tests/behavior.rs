@@ -27,20 +27,27 @@ fn a_brief_that_mentions_a_path_is_allowed() {
         "#+TITLE: Fundamentals of HPC\n* Intro\n",
     )
     .unwrap();
-    let brief = "The notes live in course-module-fundamentals-of-hpc/slides/fundamentals-of-hpc.org.\n";
+    let brief =
+        "The notes live in course-module-fundamentals-of-hpc/slides/fundamentals-of-hpc.org.\n";
     std::fs::create_dir_all(root.join("notes")).unwrap();
     std::fs::write(root.join("notes/BRIEF.md"), brief).unwrap();
     let joined = format!("notes/BRIEF.md\n{brief}");
     let c = check_shell(&["bash".into(), "-c".into(), joined]);
     let write = format!("cat > notes/BRIEF.md << 'EOF'\n{brief}EOF");
     let w = check_shell(&["bash".into(), "-c".into(), write]);
-    assert_eq!(c.decision, ljos_policyd::policy_capnp::Decision::Allow, "{}", c.token);
-    assert!(
-        !c.token.contains("script-unread"),
+    assert_eq!(
+        c.decision,
+        ljos_policyd::policy_capnp::Decision::Allow,
         "{}",
         c.token
     );
-    assert_eq!(w.decision, ljos_policyd::policy_capnp::Decision::Allow, "{}", w.token);
+    assert!(!c.token.contains("script-unread"), "{}", c.token);
+    assert_eq!(
+        w.decision,
+        ljos_policyd::policy_capnp::Decision::Allow,
+        "{}",
+        w.token
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -124,4 +131,23 @@ fn a_deny_is_appended_to_the_deny_log() {
     assert!(text.contains("sudo"), "{text}");
     assert!(text.contains('\t'), "{text}");
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn find_and_feeders_do_not_hide_rm() {
+    for (line, token) in [
+        ("find . -delete", "find-delete"),
+        ("find . -exec rm -rf {} +", "find-exec-rm"),
+        ("find /tmp -execdir rm {} ;", "find-exec-rm"),
+        ("xargs rm -rf", "feeder-rm"),
+        ("xargs -n 1 rm", "feeder-rm"),
+        ("parallel rm -rf ::: /", "feeder-rm"),
+    ] {
+        assert_eq!(verdict(&words(line)), format!("deny\t{token}"), "{line}");
+    }
+    let script = verdict(&["sh".into(), "-c".into(), "find . -delete".into()]);
+    assert_eq!(script, "deny\tfind-delete");
+    assert_eq!(verdict(&words("find . -name x")), "allow");
+    assert_eq!(verdict(&words("xargs echo hi")), "allow");
+    assert_eq!(verdict(&words("parallel echo hi")), "allow");
 }
