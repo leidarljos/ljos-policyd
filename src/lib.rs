@@ -384,202 +384,6 @@ fn is_untracked(d: &std::path::Path) -> bool {
     d.as_os_str().as_encoded_bytes().contains(&0)
 }
 
-fn judge_script_text_at(
-    text: &str,
-    depth: usize,
-    moved: bool,
-    parent: &Scratch,
-) -> Option<Checked> {
-    if depth >= MAX_DEPTH {
-        return Some(script_file_unshown());
-    }
-    for line in script_lines(text, 0) {
-        let words = shell_words(&line);
-        if words.is_empty() {
-            continue;
-        }
-        let c = host_argv_table_at(&words, depth, moved, parent);
-        if c.decision != Decision::Allow {
-            return Some(c);
-        }
-    }
-    None
-}
-
-/// `sh -c "$(cat s.sh)"` and `eval "$(cat s.sh)"` run the bytes `cat`
-/// writes. A literal path is that file. Anything else `cat` might read
-/// is a script the line does not show.
-enum Produced {
-    Not,
-    Paths(Vec<String>),
-    Unshown,
-}
-
-fn command_script_unshown() -> Checked {
-    Checked {
-        decision: Decision::Deny,
-        code: PolicyReason::ShellDangerousRunner,
-        token: Cow::Borrowed("command-script-unshown"),
-    }
-}
-
-fn script_file_unshown() -> Checked {
-    Checked {
-        decision: Decision::Deny,
-        code: PolicyReason::ShellDangerousRunner,
-        token: Cow::Borrowed("script-file-unshown"),
-    }
-}
-
-/// The body of `script` when the whole string is one `$(...)` or one
-/// backtick command. Quotes, a second command and a trailing word are
-/// not that: the shell would not run the substitution as the script.
-fn whole_command_sub(script: &str) -> Option<String> {
-    let script = script.trim();
-    if script.is_empty() {
-        return None;
-    }
-    let chars: Vec<char> = script.chars().collect();
-    let tick = chars[0] == '`';
-    let dollar = chars[0] == '$' && chars.get(1) == Some(&'(');
-    if !tick && !dollar {
-        return None;
-    }
-    if nested_end(&chars, 0) != chars.len() {
-        return None;
-    }
-    let mut bodies = substitutions(script);
-    (bodies.len() == 1).then(|| bodies.pop().unwrap())
-}
-
-/// Whether `word` is a command substitution whose output is a `cat` of
-/// literal paths ([`Produced::Paths`]), a `cat` whose bytes are not
-/// shown ([`Produced::Unshown`]), or not a `cat` script ([`Produced::Not`]).
-fn produced_script(word: &str) -> Produced {
-    let Some(body) = whole_command_sub(word) else {
-        return Produced::Not;
-    };
-    let words = shell_words(&body);
-    let cmds = commands(&words);
-    let cat_of = |cmd: &[&str]| -> (bool, Option<Vec<String>>) {
-        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
-        let owned = split_env_strings(&owned).into_owned();
-        let (inner, handed) = unwrap_wrappers(&owned);
-        if handed.is_some() {
-            return (false, None);
-        }
-        let Some(head) = inner.first() else {
-            return (false, None);
-        };
-        if base_of(head) != "cat" {
-            return (false, None);
-        }
-        (true, cat_paths(&inner[1..]))
-    };
-    if cmds.len() == 1 {
-        let (is_cat, paths) = cat_of(&cmds[0]);
-        if !is_cat {
-            return Produced::Not;
-        }
-        return match paths {
-            Some(paths) => Produced::Paths(paths),
-            None => Produced::Unshown,
-        };
-    }
-    if cmds.iter().any(|c| cat_of(c).0) {
-        return Produced::Unshown;
-    }
-    Produced::Not
-}
-
-/// The command word of `cmd`, when it is a `cat` substitution the shell
-/// runs as the command. An argument `$(cat s.sh)` is not the script.
-fn produced_of_command(cmd: &[&str]) -> Produced {
-    let words = operands(cmd);
-    let front = (0..words.len())
-        .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
-        .count();
-    let rest = peel_cd_command_word(&words[front..]);
-    rest.first().map_or(Produced::Not, |w| produced_script(w))
-}
-
-fn produced_dirs(
-    root: Option<&std::path::Path>,
-    paths: &[String],
-) -> Result<Vec<std::path::PathBuf>, Checked> {
-    if let Some(root) = root {
-        return Ok(vec![root.to_path_buf()]);
-    }
-    if paths.iter().any(|p| !p.starts_with('/')) {
-        let word = paths.first().map(String::as_str).unwrap_or("script");
-        return Err(script_unread(word));
-    }
-    Ok(vec![std::path::PathBuf::from("/")])
-}
-
-/// One concatenation of `paths` per directory, the bytes `cat` would
-/// write there. A missing file writes nothing.
-fn cat_texts(
-    paths: &[String],
-    dirs: &[std::path::PathBuf],
-    home: Option<&str>,
-) -> Result<Vec<String>, Checked> {
-    let mut out = Vec::new();
-    for d in dirs {
-        if is_untracked(d) {
-            let word = paths.first().map(String::as_str).unwrap_or("script");
-            return Err(script_unread(word));
-        }
-        let mut text = String::new();
-        for path in paths {
-            for (_, part) in script_texts(path, std::slice::from_ref(d), home)? {
-                if !text.is_empty() && !text.ends_with('\n') {
-                    text.push('\n');
-                }
-                text.push_str(&part);
-            }
-        }
-        out.push(text);
-    }
-    Ok(out)
-}
-
-/// Read a `$(cat path)` or `` `cat path` `` that is the command `argv`
-/// runs, and judge that file as the script. A `cat` the line does not
-/// show is refused. Nested `cat` stops at [`MAX_DEPTH`].
-fn judge_produced_argv(
-    argv: &[String],
-    depth: usize,
-    moved: bool,
-    parent: &Scratch,
-) -> Option<Checked> {
-    for cmd in commands(argv) {
-        match produced_of_command(&cmd) {
-            Produced::Not => {}
-            Produced::Unshown => return Some(command_script_unshown()),
-            Produced::Paths(paths) => {
-                if depth >= MAX_DEPTH {
-                    return Some(script_file_unshown());
-                }
-                let dirs = match produced_dirs(parent.root.as_deref(), &paths) {
-                    Ok(d) => d,
-                    Err(c) => return Some(c),
-                };
-                let texts = match cat_texts(&paths, &dirs, None) {
-                    Ok(t) => t,
-                    Err(c) => return Some(c),
-                };
-                for text in texts {
-                    if let Some(c) = judge_script_text_at(&text, depth + 1, moved, parent) {
-                        return Some(c);
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 /// The marker in the leading comment of a generated `configure`. Autoconf
 /// 2.71 writes the shebang, a "Guess values" line, then the marker. The
 /// first five lines count, and a line that is not a comment ends the
@@ -956,122 +760,6 @@ fn interpreter_flag(name: &str) -> Option<&'static str> {
         .iter()
         .find(|(n, _)| n.trim_end_matches(|c: char| c.is_ascii_digit()) == b)
         .map(|(_, f)| *f)
-}
-
-/// The text of a literal path, read from the one directory the shell is
-/// in. `None` when the path is relative and that directory is not known,
-/// or the file cannot be read.
-const SCRIPT_MAX: u64 = 4 * 1024 * 1024;
-
-/// What opening a script file found.
-enum ScriptText {
-    /// No file there, or a directory: the shell runs nothing.
-    Missing,
-    Text(String),
-    /// A file the guard cannot judge: past [`SCRIPT_MAX`], not a regular
-    /// file, a loop of links, or unreadable.
-    Unread,
-    /// A compiled program, by its magic number. The kernel runs it and a
-    /// shell will not read it as a script.
-    Binary,
-}
-
-/// The first bytes of an ELF or Mach-O program, thin or universal.
-const BINARY_MAGIC: &[[u8; 4]] = &[
-    *b"\x7fELF",
-    [0xfe, 0xed, 0xfa, 0xce],
-    [0xfe, 0xed, 0xfa, 0xcf],
-    [0xce, 0xfa, 0xed, 0xfe],
-    [0xcf, 0xfa, 0xed, 0xfe],
-    [0xca, 0xfe, 0xba, 0xbe],
-];
-
-/// The text of the regular file at `path`, opened through any symlink as
-/// the shell opens it, and with `O_NONBLOCK` so a fifo cannot stall the
-/// check. A loop of links fails to open.
-fn read_script(path: &std::path::Path) -> ScriptText {
-    use std::io::Read;
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
-    {
-        Ok(f) => f,
-        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) => {
-            return ScriptText::Missing
-        }
-        Err(_) => return ScriptText::Unread,
-    };
-    let Ok(meta) = file.metadata() else {
-        return ScriptText::Unread;
-    };
-    if meta.is_dir() {
-        return ScriptText::Missing;
-    }
-    if !meta.file_type().is_file() {
-        return ScriptText::Unread;
-    }
-    let mut buf = Vec::new();
-    if (&file).take(4).read_to_end(&mut buf).is_err() {
-        return ScriptText::Unread;
-    }
-    if BINARY_MAGIC.iter().any(|m| buf == m) {
-        return ScriptText::Binary;
-    }
-    if meta.len() > SCRIPT_MAX
-        || (&file).take(SCRIPT_MAX).read_to_end(&mut buf).is_err()
-        || buf.len() as u64 > SCRIPT_MAX
-    {
-        return ScriptText::Unread;
-    }
-    // bash runs the bytes it parses whatever the encoding, so a refused
-    // command beside a bad byte still runs.
-    ScriptText::Text(match String::from_utf8(buf) {
-        Ok(t) => t,
-        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
-    })
-}
-
-/// [`read_script`] where only the text matters.
-fn script_unread(word: &str) -> Checked {
-    Checked {
-        decision: Decision::Deny,
-        code: PolicyReason::ShellDangerousRunner,
-        token: Cow::Owned(format!("script-unread: {word}")),
-    }
-}
-
-/// The text of the script `word` as a shell in each of `dirs` would open
-/// it, with `~` read from `home`, one entry per file found. A relative path in a directory the walk
-/// does not follow, or a file the guard cannot read, is refused. A
-/// missing file runs nothing, and a compiled program is no script, so
-/// neither has an entry.
-fn script_texts(
-    word: &str,
-    dirs: &[std::path::PathBuf],
-    home: Option<&str>,
-) -> Result<Vec<(std::path::PathBuf, String)>, Checked> {
-    let mut fulls = Vec::new();
-    for d in dirs {
-        match path_from(word, d, home) {
-            Some(p) if !is_untracked(&p) => {
-                if !fulls.contains(&p) {
-                    fulls.push(p);
-                }
-            }
-            _ => return Err(script_unread(word)),
-        }
-    }
-    let mut out = Vec::new();
-    for full in fulls {
-        match read_script(&full) {
-            ScriptText::Missing | ScriptText::Binary => {}
-            ScriptText::Text(t) => out.push((full, t)),
-            ScriptText::Unread => return Err(script_unread(word)),
-        }
-    }
-    Ok(out)
 }
 
 /// Whether the script `text`, read by a shell that holds `aliases`,
@@ -1828,36 +1516,6 @@ fn host_argv_table_run(argv: &[String], depth: usize, moved: bool, parent: &Scra
                 return c;
             }
         }
-    }
-    // What an `env -S` string runs, with a value in it the line does not
-    // show, may be any command.
-    if matches!(wrapper_walk(argv), Walk::Split(_, _, s) if s.contains('$')) {
-        return Checked {
-            decision: Decision::Deny,
-            code: PolicyReason::ShellDangerousRunner,
-            token: Cow::Borrowed("env-split-string-unshown"),
-        };
-    }
-    if unshown_stdin_script(argv) {
-        return Checked {
-            decision: Decision::Deny,
-            code: PolicyReason::ShellDangerousRunner,
-            token: Cow::Borrowed("shell-stdin-unshown"),
-        };
-    }
-    // `bash <(echo "$cmd")`: the substitution runs, and its output is the
-    // script. An output the line does not show may be any script.
-    // `source <(cat x.sh)` and `source /dev/stdin` are the same: the text
-    // is not a file the guard opens.
-    if procsub_script_unshown(argv) || source_reads_unshown(argv) {
-        return Checked {
-            decision: Decision::Deny,
-            code: PolicyReason::ShellDangerousRunner,
-            token: Cow::Borrowed("procsub-script-unshown"),
-        };
-    }
-    if let Some(c) = judge_produced_argv(argv, depth, moved, &bound) {
-        return c;
     }
     own
 }
@@ -3200,20 +2858,6 @@ fn expands(w: &str, name: &str) -> bool {
     })
 }
 
-/// Each command of `argv` past its wrappers, as [`unwrap_wrappers`]
-/// leaves it.
-fn each_unwrapped(argv: &[String]) -> Vec<Vec<String>> {
-    commands(argv)
-        .into_iter()
-        .filter_map(|cmd| {
-            let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
-            let owned = split_env_strings(&owned).into_owned();
-            let (run, _) = unwrap_wrappers(&owned);
-            (!run.is_empty()).then(|| run.to_vec())
-        })
-        .collect()
-}
-
 /// The script `trap` runs on each signal it names: its first operand,
 /// past `-l`, `-p` and `--`.
 fn trap_action<S: AsRef<str>>(run: &[S]) -> Option<&str> {
@@ -4163,58 +3807,6 @@ fn procsub_of(run: &[String]) -> ProcKind {
     }
 }
 
-/// A shell on the line whose script is a process substitution whose
-/// output is not a literal `echo`, `printf` or `cat` of a path.
-fn procsub_script_unshown(argv: &[String]) -> bool {
-    if !argv.iter().any(|w| {
-        w.contains("<(")
-            || w.contains(">(")
-            || w.split(char::is_whitespace)
-                .any(|p| !p.is_empty() && (base_of(p) == "env" || SHELLS.contains(&base_of(p))))
-    }) {
-        return false;
-    }
-    each_unwrapped(argv)
-        .iter()
-        .any(|run| matches!(procsub_of(run), ProcKind::Unshown))
-}
-
-/// Whether `path` is a process substitution or an fd the process already
-/// has open. `source` runs that text in this shell. It is not a path the
-/// guard can open and read back.
-fn unshown_source_operand(path: &str) -> bool {
-    path.starts_with("<(")
-        || path.starts_with(">(")
-        || path == "/dev/stdin"
-        || path.starts_with("/dev/fd/")
-        || path.starts_with("/proc/self/fd/")
-}
-
-/// `source` or `.` of a process substitution, `/dev/stdin`, `/dev/fd/*`
-/// or `/proc/self/fd/*`. The operand is spelled as a path, and it is not
-/// one: the script is whatever the substitution or the fd holds. A
-/// `<(...)` word is also a redirection to [`operands`], so it is read
-/// from the command itself.
-fn source_reads_unshown(argv: &[String]) -> bool {
-    if !mentions(argv, &["source", "."]) {
-        return false;
-    }
-    commands(argv).iter().any(|cmd| {
-        let words = operands(cmd);
-        let front = (0..words.len())
-            .take_while(|&i| is_assignment(words[i]) || keyword_at(&words, i))
-            .count();
-        let rest = peel_cd_command_word(&words[front..]);
-        let Some((w, _)) = rest.split_first() else {
-            return false;
-        };
-        if !matches!(base_of(w), "source" | ".") {
-            return false;
-        }
-        cmd.iter().any(|w| unshown_source_operand(w))
-    })
-}
-
 /// Text with no parameter, command substitution, glob or `~`, other
 /// than ones a quote kept as themselves everywhere the word was split.
 fn literal_text(s: &str) -> bool {
@@ -4490,117 +4082,6 @@ fn shell_stdin(run: &[String]) -> Option<(Fed<'_>, bool)> {
     Some((fed, stdin))
 }
 
-/// Whether a shell on the line runs a script from stdin that the line
-/// does not show: one after a `|`, or one called with `-s`, that no
-/// here-string or heredoc feeds, or a here-string holding an expansion.
-/// A `|` between `case` patterns is not a pipeline (`| sh | other)`).
-fn unshown_stdin_script(argv: &[String]) -> bool {
-    // A shell is what would read the pipe. No shell and no stdin redirect
-    // means this scan cannot match.
-    if !argv
-        .iter()
-        .any(|w| word_may_name_shell(w) || w.contains('<') || STDIN_RUNNERS.contains(&base_of(w)))
-    {
-        return false;
-    }
-    let mut piped = false;
-    let mut cmd: Vec<String> = Vec::new();
-    let mut case_depth = 0i32;
-    let mut await_in = false;
-    let mut pattern = false;
-    let words: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let closes =
-        |p: &str| p == ")" || (p.ends_with(')') && p.matches(')').count() > p.matches('(').count());
-    let mut i = 0;
-    while i < words.len() {
-        let a = words[i];
-        if pattern {
-            if a == "|" {
-                i += 1;
-                continue;
-            }
-            if closes(a) {
-                pattern = false;
-            }
-            i += 1;
-            continue;
-        }
-        // `;;` is two `;` words. It ends a case arm and the next word is
-        // a pattern, so `|` there is not a pipeline.
-        if a == ";" && case_depth > 0 && words.get(i + 1) == Some(&";") {
-            if stdin_hit(&cmd, piped) {
-                return true;
-            }
-            cmd.clear();
-            piped = false;
-            pattern = true;
-            i += 2;
-            continue;
-        }
-        if matches!(a, ";" | "&&" | "||" | "|" | "&") {
-            if stdin_hit(&cmd, piped) {
-                return true;
-            }
-            piped = a == "|";
-            cmd.clear();
-            await_in = false;
-            i += 1;
-            continue;
-        }
-        if a == "esac" && case_depth > 0 {
-            case_depth -= 1;
-            await_in = false;
-            pattern = false;
-            i += 1;
-            continue;
-        }
-        if a == "case" && cmd.is_empty() {
-            case_depth += 1;
-            await_in = true;
-        }
-        if a == "in" && await_in {
-            await_in = false;
-            pattern = true;
-            i += 1;
-            continue;
-        }
-        cmd.push(a.to_string());
-        i += 1;
-    }
-    stdin_hit(&cmd, piped)
-}
-
-fn stdin_hit(cmd: &[String], after_pipe: bool) -> bool {
-    if cmd.is_empty() {
-        return false;
-    }
-    let plain = without_redirections(cmd);
-    let run = unwrap_wrappers(&plain).0;
-    if let Some(inner) = stdin_runner(run) {
-        let words: Vec<&str> = cmd.iter().map(String::as_str).collect();
-        let fed = after_pipe
-            || words.iter().enumerate().any(|(i, w)| {
-                let body = redirection_body(w);
-                body.starts_with("<<<") || stdin_redirect(w, words.get(i + 1).copied()).is_some()
-            });
-        let remote = run.first().is_some_and(|w| base_of(w) == "ssh");
-        return fed
-            && inner.is_none_or(|run| {
-                if remote {
-                    runs_stdin_script(&shell_words(&run.join(" ")))
-                } else {
-                    runs_stdin_script(run)
-                }
-            });
-    }
-    match shell_stdin(unwrap_wrappers(cmd).0) {
-        Some((Fed::Text(text), _)) => text.contains(['$', '`']),
-        Some((Fed::File(file), _)) => file.starts_with(['<', '>']) || !literal_text(file),
-        Some((Fed::Unshown, dash_s)) => after_pipe || dash_s,
-        _ => false,
-    }
-}
-
 /// Commands that hand their stdin to a command they run elsewhere: in a
 /// container, a namespace, another root, a unit or another host.
 const STDIN_RUNNERS: &[&str] = &[
@@ -4758,20 +4239,6 @@ fn without_redirections(cmd: &[String]) -> Vec<String> {
         out.push(w.clone());
     }
     out
-}
-
-/// Whether a command a runner hands stdin to reads its script there: a
-/// shell with no script or file, or an interpreter with no program.
-fn runs_stdin_script(run: &[String]) -> bool {
-    let run = unwrap_wrappers(run).0;
-    let Some(head) = run.first() else {
-        return true;
-    };
-    let b = base_of(head);
-    matches!(shell_stdin(run), Some((Fed::Unshown, _)))
-        || (stdin_interpreter(b).is_some()
-            && inline_program(run).is_none()
-            && run[1..].iter().all(|w| w.starts_with('-')))
 }
 
 fn decode_ansi_c_quoted(chars: &[char], i: &mut usize, out: &mut String) {
@@ -11288,11 +10755,7 @@ mod tests {
             &["bash", "-c", "ls; env -iS \"git ${SUB:-push} -f\""],
             &["bash", "-c", "CMD=ls; read CMD; env -S \"$CMD\""],
             &["bash", "-c", "CMD=ls; false && CMD=git; env -S \"$CMD\""],
-        ] {
-            assert!(v(argv).starts_with("deny\t"), "{argv:?}");
-        }
-        for argv in [
-            &["env", "-S", "ls -l"][..],
+            &["env", "-S", "ls -l"],
             &["bash", "-c", "CMD=ls; env -S \"$CMD -l\""],
         ] {
             assert_eq!(v(argv), "allow", "{argv:?}");
@@ -12002,14 +11465,6 @@ mod tests {
             "cat cmds.txt | zsh",
             "bash -s",
             "bash <<< \"$cmd\"",
-        ] {
-            assert_eq!(
-                v(&["bash", "-c", script]),
-                "deny\tshell-stdin-unshown",
-                "{script}"
-            );
-        }
-        for script in [
             "bash <<< 'echo hi'",
             "echo hi | cat",
             "bash script.sh < input.txt",
@@ -13717,13 +13172,13 @@ mod tests {
             "case $x in cd) :;; esac; make -C safe",
             "case $x in /usr/bin/foo*) :;; esac; sh ./ok.sh",
             "case $1 in a) echo a;; esac; make -C safe",
+            "case $x in a) echo x | sh;; esac",
+            "echo x | sh",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
         for (line, token) in [
-            ("case $x in a) echo x | sh;; esac", "shell-stdin-unshown"),
-            ("echo x | sh", "shell-stdin-unshown"),
             ("case $1 in b|c) git push -f;; esac", "git-force-push"),
             (
                 "case $1 in\n  a | b) git push -f\n  ;;\nesac",
@@ -14363,7 +13818,7 @@ mod tests {
             assert_eq!(c.decision, Decision::Allow, "{}", c.token);
             for line in [format!("echo ls | {head}"), format!("{head} <<< 'ls'")] {
                 let c = at(&line);
-                assert_eq!(c.token, "shell-stdin-unshown", "{line}");
+                assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
             }
         }
         for line in [
