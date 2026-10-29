@@ -64,18 +64,8 @@ pipeline of a line this way: `a && b | c` is two calls, `a` and `b | c`.
 A function definition's body (`f() { ...; }`, `function f { ...; }`) is
 judged as the commands it runs.
 
-A task runner is judged on what its target runs. `make` and `just` read
-the target from the Makefile or justfile, `cargo make` from
-`Makefile.toml`, and `npm run`, `pnpm`, `yarn` and `bun run` read the
-script from `package.json`. The file is read where the runner runs: the
-working directory, the one a `cd` or `pushd` earlier on the line enters,
-or the one `-C`, `--prefix` or `--cwd` names. Each line of the recipe is
-judged as above, so `cd ~/proj && make clean-all` whose recipe runs
-`rm -rf ~` is ``make clean-all runs `rm -rf ~`: rm-rf-outside-tmp``, and
-`make test` and `npm run build` still run. Nothing is spawned. A missing
-or unreadable file, or a directory the line does not name (`cd "$DIR"`),
-leaves the line judged as written. `cd -` enters `OLDPWD`, and without
-it a runner after `cd -` is refused.
+Makefile, npm, pnpm, yarn, bun and just recipes are not read. The
+line is judged as written.
 
 `cargo build` and `cargo run` are not read that way. The `build.rs` they
 compile and run is project code, the same as any other program a build
