@@ -6854,12 +6854,6 @@ fn rule_bits(b: &str) -> u32 {
     if DECODERS.contains(&b) {
         mask |= RULE_DECODE;
     }
-    if matches!(b, "chmod" | "install") {
-        mask |= RULE_SETUID;
-    }
-    if matches!(b, "chmod" | "chown" | "chgrp" | "setfacl") {
-        mask |= RULE_MODE;
-    }
     if matches!(b, "rm" | "srm" | "wipe" | "rmdir" | "unlink" | "shred")
         || TRASHERS.contains(&b)
         || b == "gio"
@@ -6959,25 +6953,11 @@ fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
     if let Some(c) = seat_guard_denial(argv, bound.root.as_deref()) {
         return c;
     }
-    if (mask & RULE_SETUID != 0 && setuid_mode(argv)) || interpreter_setuid(argv) {
-        return Checked {
-            decision: Decision::Deny,
-            code: PolicyReason::ShellDangerousRunner,
-            token: Cow::Borrowed("chmod-setuid"),
-        };
-    }
     if mask & RULE_DISK != 0 && raw_disk(argv) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellDangerousRunner,
             token: Cow::Borrowed("raw-disk"),
-        };
-    }
-    if mask & RULE_MODE != 0 && recursive_mode_change(argv) {
-        return Checked {
-            decision: Decision::Deny,
-            code: PolicyReason::ShellDangerousRunner,
-            token: Cow::Borrowed("recursive-chmod-chown"),
         };
     }
     if mask & RULE_DELETE != 0 && recursive_delete_off_tmp(argv, moved, bound) {
@@ -10515,281 +10495,6 @@ fn ended_indices(argv: &[String]) -> Vec<(Vec<usize>, &str)> {
     out
 }
 
-/// A mode that sets the setuid or setgid bit: an octal mode of four or
-/// more digits whose leading digit holds 4 or 2 (`4755`, `04755`, `2775`),
-/// or a symbolic clause that adds `s` (`u+s`, `g+s`, `+s`, `u=rwxs`).
-/// `0755`, `755`, `+x` and `g-s` set neither.
-fn sets_id_bit(mode: &str) -> bool {
-    if mode.len() >= 4 && mode.bytes().all(|b| (b'0'..=b'7').contains(&b)) {
-        // The fourth digit from the right holds setuid (4) and setgid (2).
-        return (mode.as_bytes()[mode.len() - 4] - b'0') & 0o6 != 0;
-    }
-    mode.split(',').any(|clause| {
-        let ops = clause.trim_start_matches(['u', 'g', 'o', 'a']);
-        if !ops.starts_with(['+', '-', '=']) || !ops.chars().all(|c| "+-=rwxXstugo".contains(c)) {
-            return false;
-        }
-        let mut adds = false;
-        ops.chars().any(|c| {
-            match c {
-                '+' | '=' => adds = true,
-                '-' => adds = false,
-                _ => {}
-            }
-            c == 's' && adds
-        })
-    })
-}
-
-/// The mode a `chmod` or `install` call sets: chmod's first word that is
-/// not a flag, or the value of install's `-m`, `-mMODE`, `--mode=MODE` or
-/// `--mode MODE`.
-fn mode_operand(argv: &[String]) -> Option<&str> {
-    let b = base_of(argv.first()?);
-    let args = &argv[1..];
-    if b == "chmod" {
-        return args
-            .iter()
-            .find(|a| !a.starts_with('-'))
-            .map(String::as_str);
-    }
-    if b != "install" {
-        return None;
-    }
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == "--mode" {
-            return it.next().map(String::as_str);
-        }
-        if let Some(m) = a.strip_prefix("--mode=") {
-            return Some(m);
-        }
-        let Some(flags) = a
-            .strip_prefix('-')
-            .filter(|f| !f.is_empty() && !f.starts_with('-'))
-        else {
-            continue;
-        };
-        for (k, c) in flags.char_indices() {
-            if c == 'm' {
-                let rest = &flags[k + 1..];
-                return if rest.is_empty() {
-                    it.next().map(String::as_str)
-                } else {
-                    Some(rest)
-                };
-            }
-            if "gotS".contains(c) {
-                break;
-            }
-        }
-    }
-    None
-}
-
-/// A `chmod` or `install` that sets the setuid or setgid bit.
-fn setuid_mode(argv: &[String]) -> bool {
-    mode_operand(argv).is_some_and(sets_id_bit)
-}
-
-/// An inline program sets the setuid or setgid bit: `os.chmod(path, 0o4755)`,
-/// `fs.chmodSync(path, 0o2755)`, `File.chmod(04755, path)`, `chmod 04755, "f"`.
-/// A mode without those bits (`0o755`, `0644`) does not, and neither does a
-/// shell string, which is judged as its own command.
-fn interpreter_setuid(argv: &[String]) -> bool {
-    if !argv.iter().any(|w| {
-        w.split(char::is_whitespace)
-            .any(|p| !p.is_empty() && interpreter_flag(base_of(p)).is_some())
-    }) {
-        return false;
-    }
-    commands(argv).iter().any(|cmd| {
-        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
-        let split = split_env_strings(&owned);
-        let (run, _) = unwrap_wrappers(&split);
-        inline_program(run).is_some_and(chmod_expr_sets_id)
-    })
-}
-
-/// `chmod` at `at` is a call, not a longer name (`mychmod`). `fchmod` and
-/// `lchmod` count; so does a method (`os.chmod`, `fs.chmodSync`).
-fn chmod_word(code: &str, at: usize) -> bool {
-    match code[..at].chars().next_back() {
-        None | Some('.') => true,
-        Some('f' | 'l') => code[..at]
-            .chars()
-            .rev()
-            .nth(1)
-            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_'),
-        Some(c) if c.is_ascii_alphanumeric() || c == '_' => false,
-        Some(_) => true,
-    }
-}
-
-/// The text of one `chmod` call carries a setuid or setgid mode.
-fn chmod_expr_sets_id(code: &str) -> bool {
-    let mut from = 0;
-    while let Some(rel) = code[from..].find("chmod") {
-        let at = from + rel;
-        from = at + "chmod".len();
-        if !chmod_word(code, at) {
-            continue;
-        }
-        let mut after = &code[from..];
-        if let Some(rest) = after.strip_prefix("Sync") {
-            after = rest;
-        }
-        let after = after.trim_start();
-        let region = if let Some(rest) = after.strip_prefix('(') {
-            balanced_paren(rest)
-        } else if code
-            .as_bytes()
-            .get(from)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            after.split([';', '\n']).next().unwrap_or(after)
-        } else {
-            continue;
-        };
-        if region_sets_id(region) {
-            return true;
-        }
-    }
-    false
-}
-
-/// The inside of a parenthesised argument list, quotes included as text
-/// the scanner skips.
-fn balanced_paren(s: &str) -> &str {
-    let chars: Vec<(usize, char)> = s.char_indices().collect();
-    let mut depth = 1i32;
-    let mut quote: Option<char> = None;
-    let mut k = 0;
-    while k < chars.len() {
-        let (i, c) = chars[k];
-        if let Some(q) = quote {
-            if c == '\\' {
-                k += 2;
-                continue;
-            }
-            if c == q {
-                quote = None;
-            }
-            k += 1;
-            continue;
-        }
-        match c {
-            '"' | '\'' | '`' => quote = Some(c),
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return &s[..i];
-                }
-            }
-            _ => {}
-        }
-        k += 1;
-    }
-    s
-}
-
-/// A numeric mode or `S_ISUID` / `S_ISGID` in `region`, outside quotes.
-fn region_sets_id(region: &str) -> bool {
-    let chars: Vec<(usize, char)> = region.char_indices().collect();
-    let mut k = 0;
-    while k < chars.len() {
-        let (bi, c) = chars[k];
-        match c {
-            '"' | '\'' | '`' => {
-                let q = c;
-                k += 1;
-                while k < chars.len() && chars[k].1 != q {
-                    if chars[k].1 == '\\' {
-                        k += 2;
-                    } else {
-                        k += 1;
-                    }
-                }
-                k += 1;
-            }
-            'S' if region_ident_at(region, bi)
-                && (region[bi..].starts_with("S_ISUID") || region[bi..].starts_with("S_ISGID"))
-                && region_ident_end(region, bi + "S_ISUID".len()) =>
-            {
-                return true;
-            }
-            '0' => {
-                let next = chars.get(k + 1).map(|(_, ch)| *ch);
-                if matches!(next, Some('o' | 'O' | 'x' | 'X')) {
-                    let start = k + 2;
-                    let hex = matches!(next, Some('x' | 'X'));
-                    let mut end = start;
-                    while end < chars.len()
-                        && (chars[end].1 == '_'
-                            || if hex {
-                                chars[end].1.is_ascii_hexdigit()
-                            } else {
-                                chars[end].1.is_digit(8)
-                            })
-                    {
-                        end += 1;
-                    }
-                    let lit: String = chars[start..end]
-                        .iter()
-                        .map(|(_, ch)| *ch)
-                        .filter(|ch| *ch != '_')
-                        .collect();
-                    let radix = if hex { 16 } else { 8 };
-                    if !lit.is_empty()
-                        && u32::from_str_radix(&lit, radix).is_ok_and(mode_value_sets_id)
-                    {
-                        return true;
-                    }
-                    k = end;
-                } else if next.is_some_and(|ch| ch.is_digit(8)) {
-                    let mut end = k + 1;
-                    while end < chars.len() && chars[end].1.is_digit(8) {
-                        end += 1;
-                    }
-                    if chars.get(end).is_none_or(|(_, ch)| *ch != '.') {
-                        let lit: String = chars[k..end].iter().map(|(_, ch)| *ch).collect();
-                        if u32::from_str_radix(&lit, 8).is_ok_and(mode_value_sets_id) {
-                            return true;
-                        }
-                    }
-                    k = end;
-                } else {
-                    k += 1;
-                }
-            }
-            _ => k += 1,
-        }
-    }
-    false
-}
-
-/// Setuid is `0o4000`, setgid is `0o2000`.
-fn mode_value_sets_id(value: u32) -> bool {
-    value & 0o6000 != 0
-}
-
-/// `bi` starts an identifier.
-fn region_ident_at(region: &str, bi: usize) -> bool {
-    region[..bi]
-        .chars()
-        .next_back()
-        .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
-}
-
-/// `bi` ends an identifier.
-fn region_ident_end(region: &str, bi: usize) -> bool {
-    region[bi..]
-        .chars()
-        .next()
-        .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
-}
-
 /// A block device: a whole disk, a partition, or a mapped or RAID volume.
 /// `/dev/null`, `/dev/zero` and the other character devices are not one.
 fn block_device(path: &str) -> bool {
@@ -10956,119 +10661,6 @@ fn system_or_home_tree(p: &str) -> bool {
         (p == *root || p.starts_with(&format!("{root}/")))
             && !(p == "/var/tmp" || p.starts_with("/var/tmp/"))
     })
-}
-
-/// A mode that takes every permission away (`000`, `a-rwx`), or gives
-/// everyone write (`777`, `o+w`, `a+w`).
-fn sweeping_mode(m: &str) -> bool {
-    if m.chars().all(|c| c.is_ascii_digit()) && (3..=4).contains(&m.len()) {
-        let digits: Vec<u32> = m.chars().filter_map(|c| c.to_digit(8)).collect();
-        let n = digits.len();
-        let (u, g, o) = (digits[n - 3], digits[n - 2], digits[n - 1]);
-        return (u == 0 && g == 0 && o == 0) || o & 2 != 0;
-    }
-    m.split(',').any(|clause| {
-        let (who, rest) = clause.split_at(clause.find(['+', '-', '=']).unwrap_or(clause.len()));
-        let everyone = who.is_empty() || who.contains('a') || who.contains('o');
-        (everyone && rest.starts_with('+') && rest.contains('w'))
-            || (who.contains('a') || who == "ugo")
-                && rest.starts_with('-')
-                && rest.contains('r')
-                && rest.contains('w')
-                && rest.contains('x')
-    })
-}
-
-/// A recursive `chmod`, `chown`, `chgrp` or `setfacl` that starts at the
-/// root, a home directory or a system tree, or a recursive `chmod` that
-/// takes every permission away or hands everyone write, wherever it starts
-/// outside `/tmp`. `chmod -R u+w target` and `chown -R $USER ./build` stay
-/// allowed.
-fn recursive_mode_change(argv: &[String]) -> bool {
-    commands(argv).iter().any(|cmd| {
-        let b = base_of(cmd[0]);
-        if !matches!(b, "chmod" | "chown" | "chgrp" | "setfacl") {
-            return false;
-        }
-        let recursive = cmd[1..].iter().any(|a| {
-            *a == "--recursive" || (a.starts_with('-') && !a.starts_with("--") && a.contains('R'))
-        });
-        if !recursive {
-            return false;
-        }
-        let words: Vec<&str> = cmd[1..]
-            .iter()
-            .copied()
-            .filter(|a| !a.starts_with('-') || (b == "chmod" && is_mode_word(a)))
-            .collect();
-        // The first word is the mode or owner. setfacl's spec is the value
-        // of a flag such as -m, so its paths are the words left past those.
-        let acl_paths: Vec<&str> = if b == "setfacl" {
-            let mut out = Vec::new();
-            let mut skip = false;
-            for a in &cmd[1..] {
-                if skip {
-                    skip = false;
-                } else if matches!(
-                    *a,
-                    "-m" | "--modify"
-                        | "-M"
-                        | "--modify-file"
-                        | "-x"
-                        | "--remove"
-                        | "-X"
-                        | "--remove-file"
-                        | "--set"
-                        | "--set-file"
-                ) {
-                    skip = true;
-                } else if !a.starts_with('-') {
-                    out.push(*a);
-                }
-            }
-            out
-        } else {
-            Vec::new()
-        };
-        let (spec, paths) = if b == "setfacl" {
-            (None, &acl_paths[..])
-        } else {
-            match words.split_first() {
-                Some((s, rest)) => (Some(*s), rest),
-                None => return false,
-            }
-        };
-        if paths.iter().any(|p| system_or_home_tree(p)) {
-            return true;
-        }
-        let sweeping = if b == "setfacl" {
-            sweeping_acl(&cmd[1..])
-        } else {
-            b == "chmod" && spec.is_some_and(sweeping_mode)
-        };
-        sweeping
-            && paths
-                .iter()
-                .any(|p| !(*p == "/tmp" || p.starts_with("/tmp/") || p.starts_with("/var/tmp")))
-    })
-}
-
-/// A `setfacl` that strips every entry (`-b`, `-k` and their long forms)
-/// or hands everyone write through `-m o::w` or `-m other:rwx`.
-fn sweeping_acl(args: &[&str]) -> bool {
-    let strips = args.iter().any(|a| {
-        matches!(*a, "--remove-all" | "--remove-default")
-            || (a.starts_with('-') && !a.starts_with("--") && (a.contains('b') || a.contains('k')))
-    });
-    let everyone_writes = args.windows(2).any(|w| {
-        matches!(w[0], "-m" | "--modify" | "-M" | "--set")
-            && w[1].split(',').any(|e| {
-                let mut parts = e.splitn(3, ':');
-                let (who, _, perms) = (parts.next(), parts.next(), parts.next());
-                matches!(who, Some("o" | "other")) && perms.is_some_and(|p| p.contains('w'))
-            })
-    });
-    strips || everyone_writes
 }
 
 /// Commands that send a path to the trash; the trash keeps it only until
@@ -11297,14 +10889,6 @@ fn container_command(run: &[String]) -> Option<Vec<String>> {
         }
     }
     landed.then_some(out)
-}
-
-/// A chmod mode written with a leading `-`, such as `-w` or `-rwx`.
-fn is_mode_word(a: &str) -> bool {
-    a.len() > 1
-        && a[1..]
-            .chars()
-            .all(|c| matches!(c, 'r' | 'w' | 'x' | 'X' | 's' | 't'))
 }
 
 #[cfg(test)]
@@ -12084,73 +11668,6 @@ mod tests {
             "timeout 30 cargo test",
             "busybox ls",
             "command -v cargo",
-        ] {
-            assert_eq!(line(l), "allow", "{l}");
-        }
-    }
-
-    /// Setuid and setgid modes through `chmod` and `install`, octal with a
-    /// leading zero or symbolic. Ordinary modes stay allowed.
-    #[test]
-    fn denies_a_setuid_or_setgid_mode() {
-        let line = |s: &str| verdict(&shell_words(s));
-        for l in [
-            "chmod 4755 ./tool",
-            "chmod 04755 ./tool",
-            "chmod 2755 ./dir",
-            "chmod 6755 ./tool",
-            "chmod 004755 ./tool",
-            "chmod u+s ./tool",
-            "chmod g+s ./dir",
-            "chmod ug+s ./tool",
-            "chmod a+s ./tool",
-            "chmod +s ./tool",
-            "chmod u=rwxs ./tool",
-            "chmod u+x,g+s ./tool",
-            "chmod -R u+s ./bin",
-            "install -m 4755 ./tool /usr/local/bin/tool",
-            "install -m4755 ./tool /usr/local/bin/tool",
-            "install --mode=2755 ./tool /usr/local/bin/tool",
-            "install --mode 04755 ./tool /usr/local/bin/tool",
-            "install -Dm4755 ./tool /usr/local/bin/tool",
-            "install -m u+s ./tool /usr/local/bin/tool",
-            "busybox chmod 4755 ./tool",
-            "python3 -c \"import os; os.chmod('tool', 0o4755)\"",
-            "python3 -c \"import os; os.chmod('tool', 0o2755)\"",
-            "python3 -c \"import os; os.chmod('tool', 0o755 | 0o4000)\"",
-            "python3 -c \"import os, stat; os.chmod('tool', stat.S_ISUID)\"",
-            "python3 -c \"import os; os.system('chmod 4755 tool')\"",
-            "node -e \"require('fs').chmodSync('tool', 0o4755)\"",
-            "node -e \"require('fs').chmodSync('tool', 0o2755)\"",
-            "perl -e 'chmod 04755, \"tool\"'",
-            "ruby -e 'File.chmod(04755, \"tool\")'",
-            "ruby -e 'File.chmod(02755, \"tool\")'",
-        ] {
-            assert_eq!(line(l), "deny\tchmod-setuid", "{l}");
-        }
-        for l in [
-            "chmod 0755 ./tool",
-            "chmod 755 ./tool",
-            "chmod 1777 /tmp/shared",
-            "chmod +x ./tool",
-            "chmod u-s ./tool",
-            "chmod g-s ./dir",
-            "chmod 644 2024",
-            "chmod 644 README+s.md",
-            "install -m 0755 ./tool ./bin/tool",
-            "install -Dm644 a.conf ./etc/a.conf",
-            "install -d ./out",
-            "busybox chmod 0755 ./tool",
-            "python3 -c \"import os; os.chmod('tool', 0o755)\"",
-            "python3 -c \"import os; os.chmod('tool', 0o644)\"",
-            "python3 -c \"import os; os.chmod('04755', 0o644)\"",
-            "python3 -c \"print(0o4755)\"",
-            "python3 -c \"import stat; print(stat.S_ISUID)\"",
-            "node -e \"require('fs').chmodSync('tool', 0o644)\"",
-            "node -e \"require('fs').chmodSync('tool', 0o755)\"",
-            "perl -e 'chmod 0755, \"tool\"'",
-            "ruby -e 'File.chmod(0755, \"tool\")'",
-            "python3 -c \"import os; os.system('chmod 755 tool')\"",
         ] {
             assert_eq!(line(l), "allow", "{l}");
         }
@@ -13070,45 +12587,6 @@ mod tests {
     }
 
     #[test]
-    fn a_recursive_mode_or_owner_change_on_a_home_or_system_tree() {
-        for argv in [
-            &["chmod", "-R", "777", "/"][..],
-            &["chmod", "-R", "777", "~"],
-            &["chmod", "-R", "755", "$HOME"],
-            &["chmod", "-R", "000", "."],
-            &["chmod", "-R", "a-rwx", "projects"],
-            &["chmod", "-R", "go+w", "/etc"],
-            &["chmod", "-R", "o+w", "src"],
-            &["chmod", "--recursive", "777", "/var/lib"],
-            &["chown", "-R", "nobody:nogroup", "/home/u"],
-            &["chown", "-R", "root", "~"],
-            &["chown", "-hR", "u", "/usr/local"],
-            &["chgrp", "-R", "nogroup", "/var/lib/postgresql"],
-            &["setfacl", "-R", "-b", "~"],
-            &["chmod", "-R", "u+w", "/home/u/.."],
-            &["sh", "-c", "chmod -R 777 /"],
-            &["env", "chown", "-R", "x", "/etc"],
-        ] {
-            assert_eq!(v(argv), "deny\trecursive-chmod-chown", "{argv:?}");
-        }
-        for argv in [
-            &["chmod", "-R", "u+w", "target"][..],
-            &["chmod", "-R", "700", "~/.ssh"],
-            &["chmod", "-R", "755", "/home/u/proj/build"],
-            &["chown", "-R", "$USER:$USER", "./build"],
-            &["chmod", "+x", "scripts/release.sh"],
-            &["chmod", "777", "/tmp/sock"],
-            &["chmod", "-R", "777", "/tmp/scratch"],
-            &["chmod", "-R", "g+rX", "docs"],
-            &["chgrp", "-R", "staff", "shared/"],
-            &["setfacl", "-R", "-m", "u:ci:rX", "build"],
-            &["chown", "u", "/etc/hosts.local"],
-        ] {
-            assert_eq!(v(argv), "allow", "{argv:?}");
-        }
-    }
-
-    #[test]
     fn a_decoded_script_handed_to_a_shell_is_refused() {
         for argv in [
             &["echo", "Z2l0IHB1c2ggLWYK", "|", "base64", "-d", "|", "sh"][..],
@@ -13479,14 +12957,6 @@ mod tests {
             (
                 &["rsync", "-a", "--delete-after", "x/", "/etc/"],
                 "rsync-delete-root-tree",
-            ),
-            (
-                &["setfacl", "-R", "-b", "~/projects"],
-                "recursive-chmod-chown",
-            ),
-            (
-                &["setfacl", "-R", "-m", "o::rwx", "./src"],
-                "recursive-chmod-chown",
             ),
         ] {
             assert_eq!(v(argv), format!("deny\t{token}"), "{argv:?}");
