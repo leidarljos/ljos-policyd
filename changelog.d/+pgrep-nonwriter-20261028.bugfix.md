@@ -1,1 +1,0 @@
-The tunnel script, run from the home its program lives under, was refused with "`pgrep` may write any file under" that home, as if its `pgrep` might have written the program it starts next. `pgrep` and `pkill` read the process table and send signals, as `kill` does, so they no longer count as writers. A command the guard does not know still does.

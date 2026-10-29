@@ -2,6 +2,168 @@
 
 <!-- towncrier release notes start -->
 
+## 0.6.0 (2026-10-29)
+
+### Features
+
+- Recipes of make, npm, pnpm, yarn, bun and just are not read, and a python program is not analysed. A script the line writes and then runs is judged only if it is already a file. `python x.py` and `python3 x.py` print `allow`, a tab, `rewrite`, a tab, and `uv run x.py`. A `-c` or `-e` program of python, perl, ruby or node that names a credential path asks (`prompt`, `credential-mention`) instead of refusing. A deny is appended to the deny log.
+
+### Fixes
+
+- A script that runs itself again with `"$0" on` lost every variable it had set, so a log write to `$D/tunnel.log` earlier in it was refused as a path the line does not show. When the script was started by a path with a `/`, `"$0"` runs that file in a child and binds nothing in this shell, and the names keep their values. Started as `bash tunnel`, after `eval`, `trap` or `BASH_ARGV0`, or under `-c`, `"$0"` still loses them.
+
+- `sha256sum FILE > SUMS` beside a sourced env file was refused, as if `sha256sum` might have written the sourced script. md5sum, sha1sum, sha224sum, sha256sum, sha384sum, sha512sum, b2sum and cksum print to stdout and write no file, so they no longer count as writers. A command the guard does not know still does.
+
+- The seat guard took any word with the file name of the policyd config as a word that may name it. So a write such as `cp x .cargo/config.toml` was walked as a possible seat write. A word is now placed against the working directory and matched on the full config path or its directory. The file name alone counts only where the line can move or hide the path. That is after `cd`, with a variable, a command or `~`, or from inside the config dir. `cp x .cargo/config.toml` is allowed, and a write to the config by its full or relative path is still refused as `seat-guard-path`.
+
+- A file under `~/.secrets/` was not a credential path, so inline python could read it, as `python3 -c 'print(open("/home/u/.secrets/x").read())'`. It is one now, beside `.aws`, `.gnupg` and the others. The shell readers and inline perl, node and ruby did not check credential paths at all. Each of these is now refused as `reads-credential` when it names one, for every seat. That covers a file reader such as `cat`, `head`, `less` or `base64`, and the source of `cp` or `dd if=`. It also covers an input redirect and a path an inline perl, node or ruby program spells. The place a copy writes to is still judged by the write checks. Listing the directory, and reading a file whose name only contains the word, are allowed. The policyd config is no longer read as a credential, since it names the relay secret but does not contain it.
+
+- export, readonly, declare, typeset and local store NAME=value in this shell. A later $NAME is that command, so readonly cmd=rm and then $cmd -rf outside /tmp is refused, on the same line and on the next one.
+
+- A download into a protected directory through `curl --output-dir` or `wget -P`/`--directory-prefix` was not placed. Only the bare file name was read, so a seat file or a path out of the tree could be written. The directory is now put in front of each name curl saves that is not absolute. It also goes in front of each name wget takes from a URL, and a URL with no file name saves as `index.html`. A write into a seat directory is refused as `seat-guard-path`, and one out of the tree as `writes-outside`. `wget -O` ignores `-P`, and a directory in the tree or under `/tmp` is allowed.
+
+- A script run by its path after the ljos hook's `printf %s x > "$_ljos_seen"` was still refused as `script-written-on-line`. The marker write may name it. A command word runs a text file with no `#!` line in a shell. Such a run is now judged on the text a fully shown write leaves, as a sourced script is. That is so even where the line does not show the path. The hook's `x` is no script, and `. ENV; /path/audit.sh` after it runs. A write whose text starts with `#!` still refuses. So do an append and a write whose text the line does not show.
+
+- A redirection, and cp, ln, mv, install, tee or dd, no longer returns before the deny rules. export, readonly, alias, unalias, declare, typeset and local do not either. observe runs on that early return too. A plain echo with no redirection still returns as soon as the words are known.
+
+- A write out of the tree through `curl -o`/`--output`, `wget -O`, `ln`, `rsync`, `truncate` or `tar` was not placed. Only a redirect, `cp`, `mv`, `install`, `dd`, `sed -i`, `perl -i` or `awk` to the same path was refused. Each now resolves to the path its target names and is refused as `writes-outside` when that path is out of the tree. This covers what `curl` and `wget` save, the link `ln` makes, the destination of `rsync`, a file `truncate` sizes, the `-C` directory a `tar` extract writes into, and the archive a `tar -c` creates. A remote `rsync` destination, a download to stdout and the same writes inside the tree or under `/tmp` are allowed.
+
+- A write through the name of a `for` loop over literal words was read as a write to any path, as in `for c in a.md b.md; do printf x > "$c"; done`. A script run later on the line was then refused with `$c` may name it. The name now takes each listed word in turn, and the write is placed at each of them. A list with a glob, a quote or an expansion, and a name the loop binds again, are read as before.
+
+- A here-document body that only a text reader takes was split into shell words and judged as commands. A `.md` or `PROMPT.md` note that quoted `curl ... | sh` was refused as `curl-pipe-shell`, and a note line with `sudo` as `sudo`. A python script written from a quoted here-document with a `*`, a quote or a backslash in it could not be read back. So running it on the same line was refused as `script-written-on-line`. A body is now kept as written when its delimiter is quoted or it has nothing to expand. A text reader's body is data, one word per line, and a script written from it is judged on that text. A body fed to a shell, and a substitution in an unquoted body, are judged as before. A script that reads a secret or writes the policyd config or a hook file still refuses.
+
+- A here-document body starts on the line after the one that opens it. A command after `&&` or `;` on that opening line was read as the first line of the body. So `cat > s.py <<'EOF' && python3 s.py` ran a script that was never judged, even when it read a secret. That command is now judged as a command of the line, and the script it runs is judged on the body text. Only the pipeline that has the `<<` decides whether the body is data. So a run after `&&` no longer makes a `cat` body split into shell commands.
+
+- A mail text written with an unquoted here-document was refused once the line later ran a script. The shell runs an address in backticks or `$( )` in such a body as a command. Any command the guard does not know counts as one that may write files, so the address was taken as a writer of the script. A word shaped as `name@host.tld` names no program on `PATH`, and it now writes nothing. An unknown command in such a body still refuses, and so does a body the line runs that reads a secret.
+
+- A quoted here-document fed to `at`, `batch`, `crontab`, `ssh` or `docker exec` (or `podman exec`) was read as text, so its body went unjudged though each of them runs it, later or on another host or in a container. Those commands now have the body read as a script, the same as one fed to a shell. A quoted here-document fed to a reader such as `cat`, `ljos note`, `docker logs` or `ssh-keygen` is still text.
+
+- A note or lesson passed to `ljos` through a quoted here-document was refused as `script-written-on-line` when its prose named a script in backticks, such as `foo/gf.py`. The body of a here-document with a quoted delimiter is not expanded, so when every command on its line only reads it the body is now text. An unquoted delimiter, or a body fed to a shell or an interpreter, is read as before.
+
+- An inline `perl -e`, `node -e` or `ruby -e` program could write a file out of the tree, as `perl -e 'open(F, ">/srv/x")'` or `node -e 'fs.writeFileSync("/srv/x", d)'`, where the same write by inline python or a redirect was refused. A program that names a call that may write files now has each path it spells placed: a quoted string that, past a perl open mode such as `>` or `+<`, starts at `/` or `~` or climbs with `..`. One out of the tree refuses the line as `writes-outside`. Paths in the tree, under `/tmp`, and programs that only read are allowed.
+
+- Quoted body text passed to `ljos file`, `vissue`, and `git commit -m` is treated as data, not as script-written command text.
+
+- A write to `$D/tunnel.log` was refused as a path the line does not show, even when the script set `D` to a literal. A variable the line assigns only from literals, or from other such variables, is now that path, and the existing path rules judge it. A name set from `$1`, the environment, `read`, a substitution, a branch that may leave it unset, a loop, `unset` or `eval` still refuses.
+
+- A write out of the tree, or onto a seat file, through the name of a `for` loop over literal words was allowed, as in `for f in a.json /srv/example/a.json; do sed -i s/a/b/ "$f"; done`. The path walk now takes the name as each listed word in turn. It also finds the writer after a keyword such as `do`, `then` or `{`, and keeps an assignment made after one.
+
+- The ljos hook starts each seat line with `printf %s x > "$_ljos_seen"`. That is a write to a path the line does not show, so every script the line ran after it was refused as `script-written-on-line`. This hit a python helper in the tree, an env file sourced with `.`, and a report build script. A write whose whole text the line shows is now judged by that text when a shell or python reads the script. The hook's `x` is no script, so these runs are judged as themselves. An append, a write with text the line does not show, and a program run as a command still refuse. Data piped into `python3 -c` and quoted ljos text stay allowed, and `curl` piped to a shell stays refused.
+
+- A mail wrapper, run twice on a line from its own directory, was refused with "`mktemp` may write any file under" that directory, as if its first run's `mktemp` might have written the wrapper. `mktemp` makes one new empty file or directory and overwrites nothing, as `touch` and `mkdir` do, so it no longer counts as a writer. A command the guard does not know still does.
+
+- A mail wrapper that spools its message to `$tmp`, set only from `$(mktemp)`, was refused as a write to a path the line does not show. A name set only from `mktemp`, with `-d` and one literal template at most, is now a new private file, and a path under it is too. `$tmp.log`, `x$tmp`, `..` under it, `mktemp -u`, and a temp the line writes and then runs are judged as before.
+
+- `nohup $BIN -c $D/tunnel.conf >>$D/tunnel.log &` was refused when any command word on the line had a `$`, such as `"$@"` or `$BIN` itself. The command is read a second time with `$BIN` filled in from its literal, and that read started with no variables set. It is still the command this shell runs, so `$D` keeps the value it had there and the log write is placed. A `-c` script or `eval` it hands over still starts with no variables.
+
+- Seat path guarding now covers nimvault config locations, including `~/.vault/config` and XDG nimvault config paths.
+
+- A command with a hidden head and hidden next word now refuses as `nimvault-subcommand-unshown`, after all existing rule checks.
+
+- Bots now refuse `nimvault hook` in the same command spellings and wrappers already blocked for key-handing nimvault subcommands.
+
+- Setting `NIMVAULT_GPG_RECIPIENT` through shell assignment forms (`VAR=...`, `export`, `env`) is now refused.
+
+- A renamed copy, hardlink or symlink of nimvault is now judged as nimvault. Policyd matches it by inode or by file hash against the nimvault binaries on PATH.
+
+- `nimvault run [options] ENTRY [--] PROGRAM` sets a vault entry as a variable and execs the program, but the program was read as words nimvault takes, so `nimvault run --env X e -- rm -rf /srv/example` was allowed. The program after the entry is now judged as if the line ran it. Other `nimvault` commands are read as before.
+
+- The relay line refused `--allow-unsigned` only when spelled exactly. `nimvault run` parses its options with cligen. That also takes a unique prefix such as `--allow`, and another spelling such as `--allowunsigned` or `--allow_Unsigned`. It takes the short letter `-a` and a value such as `--allow-unsigned=true` too. The walk over the line skipped every one of them. Now a `nimvault run` may only give `--env`/`-e`, `--vault`/`-v` and `--recipient`/`-r`. Each must use a value form cligen reads. Any other option refuses the line as `nimvault-run-option` for every seat, before or after the entry.
+
+- A `nimvault run` was walked only when its subcommand was the word `run`. cligen normalizes a subcommand and takes a unique prefix, so `rUn`, `r_un` and `ru` run it too. Those spellings skipped the walk, the sealed secret checks and the relay line checks. The subcommand is now read the way cligen reads it, also after a lone double dash. Any spelling of `run` but the word itself refuses the line for every seat. A spelling refuses as `nimvault-run-spelling`, and a double dash before it as `nimvault-run-option`.
+
+- A `nimvault run` word the shell fills in as the line runs was read as written. An entry such as `"$(printf %s --allow-unsigned)"` passed, so the expanded option reached nimvault unseen. On the relay line, a substitution in the entry's place also passed as the entry. A nimvault subcommand, entry or option word is now refused when it has a `$` or a backtick. Any of `*?[`, or a brace or quote left after the shell parse, refuses it too. The word the program starts at is checked as well when no double dash comes before it. Such a word refuses the line as `nimvault-run-word` for every seat and on the relay line.
+
+- `nimvault get` prints an entry's plaintext, and `nimvault unseal` writes it to disk. Both were allowed on every seat. They are now refused on every seat and on the relay line, as `nimvault-shows`. That covers every spelling cligen reads, such as `gEt`, `ge`, `un_seal`, `u` and a lone `--` first. It also covers a wrapper such as `env`, `sh -c`, `find -exec` or `xargs`, and the program `nimvault run` runs. A command word the shell fills in, or a link to `nimvault`, counts when `get` or `unseal` follows it. A `nimvault` that `xargs` or `parallel` hands its subcommand refuses as `nimvault-subcommand-unshown`. A seat uses a secret only through `nimvault run`.
+
+  The subcommands that may hand over plaintext or a data key another way are refused the same way. `status` may decrypt into a work directory the seat's user can read, and `mv` moves the plaintext file. `seal`, `add`, `add-dir`, `rm`, `remove`, `mv` and `rotate` wrap every data key to the recipient `--recipient` or `NIMVAULT_GPG_RECIPIENT` names. `init` names the recipient that later commands wrap to. `list`, `check`, `who`, `doctor`, `scan`, `gc`, `lock`, `hook`, `help` and `version` still run.
+
+- The tunnel script, run from the home its program lives under, was refused with "`pgrep` may write any file under" that home, as if its `pgrep` might have written the program it starts next. `pgrep` and `pkill` read the process table and send signals, as `kill` does, so they no longer count as writers. A command the guard does not know still does.
+
+- A seat could write the policyd config that names the relay, and so make itself the relay or point the relay at its own directory. `~/.config/ljos-policyd/`, `$XDG_CONFIG_HOME/ljos-policyd/` and the file `$LJOS_POLICYD_CONFIG` names are now seat files, refused as `seat-guard-path` for every write form and every seat, as the ljos config is. Reading them is still allowed.
+
+- Inline python could write the policyd config when `LJOS_POLICYD_CONFIG` put it in the tree or under `/tmp`. Only `~/.config/ljos-policyd` was refused, and a write in the tree counts as inside it. A python program that may write files is now refused as `writes-policyd-config` when it names that file, its directory, or a file in the directory. When the directory is the tree or above it, only the file and the directory itself are refused. The rest of the tree stays writable. Reading the config is allowed.
+
+- A python with no program that a pipe or a here-string fed was not judged on that program. So `printf ... | python3`, `cat f | python3 -` and `python3 <<< '...'` could read a secret or write a hook file. That text is now judged as a `python3 -c` program is, for reads, writes and the commands it runs. A pipe is read from `echo` or `printf` with literal words, or from `cat` of the files it names, its here-document or its here-string. A file `cat` feeds there is also taken as run by python, as `python3 FILE` runs it. So a file the line writes first is judged as before. Any other feed, or one that expands something, refuses the line as `python-stdin-unshown`.
+
+- A python with no program reads it from a here-document fed to it, as in `python3 <<'EOF'`. That body was never judged as python, so a program that read a secret or wrote a hook file was allowed. Its body was split as shell instead, so prose in it could be read as a write or a script run. The body is now judged as `python3 -c` judges its program, and the shell reads none of it. A body that expands a variable or a command is not shown in full, so it is refused as `python-stdin-unshown`.
+
+- A python program that writes its own state file in the tree was refused as `python-writes-outside` after a `cd` the shell writers allow. Two such cases are an absolute `cd` into a state directory of the tree, and `cd sub` with a write to `../.state/run.json`. Python's writes are now placed where the shell's are: in the directory each command runs in, against the tree the line began in. A `cd` inside a subshell, a function or a `-c` script keeps the directory unknown. So do a `cd` through a variable and a `cd` to a missing directory the line did not make, and the write is refused as before.
+
+- Python programs run from disk are now read like inline python. This covers `python3 script.py`, `python3 -I script.py`, and `./script.py` with a python shebang.
+
+- Inline python that `nimvault run --env NAME` hands a secret may now use it but not show it. The program is refused as `shows-secret` when the value, or a name built from it, reaches `print`, a stream or file write, a log call or an error it raises. It is also refused when it reads the whole environment or starts a child process, which would inherit the value. A value spent on a request, or only measured, is not shown.
+
+- `python3 < file.py` and `python3 -I < file.py` now read `file.py` as python code, matching `python3 file.py`.
+
+- An inline perl or ruby program could spell a path with a quote operator and go unread. Perl `q{}`, `qq{}` and `qw()` and ruby `%q()`, `%Q()`, `%w[]` and `%W[]` were not taken as strings. A write to such a path out of the tree or into a seat file was allowed. These bodies are now read as string literals with any delimiter, and a paired one may nest. A word list gives each of its words. The same literals are read for a credential path, so `perl -e 'open(F, q{~/.secrets/x})'` is refused.
+
+- Every word with a `{` in it was brace-expanded, whether quoted or not. A read-only audit script built jq objects in single-quoted programs. It was refused as `brace-expansion-unshown` once one program had more than 32 alternatives. Bash expands only a `{` outside quotes and outside a substitution. Each word the shell splits now records whether it has such a bare brace, and only those are expanded. An argv word, a single- or double-quoted program, a literal here-document body and the text of `$(...)` are left as they are. A bare `rm -rf ~/{.cursor,x}` or `echo {1..40}` is still refused. So is one in a `bash -c` script, a substitution or a body fed to a shell.
+
+- A clock time in quoted prose, as in `echo "(23:04) done"`, was read as a subshell running `23:04`, an unknown program that may write any file, so a script run later on the line was refused. A parenthesis inside quotes now opens nothing. An unquoted subshell and a `$(...)` or backtick substitution are read as before.
+
+- A backtick or `$(` inside a single-quoted argument, or in an argument handed over as argv, was read as a command the line runs. Markdown in `ljos file --body` then looked like a script write and was refused. Those are text now. A double-quoted or bare substitution is still read.
+
+- The relay could use its secret but not send it, so a relay that puts its token in a request was refused as `sends-local-data`. The `[relay]` table now names a `host`, and the relay program may send the secret in a request to `https://HOST/` and nowhere else. Each network call it makes must be `urlopen`, `Request`, or a `requests` or `httpx` call, with a URL whose leading literal is `https://HOST/`, given in the call or through a name bound once. Any other host, plain http, a port, a user in the URL, a URL built some other way, or any other network call is refused as `sends-secret`. Printing, logging, writing or raising the secret is still refused, and a program that is not the relay still may not send a sealed secret at all.
+
+- The relay line must now run its script as `python3 -I SCRIPT.py`, so python leaves the environment, the user site and the script's directory out of its import path. The line is also refused when the relay dir contains any `.py` other than the script, at any depth, since a `json.py`, `sitecustomize.py`, `usercustomize.py` or package there could be imported in place of the module the script names.
+
+- The relay could only run its secret through `python3 -c`, so its script
+  file had no way to read the token. It may now run
+  `nimvault run --env SECRET ENTRY python3 SCRIPT.py [args]`. The script
+  must be a regular file in the relay dir, reached with no symlink or `..`,
+  owned by the user and not group or world writable. Its text is judged by
+  the same rules as inline code, so printing the secret is refused and
+  sending it to the configured host is allowed.
+
+- The relay line may no longer hand its secret to inline `python3 -c` code. Only `nimvault run --env SECRET ENTRY python3 SCRIPT.py [args]`, with a script the relay dir owns, reads the secret, so the code that sees it is a file on disk and not a string on the line. An inline relay line is refused as a credential read, as it is for any other seat.
+
+- One relay may read one secret in inline python, and only when a config file names it. The file is `$LJOS_POLICYD_CONFIG`, else `$XDG_CONFIG_HOME/ljos-policyd/config.toml`, else `~/.config/ljos-policyd/config.toml`, with a `[relay]` table giving `seat`, `dir` and `secret`. A file owned by someone else, or writable by group or world, is ignored, and with no file there is no relay. The pass needs `LJOS_SEAT` set to the seat, the line in that exact directory with no change of directory, and nothing on it but `nimvault run --env SECRET ENTRY python3 -c CODE` with a bare `nimvault` and `python3`. The secret is no longer read from an env file. The program may use the secret but not print, log, write or raise it, and any other seat, directory, variable or credential is still refused.
+
+- The relay line is refused when it passes `--allow-unsigned` to `nimvault run`, before or after the entry, so the secret the relay reads is always one the vault has checked the signature of. The same line without it is allowed as before.
+
+- The same short command was judged again, and a shell copy was kept on every command in case a later one was backgrounded. The first judgment is reused while the words, the scratch and the depth stay the same. A shell copy is kept only for a list that runs in the background. A script of about 240KB is allowed in about 384 ms.
+
+- `script -c '...'` and `script -qc '...'` now unwrap their command string like `sh -c`.
+
+- A mail wrapper, run in a loop on the line, was refused with "`$tmp` may name it": its `tmp=$(mktemp ...)` counted as a binding inside that loop. A script file the line runs is a new process each time, so a loop around the run no longer reaches the bindings in the file. Its writes still count before the loop, and a loop inside the script still refuses.
+
+- Judging a long shell script copied its function bodies on every command and walked each command again after the line that already walked it. A plain program the deny rules do not read now returns as soon as the words are known. A script of this shape, about 240KB, is allowed or refused in under a second instead of several seconds past the guard's deadline.
+
+- A program `nimvault run --env NAME` hands a secret may show it in ways the line cannot read. A program that prints its environment (`env`, `printenv`, `set`), a shell, a task runner, `find`, `xargs`, and an interpreter whose program is not on the line are now refused as `shows-secret` when they run under it.
+
+- A write through a link already on the disk reached a seat file unseen. With `/tmp/c` linked to `~/.config/ljos` on an earlier line, `echo x > /tmp/c/env` was allowed. The seat guard compared paths as text only, and its quick scan skipped a line whose words named no seat file. A written path is now read from the disk with each existing link followed before it is matched against the seat files. A line that writes through such a link now reaches the path walk. A write through a link the same line makes with `ln` is refused as before. A plain `/tmp` write, and a write through a link to anywhere else, stay allowed.
+
+- git config --file and --system, a cd, a symlink, and curl, wget, rsync, tar, unzip, patch, perl, awk, chown and rmdir can write a seat file. Those writes are refused.
+
+- A script can write the seat hook files, the ljos config, the global git hooks directory or the global git config. Those writes are refused. A read of the same path stays allowed.
+
+- An `sftp -b -` here-document is read as a script, but a batch line that runs a local shell starts with `!`. That mark hid the command, so `!cat ~/.secrets/x` was allowed. The `!` is now dropped before the line is judged, after any `-` or `@` mark. A plain batch line such as `put` or `get` is still allowed.
+
+- A script the line writes and then runs by its own path is judged on its text. That text was judged as a shell script, whatever its `#!` line named. A python script run that way could read a secret and be allowed. A text whose `#!` line names python, directly or through `env`, is now judged as python. Any other text is judged as before.
+
+- More commands run what they read on stdin somewhere the line cannot see. These are `docker run -i` and `podman run -i`, `kubectl exec -i`, `nsenter`, `chroot`, `systemd-run --pipe`, `lxc exec`, `incus exec` and `sftp -b -`. A quoted here-document fed to any of them is now read as a script, not as text. A pipe, a here-string or a `<` file that feeds one is refused as `shell-stdin-unshown`. That happens when it runs a shell that reads stdin, an interpreter with no program, or no command at all. `ssh` and `docker exec` are read the same way, and the command `ssh` is given is split as the remote shell splits it. A runner that does not pass stdin on, or that hands it to a program such as `psql` or `tar`, is allowed.
+
+- Temp-path exemptions now require both lexical and on-disk paths to stay under temp roots, closing symlink escapes out of `/tmp`.
+  Temp-path exemptions now require both lexical and on-disk paths to stay under temp roots, closing symlink escapes out of `/tmp`.
+
+- A python or shell write to a state file in the tree was refused when the line spelled the tree through a symlink. An example is `/srv/tree/state/seen.json` with `/srv/tree` a link. The tree is the directory the line runs in, which the system names by its real path. The written path was only folded as text, so it did not start with that real path. A link in the tree that points out of it was let through the same way. The written path and the tree are now both read from the disk before they are compared, with each link followed. A link with no target yet is followed too. Temp and device paths are judged as spelled, as before.
+
+- The relay's send script was refused as `python-writes-outside` when it
+  also appended to a log in its own directory. The check read
+  `"/sendMessage"`, a literal joined onto an https URL, as a path out of
+  the tree. A literal that a `+` joins after a leading URL literal is now
+  read as part of that URL. A part with `..` is still judged as a path,
+  and so is a literal the program also writes to.
+
+- A command named by a variable was allowed when a wrapper ran it. env, nice, timeout, command, exec, xargs, eval and a shell -c string now use the value the line assigned, so that delete is refused.
+
+- A write that `python-writes-outside` refuses was allowed when the line wrote the same file another way, such as `sed -i` on a state file out of the tree. The target now decides. A redirection, `tee`, `cp`, `mv`, `install`, `dd of=`, `sed -i`, `perl -i`, `awk -i inplace` and an awk `print > "file"` are refused as `writes-outside` when they write out of the tree the line started in. They get the same code python's refusal has. The path is placed the way the seat files are, through `cd`, `~`, `$HOME` and a literal variable. A temp directory and the tree itself stay writable.
+
+### Documentation
+
+- A relay that sources its env file and then runs its script, as `. ./env && python3 -I send.py`, is still allowed for every seat. A test now covers this form, and also an inline program on that line that prints the secret, which is refused.
+
 ## 0.5.1 (2026-10-26)
 
 ### Fixes

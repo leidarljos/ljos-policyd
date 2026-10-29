@@ -1,1 +1,0 @@
-`sha256sum FILE > SUMS` beside a sourced env file was refused, as if `sha256sum` might have written the sourced script. md5sum, sha1sum, sha224sum, sha256sum, sha384sum, sha512sum, b2sum and cksum print to stdout and write no file, so they no longer count as writers. A command the guard does not know still does.

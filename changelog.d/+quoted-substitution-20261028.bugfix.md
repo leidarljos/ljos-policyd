@@ -1,1 +1,0 @@
-A backtick or `$(` inside a single-quoted argument, or in an argument handed over as argv, was read as a command the line runs. Markdown in `ljos file --body` then looked like a script write and was refused. Those are text now. A double-quoted or bare substitution is still read.

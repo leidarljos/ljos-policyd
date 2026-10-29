@@ -1,1 +1,0 @@
-`nimvault run [options] ENTRY [--] PROGRAM` sets a vault entry as a variable and execs the program, but the program was read as words nimvault takes, so `nimvault run --env X e -- rm -rf /srv/example` was allowed. The program after the entry is now judged as if the line ran it. Other `nimvault` commands are read as before.

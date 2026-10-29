@@ -1,1 +1,0 @@
-A seat could write the policyd config that names the relay, and so make itself the relay or point the relay at its own directory. `~/.config/ljos-policyd/`, `$XDG_CONFIG_HOME/ljos-policyd/` and the file `$LJOS_POLICYD_CONFIG` names are now seat files, refused as `seat-guard-path` for every write form and every seat, as the ljos config is. Reading them is still allowed.
