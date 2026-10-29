@@ -33,4 +33,3 @@ pub(crate) fn credential_mention(argv: &[String]) -> Option<Checked> {
     }
     None
 }
-

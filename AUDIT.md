@@ -1,8 +1,8 @@
 # policyd rule families
 
 Counted on `a7909f90` before this pare, and on the tree after it.
-Rust outside the generated Cap'n schema was 43249 lines before and 19559 after.
-Generated schema stayed 9409 lines. `src/lib.rs` is 12979 lines. The bash
+Rust outside the generated Cap'n schema was 43047 lines before and 20724 after.
+Generated schema stayed 9409 lines. `src/lib.rs` is 13038 lines. The bash
 lexer and the mail law are still the bulk of that. The rewrite lives in
 `src/rewrite.rs` and the credential ask in `src/ask.rs`.
 
@@ -11,7 +11,7 @@ lexer and the mail law are still the bulk of that. The rewrite lives in
 | Privilege (`sudo`, `doas`, `su`, `pkexec`, `run0`) | the lexer | First argv law. Privilege was in the first deny set. | KEEP |
 | Remote exec (`curl` or `wget` into a shell) | the lexer | A download handed to a shell, not a line that only names both. | KEEP |
 | Raw disk | the lexer | `mkfs`, `dd` of a device, partition tools. | KEEP |
-| `rm -rf` of a home or the root | the lexer | A recursive delete of `/`, `~`, `$HOME` or `/home/user`. | KEEP |
+| `rm -rf` outside `/tmp` and the build directories | the lexer | A recursive force delete of `./src`, `/etc`, `~/` or a home. | KEEP |
 | Force push and history rewrite of published branches | the lexer | Force push, filter-branch, filter-repo, update-ref delete. | KEEP |
 | Secrets in argv and credential paths | `disk.rs` plus the reader | A token or a credential file on the command. | KEEP |
 | Inline `-c` or `-e` that names a credential path | `ask.rs` | `python3 -c "open('/home/u/.ssh/id_rsa')"` was a deny. | ASK `credential-mention` |
@@ -35,7 +35,7 @@ lexer and the mail law are still the bulk of that. The rewrite lives in
 | Find delete and a feeder running rm | `harm.rs` | `find -delete`, `find -exec rm`, `xargs` or `parallel` running `rm`. | KEEP as a deny |
 | mv or rsync delete of an outside tree | `harm.rs` | A whole tree outside the work tree, including `/dev/null`. | KEEP as a deny |
 
-The deny list that remains is sudo, `rm -rf` of a home or the root, a force
+The deny list that remains is sudo, a recursive `rm` outside `/tmp` and the build directories, a force
 push or a history rewrite of a published branch, a secret in argv, a write
 of a hook or policy file, remote exec, and raw disk. The mail check is
 unchanged. An inline program that names `~/.ssh`, `~/.gnupg`, `~/.aws`,

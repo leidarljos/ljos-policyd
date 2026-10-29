@@ -136,7 +136,7 @@ The hook returns that line as the tool's updated input where the runner has one,
 
 A deny is also appended to `$LJOS_POLICYD_DENY_LOG`, or `$XDG_STATE_HOME/ljos-policyd/deny.log` (default `~/.local/state/ljos-policyd/deny.log`). Each line is the unix time, a tab, the reason, a tab, and the command. A prompt is not a deny and is not logged.
 
-Makefile, npm, pnpm, yarn, bun and just recipes are not read. A python program is not analysed. Writing or mentioning an ordinary file is not a reason to refuse. `sudo`, `rm -rf` of a home or the root, a force push, a secret in an argument, a write of a hook or policy file, a remote shell, and a raw disk write still refuse. `find -delete`, `find -exec rm`, and `xargs` or `parallel` running `rm` refuse. So does `mv` onto `/dev/null` or another whole tree outside the work tree, and `rsync` with `--delete` over that tree. `git reset --hard`, `git clean -fd`, `git stash clear` or `drop`, and `git checkout -- .` or `git restore .` ask instead of refusing.
+Makefile, npm, pnpm, yarn, bun and just recipes are not read. A python program is not analysed. Writing or mentioning an ordinary file is not a reason to refuse. `sudo`, a recursive `rm` outside `/tmp` and the build directories, a force push, a secret in an argument, a write of a hook or policy file, a remote shell, and a raw disk write still refuse. `find -delete`, `find -exec rm`, and `xargs` or `parallel` running `rm` refuse. So does `mv` onto `/dev/null` or another whole tree outside the work tree, and `rsync` with `--delete` over that tree. `git reset --hard`, `git clean -fd`, `git stash clear` or `drop`, and `git checkout -- .` or `git restore .` ask instead of refusing.
 
 ## Outbound mail
 

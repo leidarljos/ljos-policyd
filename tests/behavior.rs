@@ -27,20 +27,27 @@ fn a_brief_that_mentions_a_path_is_allowed() {
         "#+TITLE: Fundamentals of HPC\n* Intro\n",
     )
     .unwrap();
-    let brief = "The notes live in course-module-fundamentals-of-hpc/slides/fundamentals-of-hpc.org.\n";
+    let brief =
+        "The notes live in course-module-fundamentals-of-hpc/slides/fundamentals-of-hpc.org.\n";
     std::fs::create_dir_all(root.join("notes")).unwrap();
     std::fs::write(root.join("notes/BRIEF.md"), brief).unwrap();
     let joined = format!("notes/BRIEF.md\n{brief}");
     let c = check_shell(&["bash".into(), "-c".into(), joined]);
     let write = format!("cat > notes/BRIEF.md << 'EOF'\n{brief}EOF");
     let w = check_shell(&["bash".into(), "-c".into(), write]);
-    assert_eq!(c.decision, ljos_policyd::policy_capnp::Decision::Allow, "{}", c.token);
-    assert!(
-        !c.token.contains("script-unread"),
+    assert_eq!(
+        c.decision,
+        ljos_policyd::policy_capnp::Decision::Allow,
         "{}",
         c.token
     );
-    assert_eq!(w.decision, ljos_policyd::policy_capnp::Decision::Allow, "{}", w.token);
+    assert!(!c.token.contains("script-unread"), "{}", c.token);
+    assert_eq!(
+        w.decision,
+        ljos_policyd::policy_capnp::Decision::Allow,
+        "{}",
+        w.token
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
