@@ -1,8 +1,8 @@
 # policyd rule families
 
 Counted on `a7909f90` before this pare, and on the tree after it.
-Rust outside the generated Cap'n schema was 43047 lines before and 20724 after.
-Generated schema stayed 9409 lines. `src/lib.rs` is 13038 lines. The bash
+Rust outside the generated Cap'n schema was 43047 lines before and 21273 after.
+Generated schema stayed 9409 lines. `src/lib.rs` is 13168 lines. The bash
 lexer and the mail law are still the bulk of that. The rewrite lives in
 `src/rewrite.rs` and the credential ask in `src/ask.rs`.
 

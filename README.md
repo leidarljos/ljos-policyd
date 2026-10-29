@@ -21,6 +21,16 @@ $ ljos-policyd version
 ljos-policyd 0.6.0 (phronesis)
 ```
 
+## Threat model
+
+This check catches a bot's honest mistakes: a secret on the command, a
+destructive command, a history rewrite, or a write of its own hooks or
+policy. It is not a sandbox against a bot that hides a path on purpose.
+A literal path in a redirect, in `tee` or `sponge`, in `cp`, `install`
+or `mv`, or in an interpreter `open` or `write` call is checked. A name
+built by concatenation, by `Path.home()`, or by an interpreter this
+check does not read, is outside that model.
+
 ## What it refuses
 
 The rules are tried in this order, and the first that matches decides.

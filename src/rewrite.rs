@@ -35,8 +35,7 @@ fn rewrite_shell(argv: &[String]) -> Option<String> {
         return None;
     }
     let script = splice_python(&argv[at])?;
-    let file = script_token(&script)?;
-    if !uv_rewrite_fits(file) {
+    if !script_fits(&script) {
         return None;
     }
     let mut parts = Vec::new();
@@ -77,6 +76,119 @@ fn rewrite_argv(argv: &[String]) -> Option<String> {
 /// redirections and quotes, stays byte for byte. `-c` and `-m` are not a
 /// script, so they are not rewritten.
 fn splice_python(script: &str) -> Option<String> {
+    let mut text = script.to_string();
+    let mut changed = false;
+    for (start, end) in nested_regions(&text).into_iter().rev() {
+        if let Some(inner) = splice_python(&text[start..end]) {
+            if inner != text[start..end] {
+                text.replace_range(start..end, &inner);
+                changed = true;
+            }
+        }
+    }
+    if let Some(top) = splice_top(&text) {
+        return Some(top);
+    }
+    changed.then_some(text)
+}
+
+/// Interiors of `$(...)`, backticks and `(...)` subshells, outermost first.
+fn nested_regions(script: &str) -> Vec<(usize, usize)> {
+    let b = script.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let mut quote: Option<u8> = None;
+    while i < b.len() {
+        let c = b[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+                i += 1;
+                continue;
+            }
+            if q == b'"' && c == b'\\' && i + 1 < b.len() {
+                i += 2;
+                continue;
+            }
+            if q == b'\'' {
+                i += 1;
+                continue;
+            }
+        } else if c == b'\'' {
+            quote = Some(b'\'');
+            i += 1;
+            continue;
+        } else if c == b'"' {
+            quote = Some(b'"');
+            i += 1;
+            continue;
+        }
+        if c == b'\\' && i + 1 < b.len() {
+            i += 2;
+            continue;
+        }
+        if c == b'`' {
+            if let Some(end) = script[i + 1..].find('`') {
+                let close = i + 1 + end;
+                out.push((i + 1, close));
+                i = close + 1;
+                continue;
+            }
+        }
+        if c == b'$' && b.get(i + 1) == Some(&b'(') {
+            if let Some(close) = match_paren(script, i + 1) {
+                out.push((i + 2, close));
+                i = close + 1;
+                continue;
+            }
+        }
+        if c == b'(' {
+            if let Some(close) = match_paren(script, i) {
+                out.push((i + 1, close));
+                i = close + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn match_paren(script: &str, open: usize) -> Option<usize> {
+    let b = script.as_bytes();
+    let mut depth = 0;
+    let mut i = open;
+    let mut quote: Option<u8> = None;
+    while i < b.len() {
+        let c = b[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else if c == b'\\' && q == b'"' && i + 1 < b.len() {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'\'' || c == b'"' {
+            quote = Some(c);
+            i += 1;
+            continue;
+        }
+        if c == b'(' {
+            depth += 1;
+        } else if c == b')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn splice_top(script: &str) -> Option<String> {
     let mut spans = Vec::new();
     for (start, end) in command_segments(script) {
         if let Some((at, to)) = command_python(&script[start..end]) {
@@ -163,6 +275,14 @@ fn command_python(command: &str) -> Option<(usize, usize)> {
         unquote_token(&command[*start..*end]) == wanted
             && python_command(&unquote_token(&command[*start..*end]))
     })
+}
+
+fn script_fits(script: &str) -> bool {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    if project_uses_uv(&cwd) {
+        return true;
+    }
+    script_token(script).is_some_and(uv_rewrite_fits)
 }
 
 fn script_token(script: &str) -> Option<&str> {

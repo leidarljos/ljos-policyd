@@ -276,22 +276,8 @@ fn one_around(cmd: &[&str]) -> Option<&'static str> {
         .position(|w| !is_assignment(w) && !w.starts_with('<') && !w.starts_with('>'))?;
     let head = base_of(cmd[head_at]);
     if head == "find" {
-        if find_delete_hit(cmd) {
-            return Some("find-delete");
-        }
-        let mut i = 0;
-        while i < cmd.len() {
-            if matches!(cmd[i], "-exec" | "-execdir" | "-ok" | "-okdir") {
-                let payload = &cmd[i + 1..];
-                let end = payload
-                    .iter()
-                    .position(|w| matches!(*w, ";" | "+" | "\\;" | "\\+"))
-                    .unwrap_or(payload.len());
-                if deletes_command(&payload[..end]) {
-                    return Some("find-exec-rm");
-                }
-            }
-            i += 1;
+        if let Some(token) = find_action_unsafe(cmd) {
+            return Some(token);
         }
     }
     if matches!(head, "xargs" | "parallel") {
@@ -304,31 +290,206 @@ fn one_around(cmd: &[&str]) -> Option<&'static str> {
     None
 }
 
-/// A filtered `find -delete` whose starting points stay in the work tree
-/// is cleanup. An unfiltered `-delete`, or one aimed at `/`, `~`, or a
-/// parent of the tree, is a delete.
-fn find_delete_hit(cmd: &[&str]) -> bool {
-    if !cmd.contains(&"-delete") {
-        return false;
+/// A `find` action is safe only when every way it runs already passed a
+/// name filter, and the starting points stay in the work tree. `-o` does
+/// not carry a filter onto the other branch. An action before its filter
+/// runs first.
+pub(crate) fn find_action_unsafe(cmd: &[&str]) -> Option<&'static str> {
+    let expr = &cmd[find_expr_at(cmd)..];
+    let Some((tree, end)) = parse_or(expr) else {
+        return raw_find_action(cmd);
+    };
+    if end != expr.len() {
+        return raw_find_action(cmd);
     }
-    let filtered = cmd.iter().any(|w| {
-        matches!(
-            *w,
-            "-name"
-                | "-iname"
-                | "-path"
-                | "-ipath"
-                | "-regex"
-                | "-iregex"
-                | "-wholename"
-                | "-iwholename"
-        )
-    });
-    let starts = find_starts(cmd);
-    if starts.iter().copied().any(find_start_leaves) {
-        return true;
+    let kind = if find_starts(cmd).iter().copied().any(find_start_leaves) {
+        any_action(&tree)?
+    } else {
+        unguarded_action(&tree, false)?
+    };
+    Some(action_token(kind))
+}
+
+fn raw_find_action(cmd: &[&str]) -> Option<&'static str> {
+    if cmd.contains(&"-delete") {
+        return Some("find-delete");
     }
-    !filtered
+    let mut i = 0;
+    while i < cmd.len() {
+        if matches!(cmd[i], "-exec" | "-execdir" | "-ok" | "-okdir") {
+            let rest = &cmd[i + 1..];
+            let end = rest
+                .iter()
+                .position(|w| matches!(*w, ";" | "+" | "\\;" | "\\+"))
+                .unwrap_or(rest.len());
+            if deletes_command(&rest[..end]) {
+                return Some("find-exec-rm");
+            }
+            i += 1 + end;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+enum ActKind {
+    Delete,
+    ExecRm,
+}
+
+enum Fx {
+    Filter,
+    Test,
+    Act(ActKind),
+    Not(Box<Fx>),
+    And(Box<Fx>, Box<Fx>),
+    Or(Box<Fx>, Box<Fx>),
+}
+
+fn action_token(kind: ActKind) -> &'static str {
+    match kind {
+        ActKind::Delete => "find-delete",
+        ActKind::ExecRm => "find-exec-rm",
+    }
+}
+
+fn find_expr_at(cmd: &[&str]) -> usize {
+    let mut i = 1;
+    while i < cmd.len() {
+        let a = cmd[i];
+        if matches!(a, "-H" | "-L" | "-P") {
+            i += 1;
+            continue;
+        }
+        if a.starts_with('-') || a == "(" || a == "!" {
+            break;
+        }
+        i += 1;
+    }
+    i
+}
+
+fn parse_or(toks: &[&str]) -> Option<(Fx, usize)> {
+    parse_or_at(toks, 0)
+}
+
+fn parse_or_at(toks: &[&str], i: usize) -> Option<(Fx, usize)> {
+    let (mut left, mut i) = parse_and(toks, i)?;
+    while matches!(toks.get(i), Some(&"-o" | &"-or")) {
+        let (right, j) = parse_and(toks, i + 1)?;
+        left = Fx::Or(Box::new(left), Box::new(right));
+        i = j;
+    }
+    Some((left, i))
+}
+
+fn parse_and(toks: &[&str], i: usize) -> Option<(Fx, usize)> {
+    let (mut left, mut i) = parse_unary(toks, i)?;
+    while i < toks.len() && !matches!(toks[i], "-o" | "-or" | ")") {
+        if matches!(toks[i], "-a" | "-and") {
+            i += 1;
+        }
+        let (right, j) = parse_unary(toks, i)?;
+        left = Fx::And(Box::new(left), Box::new(right));
+        i = j;
+    }
+    Some((left, i))
+}
+
+fn parse_unary(toks: &[&str], i: usize) -> Option<(Fx, usize)> {
+    if matches!(toks.get(i), Some(&"!" | &"-not")) {
+        let (inner, j) = parse_unary(toks, i + 1)?;
+        return Some((Fx::Not(Box::new(inner)), j));
+    }
+    if toks.get(i) == Some(&"(") {
+        let (inner, j) = parse_or_at(toks, i + 1)?;
+        if toks.get(j) != Some(&")") {
+            return None;
+        }
+        return Some((inner, j + 1));
+    }
+    parse_atom(toks, i)
+}
+
+fn parse_atom(toks: &[&str], i: usize) -> Option<(Fx, usize)> {
+    let w = *toks.get(i)?;
+    if matches!(
+        w,
+        "-name"
+            | "-iname"
+            | "-path"
+            | "-ipath"
+            | "-regex"
+            | "-iregex"
+            | "-wholename"
+            | "-iwholename"
+    ) {
+        return toks.get(i + 1).map(|_| (Fx::Filter, i + 2));
+    }
+    if w == "-delete" {
+        return Some((Fx::Act(ActKind::Delete), i + 1));
+    }
+    if matches!(w, "-exec" | "-execdir" | "-ok" | "-okdir") {
+        let rest = &toks[i + 1..];
+        let term = rest
+            .iter()
+            .position(|t| matches!(*t, ";" | "+" | "\\;" | "\\+"));
+        let end = term.unwrap_or(rest.len());
+        let kind = if deletes_command(&rest[..end]) {
+            Fx::Act(ActKind::ExecRm)
+        } else {
+            Fx::Test
+        };
+        return Some((kind, i + 1 + end + usize::from(term.is_some())));
+    }
+    if w.starts_with('-') && w != "-" && !matches!(w, "-o" | "-or" | "-a" | "-and" | "-not") {
+        let next = toks.get(i + 1).copied();
+        if next.is_some_and(|n| !n.starts_with('-') && n != "(" && n != ")" && n != "!") {
+            return Some((Fx::Test, i + 2));
+        }
+        return Some((Fx::Test, i + 1));
+    }
+    None
+}
+
+/// An action that runs on a path where no name filter has already matched.
+fn unguarded_action(expr: &Fx, held: bool) -> Option<ActKind> {
+    match expr {
+        Fx::Filter | Fx::Test => None,
+        Fx::Act(kind) if !held => Some(*kind),
+        Fx::Act(_) => None,
+        Fx::Not(inner) => unguarded_action(inner, held),
+        Fx::And(left, right) => {
+            let held_right = held || implies_filter(left);
+            unguarded_action(left, held).or_else(|| unguarded_action(right, held_right))
+        }
+        Fx::Or(left, right) => {
+            unguarded_action(left, held).or_else(|| unguarded_action(right, held))
+        }
+    }
+}
+
+fn any_action(expr: &Fx) -> Option<ActKind> {
+    match expr {
+        Fx::Act(kind) => Some(*kind),
+        Fx::Not(inner) => any_action(inner),
+        Fx::And(left, right) | Fx::Or(left, right) => {
+            any_action(left).or_else(|| any_action(right))
+        }
+        Fx::Filter | Fx::Test => None,
+    }
+}
+
+/// True when the expression being true means a name filter matched.
+fn implies_filter(expr: &Fx) -> bool {
+    match expr {
+        Fx::Filter => true,
+        Fx::Test | Fx::Act(_) | Fx::Not(_) => false,
+        Fx::And(left, right) => implies_filter(left) || implies_filter(right),
+        Fx::Or(left, right) => implies_filter(left) && implies_filter(right),
+    }
 }
 
 /// Path operands before the expression. No path means the current directory.
