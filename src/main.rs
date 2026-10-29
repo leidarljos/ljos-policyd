@@ -7,8 +7,7 @@ use std::path::Path;
 use std::process::{self, Command};
 
 use ljos_policyd::{
-    check_mail_argv, check_shell, encode_decision, load_config, verdict, MailVerdict,
-    MAIL_MESSAGE_MAX,
+    check_mail_argv, check_shell, encode_decision, verdict, MailVerdict, MAIL_MESSAGE_MAX,
 };
 
 fn usage() {
@@ -17,7 +16,6 @@ fn usage() {
 }
 
 fn main() {
-    load_config();
     let mut args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
         usage();
