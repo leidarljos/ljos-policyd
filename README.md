@@ -134,7 +134,7 @@ without the library reports `host table`, and the doctor warns about it.
 | `prompt`<TAB>`reason` | ask the person. A mention of a credential path in `python`, `perl`, `ruby` or `node` `-c` or `-e` is `credential-mention` |
 | `allow`<TAB>`rewrite`<TAB>`new line` | the command may run, and the hook should run `new line` instead |
 
-`python x.py` and `python3 x.py` rewrite to `uv run x.py`, arguments included. `python -c` and `python -m` stay as written: `uv run` does not take `-c`.
+`python x.py` and `python3 x.py` rewrite to `uv run x.py`, arguments included, when the working directory or a parent has `pyproject.toml` or `uv.lock`, or the script file has a PEP 723 `# /// script` block. Otherwise the line stays as written. `python -c` and `python -m` stay as written: `uv run` does not take `-c`.
 
 The hook returns that line as the tool's updated input where the runner has one, and as a note where it does not.
 

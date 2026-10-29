@@ -334,10 +334,6 @@ fn braces_quoted(w: &str) -> bool {
 /// The text of the literal here-document closed by `delim` whose body
 /// split into `words`. Only where every body read this check with those
 /// words was literal, and all of them were written alike.
-fn spell_gen() -> u64 {
-    SPELL_GEN.with(std::cell::Cell::get)
-}
-
 fn bump_spell_gen() {
     SPELL_GEN.with(|g| g.set(g.get().wrapping_add(1)));
 }
@@ -366,9 +362,6 @@ fn spelled(w: &str, quoted: bool) {
 /// How many runner levels deep (`make a` whose recipe runs `npm run b`)
 /// script targets are read before the line is judged as written.
 fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Checked {
-    if depth == 0 {
-        clear_table_memo();
-    }
     let parent = Scratch {
         root: Some(cwd.to_path_buf()),
         work: Some(cwd.to_path_buf()),
@@ -1092,11 +1085,6 @@ fn script_texts(
 /// Whether the script `text`, read by a shell that holds `aliases`,
 /// leaves the shell where it was. `words` is that text with the aliases
 /// expanded, function bodies still in place.
-struct ScriptScan {
-    keeps: bool,
-    words: Vec<String>,
-}
-
 fn is_name(w: &str) -> bool {
     let mut chars = w.chars();
     match chars.next() {
@@ -1849,184 +1837,7 @@ fn inert_argv(argv: &[String]) -> bool {
 
 /// Words past this stay out of the reuse map. The long script is one argv;
 /// its commands are the short ones worth keeping.
-const TABLE_MEMO_WORDS: usize = 48;
-
-struct TableHit {
-    argv: Vec<String>,
-    scratch: Scratch,
-    depth: usize,
-    moved: bool,
-    gen: u64,
-    decision: Decision,
-    code: PolicyReason,
-    token: Cow<'static, str>,
-}
-
-thread_local! {
-    static TABLE_MEMO: std::cell::RefCell<std::collections::HashMap<u64, Vec<TableHit>>> =
-        std::cell::RefCell::default();
-}
-
-fn clear_table_memo() {
-    TABLE_MEMO.with(|m| m.borrow_mut().clear());
-}
-
-fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf29ce484222325u64;
-    for &b in bytes {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
-
-fn hash_argv(argv: &[String]) -> u64 {
-    let mut h = 0x84222325cbf29ce1u64 ^ argv.len() as u64;
-    for w in argv {
-        h = h
-            .wrapping_mul(0x100000001b3)
-            .wrapping_add(hash_bytes(w.as_bytes()));
-    }
-    h
-}
-
-fn hash_scratch(scratch: &Scratch) -> u64 {
-    let mut h = 0x6a09e667f3bcc909u64;
-    for (k, v) in &scratch.vars {
-        let mut e = hash_bytes(k.as_bytes());
-        e = e.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(match v {
-            None => 1,
-            Some(Hold::Temp) => 2,
-            Some(Hold::Root) => 3,
-        });
-        h ^= e;
-    }
-    for (k, v) in &scratch.suffixes {
-        let mut e = hash_bytes(k.as_bytes());
-        e = e
-            .wrapping_mul(0xBF58476D1CE4E5B9)
-            .wrapping_add(u64::from(*v));
-        h ^= e.wrapping_add(0x94d049bb133111eb);
-    }
-    if scratch.autoconf {
-        h ^= 0xA5A5_A5A5_A5A5_A5A5;
-    }
-    if scratch.ifs_assigned {
-        h ^= 0x1234_5678_9ABC_DEF0;
-    }
-    if let Some(root) = &scratch.root {
-        h ^= hash_bytes(root.as_os_str().as_encoded_bytes()).wrapping_mul(0x100000001b3);
-    } else {
-        h ^= 0x0F0F_0F0F_0F0F_0F0F;
-    }
-    if let Some(work) = &scratch.work {
-        h ^= hash_bytes(work.as_os_str().as_encoded_bytes()).wrapping_mul(0xC2B2AE3D27D4EB4F);
-    }
-    if scratch.placed {
-        h ^= 0x5A5A_5A5A_5A5A_5A5A;
-    }
-    if let Some(name) = &scratch.relayed {
-        h ^= hash_bytes(name.as_bytes()).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    }
-    for (i, mark) in scratch.fed_marks.iter().enumerate() {
-        h = h
-            .wrapping_mul(0x100000001b3)
-            .wrapping_add(hash_bytes(mark.as_bytes()))
-            .wrapping_add(i as u64);
-    }
-    h
-}
-
-fn table_key(argv: &[String], depth: usize, moved: bool, parent: &Scratch, gen: u64) -> u64 {
-    let mut h = hash_argv(argv);
-    h = h
-        .wrapping_mul(0x100000001b3)
-        .wrapping_add(hash_scratch(parent));
-    h = h.wrapping_mul(0x100000001b3).wrapping_add(depth as u64);
-    h = h.wrapping_mul(0x100000001b3).wrapping_add(u64::from(moved));
-    h.wrapping_mul(0x100000001b3).wrapping_add(gen)
-}
-
-fn table_memo_get(
-    key: u64,
-    argv: &[String],
-    depth: usize,
-    moved: bool,
-    parent: &Scratch,
-    gen: u64,
-) -> Option<Checked> {
-    TABLE_MEMO.with(|m| {
-        let m = m.borrow();
-        let hits = m.get(&key)?;
-        let hit = hits.iter().find(|hit| {
-            hit.depth == depth
-                && hit.moved == moved
-                && hit.gen == gen
-                && hit.argv == argv
-                && hit.scratch == *parent
-        })?;
-        Some(Checked {
-            decision: hit.decision,
-            code: hit.code,
-            token: hit.token.clone(),
-        })
-    })
-}
-
-fn table_memo_put(
-    key: u64,
-    argv: &[String],
-    depth: usize,
-    moved: bool,
-    parent: &Scratch,
-    gen: u64,
-    got: &Checked,
-) {
-    TABLE_MEMO.with(|m| {
-        let mut m = m.borrow_mut();
-        let hits = m.entry(key).or_default();
-        if hits.iter().any(|hit| {
-            hit.depth == depth
-                && hit.moved == moved
-                && hit.gen == gen
-                && hit.argv == argv
-                && hit.scratch == *parent
-        }) {
-            return;
-        }
-        hits.push(TableHit {
-            argv: argv.to_vec(),
-            scratch: parent.clone(),
-            depth,
-            moved,
-            gen,
-            decision: got.decision,
-            code: got.code,
-            token: got.token.clone(),
-        });
-    });
-}
-
-/// The table on one argv, then on every command it runs through a wrapper
-/// (`env`, `nice`, `xargs`, ...) or a shell's `-c` script, so `env git push
-/// -f` and `sh -c "git push -f"` meet the same rules as `git push -f`.
-/// `moved` is true when a `cd` or `pushd` anywhere on the line can leave the
-/// working tree, so a relative path no longer says where a delete lands.
-///
-/// A short command is judged once. A later copy with the same scratch,
-/// depth and quote map reuses that result. The lookup is outside the
-/// timed walk, so a hit does not pay for it.
 fn host_argv_table_at(argv: &[String], depth: usize, moved: bool, parent: &Scratch) -> Checked {
-    let gen = spell_gen();
-    if argv.len() <= TABLE_MEMO_WORDS {
-        let key = table_key(argv, depth, moved, parent, gen);
-        if let Some(c) = table_memo_get(key, argv, depth, moved, parent, gen) {
-            return c;
-        }
-        let c = host_argv_table_run(argv, depth, moved, parent);
-        table_memo_put(key, argv, depth, moved, parent, gen, &c);
-        return c;
-    }
     host_argv_table_run(argv, depth, moved, parent)
 }
 
