@@ -17,23 +17,24 @@ fn refused(args: &[&str]) -> bool {
     line(args).starts_with("deny\t")
 }
 
+fn hooks_json() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".into());
+    format!("{home}/.cursor/hooks.json")
+}
+
 #[test]
 fn python_cannot_rewrite_its_own_hooks() {
-    let v = line(&[
-        "python",
-        "-c",
-        "open('/home/ubuntu/.cursor/hooks.json','w').write('[]')",
-    ]);
+    let hooks = hooks_json();
+    let code = format!("open('{hooks}','w').write('[]')");
+    let v = line(&["python", "-c", &code]);
     assert!(v.starts_with("deny\tseat-guard-path:"), "{v}");
 }
 
 #[test]
 fn node_cannot_rewrite_its_own_hooks() {
-    let v = line(&[
-        "node",
-        "-e",
-        "require('fs').writeFileSync('/home/ubuntu/.cursor/hooks.json','[]')",
-    ]);
+    let hooks = hooks_json();
+    let code = format!("require('fs').writeFileSync('{hooks}','[]')");
+    let v = line(&["node", "-e", &code]);
     assert!(v.starts_with("deny\tseat-guard-path:"), "{v}");
 }
 
