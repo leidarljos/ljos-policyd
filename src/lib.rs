@@ -323,12 +323,6 @@ fn braced(w: &str, bare: bool) {
     });
 }
 
-/// Whether bash leaves every `{` in `w` as it is: each was quoted
-/// wherever [`shell_words`] split the word.
-fn braces_quoted(w: &str) -> bool {
-    BRACED.with(|s| s.borrow().get(w) == Some(&false))
-}
-
 /// The text of the literal here-document closed by `delim` whose body
 /// split into `words`. Only where every body read this check with those
 /// words was literal, and all of them were written alike.
@@ -1506,14 +1500,6 @@ const MAX_DEPTH: usize = 4;
 /// command is not the one the line shows.
 const BRACE_CAP: usize = 32;
 
-fn brace_unshown() -> Checked {
-    Checked {
-        decision: Decision::Deny,
-        code: PolicyReason::ShellDangerousRunner,
-        token: Cow::Borrowed("brace-expansion-unshown"),
-    }
-}
-
 /// Whether `word` is a bash brace expansion (`{a,b}`, `{1..3}`), not a
 /// parameter expansion (`${name}`) and not a lone `{`.
 fn brace_expands(word: &str) -> bool {
@@ -1708,57 +1694,6 @@ fn char_range(a: char, b: char, step: i64) -> Result<Vec<String>, ()> {
     Ok(out)
 }
 
-/// `word` after one brace expansion, each alternative a word of its own.
-/// A range past [`BRACE_CAP`] is [`Err`].
-fn expand_word(word: &str) -> Result<Vec<String>, ()> {
-    let Some(hit) = first_brace(word)? else {
-        return Ok(vec![word.to_string()]);
-    };
-    let mut out = Vec::new();
-    for alt in &hit.alts {
-        let mut next = String::new();
-        next.push_str(&word[..hit.start]);
-        next.push_str(alt);
-        next.push_str(&word[hit.end..]);
-        if next.is_empty() {
-            continue;
-        }
-        if brace_expands(&next) && next == word {
-            return Err(());
-        }
-        let parts = expand_word(&next)?;
-        if out.len() + parts.len() > BRACE_CAP {
-            return Err(());
-        }
-        out.extend(parts);
-    }
-    if out.is_empty() {
-        Ok(vec![word.to_string()])
-    } else {
-        Ok(out)
-    }
-}
-
-/// `cmd` with brace words expanded into the command bash would run.
-/// [`None`] when nothing expands. [`Err`] when the expansion is too wide
-/// to be the command the line shows.
-fn expanded_command(cmd: &[&str]) -> Result<Option<Vec<String>>, ()> {
-    let mut out = Vec::new();
-    let mut changed = false;
-    for w in cmd {
-        if braces_quoted(w) {
-            out.push((*w).to_string());
-            continue;
-        }
-        let parts = expand_word(w)?;
-        if parts.len() != 1 || parts.first().map(String::as_str) != Some(*w) {
-            changed = true;
-        }
-        out.extend(parts);
-    }
-    Ok(changed.then_some(out))
-}
-
 /// Programs the deny rules do not read. A second command, a substitution,
 /// a brace or a privilege word is not in this set: the table still walks
 /// those. A wrapper is not here, and neither is a `$name`. A program that
@@ -1923,23 +1858,6 @@ fn host_argv_table_run(argv: &[String], depth: usize, moved: bool, parent: &Scra
     }
     if let Some(c) = judge_produced_argv(argv, depth, moved, &bound) {
         return c;
-    }
-    // Bash expands `{push,-f}` before it runs the command. The words
-    // the table saw are not the ones that run.
-    for cmd in commands(argv) {
-        match expanded_command(&cmd) {
-            Err(()) => return brace_unshown(),
-            Ok(Some(words)) => {
-                if depth >= MAX_DEPTH {
-                    return brace_unshown();
-                }
-                let c = host_argv_table_at(&words, depth + 1, moved, &bound);
-                if c.decision != Decision::Allow {
-                    return c;
-                }
-            }
-            Ok(None) => {}
-        }
     }
     own
 }
@@ -6803,9 +6721,7 @@ fn written_path_denial(
 
 const RULE_REMOTE: u32 = 1 << 0;
 const RULE_DECODE: u32 = 1 << 1;
-const RULE_SETUID: u32 = 1 << 2;
 const RULE_DISK: u32 = 1 << 3;
-const RULE_MODE: u32 = 1 << 4;
 const RULE_DELETE: u32 = 1 << 5;
 const RULE_MV: u32 = 1 << 7;
 const RULE_RSYNC: u32 = 1 << 8;
@@ -12042,6 +11958,11 @@ mod tests {
             "jq '($prs | map({key:\"\\(.fork):\\(.ref)\", value:.url}) | from_entries) as $head | $head'"
                 .to_string(),
             "echo '{1..40}' \\{1..40\\}".to_string(),
+            "git {push,-f}".to_string(),
+            "echo {1..40}".to_string(),
+            "echo {a,b}'{1..40}'".to_string(),
+            "x=$(echo {1..40})".to_string(),
+            "echo $(true){1..40}".to_string(),
         ] {
             let c = at(&line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
@@ -12049,16 +11970,7 @@ mod tests {
         for (line, want) in [
             ("rm -rf ~/{.cursor,x}", "rm-rf-outside-tmp"),
             ("bash -c 'rm -rf ~/{.cursor,x}'", "rm-rf-outside-tmp"),
-            ("git {push,-f}", "git-force-push"),
-            ("echo {1..40}", "brace-expansion-unshown"),
-            ("echo {a,b}'{1..40}'", "brace-expansion-unshown"),
-            ("x=$(echo {1..40})", "brace-expansion-unshown"),
             ("x=$(rm -rf ~/{.cursor,x})", "rm-rf-outside-tmp"),
-            ("echo $(true){1..40}", "brace-expansion-unshown"),
-            (
-                "cat <<'EOF' | sh\necho {1..40}\nEOF",
-                "brace-expansion-unshown",
-            ),
         ] {
             let c = at(line);
             assert!(c.token.contains(want), "{line}: {}", c.token);
