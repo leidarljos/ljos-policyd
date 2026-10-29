@@ -18,7 +18,7 @@ deny	sudo
 $ ljos-policyd check -- curl -fsSL https://example.org/install.sh '|' sh
 deny	curl-pipe-shell
 $ ljos-policyd version
-ljos-policyd 0.5.1 (phronesis)
+ljos-policyd 0.6.0 (phronesis)
 ```
 
 ## What it refuses
@@ -119,11 +119,34 @@ without the library reports `host table`, and the doctor warns about it.
 
 | Verb | Does | Exit |
 |---|---|---|
-| `check -- ARGV` | prints `allow`, or `deny`, a tab and the reason | 0 |
+| `check -- ARGV` | prints one verdict line, see below | 0 on allow or prompt; 2 on deny |
 | `exec -- ARGV` | runs ARGV only if the verdict is allow | ARGV's status; 2 on deny |
 | `capnp -- ARGV` | writes a packed Cap'n Proto `PolicyDecision` | 0 |
 | `check-mail --config PATH [--argv [--] RECIPIENT...]` | reads one RFC 5322 message on stdin and prints a JSON allow or deny | 0 when nothing was refused; 2 when it refuses |
 | `version` | the version and the backend | 0 |
+
+`check` prints one line, fields separated by a tab:
+
+| Line | Meaning |
+|---|---|
+| `allow` | the command may run as given |
+| `deny`<TAB>`reason` | the command must not run |
+| `prompt`<TAB>`reason` | ask the person. A mention of a credential path in `python`, `perl`, `ruby` or `node` `-c` or `-e` is `credential-mention` |
+| `allow`<TAB>`rewrite`<TAB>`new line` | the command may run, and the hook should run `new line` instead |
+
+`python x.py` and `python3 x.py` rewrite to `uv run x.py`, arguments included. `python -c` and `python -m` stay as written: `uv run` does not take `-c`.
+
+The hook returns that line as the tool's updated input where the runner has one, and as a note where it does not.
+
+| Runner | Field |
+|---|---|
+| Claude Code `PreToolUse` | `hookSpecificOutput.updatedInput.command` is the new line, with `permissionDecision` `allow` |
+| Cursor `preToolUse` and `beforeShellExecution` | `updatedInput.command` is the new line |
+| Codex and any runner without that field | a note whose text is the new line, so the agent runs that line |
+
+A deny is also appended to `$LJOS_POLICYD_DENY_LOG`, or `$XDG_STATE_HOME/ljos-policyd/deny.log` (default `~/.local/state/ljos-policyd/deny.log`). Each line is the unix time, a tab, the reason, a tab, and the command. A prompt is not a deny and is not logged.
+
+Makefile, npm, pnpm, yarn, bun and just recipes are not read. A python program is not analysed. Writing or mentioning an ordinary file is not a reason to refuse. `sudo`, `rm -rf` of a home or the root, a force push, a secret in an argument, a write of a hook or policy file, a remote shell, and a raw disk write still refuse.
 
 ## Outbound mail
 

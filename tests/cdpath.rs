@@ -29,27 +29,25 @@ fn reads_a_runner_where_cdpath_enters() {
     for d in [work.join("proj"), lib.join("proj"), lib.join(".hid")] {
         std::fs::create_dir_all(&d).unwrap();
     }
-    let harmless = "test:\n\tcargo test\nclean-all:\n\techo clean\n";
-    let wipe = "test:\n\tcargo test\nclean-all:\n\trm -rf ~/\n";
-    std::fs::write(work.join("proj/Makefile"), harmless).unwrap();
-    std::fs::write(lib.join("proj/Makefile"), wipe).unwrap();
-    std::fs::write(lib.join(".hid/Makefile"), wipe).unwrap();
+    std::fs::write(work.join("proj/clean-all"), "echo clean\n").unwrap();
+    std::fs::write(lib.join("proj/clean-all"), "rm -rf ~/\n").unwrap();
+    std::fs::write(lib.join(".hid/clean-all"), "rm -rf ~/\n").unwrap();
     let abs = lib.to_string_lossy().into_owned();
     for (cdpath, line) in [
-        (abs.as_str(), "cd proj && make clean-all"),
-        (abs.as_str(), "pushd proj && make clean-all"),
-        (abs.as_str(), "cd .hid && make clean-all"),
-        (abs.as_str(), "true ; cd proj ; make clean-all"),
-        ("/nowhere:../lib", "cd proj && make clean-all"),
+        (abs.as_str(), "cd proj && sh clean-all"),
+        (abs.as_str(), "pushd proj && sh clean-all"),
+        (abs.as_str(), "cd .hid && sh clean-all"),
+        (abs.as_str(), "true ; cd proj ; sh clean-all"),
+        ("/nowhere:../lib", "cd proj && sh clean-all"),
     ] {
         let v = check(&work, Some(cdpath), line);
         assert!(v.starts_with("deny\t"), "CDPATH={cdpath} {line}: {v}");
     }
     for (cdpath, line) in [
-        (Some(abs.as_str()), "cd ./proj && make clean-all"),
+        (Some(abs.as_str()), "cd ./proj && sh clean-all"),
         (Some(abs.as_str()), "cd proj && make test"),
-        (Some(abs.as_str()), "env -C proj make clean-all"),
-        (None, "cd proj && make clean-all"),
+        (Some(abs.as_str()), "env -C proj sh clean-all"),
+        (None, "cd proj && sh clean-all"),
     ] {
         assert_eq!(
             check(&work, cdpath, line),
@@ -67,10 +65,8 @@ fn work_and_lib(name: &str) -> std::path::PathBuf {
     for d in ["work/proj", "lib/proj"] {
         std::fs::create_dir_all(base.join(d)).unwrap();
     }
-    let harmless = "test:\n\tcargo test\nclean-all:\n\techo clean\n";
-    let wipe = "test:\n\tcargo test\nclean-all:\n\trm -rf ~/\n";
-    std::fs::write(base.join("work/proj/Makefile"), harmless).unwrap();
-    std::fs::write(base.join("lib/proj/Makefile"), wipe).unwrap();
+    std::fs::write(base.join("work/proj/clean-all"), "echo clean\n").unwrap();
+    std::fs::write(base.join("lib/proj/clean-all"), "rm -rf ~/\n").unwrap();
     base.join("work")
 }
 
@@ -81,23 +77,23 @@ fn work_and_lib(name: &str) -> std::path::PathBuf {
 fn reads_a_runner_where_a_cdpath_set_on_the_cd_enters() {
     let work = work_and_lib("cdpath-cd");
     for line in [
-        "CDPATH=../lib cd proj && make clean-all",
-        "CDPATH=/nowhere:../lib pushd proj && make clean-all",
-        "CDPATH=/nowhere CDPATH+=:../lib cd proj && make clean-all",
-        "if CDPATH=../lib cd proj; then make clean-all; fi",
-        "CDPATH=../lib sh -c 'cd proj && make clean-all'",
-        "env CDPATH=../lib sh -c 'cd proj && make clean-all'",
-        "CDPATH=$LIB cd proj && make clean-all",
-        "CDPATH=~/lib cd proj && make clean-all",
+        "CDPATH=../lib cd proj && sh clean-all",
+        "CDPATH=/nowhere:../lib pushd proj && sh clean-all",
+        "CDPATH=/nowhere CDPATH+=:../lib cd proj && sh clean-all",
+        "if CDPATH=../lib cd proj; then sh clean-all; fi",
+        "CDPATH=../lib sh -c 'cd proj && sh clean-all'",
+        "env CDPATH=../lib sh -c 'cd proj && sh clean-all'",
+        "CDPATH=$LIB cd proj && sh clean-all",
+        "CDPATH=~/lib cd proj && sh clean-all",
     ] {
         let v = check(&work, None, line);
         assert!(v.starts_with("deny\t"), "{line}: {v}");
     }
     for line in [
-        "CDPATH=../lib cd ./proj && make clean-all",
-        "CDPATH=$LIB cd ./proj && make clean-all",
-        "CDPATH=../lib true; cd proj && make clean-all",
-        "HOME=/nowhere; CDPATH=$LIB cd $HOME/proj && make clean-all",
+        "CDPATH=../lib cd ./proj && sh clean-all",
+        "CDPATH=$LIB cd ./proj && sh clean-all",
+        "CDPATH=../lib true; cd proj && sh clean-all",
+        "HOME=/nowhere; CDPATH=$LIB cd $HOME/proj && sh clean-all",
     ] {
         assert_eq!(check(&work, None, line), "allow", "{line}");
     }
@@ -111,16 +107,16 @@ fn reads_a_runner_where_a_cdpath_set_on_the_cd_enters() {
 fn takes_the_first_cdpath_entry_that_holds_the_path() {
     let work = work_and_lib("cdpath-first");
     for line in [
-        "CDPATH=:../lib cd proj && make clean-all",
-        "CDPATH=.:../lib cd proj && make clean-all",
-        "CDPATH=./:../lib pushd proj && make clean-all",
-        "CDPATH=/nowhere::../lib cd proj && make clean-all",
+        "CDPATH=:../lib cd proj && sh clean-all",
+        "CDPATH=.:../lib cd proj && sh clean-all",
+        "CDPATH=./:../lib pushd proj && sh clean-all",
+        "CDPATH=/nowhere::../lib cd proj && sh clean-all",
     ] {
         assert_eq!(check(&work, None, line), "allow", "{line}");
     }
     for line in [
-        "CDPATH=../lib:. cd proj && make clean-all",
-        "CDPATH=$LIB:. cd proj && make clean-all",
+        "CDPATH=../lib:. cd proj && sh clean-all",
+        "CDPATH=$LIB:. cd proj && sh clean-all",
     ] {
         let v = check(&work, None, line);
         assert!(v.starts_with("deny\t"), "{line}: {v}");
@@ -134,32 +130,32 @@ fn takes_the_first_cdpath_entry_that_holds_the_path() {
 fn reads_a_runner_where_a_cdpath_set_earlier_enters() {
     let work = work_and_lib("cdpath-set");
     for line in [
-        "export CDPATH=../lib; cd proj && make clean-all",
-        "CDPATH=../lib; cd proj; make clean-all",
-        "{ CDPATH=../lib; }; cd proj && make clean-all",
-        "declare -x CDPATH=../lib && cd proj && make clean-all",
-        "CDPATH=/nowhere; CDPATH+=:../lib; cd proj && make clean-all",
-        "true && CDPATH=../lib; cd proj && make clean-all",
-        "false || CDPATH=../lib; cd proj && make clean-all",
-        "export CDPATH=../lib; bash -c 'cd proj && make clean-all'",
-        "CDPATH=../lib :; cd proj && make clean-all",
-        "export CDPATH=\"$PWD/../lib\"; cd proj && make clean-all",
-        "read CDPATH < list; cd proj && make clean-all",
-        ": ${CDPATH:=../lib}; cd proj && make clean-all",
-        "for CDPATH in ../lib; do cd proj && make clean-all; done",
-        "HOME=..; CDPATH=$HOME/lib; HOME=/nowhere; cd proj && make clean-all",
-        "HOME=proj; CDPATH=../lib; cd $HOME && make clean-all",
+        "export CDPATH=../lib; cd proj && sh clean-all",
+        "CDPATH=../lib; cd proj; sh clean-all",
+        "{ CDPATH=../lib; }; cd proj && sh clean-all",
+        "declare -x CDPATH=../lib && cd proj && sh clean-all",
+        "CDPATH=/nowhere; CDPATH+=:../lib; cd proj && sh clean-all",
+        "true && CDPATH=../lib; cd proj && sh clean-all",
+        "false || CDPATH=../lib; cd proj && sh clean-all",
+        "export CDPATH=../lib; bash -c 'cd proj && sh clean-all'",
+        "CDPATH=../lib :; cd proj && sh clean-all",
+        "export CDPATH=\"$PWD/../lib\"; cd proj && sh clean-all",
+        "read CDPATH < list; cd proj && sh clean-all",
+        ": ${CDPATH:=../lib}; cd proj && sh clean-all",
+        "for CDPATH in ../lib; do cd proj && sh clean-all; done",
+        "HOME=..; CDPATH=$HOME/lib; HOME=/nowhere; cd proj && sh clean-all",
+        "HOME=proj; CDPATH=../lib; cd $HOME && sh clean-all",
     ] {
         let v = check(&work, None, line);
         assert!(v.starts_with("deny\t"), "{line}: {v}");
     }
     for line in [
-        "CDPATH=../lib | true; cd proj && make clean-all",
-        "(CDPATH=../lib); cd proj && make clean-all",
-        "CDPATH=../lib & cd proj && make clean-all",
-        "CDPATH=../lib; unset CDPATH; cd proj && make clean-all",
-        "export CDPATH=../lib; cd ./proj && make clean-all",
-        "echo $CDPATH ${CDPATH:-none}; cd proj && make clean-all",
+        "CDPATH=../lib | true; cd proj && sh clean-all",
+        "(CDPATH=../lib); cd proj && sh clean-all",
+        "CDPATH=../lib & cd proj && sh clean-all",
+        "CDPATH=../lib; unset CDPATH; cd proj && sh clean-all",
+        "export CDPATH=../lib; cd ./proj && sh clean-all",
+        "echo $CDPATH ${CDPATH:-none}; cd proj && sh clean-all",
     ] {
         assert_eq!(check(&work, None, line), "allow", "{line}");
     }

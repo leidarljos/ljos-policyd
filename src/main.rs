@@ -31,7 +31,7 @@ fn main() {
         "check" => {
             let v = verdict(&args);
             println!("{v}");
-            if !v.starts_with("allow") {
+            if v.starts_with("deny") {
                 process::exit(2);
             }
         }

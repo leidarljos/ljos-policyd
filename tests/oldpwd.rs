@@ -24,61 +24,56 @@ fn check(dir: &std::path::Path, oldpwd: Option<&std::path::Path>, line: &str) ->
 fn reads_a_runner_where_cd_dash_goes_back() {
     let base = std::env::temp_dir().join(format!("ljos-policyd-oldpwd-{}", std::process::id()));
     let [safe, other, old, proj] = ["safe", "other", "old", "proj"].map(|d| base.join(d));
-    let harmless = "test:\n\tcargo test\nclean-all:\n\techo clean\n";
-    let wipe = "test:\n\tcargo test\nclean-all:\n\trm -rf ~/\n";
     for (d, body) in [
-        (&safe, harmless),
-        (&other, harmless),
-        (&old, wipe),
-        (&proj, wipe),
+        (&safe, "echo clean\n"),
+        (&other, "echo clean\n"),
+        (&old, "rm -rf ~/\n"),
+        (&proj, "rm -rf ~/\n"),
     ] {
         std::fs::create_dir_all(d).unwrap();
-        std::fs::write(d.join("Makefile"), body).unwrap();
+        std::fs::write(d.join("clean-all"), body).unwrap();
     }
     let line = |l: &str| {
         l.replace("{proj}", &proj.to_string_lossy())
             .replace("{other}", &other.to_string_lossy())
     };
     for (oldpwd, l) in [
-        (Some(&old), "cd - && make clean-all"),
-        (Some(&old), "pushd - && make clean-all"),
-        (Some(&old), "cd -- - ; make clean-all"),
-        (Some(&old), "sh -c 'cd - && make clean-all'"),
-        (Some(&old), "(cd {other}) && cd - && make clean-all"),
+        (Some(&old), "cd - && sh clean-all"),
+        (Some(&old), "pushd - && sh clean-all"),
+        (Some(&old), "cd -- - ; sh clean-all"),
+        (Some(&old), "sh -c 'cd - && sh clean-all'"),
+        (Some(&old), "(cd {other}) && cd - && sh clean-all"),
         (
             Some(&other),
-            "cd {proj} && cd {other} && cd - && make clean-all",
+            "cd {proj} && cd {other} && cd - && sh clean-all",
         ),
         (
             Some(&other),
-            "cd {proj} && cd {other} && sh -c 'cd - && make clean-all'",
+            "cd {proj} && cd {other} && sh -c 'cd - && sh clean-all'",
         ),
         (
             Some(&other),
-            "pushd {proj} && popd && cd - && make clean-all",
+            "pushd {proj} && popd && cd - && sh clean-all",
         ),
-        (None, "cd - && make clean-all"),
-        (None, "cd - ; make clean-all"),
+        (None, "cd - && sh clean-all"),
+        (None, "cd - ; sh clean-all"),
     ] {
         let v = check(&safe, oldpwd.map(|p| p.as_path()), &line(l));
         assert!(v.starts_with("deny\t"), "OLDPWD={oldpwd:?} {l}: {v}");
     }
-    let v = check(&safe, None, "cd - && make clean-all");
-    assert!(
-        v.ends_with("make clean-all may run in an untracked directory"),
-        "{v}"
-    );
-    let v = check(&proj, Some(&other), "cd \"$X\" && cd - && make clean-all");
+    let v = check(&safe, None, "cd - && sh clean-all");
+    assert!(v.starts_with("deny\t"), "{v}");
+    let v = check(&proj, Some(&other), "cd \"$X\" && cd - && sh clean-all");
     assert!(v.starts_with("deny\t"), "{v}");
     for (oldpwd, l) in [
-        (Some(&other), "cd - && make clean-all"),
+        (Some(&other), "cd - && sh clean-all"),
         (Some(&old), "cd - && make test"),
-        (Some(&old), "cd {other} && cd - && make clean-all"),
+        (Some(&old), "cd {other} && cd - && sh clean-all"),
         (
             Some(&old),
-            "cd /nonexistent ; cd {other} && cd - && make clean-all",
+            "cd /nonexistent ; cd {other} && cd - && sh clean-all",
         ),
-        (None, "cd {proj} && cd - && make clean-all"),
+        (None, "cd {proj} && cd - && sh clean-all"),
         (None, "cargo test"),
     ] {
         let v = check(&safe, oldpwd.map(|p| p.as_path()), &line(l));
