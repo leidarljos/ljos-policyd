@@ -146,10 +146,7 @@ fn path_mention(text: &str, part: &str) -> bool {
         let before = rest[..i].chars().next_back();
         let after = rest[i + part.len()..].chars().next();
         let before_ok = before.is_none_or(|c| {
-            matches!(
-                c,
-                '/' | '~' | '\'' | '"' | ' ' | '(' | ',' | '=' | ':' | '\n'
-            )
+            matches!(c, '/' | '~' | '\'' | '"' | ' ' | '(' | ',' | '=' | ':' | '\n')
         });
         let after_ok = after.is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'));
         if before_ok && after_ok {

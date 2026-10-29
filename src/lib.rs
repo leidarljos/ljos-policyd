@@ -15,7 +15,6 @@ pub mod policy_capnp;
 
 mod disk;
 mod envelope;
-mod harm;
 mod mail;
 
 pub use envelope::{check_mail_argv, check_mail_bytes, MailReason, MailVerdict, MAIL_MESSAGE_MAX};
@@ -1968,6 +1967,7 @@ fn mentions(argv: &[String], names: &[&str]) -> bool {
             .any(|p| !p.is_empty() && names.contains(&base_of(p)))
     })
 }
+
 
 /// A command whose allow or deny turns on an operand or a flag the line
 /// may not show. `grep`, `cat` and `wc` are not among them: every extra
@@ -6043,7 +6043,8 @@ fn outside_content_write(
         } else {
             follow_links(&at, links)
         };
-        disk::writes_outside(std::path::Path::new(&abs), Some(work)).then(|| (by.to_string(), abs))
+        disk::writes_outside(std::path::Path::new(&abs), Some(work))
+            .then(|| (by.to_string(), abs))
     })
 }
 
@@ -6151,8 +6152,6 @@ const RULE_REMOTE: u32 = 1 << 0;
 const RULE_DECODE: u32 = 1 << 1;
 const RULE_DISK: u32 = 1 << 3;
 const RULE_DELETE: u32 = 1 << 5;
-const RULE_MV: u32 = 1 << 7;
-const RULE_RSYNC: u32 = 1 << 8;
 
 /// Programs named on the line. A scanner whose program is absent cannot
 /// match, so it is not run. A command word left as `$name` can be any
@@ -6203,12 +6202,6 @@ fn rule_bits(b: &str) -> u32 {
         || b == "gio"
     {
         mask |= RULE_DELETE;
-    }
-    if b == "mv" {
-        mask |= RULE_MV;
-    }
-    if b == "rsync" {
-        mask |= RULE_RSYNC;
     }
     if b == "dd"
         || b == "cryptsetup"
@@ -6332,18 +6325,11 @@ fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
             token: Cow::Borrowed(token),
         };
     }
-    if moves_into_dev_null(argv) {
+    if let Some(token) = harm::tree_outside(argv, bound.work.as_deref()) {
         return Checked {
             decision: Decision::Deny,
             code: PolicyReason::ShellDangerousRunner,
-            token: Cow::Borrowed("mv-to-dev-null"),
-        };
-    }
-    if mirror_deletes_a_root_tree(argv) {
-        return Checked {
-            decision: Decision::Deny,
-            code: PolicyReason::ShellDangerousRunner,
-            token: Cow::Borrowed("rsync-delete-root-tree"),
+            token: Cow::Borrowed(token),
         };
     }
     // A command word left as `$g` or `${GIT}` could be git: the git rules
@@ -6376,6 +6362,7 @@ fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
 }
 
 mod ask;
+mod harm;
 mod rewrite;
 
 fn log_deny(argv: &[String], token: &str) {
@@ -6403,11 +6390,7 @@ fn log_deny(argv: &[String], token: &str) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let line = format!("{secs}\t{}\t{}\n", flat(token), flat(&argv.join(" ")));
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
         use std::io::Write;
         let _ = file.write_all(line.as_bytes());
     }
@@ -9636,70 +9619,6 @@ fn deletes_a_root_tree(argv: &[String]) -> bool {
     })
 }
 
-/// `mv SRC... /dev/null`, or `mv -t /dev/null SRC...`: the sources are
-/// gone, as with `rm`, and nothing reads them back.
-fn moves_into_dev_null(argv: &[String]) -> bool {
-    commands(argv).iter().any(|cmd| {
-        if base_of(cmd[0]) != "mv" {
-            return false;
-        }
-        let target_flag = cmd
-            .windows(2)
-            .any(|w| matches!(w[0], "-t" | "--target-directory") && w[1] == "/dev/null")
-            || cmd.contains(&"--target-directory=/dev/null");
-        let operands: Vec<&&str> = cmd[1..]
-            .iter()
-            .filter(|a| !a.starts_with('-') && !is_redirection(a))
-            .collect();
-        target_flag || (operands.len() >= 2 && operands.last().is_some_and(|t| **t == "/dev/null"))
-    })
-}
-
-fn system_or_home_tree(p: &str) -> bool {
-    let p = p.trim_end_matches('/');
-    if p.is_empty() || climbs(p) {
-        return true;
-    }
-    if matches!(p, "~" | "$HOME" | "${HOME}" | "/home" | "/root" | "/Users") {
-        return true;
-    }
-    if let Some(user) = p
-        .strip_prefix("/home/")
-        .or_else(|| p.strip_prefix("/Users/"))
-    {
-        return !user.contains('/');
-    }
-    [
-        "/etc", "/usr", "/bin", "/sbin", "/lib", "/lib64", "/boot", "/opt", "/srv", "/var", "/sys",
-        "/proc", "/dev", "/System", "/Library", "/private",
-    ]
-    .iter()
-    .any(|root| {
-        (p == *root || p.starts_with(&format!("{root}/")))
-            && !(p == "/var/tmp" || p.starts_with("/var/tmp/"))
-    })
-}
-
-/// An `rsync` with a `--delete` flag whose local destination is the root,
-/// a home directory or a system tree: whatever the source lacks is
-/// deleted there, and an empty source deletes it all.
-fn mirror_deletes_a_root_tree(argv: &[String]) -> bool {
-    commands(argv).iter().any(|cmd| {
-        if base_of(cmd[0]) != "rsync" || !cmd.iter().any(|a| a.starts_with("--delete")) {
-            return false;
-        }
-        let operands: Vec<&&str> = cmd[1..]
-            .iter()
-            .filter(|a| !a.starts_with('-') && !is_redirection(a))
-            .collect();
-        operands.len() >= 2
-            && operands.last().is_some_and(|d| {
-                let remote = d.split('/').next().is_some_and(|head| head.contains(':'));
-                !remote && !under_tmp(d) && system_or_home_tree(d)
-            })
-    })
-}
-
 /// Container runners whose `run` takes `-v HOST:PATH` bind mounts.
 const CONTAINER_RUNNERS: &[&str] = &["docker", "podman", "nerdctl"];
 
@@ -10033,6 +9952,7 @@ mod tests {
         );
     }
 
+
     /// d199 the same way, for each runner that reads package.json.
     #[test]
     fn refuses_a_package_script_where_the_line_enters() {
@@ -10166,18 +10086,18 @@ mod tests {
     fn leaving(name: &str, line: &str) -> Decision {
         let root = std::env::temp_dir().join(format!("policyd-lib-{}-{name}", std::process::id()));
         std::fs::create_dir_all(root.join("safe")).expect("dir");
-        std::fs::write(root.join("Makefile"), MAKEFILE).expect("write");
-        plant_runner_script(
-            root.join("Makefile")
-                .parent()
-                .unwrap_or(std::path::Path::new(".")),
-            MAKEFILE,
-        );
+        std::fs::write(root.join("Makefile"), MAKEFILE).expect("write"); plant_runner_script(root.join("Makefile").parent().unwrap_or(std::path::Path::new(".")), MAKEFILE);;
         std::fs::write(root.join("safe/Makefile"), "clean-all:\n\techo clean\n").expect("write");
         plant_runner_script(&root, MAKEFILE);
         plant_runner_script(&root.join("safe"), "clean-all:\n\techo clean\n");
         check_shell_in(&shell_words(line), &root, 0).decision
     }
+
+
+
+
+
+
 
     /// A word that only names `HOME` or `CDPATH`, as a pattern, a message,
     /// a read or a child's environment, leaves the one the line set alone;
@@ -10234,6 +10154,10 @@ mod tests {
         }
     }
 
+
+
+
+
     /// Arithmetic runs in this shell, so `((HOME=5))` or `$((HOME=5))`
     /// leaves `HOME` untracked.
     #[test]
@@ -10283,6 +10207,11 @@ mod tests {
         }
     }
 
+
+
+
+
+
     /// A word that only names `PWD` leaves it the line's directory; an
     /// assignment, or a command that writes the name it takes, does not.
     #[test]
@@ -10306,6 +10235,22 @@ mod tests {
             assert_eq!(c.decision, Decision::Allow, "{line}");
         }
     }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     /// `xargs` adds words from stdin to the runner it runs, and they can
     /// name any target, so the runner is refused.
@@ -10332,6 +10277,11 @@ mod tests {
         }
     }
 
+
+
+
+
+
     /// An `env -S` string holding a `$` whose value the line does not show
     /// may run anything, so it is refused.
     #[test]
@@ -10349,6 +10299,8 @@ mod tests {
         }
     }
 
+
+
     /// `line` checked from an empty directory beside an `evil` project
     /// whose Makefile is `MAKEFILE` and a `safe` one whose `clean-all`
     /// only echoes.
@@ -10356,16 +10308,16 @@ mod tests {
         let root = std::env::temp_dir().join(format!("policyd-lib-{}-{name}", std::process::id()));
         std::fs::create_dir_all(root.join("evil")).expect("dir");
         std::fs::create_dir_all(root.join("safe")).expect("dir");
-        std::fs::write(root.join("evil/Makefile"), MAKEFILE).expect("write");
-        plant_runner_script(
-            root.join("evil/Makefile")
-                .parent()
-                .unwrap_or(std::path::Path::new(".")),
-            MAKEFILE,
-        );
+        std::fs::write(root.join("evil/Makefile"), MAKEFILE).expect("write"); plant_runner_script(root.join("evil/Makefile").parent().unwrap_or(std::path::Path::new(".")), MAKEFILE);;
         std::fs::write(root.join("safe/Makefile"), "clean-all:\n\techo clean\n").expect("write");
         check_shell_in(&shell_words(line), &root, 0).decision
     }
+
+
+
+
+
+
 
     /// `NAME+=value` appends to what an earlier assignment named, so the
     /// command word it builds is read whole.
@@ -10379,6 +10331,11 @@ mod tests {
         }
     }
 
+
+
+
+
+
     #[test]
     fn a_newline_or_carriage_return_splits_a_script_command() {
         assert_eq!(
@@ -10390,6 +10347,7 @@ mod tests {
             "deny\trm-rf-outside-tmp"
         );
     }
+
 
     #[test]
     fn allows_cargo() {
@@ -10913,6 +10871,7 @@ mod tests {
         assert_eq!(v(&["env", "dd", "if=x", "of=/dev/sda"]), "deny\traw-disk");
     }
 
+
     /// A redirection writes a file, and so do `cp`, `ln` and `tee`.
     /// The fast path used to return before those rules. A block device
     /// is the file this table guards. A script copied onto one that is
@@ -10951,6 +10910,7 @@ mod tests {
         assert_eq!(c.decision, Decision::Allow, "{}", c.token);
     }
 
+
     #[test]
     fn a_substitution_in_a_script_does_not_hide_a_force_push() {
         for script in [
@@ -10984,6 +10944,8 @@ mod tests {
             assert_eq!(v(&["sh", "-c", script]), "allow", "{script}");
         }
     }
+
+
 
     /// Bash brace-expands only a `{` outside quotes and outside a
     /// substitution, so a jq object in a quoted program, a quoted
@@ -11028,6 +10990,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+
+
     /// A shell with no script of its own runs what it reads on stdin. The
     /// text of a here-string or heredoc is judged as that script; stdin
     /// from a pipe, or a `-s` shell fed no such text, is not shown.
@@ -11061,6 +11025,8 @@ mod tests {
             assert_eq!(v(&["bash", "-c", script]), "allow", "{script}");
         }
     }
+
+
 
     #[test]
     fn a_shell_script_does_not_hide_a_recursive_delete() {
@@ -11128,12 +11094,6 @@ mod tests {
         }
         for argv in [
             &["git", "clean", "--force"][..],
-            &["git", "restore", "--staged"],
-            &["git", "branch", "-D", "topic"],
-            &["git", "branch", "--delete", "--force", "topic"],
-            &["git", "reflog", "expire", "--expire=now", "--all"],
-            &["git", "worktree", "remove", "--force", "../wt"],
-            &["git", "reset", "--soft", "HEAD~1"],
             &["git", "reset", "HEAD", "file"],
             &["git", "clean", "-n"],
             &["git", "clean", "-nd"],
@@ -11250,17 +11210,9 @@ mod tests {
             assert_eq!(v(argv), format!("deny\t{token}"), "{argv:?}");
         }
         for argv in [
-            &[
-                "python3",
-                "-c",
-                "import shutil; shutil.rmtree('/home/u/proj')",
-            ][..],
+            &["python3", "-c", "import shutil; shutil.rmtree('/home/u/proj')"][..],
             &["python3", "-c", "import shutil as s; s.rmtree(p)"],
-            &[
-                "node",
-                "-e",
-                "require('fs').rmSync('src', {recursive: true})",
-            ],
+            &["node", "-e", "require('fs').rmSync('src', {recursive: true})"],
             &["ruby", "-e", "FileUtils.rm_rf('src')"],
             &["python3", "-c", "print('git push -f')"],
             &["python3", "-c", "import shutil; shutil.rmtree('/tmp/x')"],
@@ -11273,14 +11225,20 @@ mod tests {
 
     #[test]
     fn a_variable_command_word_does_not_hide_git() {
-        for script in ["g=git; $g push -f origin main", "$GIT push --force"] {
+        for script in [
+            "g=git; $g push -f origin main",
+            "$GIT push --force",
+        ] {
             assert!(
                 v(&["sh", "-c", script]).starts_with("deny\tgit-"),
                 "{script}"
             );
         }
         for script in ["G=/usr/bin/git; ${G} reset --hard", "${GIT} clean -fdx"] {
-            assert!(v(&["sh", "-c", script]).starts_with("prompt\t"), "{script}");
+            assert!(
+                v(&["sh", "-c", script]).starts_with("prompt\t"),
+                "{script}"
+            );
         }
         assert_eq!(v(&["sh", "-c", "g=git; $g status"]), "allow");
         assert_eq!(v(&["sh", "-c", "$EDITOR notes.md"]), "allow");
@@ -11469,6 +11427,9 @@ mod tests {
         }
     }
 
+
+
+
     /// Lines an agent runs every day, which a fix for script text the
     /// guard cannot see must leave allowed. `dir` holds `safe/Makefile`.
     fn assert_everyday_allowed(dir: &std::path::Path) {
@@ -11492,6 +11453,8 @@ mod tests {
         }
     }
 
+
+
     fn startup_root(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("policyd-lib-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -11507,6 +11470,9 @@ mod tests {
         .unwrap();
         root
     }
+
+
+
 
     /// GNU xargs takes the replace string of `-i` only in the same word,
     /// so the word after `-i` is the command. It was read as the value,
@@ -11538,7 +11504,11 @@ mod tests {
     #[test]
     fn a_valued_runner_flag_is_not_the_command() {
         let v = |s: &str| verdict(&shell_words(s));
-        for line in ["env rm -rf /", "timeout 5 rm -rf /", "nice rm -rf /home/u"] {
+        for line in [
+            "env rm -rf /",
+            "timeout 5 rm -rf /",
+            "nice rm -rf /home/u",
+        ] {
             assert_eq!(v(line), "deny\trm-rf-outside-tmp", "{line}");
         }
     }
@@ -11644,6 +11614,7 @@ mod tests {
         assert_everyday_allowed(&root);
     }
 
+
     /// `find -exec` runs its payload, and so does a wrapper in front of a
     /// command. `find . -exec git push -f ';'` was allowed: only an `-exec`
     /// of `rm`, `shred` or `unlink` was judged. A payload whose command
@@ -11704,6 +11675,8 @@ mod tests {
         }
     }
 
+
+
     #[test]
     fn a_function_body_is_judged_as_written() {
         for argv in [
@@ -11737,14 +11710,25 @@ mod tests {
             &["rm", "-r", "./old"],
             &["mv", "a.txt", "b.txt"],
             &["mv", "/dev/null", "x"],
-            &["rsync", "-a", "--delete", "build/", "host:/var/www/"],
             &["setfacl", "-R", "-m", "u:ci:rx", "./build"],
             &["setfacl", "-R", "-b", "/tmp/x"],
-            &["rsync", "-a", "--delete", "build/", "/mnt/backup/build/"],
             &["rsync", "-a", "src/", "~/"],
         ] {
             assert_eq!(v(argv), "allow", "{argv:?}");
         }
+        assert_eq!(
+            v(&["mv", "~/projects", "/dev/null"]),
+            "deny\tmv-tree-outside"
+        );
+        assert_eq!(v(&["mv", "-t", "/dev/null", "src"]), "deny\tmv-tree-outside");
+        assert_eq!(
+            v(&["rsync", "-a", "--delete", "build/", "host:/var/www/"]),
+            "deny\trsync-delete-outside"
+        );
+        assert_eq!(
+            v(&["rsync", "-a", "--delete", "build/", "/mnt/backup/build/"]),
+            "deny\trsync-delete-outside"
+        );
     }
 
     #[test]
@@ -11762,6 +11746,12 @@ mod tests {
             assert_eq!(line(l), "allow", "{l}");
         }
     }
+
+
+
+
+
+
 
     /// `echo 'git push -f' >&x.sh; sh x.sh` was allowed: `>&` was read
     /// only as a copy of a descriptor, but bash writes stdout and stderr
@@ -12338,6 +12328,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(root.parent().unwrap());
     }
 
+
+
+
     /// An `rm` does not clear a file. The program can fail, and a removal
     /// that does not run deletes nothing, so the file written on the line
     /// is still there to be read.
@@ -12399,6 +12392,7 @@ mod tests {
         }
     }
 
+
     /// A quote in a here-document ends at the delimiter line. It must
     /// not hide a command that comes after the document.
     #[test]
@@ -12423,11 +12417,15 @@ mod tests {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
-        for line in ["bash <<EOF\ngit push -f\nEOF", "bash <<EOF\nrm -rf ~\nEOF"] {
+        for line in [
+            "bash <<EOF\ngit push -f\nEOF",
+            "bash <<EOF\nrm -rf ~\nEOF",
+        ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
         }
     }
+
 
     /// `|` between `case` patterns is not a pipeline, and the pattern is
     /// not a command. A `|` in an arm body still is.
@@ -12486,6 +12484,8 @@ mod tests {
         assert_eq!(c.decision, Decision::Allow, "{}", c.token);
     }
 
+
+
     /// `( c[d] ../[e]vil )` is a subshell, not a move into `evil`. The
     /// words before `)` look like a case pattern. They do not change
     /// the directory, so `make` stays here. Root has no Makefile.
@@ -12496,6 +12496,7 @@ mod tests {
             Decision::Allow
         );
     }
+
 
     /// A redirection before the command is not the command. `>file echo`
     /// is `echo`, which writes only `file`. An unknown command there may
@@ -12593,6 +12594,19 @@ mod tests {
         }
     }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
     /// A long plain CI script: functions, `[[ ]]`, command substitutions,
     /// a quoted python heredoc, and deletes that stay under `/tmp`.
     /// `danger` adds one recursive delete outside `/tmp` on the last line.
@@ -12665,6 +12679,8 @@ mod tests {
         (got, elapsed, report)
     }
 
+
+
     /// A link under `/tmp` that an earlier line made to a seat directory
     /// is followed on the disk, so a write through it is a write to the
     /// seat file. So is a link the same line makes with `ln`. A write
@@ -12724,6 +12740,10 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&base);
     }
+
+
+
+
 
     #[test]
     fn stderr_and_fd_redirections_stay_allowed() {

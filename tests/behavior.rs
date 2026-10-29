@@ -27,27 +27,20 @@ fn a_brief_that_mentions_a_path_is_allowed() {
         "#+TITLE: Fundamentals of HPC\n* Intro\n",
     )
     .unwrap();
-    let brief =
-        "The notes live in course-module-fundamentals-of-hpc/slides/fundamentals-of-hpc.org.\n";
+    let brief = "The notes live in course-module-fundamentals-of-hpc/slides/fundamentals-of-hpc.org.\n";
     std::fs::create_dir_all(root.join("notes")).unwrap();
     std::fs::write(root.join("notes/BRIEF.md"), brief).unwrap();
     let joined = format!("notes/BRIEF.md\n{brief}");
     let c = check_shell(&["bash".into(), "-c".into(), joined]);
     let write = format!("cat > notes/BRIEF.md << 'EOF'\n{brief}EOF");
     let w = check_shell(&["bash".into(), "-c".into(), write]);
-    assert_eq!(
-        c.decision,
-        ljos_policyd::policy_capnp::Decision::Allow,
+    assert_eq!(c.decision, ljos_policyd::policy_capnp::Decision::Allow, "{}", c.token);
+    assert!(
+        !c.token.contains("script-unread"),
         "{}",
         c.token
     );
-    assert!(!c.token.contains("script-unread"), "{}", c.token);
-    assert_eq!(
-        w.decision,
-        ljos_policyd::policy_capnp::Decision::Allow,
-        "{}",
-        w.token
-    );
+    assert_eq!(w.decision, ljos_policyd::policy_capnp::Decision::Allow, "{}", w.token);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -134,6 +127,25 @@ fn a_deny_is_appended_to_the_deny_log() {
 }
 
 #[test]
+fn local_git_lost_work_asks() {
+    for (line, token) in [
+        ("git reset --hard HEAD~3", "git-reset-hard"),
+        ("git clean -fd", "git-clean-force"),
+        ("git clean -fdx", "git-clean-force"),
+        ("git stash clear", "git-stash-clear"),
+        ("git stash drop", "git-stash-drop"),
+        ("git checkout -- .", "git-discard-worktree"),
+        ("git restore .", "git-discard-worktree"),
+    ] {
+        assert_eq!(verdict(&words(line)), format!("prompt\t{token}"), "{line}");
+    }
+    let script = verdict(&["sh".into(), "-c".into(), "git reset --hard".into()]);
+    assert_eq!(script, "prompt\tgit-reset-hard");
+    assert_eq!(verdict(&words("git reset --soft HEAD~1")), "allow");
+    assert!(verdict(&words("git push --force origin main")).starts_with("deny\t"));
+}
+
+#[test]
 fn find_and_feeders_do_not_hide_rm() {
     for (line, token) in [
         ("find . -delete", "find-delete"),
@@ -153,18 +165,21 @@ fn find_and_feeders_do_not_hide_rm() {
 }
 
 #[test]
-fn local_git_lost_work_asks() {
-    for line in [
-        "git reset --hard HEAD~1",
-        "git clean -fd",
-        "git stash clear",
-        "git stash drop",
-        "git checkout -- .",
-        "git restore .",
+fn mv_or_rsync_delete_outside_the_work_tree_is_refused() {
+    for (line, token) in [
+        ("mv ~/projects /dev/null", "mv-tree-outside"),
+        ("mv -t /dev/null src", "mv-tree-outside"),
+        ("rsync -a --delete empty/ ~/", "rsync-delete-outside"),
+        ("rsync -a --delete-after x/ /etc/", "rsync-delete-outside"),
     ] {
-        let v = verdict(&words(line));
-        assert!(v.starts_with("prompt\t"), "{line} {v}");
+        assert_eq!(verdict(&words(line)), format!("deny\t{token}"), "{line}");
     }
-    assert_eq!(verdict(&words("git reset --soft HEAD~1")), "allow");
-    assert!(verdict(&words("git push --force origin main")).starts_with("deny\t"));
+    let script = verdict(&[
+        "sh".into(),
+        "-c".into(),
+        "rsync -a --delete empty/ ~/".into(),
+    ]);
+    assert_eq!(script, "deny\trsync-delete-outside");
+    assert_eq!(verdict(&words("mv a.txt b.txt")), "allow");
+    assert_eq!(verdict(&words("rsync -a src/ dest/")), "allow");
 }

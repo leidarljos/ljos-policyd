@@ -1,8 +1,8 @@
 # policyd rule families
 
 Counted on `a7909f90` before this pare, and on the tree after it.
-Rust outside the generated Cap'n schema was 43249 lines before and 19214 after.
-Generated schema stayed 9409 lines. `src/lib.rs` is 12950 lines. The bash
+Rust outside the generated Cap'n schema was 43249 lines before and 19559 after.
+Generated schema stayed 9409 lines. `src/lib.rs` is 12979 lines. The bash
 lexer and the mail law are still the bulk of that. The rewrite lives in
 `src/rewrite.rs` and the credential ask in `src/ask.rs`.
 
@@ -31,7 +31,9 @@ lexer and the mail law are still the bulk of that. The rewrite lives in
 | Brace expansion of a command | removed | `{push,-f}` turned into the command. | DELETE |
 | Unshown script guesses | removed | A pipe into a shell, a process substitution. | DELETE |
 | Writes outside the tree | removed | An ordinary file write. | DELETE |
-| Local git lost work | removed | `reset --hard`, `clean -fd`, `stash clear`. | DELETE |
+| Local git lost work | `harm.rs` | `reset --hard`, `clean -fd`, `stash clear` or `drop`, `checkout -- .`, `restore .`. | ASK |
+| Find delete and a feeder running rm | `harm.rs` | `find -delete`, `find -exec rm`, `xargs` or `parallel` running `rm`. | KEEP as a deny |
+| mv or rsync delete of an outside tree | `harm.rs` | A whole tree outside the work tree, including `/dev/null`. | KEEP as a deny |
 
 The deny list that remains is sudo, `rm -rf` of a home or the root, a force
 push or a history rewrite of a published branch, a secret in argv, a write

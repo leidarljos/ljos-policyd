@@ -1,12 +1,15 @@
 //! Rewrite a python script invocation to `uv run` when the tree asks for uv.
 
-use super::{base_of, commands, is_assignment, shell_script, shell_words, unwrap_wrappers, SHELLS};
+use super::{
+    base_of, commands, is_assignment, shell_script, shell_words, unwrap_wrappers, SHELLS,
+};
 
 fn shell_quote(w: &str) -> String {
     if w.is_empty() {
         return "''".into();
     }
-    if w.chars()
+    if w
+        .chars()
         .all(|c| c.is_ascii_alphanumeric() || "._/-@=,:+".contains(c))
     {
         w.to_string()
@@ -149,3 +152,4 @@ fn pep723_header(path: &std::path::Path) -> bool {
     }
     false
 }
+
