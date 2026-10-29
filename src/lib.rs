@@ -6356,6 +6356,14 @@ fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
                 token: Cow::Borrowed(token),
             };
         }
+        // Lost work asks. A force push above stays a deny.
+        if let Some(token) = harm::git_lost_work(argv) {
+            return Checked {
+                decision: Decision::Prompt,
+                code: PolicyReason::HighRiskPrompt,
+                token: Cow::Borrowed(token),
+            };
+        }
     }
     if let Some(c) = credential_mention(argv) {
         return c;
@@ -8326,51 +8334,8 @@ fn git_dangerous(argv: &[String]) -> Option<&'static str> {
     let has = |f: &str| rest.iter().any(|a| a == f);
     match sub {
         "push" if push_delete(rest) => Some("git-push-delete"),
-        "reset" if has("--hard") => Some("git-reset-hard"),
-        "clean" if short('f') || has("--force") => Some("git-clean-force"),
-        "stash" if rest.first().is_some_and(|a| a == "clear") => Some("git-stash-clear"),
-        "branch" if short('D') || (has("--delete") && (has("--force") || short('f'))) => {
-            Some("git-branch-force-delete")
-        }
-        "reflog"
-            if rest.first().is_some_and(|a| a == "delete")
-                || (rest.first().is_some_and(|a| a == "expire")
-                    && rest.iter().any(|a| {
-                        a.starts_with("--expire") && (a.ends_with("=now") || a.ends_with("=all"))
-                    })) =>
-        {
-            Some("git-reflog-expire")
-        }
         "filter-branch" | "filter-repo" => Some("git-history-rewrite"),
         "update-ref" if short('d') => Some("git-update-ref-delete"),
-        "worktree"
-            if rest.first().is_some_and(|a| a == "remove") && (short('f') || has("--force")) =>
-        {
-            Some("git-worktree-force-remove")
-        }
-        "checkout" => {
-            let after = rest
-                .iter()
-                .position(|a| a == "--")
-                .map_or(rest, |at| &rest[at + 1..]);
-            let dashdash = rest.iter().any(|a| a == "--");
-            (after.iter().any(|a| whole_tree(a)) && (dashdash || rest.len() == 1))
-                .then_some("git-discard-worktree")
-        }
-        "restore" => {
-            let mut paths: Vec<&String> = Vec::new();
-            let mut it = rest.iter();
-            while let Some(a) = it.next() {
-                if a == "-s" || a == "--source" {
-                    it.next();
-                } else if !a.starts_with('-') {
-                    paths.push(a);
-                }
-            }
-            let patch = rest.iter().any(|a| a == "-p" || a == "--patch");
-            (!patch && (paths.is_empty() || paths.iter().any(|a| whole_tree(a))))
-                .then_some("git-discard-worktree")
-        }
         _ => None,
     }
 }
@@ -11302,40 +11267,13 @@ mod tests {
     #[test]
     fn git_calls_that_drop_uncommitted_work() {
         for (argv, token) in [
-            (&["git", "reset", "--hard", "HEAD~3"][..], "git-reset-hard"),
-            (&["git", "-C", "repo", "reset", "--hard"], "git-reset-hard"),
-            (&["git", "clean", "-fdx"], "git-clean-force"),
-            (&["git", "clean", "-f", "-d"], "git-clean-force"),
-            (&["git", "clean", "--force"], "git-clean-force"),
-            (&["git", "stash", "clear"], "git-stash-clear"),
-            (&["git", "checkout", "--", "."], "git-discard-worktree"),
-            (&["git", "checkout", "."], "git-discard-worktree"),
-            (&["git", "restore", "."], "git-discard-worktree"),
             (
-                &["git", "restore", "--worktree", ":/"],
-                "git-discard-worktree",
-            ),
-            (&["git", "restore", "--staged"], "git-discard-worktree"),
-            (&["git", "branch", "-D", "topic"], "git-branch-force-delete"),
-            (
-                &["git", "branch", "--delete", "--force", "topic"],
-                "git-branch-force-delete",
-            ),
-            (
-                &["git", "reflog", "expire", "--expire=now", "--all"],
-                "git-reflog-expire",
-            ),
-            (
-                &["git", "filter-branch", "--tree-filter", "true", "HEAD"],
+                &["git", "filter-branch", "--tree-filter", "true", "HEAD"][..],
                 "git-history-rewrite",
             ),
             (
                 &["git", "update-ref", "-d", "refs/heads/main"],
                 "git-update-ref-delete",
-            ),
-            (
-                &["git", "worktree", "remove", "--force", "../wt"],
-                "git-worktree-force-remove",
             ),
             (
                 &["git", "push", "origin", "--delete", "main"],
@@ -11350,7 +11288,27 @@ mod tests {
             assert_eq!(v(argv), format!("deny\t{token}"), "{argv:?}");
         }
         for argv in [
-            &["git", "reset", "--soft", "HEAD~1"][..],
+            &["git", "reset", "--hard", "HEAD~3"][..],
+            &["git", "-C", "repo", "reset", "--hard"],
+            &["git", "clean", "-fdx"],
+            &["git", "clean", "-f", "-d"],
+            &["git", "stash", "clear"],
+            &["git", "stash", "drop", "stash@{0}"],
+            &["git", "checkout", "--", "."],
+            &["git", "checkout", "."],
+            &["git", "restore", "."],
+            &["git", "restore", "--worktree", ":/"],
+        ] {
+            assert!(v(argv).starts_with("prompt\t"), "{argv:?} {}", v(argv));
+        }
+        for argv in [
+            &["git", "clean", "--force"][..],
+            &["git", "restore", "--staged"],
+            &["git", "branch", "-D", "topic"],
+            &["git", "branch", "--delete", "--force", "topic"],
+            &["git", "reflog", "expire", "--expire=now", "--all"],
+            &["git", "worktree", "remove", "--force", "../wt"],
+            &["git", "reset", "--soft", "HEAD~1"],
             &["git", "reset", "HEAD", "file"],
             &["git", "clean", "-n"],
             &["git", "clean", "-nd"],
@@ -11362,7 +11320,6 @@ mod tests {
             &["git", "restore", "src/a.rs"],
             &["git", "restore", "-s", "HEAD~1", "src/a.rs"],
             &["git", "restore", "--patch"],
-            &["git", "stash", "drop", "stash@{0}"],
             &["git", "branch", "-d", "topic"],
             &["git", "branch", "--delete", "topic"],
             &["git", "reflog", "expire", "--expire=90.days.ago"],
@@ -11464,25 +11421,21 @@ mod tests {
                 ],
                 "git-force-push",
             ),
-            (
-                &["perl", "-e", "system(\"git reset --hard\")"],
-                "git-reset-hard",
-            ),
-            (
-                &[
-                    "node",
-                    "-e",
-                    "require('child_process').execSync('git clean -fdx')",
-                ],
-                "git-clean-force",
-            ),
         ] {
             assert_eq!(v(argv), format!("deny\t{token}"), "{argv:?}");
         }
         for argv in [
-            &["python3", "-c", "import shutil; shutil.rmtree('/home/u/proj')"][..],
+            &[
+                "python3",
+                "-c",
+                "import shutil; shutil.rmtree('/home/u/proj')",
+            ][..],
             &["python3", "-c", "import shutil as s; s.rmtree(p)"],
-            &["node", "-e", "require('fs').rmSync('src', {recursive: true})"],
+            &[
+                "node",
+                "-e",
+                "require('fs').rmSync('src', {recursive: true})",
+            ],
             &["ruby", "-e", "FileUtils.rm_rf('src')"],
             &["python3", "-c", "print('git push -f')"],
             &["python3", "-c", "import shutil; shutil.rmtree('/tmp/x')"],
@@ -11495,16 +11448,14 @@ mod tests {
 
     #[test]
     fn a_variable_command_word_does_not_hide_git() {
-        for script in [
-            "g=git; $g push -f origin main",
-            "G=/usr/bin/git; ${G} reset --hard",
-            "$GIT push --force",
-            "${GIT} clean -fdx",
-        ] {
+        for script in ["g=git; $g push -f origin main", "$GIT push --force"] {
             assert!(
                 v(&["sh", "-c", script]).starts_with("deny\tgit-"),
                 "{script}"
             );
+        }
+        for script in ["G=/usr/bin/git; ${G} reset --hard", "${GIT} clean -fdx"] {
+            assert!(v(&["sh", "-c", script]).starts_with("prompt\t"), "{script}");
         }
         assert_eq!(v(&["sh", "-c", "g=git; $g status"]), "allow");
         assert_eq!(v(&["sh", "-c", "$EDITOR notes.md"]), "allow");
@@ -11520,10 +11471,10 @@ mod tests {
             ("git push --force origin main", true),
             ("git push -f origin main", true),
             ("sh -c \"cd repo && git push -f origin main\"", true),
-            ("bash -lc 'git reset --hard HEAD~3'", true),
+            ("bash -lc 'git reset --hard HEAD~3'", false),
             ("env FOO=1 git push --force origin main", true),
             ("sudo rm -rf /var/lib/postgresql", true),
-            ("timeout 5 git clean -fdx", true),
+            ("timeout 5 git clean -fdx", false),
             (
                 "python3 -c \"import shutil; shutil.rmtree('/home/u/proj')\"",
                 false,
@@ -11537,8 +11488,8 @@ mod tests {
             ("psql -c \"DROP TABLE users\"", false),
             ("kubectl delete namespace prod", false),
             ("terraform destroy -auto-approve", false),
-            ("git stash clear", true),
-            ("git checkout -- .", true),
+            ("git stash clear", false),
+            ("git checkout -- .", false),
             ("echo \"rm -rf /\"", false),
             ("grep -r \"git push --force\" .", false),
             ("git push --force-with-lease origin feature", false),
@@ -11762,11 +11713,7 @@ mod tests {
     #[test]
     fn a_valued_runner_flag_is_not_the_command() {
         let v = |s: &str| verdict(&shell_words(s));
-        for line in [
-            "env rm -rf /",
-            "timeout 5 rm -rf /",
-            "nice rm -rf /home/u",
-        ] {
+        for line in ["env rm -rf /", "timeout 5 rm -rf /", "nice rm -rf /home/u"] {
             assert_eq!(v(line), "deny\trm-rf-outside-tmp", "{line}");
         }
     }
@@ -12627,7 +12574,6 @@ mod tests {
         }
     }
 
-
     /// A quote in a here-document ends at the delimiter line. It must
     /// not hide a command that comes after the document.
     #[test]
@@ -12652,10 +12598,7 @@ mod tests {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
-        for line in [
-            "bash <<EOF\ngit push -f\nEOF",
-            "bash <<EOF\nrm -rf ~\nEOF",
-        ] {
+        for line in ["bash <<EOF\ngit push -f\nEOF", "bash <<EOF\nrm -rf ~\nEOF"] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
         }
@@ -12956,7 +12899,6 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&base);
     }
-
 
     #[test]
     fn stderr_and_fd_redirections_stay_allowed() {

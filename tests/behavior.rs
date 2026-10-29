@@ -151,3 +151,20 @@ fn find_and_feeders_do_not_hide_rm() {
     assert_eq!(verdict(&words("xargs echo hi")), "allow");
     assert_eq!(verdict(&words("parallel echo hi")), "allow");
 }
+
+#[test]
+fn local_git_lost_work_asks() {
+    for line in [
+        "git reset --hard HEAD~1",
+        "git clean -fd",
+        "git stash clear",
+        "git stash drop",
+        "git checkout -- .",
+        "git restore .",
+    ] {
+        let v = verdict(&words(line));
+        assert!(v.starts_with("prompt\t"), "{line} {v}");
+    }
+    assert_eq!(verdict(&words("git reset --soft HEAD~1")), "allow");
+    assert!(verdict(&words("git push --force origin main")).starts_with("deny\t"));
+}
