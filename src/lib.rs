@@ -5789,33 +5789,6 @@ fn command_guard_hit(
     None
 }
 
-/// A word that may write a file's content: a redirection, or a program
-/// [`content_writes`] names the targets of.
-fn content_writer(w: &str) -> bool {
-    w.contains('>')
-        || matches!(
-            base_of(w),
-            "tee"
-                | "cp"
-                | "mv"
-                | "install"
-                | "dd"
-                | "sed"
-                | "perl"
-                | "awk"
-                | "gawk"
-                | "mawk"
-                | "node"
-                | "ruby"
-                | "curl"
-                | "wget"
-                | "ln"
-                | "rsync"
-                | "truncate"
-                | "tar"
-        )
-}
-
 /// The files `cmd` writes the content of, each with what writes it: a
 /// redirection, `tee`, the target of `cp`, `mv`, `install` and `rsync`,
 /// `dd of=`, the files of `sed -i`, `perl -i` and `awk -i inplace`, a
@@ -6085,18 +6058,6 @@ fn seat_guard_denial(argv: &[String], cwd: Option<&std::path::Path>) -> Option<C
         return None;
     }
     written_path_denial(argv, cwd, None)
-}
-
-/// A write the line shows onto a path out of the tree `work`. The path
-/// is placed the way [`seat_guard_denial`] places a seat file, so each
-/// writer that reaches it is refused the same way.
-fn outside_write_denial(
-    argv: &[String],
-    cwd: Option<&std::path::Path>,
-    work: Option<&std::path::Path>,
-) -> Option<Checked> {
-    let work = work.filter(|_| argv.iter().any(|w| content_writer(w)))?;
-    written_path_denial(argv, cwd, Some(work))
 }
 
 /// The path walk: with no `work`, a write onto a seat file, and with
@@ -6397,9 +6358,6 @@ fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
         }
     }
     if let Some(c) = credential_mention(argv) {
-        return c;
-    }
-    if let Some(c) = outside_write_denial(argv, bound.root.as_deref(), bound.work.as_deref()) {
         return c;
     }
     Checked {
@@ -12337,17 +12295,10 @@ mod tests {
             &["rsync", "-a", "--delete", "build/", "host:/var/www/"],
             &["setfacl", "-R", "-m", "u:ci:rx", "./build"],
             &["setfacl", "-R", "-b", "/tmp/x"],
-        ] {
-            assert_eq!(v(argv), "allow", "{argv:?}");
-        }
-        for argv in [
-            &["rsync", "-a", "--delete", "build/", "/mnt/backup/build/"][..],
+            &["rsync", "-a", "--delete", "build/", "/mnt/backup/build/"],
             &["rsync", "-a", "src/", "~/"],
         ] {
-            assert!(
-                v(argv).starts_with("deny\twrites-outside: rsync with "),
-                "{argv:?}"
-            );
+            assert_eq!(v(argv), "allow", "{argv:?}");
         }
     }
 
@@ -13465,210 +13416,6 @@ mod tests {
         host_argv_table_at(&argv, 0, leaves_tree(&argv, 0), &at)
     }
 
-    /// An inline perl, node or ruby program that writes files is placed by
-    /// the paths it spells, as inline python is.
-    #[test]
-    fn an_inline_program_writes_where_its_paths_say() {
-        let t = "/srv/example/state/run.json";
-        for (by, line) in [
-            (
-                "perl",
-                format!("perl -e 'open(my $f, \">\", \"{t}\"); print $f 1'"),
-            ),
-            ("perl", format!("perl -e 'open(F, \">>{t}\"); print F 1'")),
-            ("perl", format!("perl -le 'rename \"in.json\", \"{t}\"'")),
-            (
-                "node",
-                format!("node -e 'require(\"fs\").writeFileSync(\"{t}\", \"{{}}\")'"),
-            ),
-            (
-                "node",
-                format!("node -e \"require('fs').appendFileSync('{t}', 'x')\""),
-            ),
-            ("ruby", format!("ruby -e 'File.write(\"{t}\", \"{{}}\")'")),
-            (
-                "ruby",
-                format!("ruby -rfileutils -e 'FileUtils.cp(\"in.json\", \"{t}\")'"),
-            ),
-        ] {
-            let c = in_tree(&line);
-            assert_eq!(c.decision, Decision::Deny, "{line}");
-            assert_eq!(c.code, PolicyReason::PathOutsideWorkspace, "{line}");
-            assert_eq!(c.token, format!("writes-outside: {by} with {t}"), "{line}");
-        }
-        for line in [
-            "perl -e 'open(my $f, \">\", \".state/run.json\"); print $f 1'",
-            "perl -ne 'print if /x/' in.json",
-            "perl -e 'print \"/srv/example/state/run.json\"'",
-            "perl -e 'open(F, \">/tmp/run.json\")'",
-            "node -e 'require(\"fs\").writeFileSync(\".state/run.json\", \"x\")'",
-            "node -e 'console.log(require(\"fs\").readFileSync(\"/etc/hostname\", \"utf8\"))'",
-            "node -e 'require(\"fs\").writeFileSync(\"out.txt\", \"/\")'",
-            "ruby -e 'File.write(\".state/run.json\", \"{}\")'",
-            "ruby -e 'puts File.read(\"/etc/hostname\")'",
-        ] {
-            let c = in_tree(line);
-            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
-        }
-    }
-
-    /// `curl --output-dir` and `wget -P` put what they save in a
-    /// directory, and that is where the write is placed.
-    #[test]
-    fn a_download_dir_places_what_it_saves() {
-        let t = "/srv/example/state/run.json";
-        for (by, line) in [
-            (
-                "curl",
-                "curl --output-dir /srv/example/state -o run.json https://example.org/a",
-            ),
-            (
-                "curl",
-                "curl --output-dir=/srv/example/state -O https://example.org/run.json",
-            ),
-            (
-                "curl",
-                "curl -O --output-dir /srv/example/state https://example.org/run.json",
-            ),
-            (
-                "wget",
-                "wget -P /srv/example/state https://example.org/run.json",
-            ),
-            (
-                "wget",
-                "wget -qP/srv/example/state https://example.org/run.json",
-            ),
-            (
-                "wget",
-                "wget --directory-prefix /srv/example/state https://example.org/run.json",
-            ),
-            (
-                "wget",
-                "wget --directory-prefix=/srv/example/state https://example.org/run.json",
-            ),
-        ] {
-            let c = in_tree(line);
-            assert_eq!(c.token, format!("writes-outside: {by} with {t}"), "{line}");
-        }
-        let c = in_tree("wget -P /srv/example/state https://example.org/");
-        assert_eq!(
-            c.token,
-            "writes-outside: wget with /srv/example/state/index.html"
-        );
-        for line in [
-            "curl --output-dir ~/.config/ljos -O https://example.org/hooks.json",
-            "wget -P ~/.config/ljos-policyd https://example.org/config.toml",
-        ] {
-            let c = in_tree(line);
-            assert!(
-                c.token.starts_with("seat-guard-path:"),
-                "{line}: {}",
-                c.token
-            );
-        }
-        for line in [
-            "curl --output-dir .state -O https://example.org/run.json",
-            "curl --output-dir /srv/example -o /tmp/run.json https://example.org/a",
-            "wget -P .state https://example.org/run.json",
-            "wget -P /tmp/dl https://example.org/run.json",
-            "wget -P /srv/example -O .state/run.json https://example.org/a",
-            "curl --output-dir /srv/example https://example.org/a",
-        ] {
-            let c = in_tree(line);
-            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
-        }
-    }
-
-    /// A perl `q{}` or `qq{}` and a ruby `%q()` or `%Q()` spell a path as
-    /// a quoted string does, with any delimiter.
-    #[test]
-    fn an_inline_program_quotes_paths_any_way() {
-        let t = "/srv/example/state/run.json";
-        for (by, line) in [
-            ("perl", format!("perl -e 'open(F, q{{>{t}}}); print F 1'")),
-            ("perl", format!("perl -e 'open(F, qq(>>{t})); print F 1'")),
-            ("perl", format!("perl -e 'open(my $f, q[>], q {{{t}}})'")),
-            ("perl", format!("perl -e 'open(F, qq|>{t}|)'")),
-            ("perl", format!("perl -e 'unlink qw(a.json {t})'")),
-            ("ruby", format!("ruby -e 'File.write(%q({t}), \"x\")'")),
-            ("ruby", format!("ruby -e 'File.write(%Q{{{t}}}, \"x\")'")),
-            ("ruby", format!("ruby -e 'File.open(%q[{t}], \"w\")'")),
-            (
-                "ruby",
-                format!("ruby -rfileutils -e 'FileUtils.rm(%w[a.json {t}])'"),
-            ),
-        ] {
-            let c = in_tree(&line);
-            assert_eq!(c.decision, Decision::Deny, "{line}");
-            assert_eq!(c.token, format!("writes-outside: {by} with {t}"), "{line}");
-        }
-        for line in [
-            "perl -e 'open(F, q{>.state/run.json}); print F 1'",
-            "perl -e 'open(F, qq(>/tmp/run.json))'",
-            "perl -e 'open(F, q{>a/{b}.json})'",
-            "perl -e 'print 1 if $a eq ($b); open(F, \">x\")'",
-            "perl -e 'my @s = seq(1); open(F, \">out.txt\")'",
-            "ruby -e 'File.write(%q(.state/run.json), \"x\")'",
-            "ruby -e 'File.write(%Q{/tmp/run.json}, \"x\")'",
-            "ruby -e 'x = 5 % q; File.write(\"out.txt\", x)'",
-        ] {
-            let c = in_tree(line);
-            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
-        }
-    }
-
-    /// A download, a link, a sync, a truncate or a tar extract is a write
-    /// where its target lands, judged as a redirect to that path is.
-    #[test]
-    fn the_file_tools_write_where_they_say() {
-        let t = "/srv/example/state/run.json";
-        for (by, line) in [
-            ("curl", format!("curl -o {t} https://example.org/a")),
-            (
-                "curl",
-                format!("curl -sS --output {t} https://example.org/a"),
-            ),
-            ("curl", format!("curl --output={t} https://example.org/a")),
-            ("wget", format!("wget -O {t} https://example.org/a")),
-            ("wget", format!("wget -qO {t} https://example.org/a")),
-            ("ln", format!("ln -sf in.json {t}")),
-            ("rsync", format!("rsync -a in.json {t}")),
-            ("truncate", format!("truncate -s 0 {t}")),
-            ("tar", format!("tar -czf {t} .state")),
-        ] {
-            let c = in_tree(&line);
-            assert_eq!(c.decision, Decision::Deny, "{line}");
-            assert_eq!(c.code, PolicyReason::PathOutsideWorkspace, "{line}");
-            assert_eq!(c.token, format!("writes-outside: {by} with {t}"), "{line}");
-        }
-        for line in [
-            "tar -C /srv/example/state -xf a.tar",
-            "tar -xf a.tar -C /srv/example/state",
-            "tar --directory=/srv/example/state -xf a.tar",
-        ] {
-            let c = in_tree(line);
-            assert_eq!(c.decision, Decision::Deny, "{line}");
-            assert_eq!(
-                c.token, "writes-outside: tar with /srv/example/state",
-                "{line}"
-            );
-        }
-        for line in [
-            "curl -o .state/run.json https://example.org/a",
-            "curl -O https://example.org/a.json",
-            "curl -sS https://example.org/a",
-            "wget -O - https://example.org/a",
-            "wget -O /tmp/run.json https://example.org/a",
-            "ln -s /srv/example/in.json .state/in.json",
-            "rsync -a /srv/example/in.json .state/",
-            "truncate -s 0 .state/run.json",
-            "tar -C .state -xf /srv/example/a.tar",
-            "tar -xf /srv/example/a.tar",
-            "tar -tf /srv/example/a.tar",
-        ] {
-            assert_eq!(in_tree(line).decision, Decision::Allow, "{line}");
-        }
-    }
 
     #[test]
     fn stderr_and_fd_redirections_stay_allowed() {
