@@ -60,23 +60,48 @@ fn a_read_only_rg_xargs_search_is_allowed() {
 
 #[test]
 fn python_scripts_rewrite_to_uv_run() {
+    let dir = std::env::temp_dir().join(format!(
+        "policyd-uv-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("x.py"), "print(1)\n").unwrap();
+    let here = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&dir).unwrap();
+    assert_eq!(verdict(&words("python x.py")), "allow", "no project file");
+    assert_eq!(verdict(&words("python3 x.py")), "allow");
+    std::fs::write(dir.join("pyproject.toml"), "[project]\nname='x'\n").unwrap();
     assert_eq!(
         verdict(&words("python x.py")),
-        "allow\trewrite\tuv run x.py"
-    );
-    assert_eq!(
-        verdict(&words("python3 x.py")),
         "allow\trewrite\tuv run x.py"
     );
     assert_eq!(
         verdict(&["python3".into(), "x.py".into(), "a".into()]),
         "allow\trewrite\tuv run x.py a"
     );
-    let inline = verdict(&[
-        "python3".into(),
-        "-c".into(),
-        "print(1)".into(),
-    ]);
+    let _ = std::fs::remove_file(dir.join("pyproject.toml"));
+    std::fs::write(dir.join("uv.lock"), "version = 1\n").unwrap();
+    assert_eq!(
+        verdict(&words("python3 x.py")),
+        "allow\trewrite\tuv run x.py"
+    );
+    let _ = std::fs::remove_file(dir.join("uv.lock"));
+    std::fs::write(
+        dir.join("tool.py"),
+        "# /// script\n# requires-python = \">=3.11\"\n# ///\nprint(1)\n",
+    )
+    .unwrap();
+    assert_eq!(
+        verdict(&words("python tool.py")),
+        "allow\trewrite\tuv run tool.py"
+    );
+    std::env::set_current_dir(here).unwrap();
+    let inline = verdict(&["python3".into(), "-c".into(), "print(1)".into()]);
     assert_eq!(inline, "allow");
     let ask = verdict(&[
         "python3".into(),
@@ -84,6 +109,7 @@ fn python_scripts_rewrite_to_uv_run() {
         "open('/home/u/.ssh/id_rsa')".into(),
     ]);
     assert_eq!(ask, "prompt\tcredential-mention");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

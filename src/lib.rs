@@ -9006,13 +9006,71 @@ fn rewrite_words(argv: &[String]) -> Option<Vec<String>> {
 }
 
 /// The line a hook should run instead, when this command is a python
-/// invocation.
+/// invocation and the tree asks for uv.
 fn rewrite_command(argv: &[String]) -> Option<String> {
     let words = rewrite_words(argv)?;
     if words.as_slice() == argv {
         return None;
     }
+    let script = rewritten_script(&words)?;
+    if !uv_rewrite_fits(script) {
+        return None;
+    }
     Some(join_line(&words))
+}
+
+fn rewritten_script(words: &[String]) -> Option<&str> {
+    let i = words.iter().position(|w| w == "uv")?;
+    if words.get(i + 1).map(String::as_str) != Some("run") {
+        return None;
+    }
+    words.get(i + 2).map(String::as_str)
+}
+
+/// Rewrite only when this directory or a parent has `pyproject.toml` or
+/// `uv.lock`, or the script itself carries a PEP 723 header.
+fn uv_rewrite_fits(script: &str) -> bool {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    if project_uses_uv(&cwd) {
+        return true;
+    }
+    let path = std::path::Path::new(script);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    pep723_header(&path)
+}
+
+fn project_uses_uv(start: &std::path::Path) -> bool {
+    let mut dir = Some(start);
+    while let Some(d) = dir {
+        if d.join("pyproject.toml").is_file() || d.join("uv.lock").is_file() {
+            return true;
+        }
+        dir = d.parent();
+    }
+    false
+}
+
+fn pep723_header(path: &std::path::Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if line.trim() != "# /// script" {
+            continue;
+        }
+        for line in lines.by_ref().take(64) {
+            if line.trim() == "# ///" {
+                return true;
+            }
+        }
+        return false;
+    }
+    false
 }
 
 fn log_deny(argv: &[String], token: &str) {
