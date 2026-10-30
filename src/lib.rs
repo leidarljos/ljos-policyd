@@ -79,6 +79,8 @@ pub struct Checked {
 pub fn check_shell(argv: &[String]) -> Checked {
     let cwd = std::env::current_dir().unwrap_or_default();
     SPELLED.with(|s| s.borrow_mut().clear());
+    BRACED.with(|s| s.borrow_mut().clear());
+    LITERAL.with(|s| *s.borrow_mut() = argv.iter().cloned().collect());
     check_shell_in(argv, &cwd, 0)
 }
 
@@ -92,8 +94,34 @@ thread_local! {
         std::cell::RefCell::default();
 }
 
+thread_local! {
+    /// Each word [`shell_words`] made during a check with a `{` no quote
+    /// or backslash kept as itself. Bash may brace-expand such a word.
+    static BRACED: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::default();
+    /// The words of the argv a check was handed. A program gets each one
+    /// as it stands, so a brace in one is no expansion, unless a shell on
+    /// the line also lexed the same text with a bare `{`.
+    static LITERAL: std::cell::RefCell<std::collections::HashSet<String>> =
+        std::cell::RefCell::default();
+}
+
+/// Whether bash may brace-expand `w`: it is not a word of the argv the
+/// check was handed, or a shell on the line also made it with a bare `{`.
+fn may_brace_expand(w: &str) -> bool {
+    !LITERAL.with(|l| l.borrow().contains(w)) || BRACED.with(|b| b.borrow().contains(w))
+}
+
 /// The characters a shell may expand in an unquoted word.
 const EXPANDS: [char; 7] = ['$', '`', '*', '?', '[', '~', '\n'];
+
+fn braced_word(w: &str, braced: bool) {
+    if braced {
+        BRACED.with(|b| {
+            b.borrow_mut().insert(w.to_string());
+        });
+    }
+}
 
 fn spelled(w: &str, quoted: bool) {
     if w.contains(EXPANDS) {
@@ -2189,6 +2217,7 @@ fn walk(
     // command still knows which file `. ./$x` names.
     let mut cmd_at = Vec::new();
     let ended = ended_commands(&argv);
+    let line_names = line_assigned(&argv, shell.vars.home.as_deref());
     let (heredocs, data) = heredoc_bodies(&ended);
     let pattern_skip = case_pattern_skips(&argv);
     for (ci, (cmd, end)) in ended.iter().enumerate() {
@@ -2670,7 +2699,13 @@ fn walk(
         }
         if b == "cd" || b == "pushd" {
             let pushd = b == "pushd";
-            let args = operands(&words[1..]);
+            // `D=~/proj; cd $D`: a name the line gives one plain value is
+            // that directory.
+            let shown_args: Vec<String> = operands(&words[1..])
+                .into_iter()
+                .map(|a| assigned_dir(a, &line_names, &argv).unwrap_or_else(|| a.to_string()))
+                .collect();
+            let args: Vec<&str> = shown_args.iter().map(String::as_str).collect();
             // `pushd -n` changes the stack and leaves the directory.
             let keep = pushd && args.contains(&"-n");
             let args: Vec<&str> = args.into_iter().filter(|a| !keep || *a != "-n").collect();
@@ -6470,6 +6505,10 @@ fn expanded_command(cmd: &[&str]) -> Result<Option<Vec<String>>, ()> {
     let mut out = Vec::new();
     let mut changed = false;
     for w in cmd {
+        if !may_brace_expand(w) {
+            out.push((*w).to_string());
+            continue;
+        }
         let parts = expand_word(w)?;
         if parts.len() != 1 || parts.first().map(String::as_str) != Some(*w) {
             changed = true;
@@ -8667,6 +8706,54 @@ fn trap_action<S: AsRef<str>>(run: &[S]) -> Option<&str> {
         .find(|a| !(a.starts_with('-') && a.len() > 1))
 }
 
+/// The plain values the bare assignments on `argv` give names, as
+/// [`with_names`] reads them. A value that expands, globs or splits is
+/// left out. A leading `~` the line does not quote is `home`, as bash
+/// expands it when it assigns; a quoted one is no directory this reads.
+fn line_assigned(argv: &[String], home: Option<&str>) -> Vec<(String, String)> {
+    let mut names = Vec::new();
+    for cmd in commands(argv) {
+        if !cmd.iter().all(|w| is_assignment(w)) {
+            continue;
+        }
+        for w in &cmd {
+            let Some((k, raw)) = w.split_once('=') else {
+                continue;
+            };
+            if !is_name(k) || raw.is_empty() {
+                continue;
+            }
+            let value = match raw.strip_prefix('~') {
+                Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+                    let unquoted = SPELLED.with(|m| m.borrow().get(*w) == Some(&false));
+                    match home.filter(|_| unquoted) {
+                        Some(h) => format!("{h}{rest}"),
+                        None => continue,
+                    }
+                }
+                Some(_) => continue,
+                None => raw.to_string(),
+            };
+            if value.contains(['$', '`', '*', '?', '[', '{', '~', '"', '\'', '\\'])
+                || value.contains(char::is_whitespace)
+            {
+                continue;
+            }
+            names.push((k.to_string(), value));
+        }
+    }
+    names
+}
+
+/// The directory a `cd` operand that is only `$NAME`, `${NAME}` or
+/// `"$NAME"` names, when [`with_names`] knows the one value the line gave
+/// that name.
+fn assigned_dir(arg: &str, names: &[(String, String)], argv: &[String]) -> Option<String> {
+    let name = bare_var(arg)?;
+    let value = with_names(&format!("${{{name}}}"), names, argv);
+    (!value.contains('$')).then_some(value)
+}
+
 /// `w` with each `$NAME` and `${NAME}` whose value the line shows read as
 /// that value: `names` holds one value for it, and no other command on
 /// `argv` may set it. Any other is left as written.
@@ -10036,6 +10123,8 @@ fn shell_words(script: &str) -> Vec<String> {
     let mut dq_dollar = false;
     // The word has a character the shell may expand where it stands.
     let mut bare = false;
+    // The word has a `{` bash may brace-expand.
+    let mut braced = false;
     let mut i = 0;
     // Here-documents opened on the command just finished, read from the
     // next line. A body is not the script that follows it: a quote in
@@ -10121,6 +10210,7 @@ fn shell_words(script: &str) -> Vec<String> {
             c if !single && !double && (c.is_whitespace() || matches!(c, ';' | '|' | '&')) => {
                 if word {
                     spelled(&cur, !std::mem::take(&mut bare));
+                    braced_word(&cur, std::mem::take(&mut braced));
                     finish_word(
                         std::mem::take(&mut cur),
                         &mut out,
@@ -10150,6 +10240,9 @@ fn shell_words(script: &str) -> Vec<String> {
                 if !single && (matches!(c, '$' | '`') || (!double && EXPANDS.contains(&c))) {
                     bare = true;
                 }
+                if !single && !double && c == '{' {
+                    braced = true;
+                }
                 cur.push(c);
                 word = true;
             }
@@ -10157,6 +10250,7 @@ fn shell_words(script: &str) -> Vec<String> {
     }
     if word {
         spelled(&cur, !bare);
+        braced_word(&cur, braced);
         finish_word(cur, &mut out, &mut pending, &mut want_delim);
     }
     take_heredoc_bodies(&chars, &mut i, &mut out, &mut pending);
@@ -11823,25 +11917,40 @@ fn sed_in_place(args: &[&str]) -> bool {
     })
 }
 
-/// The operands of a `sed`, past the script and option values. With no
-/// `-e` or `-f` the first is the script, which is kept: a path it might
-/// name is still no file the line runs.
+/// The files a `sed` edits: its operands, past option values. With no
+/// `-e`, `-f`, `--expression` or `--file` the first operand is the
+/// script, which sed reads as commands and never writes, so it is left
+/// out: a `?` or `*` in `s/x?/y/` is not a path the line may name.
 fn sed_files(args: &[&str]) -> Vec<String> {
     let mut out = Vec::new();
     let mut words = args.iter().copied();
+    let mut scripted = false;
     while let Some(a) = words.next() {
-        if matches!(a, "--expression" | "--file" | "--line-length") {
+        if matches!(a, "--expression" | "--file") {
+            scripted = true;
             words.next();
+        } else if a == "--line-length" {
+            words.next();
+        } else if a.starts_with("--expression=") || a.starts_with("--file=") {
+            scripted = true;
+        } else if a == "--" {
+            out.extend(words.by_ref().map(str::to_string));
         } else if let Some(f) = a
             .strip_prefix('-')
             .filter(|f| !f.starts_with('-') && !f.is_empty())
         {
-            if f.find(['e', 'f', 'l']).is_some_and(|k| k + 1 == f.len()) {
-                words.next();
+            if let Some(k) = f.find(['e', 'f', 'l']) {
+                scripted |= f[k..].starts_with(['e', 'f']);
+                if k + 1 == f.len() {
+                    words.next();
+                }
             }
         } else if !a.starts_with("--") {
             out.push(a.to_string());
         }
+    }
+    if !scripted && !out.is_empty() {
+        out.remove(0);
     }
     out
 }
@@ -12338,7 +12447,13 @@ fn git_dangerous(argv: &[String]) -> Option<&'static str> {
                 }
             }
             let patch = rest.iter().any(|a| a == "-p" || a == "--patch");
-            (!patch && (paths.is_empty() || paths.iter().any(|a| whole_tree(a))))
+            // `--staged` alone resets the index and leaves every file in
+            // the tree as it is: it unstages and discards nothing. With
+            // `--worktree` as well it writes the files too.
+            let unstage_only = (has("--staged") || short('S'))
+                && !(has("--worktree") || short('W'))
+                && !paths.is_empty();
+            (!patch && !unstage_only && (paths.is_empty() || paths.iter().any(|a| whole_tree(a))))
                 .then_some("git-discard-worktree")
         }
         _ => None,
@@ -17276,6 +17391,31 @@ hash -r 2> /dev/null
         assert_everyday_allowed(&root);
     }
 
+    /// A program gets each word of its argv as it stands: no shell
+    /// expands the braces of a dict in `python3 -c PROGRAM`, or of the
+    /// line `bash -c LINE` is handed. Braces a shell on the line lexes
+    /// bare still expand, however wide.
+    #[test]
+    fn braces_in_a_literal_argument_are_not_an_expansion() {
+        let wide = "k = {1,2,3,4,5,6}\nv = {7,8}\nw = {1,2,3}\nprint({a: b for a, b in [(1, 2)]})";
+        let squeezed = "{1,2,3,4,5,6}{7,8}{1,2,3}";
+        for argv in [
+            &["python3", "-c", wide][..],
+            &["python3", "-I", "-c", squeezed],
+            &["printf", "%s\\n", squeezed],
+            &["git", "{push,-f}"],
+        ] {
+            assert_eq!(v(argv), "allow", "{argv:?}");
+        }
+        for script in [
+            "echo {1,2,3,4,5,6}{7,8}{1,2,3}",
+            "git {push,-f}",
+            "python3 -c 'print(1)'; git {push,-f}",
+        ] {
+            assert!(v(&["bash", "-c", script]).starts_with("deny"), "{script}");
+        }
+    }
+
     /// A `case` arm runs the command after its pattern.
     #[test]
     fn a_case_arm_does_not_hide_a_force_push() {
@@ -17573,6 +17713,30 @@ hash -r 2> /dev/null
             &["git", "push", "--dry-run", "origin", "main"],
         ] {
             assert_eq!(v(argv), "allow", "{argv:?}");
+        }
+    }
+
+    /// `git restore --staged` over the whole tree only unstages: the files
+    /// in the tree stay as they are. With `--worktree` it writes them back
+    /// from the index, and that discards the uncommitted changes.
+    #[test]
+    fn unstaging_the_whole_tree_discards_nothing() {
+        for argv in [
+            &["git", "restore", "--staged", "."][..],
+            &["git", "restore", "-S", "."],
+            &["git", "-C", "repo", "restore", "--staged", ":/"],
+            &["bash", "-c", "git restore --staged . && git add docs/a.org"],
+        ] {
+            assert_eq!(v(argv), "allow", "{argv:?}");
+        }
+        for argv in [
+            &["git", "restore", "."][..],
+            &["git", "restore", "--staged", "--worktree", "."],
+            &["git", "restore", "-SW", "."],
+            &["git", "restore", "-W", "-S", ":/"],
+            &["bash", "-c", "git restore --staged --worktree ."],
+        ] {
+            assert_eq!(v(argv), "deny\tgit-discard-worktree", "{argv:?}");
         }
     }
 
@@ -19073,6 +19237,82 @@ hash -r 2> /dev/null
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
         assert_everyday_allowed(&root);
+    }
+
+    /// `D=dir; cd $D && ./tool` runs `./tool` in the directory the line
+    /// gave `D`, so a compiled program there is no script to read, and a
+    /// script there is read and judged. A name given two values, or set by
+    /// another command, is still a directory the walk does not know.
+    #[test]
+    fn a_cd_to_a_name_the_line_assigns_is_followed() {
+        let root = startup_root("cdname");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::copy("/bin/true", root.join("bin/tool")).unwrap();
+        let bin = root.join("bin").display().to_string();
+        let evil = root.join("evil").display().to_string();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            format!("D={bin}; cd $D && ./tool package latest --json > out.json"),
+            format!("D={bin}; cd \"$D\" && ./tool --version"),
+            format!("D={bin}; cd ${{D}} && args=$(ls) && ./tool $args"),
+        ] {
+            let c = at(&line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        let c = at(&format!("D={evil}; cd $D && ./force.sh"));
+        assert_eq!(c.decision, Decision::Deny, "{}", c.token);
+        assert!(c.token.contains("git-force-push"), "{}", c.token);
+        for line in [
+            format!("D={bin}; D={evil}; cd $D && ./tool"),
+            format!("D={bin}; read D; cd $D && ./tool"),
+            "cd $UNSET_DIR && ./tool".to_string(),
+        ] {
+            let c = at(&line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(c.token.starts_with("script-unread"), "{line}: {}", c.token);
+        }
+        let words = shell_words("D=~/p; E=\"~/q\"; F=/x/$Y; cd $D");
+        assert_eq!(
+            line_assigned(&words, Some("/h")),
+            [("D".to_string(), "/h/p".to_string())]
+        );
+    }
+
+    /// The script of a `sed -i` with no `-e` is sed's commands, not a file
+    /// it writes. A `?`, `*` or `&` in it does not make it a path that may
+    /// name the program the line runs next. The file it edits still does.
+    #[test]
+    fn a_sed_script_is_not_a_file_it_writes() {
+        let root = startup_root("sedscript");
+        std::fs::create_dir_all(root.join("scripts")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("scripts/gen.py"), "print(1)\n").unwrap();
+        std::fs::write(root.join("src/mcp.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "sed -i 's/f(&x).map_err(e)?;/f(\\&x).map_err(|e| e.to_string())?;/' src/mcp.rs && python3 -I scripts/gen.py",
+            "sed -i 's/a*b?/c/' src/mcp.rs; sh ok.sh",
+            "sed -i -- 's/a?/b/' src/mcp.rs; sh ok.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for line in [
+            "sed -i 's/a?/b/' scripts/gen.py && python3 -I scripts/gen.py",
+            "sed -i 's/a?/b/' ok.sh; sh ok.sh",
+            "sed -i -e 's/a/b/' ok.sh; sh ok.sh",
+            "sed -i --expression='s/a/b/' ok.sh; sh ok.sh",
+            "sed -i 's/a/b/' src/mcp.rs ok.sh; sh ok.sh",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert!(
+                c.token.starts_with("script-written-on-line: "),
+                "{line}: {}",
+                c.token
+            );
+        }
     }
 
     /// `bash evil.sh` was allowed whatever evil.sh held: only a `-c`
