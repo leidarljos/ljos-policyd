@@ -54,6 +54,9 @@ fn a_brief_that_mentions_a_path_is_allowed() {
 #[test]
 fn a_read_only_rg_xargs_search_is_allowed() {
     for line in [
+        "rg -l foo src | xargs rg -n bar",
+        "rg --files | xargs wc -l",
+        "fd -e rs | xargs grep -n x",
         "rg -n pattern src | xargs rg -n pattern",
         "rg -l pattern | xargs grep pattern",
         "rg -n pattern | xargs -I {} rg pattern {}",
@@ -62,6 +65,51 @@ fn a_read_only_rg_xargs_search_is_allowed() {
         let v = verdict(&["bash".into(), "-c".into(), line.into()]);
         assert!(v.starts_with("allow"), "{line}: {v}");
         assert!(!v.contains("xargs-script-unshown"), "{line}: {v}");
+    }
+}
+
+#[test]
+fn xargs_still_refuses_destructive_tools() {
+    for line in [
+        "printf x | xargs rm -rf",
+        "printf x | xargs mv src",
+        "printf x | xargs chmod 777",
+        "printf main | xargs git push origin",
+        "printf /tmp/out | xargs -I{} sh -c 'echo hi > {}'",
+    ] {
+        let v = verdict(&["bash".into(), "-c".into(), line.into()]);
+        assert!(v.starts_with("deny\t"), "{line}: {v}");
+    }
+}
+
+#[test]
+fn prompt_lines_always_include_a_token() {
+    let corpus: Vec<Vec<String>> = vec![
+        vec![
+            "python3".into(),
+            "-c".into(),
+            "open('/home/u/.ssh/id_rsa')".into(),
+        ],
+        vec![
+            "python3".into(),
+            "-c".into(),
+            "open('/home/u/.aws/credentials')".into(),
+        ],
+        vec!["python3".into(), "-c".into(), "print(1)".into()],
+        vec![
+            "bash".into(),
+            "-c".into(),
+            "rg --files | xargs wc -l".into(),
+        ],
+        vec!["bash".into(), "-c".into(), "sudo id".into()],
+    ];
+    for argv in corpus {
+        let v = verdict(&argv);
+        assert!(!v.trim().is_empty(), "{argv:?}");
+        if v.starts_with("prompt\t") {
+            let token = v.split('\t').nth(1).unwrap_or_default().trim();
+            assert!(!token.is_empty(), "{argv:?} -> {v}");
+        }
     }
 }
 
