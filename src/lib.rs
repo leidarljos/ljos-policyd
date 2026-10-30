@@ -2303,14 +2303,17 @@ fn walk(
             let fn_depth = shell.fn_depth;
             let left = shell.left_tree;
             let files = shell.files.clone();
-            for w in &cmd {
+            // A subshell is a whole word where a command stands: past
+            // assignments and keywords, and nowhere after the command word.
+            let head = (0..cmd.len()).find(|&k| !is_assignment(cmd[k]) && !keyword_at(&cmd, k));
+            for (k, w) in cmd.iter().enumerate() {
                 // A here-document is text. Parentheses in it are not a
                 // subshell. An unquoted body still expands `$(...)` and
                 // backticks, and those run.
                 if (data[ci] || pat) && !w.contains("$(") && !w.contains('`') {
                     continue;
                 }
-                for body in substitutions(w) {
+                for body in substitutions_in(w, head.is_none_or(|h| k <= h)) {
                     let words = shell_words(&body);
                     for dir in &dirs {
                         let inn = ShellIn {
@@ -9035,6 +9038,14 @@ fn opens_nested(chars: &[char], i: usize, double: bool) -> bool {
 /// and `\$` unescaped, and outside double quotes each `<(...)`, `>(...)`
 /// and subshell.
 fn substitutions(script: &str) -> Vec<String> {
+    substitutions_in(script, true)
+}
+
+/// [`substitutions`], with a plain `(...)` read as a subshell only when
+/// `subshells` holds. A word the shell already split has lost its quotes,
+/// so a `(` in `-m "fix (a/, b/)"` is text, not a subshell, unless the
+/// word stands where a command does.
+fn substitutions_in(script: &str, subshells: bool) -> Vec<String> {
     let chars: Vec<char> = script.chars().collect();
     let n = chars.len();
     let mut out = Vec::new();
@@ -9055,7 +9066,7 @@ fn substitutions(script: &str) -> Vec<String> {
                 double = !double;
                 i += 1;
             }
-            _ if opens_nested(&chars, i, double) => {
+            _ if opens_nested(&chars, i, double) && (subshells || chars[i] != '(') => {
                 let end = nested_end(&chars, i);
                 let tick = chars[i] == '`';
                 let from = if tick || chars[i] == '(' {
@@ -19276,6 +19287,34 @@ hash -r 2> /dev/null
             line_assigned(&words, Some("/h")),
             [("D".to_string(), "/h/p".to_string())]
         );
+    }
+
+    /// Parentheses in an argument the line quotes are text: a commit
+    /// message naming `(Blender4.0/, v2.12/downloads/)` runs no
+    /// `Blender4.0/,`. A subshell where a command stands still runs, and so
+    /// does a `$(...)` in an argument.
+    #[test]
+    fn a_quoted_paren_in_an_argument_is_not_a_subshell() {
+        let root = startup_root("quotedparen");
+        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+        for line in [
+            "git add -u && git commit -q -m \"fix: versions\n\nA versioned directory\n(Blender4.0/, v2.12/downloads/) lists two more.\" && git log --oneline -1",
+            "git add -u; echo \"(foo/)\"",
+            "git add -u; echo '(./foo)'",
+            "git add -u; echo \"x (foo/) y\"",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+        }
+        for line in [
+            "git add -u; (./foo)",
+            "git add -u; echo \"$(./foo)\"",
+            "git add -u; if (./foo); then :; fi",
+            "git add -u; (cd evil && sh force.sh)",
+        ] {
+            let c = at(line);
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+        }
     }
 
     /// The script of a `sed -i` with no `-e` is sed's commands, not a file
