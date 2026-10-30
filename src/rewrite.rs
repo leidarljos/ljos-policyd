@@ -15,10 +15,23 @@ fn python_command(w: &str) -> bool {
 /// The line a hook should run instead, when this command is a python
 /// invocation and the tree asks for uv.
 pub(crate) fn rewrite_command(argv: &[String]) -> Option<String> {
+    rewrite_with(argv, true)
+}
+
+/// The line a hook should run instead, when the law in force already
+/// says python runs through uv. The tree is not asked again: the pack's
+/// refusal is the reason, so a script with no project file beside it is
+/// rewritten too, and the rewritten line meets the pack's PEP 723 rule
+/// on its own.
+pub(crate) fn rewrite_for_uv_law(argv: &[String]) -> Option<String> {
+    rewrite_with(argv, false)
+}
+
+fn rewrite_with(argv: &[String], require_fit: bool) -> Option<String> {
     if shell_c(argv) {
         return rewrite_shell(argv);
     }
-    rewrite_argv(argv)
+    rewrite_argv(argv, require_fit)
 }
 
 fn shell_c(argv: &[String]) -> bool {
@@ -49,7 +62,7 @@ fn rewrite_shell(argv: &[String]) -> Option<String> {
     Some(parts.join(" "))
 }
 
-fn rewrite_argv(argv: &[String]) -> Option<String> {
+fn rewrite_argv(argv: &[String], require_fit: bool) -> Option<String> {
     let Walk::Run(idx) = wrapper_walk(argv) else {
         return None;
     };
@@ -57,7 +70,7 @@ fn rewrite_argv(argv: &[String]) -> Option<String> {
         return None;
     }
     let file = script_arg(&argv[idx + 1..])?;
-    if !uv_rewrite_fits(file) {
+    if require_fit && !uv_rewrite_fits(file) {
         return None;
     }
     let mut parts = Vec::new();

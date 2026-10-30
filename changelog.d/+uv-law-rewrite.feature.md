@@ -1,0 +1,1 @@
+A phronesis seat-pack refusal of bare `python x.py` (`python-requires-uv-run`) is answered as `allow`, a tab, `rewrite`, a tab, `uv run x.py`, so the hook runs the uv line in place of stopping. Before, only a host-table allow was rewritten, and a pack that required uv refused the call it could have fixed. `-c` and `-m` keep the refusal.

@@ -220,12 +220,25 @@ pub const BACKEND: &str = "host table";
 /// or the pack's own text, on one line with no tabs.
 #[must_use]
 pub fn verdict(argv: &[String]) -> String {
-    let d = check_shell(argv);
+    verdict_line(argv, &check_shell(argv))
+}
+
+/// The hook line for a decision already made on `argv`. A pack refusal
+/// that only asks for uv (`python-requires-uv-run`) is answered with the
+/// line that meets it, so the hook runs `uv run x.py` in place of
+/// `python x.py` instead of stopping.
+fn verdict_line(argv: &[String], d: &Checked) -> String {
     match d.decision {
         Decision::Allow => match rewrite::rewrite_command(argv) {
             Some(line) => format!("allow\trewrite\t{line}"),
             None => "allow".into(),
         },
+        Decision::Deny if matches!(d.code, PolicyReason::PythonRequiresUvRun) => {
+            match rewrite::rewrite_for_uv_law(argv) {
+                Some(line) => format!("allow\trewrite\t{line}"),
+                None => format!("deny\t{}", one_line(&d.token)),
+            }
+        }
         Decision::Deny => format!("deny\t{}", one_line(&d.token)),
         Decision::Prompt => format!("prompt\t{}", one_line(&d.token)),
     }
@@ -13164,5 +13177,46 @@ mod tests {
             assert_eq!(at(line).decision, Decision::Allow, "{line}");
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn uv_law_refusal(code: PolicyReason) -> Checked {
+        Checked {
+            decision: Decision::Deny,
+            code,
+            token: Cow::Borrowed("python requires uv run + PEP 723"),
+        }
+    }
+
+    #[test]
+    fn a_pack_refusal_that_only_asks_for_uv_is_answered_with_the_uv_line() {
+        let words = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        let d = uv_law_refusal(PolicyReason::PythonRequiresUvRun);
+        assert_eq!(
+            verdict_line(&words(&["python", "x.py"]), &d),
+            "allow\trewrite\tuv run x.py"
+        );
+        assert_eq!(
+            verdict_line(&words(&["python3", "x.py", "--n", "3"]), &d),
+            "allow\trewrite\tuv run x.py --n 3"
+        );
+        assert_eq!(
+            verdict_line(&words(&["sh", "-c", "python x.py > out.txt"]), &d),
+            "allow\trewrite\tsh -c 'uv run x.py > out.txt'"
+        );
+        // `-c` and `-m` have no uv spelling, so the refusal stands as said.
+        assert_eq!(
+            verdict_line(&words(&["python3", "-c", "print(1)"]), &d),
+            "deny\tpython requires uv run + PEP 723"
+        );
+        assert_eq!(
+            verdict_line(&words(&["python", "-m", "pytest"]), &d),
+            "deny\tpython requires uv run + PEP 723"
+        );
+        // Any other refusal is never rewritten.
+        let other = uv_law_refusal(PolicyReason::PythonMissingPep723);
+        assert_eq!(
+            verdict_line(&words(&["python", "x.py"]), &other),
+            "deny\tpython requires uv run + PEP 723"
+        );
     }
 }

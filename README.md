@@ -136,6 +136,8 @@ without the library reports `host table`, and the doctor warns about it.
 
 `python x.py` and `python3 x.py` rewrite to `uv run x.py`, arguments included, when the working directory or a parent has `pyproject.toml` or `uv.lock`, or the script file has a PEP 723 `# /// script` block. Otherwise the line stays as written. `python -c` and `python -m` stay as written: `uv run` does not take `-c`.
 
+With phronesis linked and its seat pack loaded, bare `python x.py` is a refusal, `python-requires-uv-run`. That refusal is answered with the same rewrite, project file or not, since the pack's law is the reason to run through uv. The hook judges the rewritten line again, so a script with no PEP 723 block still meets `python-missing-pep723` there. `python -c` under that pack stays a refusal.
+
 The hook returns that line as the tool's updated input where the runner has one, and as a note where it does not.
 
 | Runner | Field |

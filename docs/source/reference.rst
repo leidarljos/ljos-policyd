@@ -9,7 +9,7 @@ reads one RFC 5322 message on stdin. See "Outbound mail" below.
 ================ ========================================================================================
 Verb             Meaning
 ================ ========================================================================================
-``check``        print ``allow`` or ``deny<TAB>reason``; exit 2 on deny
+``check``        print ``allow``, ``deny<TAB>reason``, ``prompt<TAB>reason`` or ``allow<TAB>rewrite<TAB>line``; exit 2 on deny
 ``capnp``        write a packed Cap'n ``PolicyDecision`` to stdout; exit 2 on deny
 ``exec``         same text verdict; on allow, run argv; on deny, print the verdict on stderr and exit 2
 ``check-mail``   JSON ``allow`` or ``deny`` for one message on stdin; exit 2 when it refuses
@@ -46,6 +46,13 @@ Token                 Cap'n PolicyReason       When
 ===================== ======================== ============================
 
 Anything else is ``allow``. ``python -c`` is allow. Schema: ``schema/policy.capnp``.
+
+``python x.py`` is ``allow<TAB>rewrite<TAB>uv run x.py`` when the tree has
+``pyproject.toml`` or ``uv.lock``, or the script carries a PEP 723 block.
+Under the phronesis seat pack, whose law refuses bare python as
+``python-requires-uv-run``, the same rewrite answers that refusal with no
+project file asked for. The hook judges the new line again. ``-c`` and
+``-m`` have no uv spelling and keep the refusal.
 
 Task runners
 ============
