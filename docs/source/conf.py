@@ -22,8 +22,11 @@ _GENERATED = {
 project = "ljos-policyd"
 copyright = "2026, Rohit Goswami"
 author = "Rohit Goswami"
-release = "0.5.0"
-version = "0.5.0"
+# The version is the crate's, so the site never lags a release.
+_CARGO = Path(__file__).resolve().parents[2] / "Cargo.toml"
+_m = re.search(r'^version\s*=\s*"([^"]+)"', _CARGO.read_text(), re.M)
+release = _m.group(1) if _m else "0.0.0"
+version = release
 
 extensions = [
     "sphinx.ext.mathjax",
@@ -58,7 +61,6 @@ html_theme_options = {
     "accent_color": "gold",
     "color_mode": "auto",
     "dark_code": True,
-    "open_in_chatgpt": False,
     "open_in_claude": False,
     "og_image_url": _OG_IMAGE,
     "github_url": "https://github.com/leidarljos/ljos-policyd",
