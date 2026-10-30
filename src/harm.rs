@@ -258,9 +258,9 @@ fn discards_tree(rest: &[String]) -> bool {
     paths.iter().any(|p| whole_tree(p))
 }
 
-/// `find -delete`, `find -exec rm`, and `xargs` or `parallel` whose
-/// command is `rm`. The path arrives from the feeder, so the `rm` rule
-/// on a written operand never sees it.
+/// `find -delete`, `find -exec rm`, and feeder commands (`xargs`,
+/// `parallel`) whose payload is destructive. The payload path arrives
+/// from stdin, so normal operand checks do not see it.
 pub(crate) fn around_rm(argv: &[String]) -> Option<&'static str> {
     for cmd in commands(argv) {
         if let Some(token) = one_around(&cmd) {
@@ -282,12 +282,92 @@ fn one_around(cmd: &[&str]) -> Option<&'static str> {
     }
     if matches!(head, "xargs" | "parallel") {
         if let Some(at) = command_at(cmd, head_at) {
-            if deletes_command(&cmd[at..]) {
-                return Some("feeder-rm");
+            if let Some(token) = feeder_token(&cmd[at..]) {
+                return Some(token);
             }
         }
     }
     None
+}
+
+fn feeder_token(words: &[&str]) -> Option<&'static str> {
+    let owned: Vec<String> = words.iter().map(|s| (*s).to_string()).collect();
+    let (run, handed) = super::unwrap_wrappers(&owned);
+    if let Some(script) = handed {
+        let inner = shell_words(script);
+        if let Some(token) = commands(&inner).iter().find_map(|c| feeder_token(c)) {
+            return Some(token);
+        }
+    }
+    let head = run.first()?;
+    let b = base_of(head);
+    if matches!(b, "rm" | "unlink") {
+        return Some("feeder-rm");
+    }
+    if b == "mv" {
+        return Some("feeder-mv");
+    }
+    if matches!(b, "chmod" | "chown" | "chgrp" | "setfacl") {
+        return Some("feeder-chmod");
+    }
+    if b == "git" {
+        if let Some((sub, rest)) = git_subcommand(run) {
+            if sub == "push" {
+                if feeder_git_push_force(rest) {
+                    return Some("git-force-push");
+                }
+                return Some("feeder-git-push");
+            }
+        }
+    }
+    if truncating_redirection(run) {
+        return Some("feeder-truncate");
+    }
+    if b == "eval" {
+        let joined = run[1..].join(" ");
+        let inner = shell_words(&joined);
+        if let Some(token) = commands(&inner).iter().find_map(|c| feeder_token(c)) {
+            return Some(token);
+        }
+    }
+    if SHELLS.contains(&b) {
+        if let Some(script) = shell_script(run) {
+            let inner = shell_words(script);
+            if let Some(token) = commands(&inner).iter().find_map(|c| feeder_token(c)) {
+                return Some(token);
+            }
+        }
+    }
+    None
+}
+
+fn truncating_redirection(run: &[String]) -> bool {
+    run.iter().any(|w| truncating_word(w))
+}
+
+fn feeder_git_push_force(rest: &[String]) -> bool {
+    rest.iter().any(|a| {
+        a == "--force"
+            || a == "--mirror"
+            || a.starts_with('+')
+            || a == "-f"
+            || (a.starts_with('-') && !a.starts_with("--") && a.contains('f'))
+    })
+}
+
+fn truncating_word(w: &str) -> bool {
+    if w == ">" || w == ">|" || w.starts_with(">|") {
+        return true;
+    }
+    if w.starts_with(">>") || w.starts_with(">&") || w.starts_with("&>>") {
+        return false;
+    }
+    if w.starts_with("&>") {
+        return true;
+    }
+    let digits = w.chars().take_while(|c| c.is_ascii_digit()).count();
+    let rest = &w[digits..];
+    rest.starts_with('>') && !rest.starts_with(">>") && !rest.starts_with(">&")
 }
 
 /// A `find` action is safe only when every way it runs already passed a
