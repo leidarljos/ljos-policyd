@@ -11101,6 +11101,16 @@ type Job = (
     Vec<String>,
     std::path::PathBuf,
     std::sync::mpsc::Sender<Checked>,
+    BraceWords,
+);
+
+/// The words of the check's argv and the words its shells lexed with a
+/// bare `{`, carried to the phronesis worker so it reads braces as the
+/// calling thread does ([`may_brace_expand`]).
+#[cfg(has_phronesis)]
+type BraceWords = (
+    std::collections::HashSet<String>,
+    std::collections::HashSet<String>,
 );
 
 /// phronesis keeps its Janet VM in the thread that first loaded the pack,
@@ -11116,7 +11126,9 @@ fn check_shell_phronesis(argv: &[String], cwd: &std::path::Path) -> Checked {
         std::thread::Builder::new()
             .name("phronesis".into())
             .spawn(move || {
-                for (argv, cwd, reply) in rx {
+                for (argv, cwd, reply, (literal, braced)) in rx {
+                    LITERAL.with(|l| *l.borrow_mut() = literal);
+                    BRACED.with(|b| *b.borrow_mut() = braced);
                     let parent = Scratch {
                         root: Some(cwd),
                         ..Scratch::default()
@@ -11135,7 +11147,14 @@ fn check_shell_phronesis(argv: &[String], cwd: &std::path::Path) -> Checked {
         return refused("phronesis: no worker thread");
     };
     let (reply, answer) = std::sync::mpsc::channel();
-    if tx.send((argv.to_vec(), cwd.to_path_buf(), reply)).is_err() {
+    let words = (
+        LITERAL.with(|l| l.borrow().clone()),
+        BRACED.with(|b| b.borrow().clone()),
+    );
+    if tx
+        .send((argv.to_vec(), cwd.to_path_buf(), reply, words))
+        .is_err()
+    {
         return refused("phronesis: worker thread gone");
     }
     answer
