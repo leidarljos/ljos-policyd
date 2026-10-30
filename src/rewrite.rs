@@ -29,7 +29,7 @@ pub(crate) fn rewrite_for_uv_law(argv: &[String]) -> Option<String> {
 
 fn rewrite_with(argv: &[String], require_fit: bool) -> Option<String> {
     if shell_c(argv) {
-        return rewrite_shell(argv);
+        return rewrite_shell(argv, require_fit);
     }
     rewrite_argv(argv, require_fit)
 }
@@ -42,13 +42,13 @@ fn shell_c(argv: &[String]) -> bool {
     i < argv.len() && SHELLS.contains(&base_of(&argv[i])) && argv[i + 1..].iter().any(|w| w == "-c")
 }
 
-fn rewrite_shell(argv: &[String]) -> Option<String> {
+fn rewrite_shell(argv: &[String], require_fit: bool) -> Option<String> {
     let at = argv.iter().position(|w| w == "-c")? + 1;
     if at >= argv.len() {
         return None;
     }
     let script = splice_python(&argv[at])?;
-    if !script_fits(&script) {
+    if require_fit && !script_fits(&script) {
         return None;
     }
     let mut parts = Vec::new();
