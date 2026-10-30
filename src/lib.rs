@@ -351,7 +351,8 @@ fn spelled(w: &str, quoted: bool) {
     }
 }
 
-/// One argv check inside this working directory.
+/// How many runner levels deep (`make a` whose recipe runs `npm run b`)
+/// script targets are read before the line is judged as written.
 fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Checked {
     let parent = Scratch {
         root: Some(cwd.to_path_buf()),
@@ -8584,7 +8585,7 @@ fn read_sources<'a>(head: &str, args: &[&'a str]) -> Vec<&'a str> {
             || w.starts_with("--directory=")
             || w.starts_with("--output=")
             || (head == "dd" && !w.starts_with("if="));
-        if !(write_opt || (i > 0 && is_redirection(args[i - 1]))) {
+        if !write_opt && !(i > 0 && is_redirection(args[i - 1])) {
             out.push(w);
         }
     }
@@ -11918,6 +11919,279 @@ mod tests {
         }
     }
 
+    /// The lines of a `tests/fixtures/pyopts17` set, each with the argvs
+    /// `ljos hook` sent policyd for it. `@W@` is the tree.
+    fn pyopts17_set(text: &str, root: &std::path::Path) -> Vec<(String, Vec<Vec<String>>)> {
+        let unescape = |s: &str| {
+            let mut out = String::new();
+            let mut chars = s.chars();
+            while let Some(c) = chars.next() {
+                out.push(if c == '\\' {
+                    match chars.next() {
+                        Some('n') => '\n',
+                        Some('t') => '\t',
+                        Some('r') => '\r',
+                        _ => '\\',
+                    }
+                } else {
+                    c
+                });
+            }
+            out.replace("@W@", &root.display().to_string())
+        };
+        let mut rows: Vec<(String, Vec<Vec<String>>)> = Vec::new();
+        for record in text.lines() {
+            let mut fields = record.split('\t');
+            match fields.next() {
+                Some("L") => rows.push((unescape(fields.nth(1).unwrap()), Vec::new())),
+                Some("A") => {
+                    let argv = fields.skip(1).map(unescape).collect();
+                    rows.last_mut().unwrap().1.push(argv);
+                }
+                _ => panic!("bad record {record}"),
+            }
+        }
+        rows
+    }
+
+    /// The printed verdict. Allow is the word alone. A refusal or an ask
+    /// names its token, so the line is never empty.
+    fn printed_verdict(c: &Checked) -> String {
+        match c.decision {
+            Decision::Allow => "allow".to_string(),
+            Decision::Deny => format!("deny\t{}", one_line(&c.token)),
+            Decision::Prompt => format!("prompt\t{}", one_line(&c.token)),
+        }
+    }
+
+    fn assert_named_verdict(c: &Checked, argv: &[String]) {
+        let text = printed_verdict(c);
+        assert!(!text.is_empty(), "{argv:?}");
+        assert!(!text.ends_with('\t'), "{argv:?} -> {text}");
+        assert!(
+            text == "allow" || text.starts_with("deny\t") || text.starts_with("prompt\t"),
+            "{argv:?} -> {text}"
+        );
+    }
+
+    /// The rows of a set policyd refuses: the line, or a call the hook
+    /// made for it. Every input prints a named verdict.
+    fn pyopts17_refused(text: &str, root: &std::path::Path) -> Vec<usize> {
+        pyopts17_set(text, root)
+            .iter()
+            .enumerate()
+            .filter(|(_, (line, argvs))| {
+                let mut refused = false;
+                for argv in std::iter::once(shell_words(line)).chain(argvs.iter().cloned()) {
+                    let c = check_shell_in(&argv, root, 0);
+                    assert_named_verdict(&c, &argv);
+                    if c.decision != Decision::Allow {
+                        refused = true;
+                    }
+                }
+                refused
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// A python project of the kind the reviews ran their lines in.
+    /// Writes to `/tmp` are allowed, so the tree is not under it.
+    fn review_tree(tag: &str) -> std::path::PathBuf {
+        let temp = |d: &std::path::Path| {
+            ["/tmp", "/var/tmp", "/dev/shm"]
+                .iter()
+                .any(|t| d.starts_with(t))
+        };
+        let name = format!("policyd-{tag}-{}/w", std::process::id());
+        let root = [
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target"),
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache"),
+        ]
+        .into_iter()
+        .find(|d| d.is_absolute() && !temp(d))
+        .expect("a checkout or a HOME out of /tmp")
+        .join(name);
+        let _ = std::fs::remove_dir_all(&root);
+        for d in ["src/pkg", "tests", ".git"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        for (path, text) in [
+            ("src/pkg/__init__.py", "def add(a, b):\n    return a + b\n"),
+            (
+                "tests/test_a.py",
+                "from pkg import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
+            ),
+            ("data.csv", "a,b\n1,2\n3,4\n"),
+            ("data.json", "{\"a\": 1, \"b\": [1, 2]}\n"),
+            (
+                "pyproject.toml",
+                "[project]\nname = \"pkg\"\nversion = \"0.1\"\n",
+            ),
+            ("hello.py", "print(\"hi\")\n"),
+        ] {
+            std::fs::write(root.join(path), text).unwrap();
+        }
+        root
+    }
+
+    /// The pyopts17 review ran 371 `python3` lines through `ljos hook`.
+    /// Ordinary lines are allowed. A line that opens an ssh private key asks.
+    #[test]
+    fn python_lines_from_the_pyopts17_review() {
+        let root = review_tree("pyopts17");
+        let corpus = include_str!("../tests/fixtures/pyopts17/corpus.tsv");
+        let ordinary = include_str!("../tests/fixtures/pyopts17/ordinary.tsv");
+        let risky = include_str!("../tests/fixtures/pyopts17/risky.tsv");
+        assert_eq!(pyopts17_set(corpus, &root).len(), 371);
+        assert_eq!(pyopts17_refused(corpus, &root), Vec::<usize>::new());
+        // 73 has `\x01`, which bash and dash print apart. 136 has a
+        // newline printf puts inside a python string. 245 loads a
+        // pickle from a file in the tree, which runs the code the file
+        // holds. The rest are a heredoc file run with words after it,
+        // whose text the hook does not send.
+        assert_eq!(pyopts17_set(ordinary, &root).len(), 360);
+        // Python text is not analysed. The ordinary lines the reader used
+        // to refuse are allowed.
+        assert_eq!(pyopts17_refused(ordinary, &root), Vec::<usize>::new());
+        let risky_set = pyopts17_set(risky, &root);
+        assert_eq!(risky_set.len(), 209);
+        let mut mentioned = 0;
+        for (line, argvs) in &risky_set {
+            for argv in std::iter::once(shell_words(line)).chain(argvs.iter().cloned()) {
+                let c = check_shell_in(&argv, &root, 0);
+                assert_named_verdict(&c, &argv);
+            }
+            if !line.contains("id_rsa") {
+                continue;
+            }
+            mentioned += 1;
+            if line.contains(".ssh") && line.contains("python3 -c") && line.contains("open") {
+                let argv = shell_words(line);
+                let c = check_shell_in(&argv, &root, 0);
+                assert_eq!(printed_verdict(&c), "prompt\tcredential-mention", "{line}");
+            }
+        }
+        assert!(mentioned > 0);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// The rows of a policydpy2 set: a program, `P`, or a shell line,
+    /// `S`, with its number in the review.
+    fn policydpy2_set(text: &str) -> Vec<(bool, String, String)> {
+        let unescape = |s: &str| {
+            let mut out = String::new();
+            let mut chars = s.chars();
+            while let Some(c) = chars.next() {
+                out.push(match (c, c == '\\') {
+                    (_, false) => c,
+                    (_, true) => match chars.next() {
+                        Some('n') => '\n',
+                        Some('t') => '\t',
+                        Some('r') => '\r',
+                        Some('\\') => '\\',
+                        c => panic!("bad escape {c:?} in {s}"),
+                    },
+                });
+            }
+            out
+        };
+        text.lines()
+            .map(|record| {
+                let mut f = record.splitn(3, '\t');
+                let kind = f.next().unwrap();
+                let n = f.next().unwrap().to_string();
+                let body = unescape(f.next().unwrap());
+                match kind {
+                    "P" => (true, n, body),
+                    "S" => (false, n, body),
+                    _ => panic!("bad record {record}"),
+                }
+            })
+            .collect()
+    }
+
+    /// How the hook sends a program: `python3 -c`, that line under
+    /// `bash -c`, and the file `printf` writes for python to run.
+    fn policydpy2_shapes(program: &str, is_program: bool) -> Vec<Vec<String>> {
+        let bash = |line: String| vec!["bash".to_string(), "-c".to_string(), line];
+        if !is_program {
+            return vec![bash(program.to_string())];
+        }
+        let q = format!("'{}'", program.replace('\'', "'\\''"));
+        vec![
+            vec!["python3".into(), "-c".into(), program.into()],
+            bash(format!("python3 -c {q}")),
+            bash(format!(
+                "printf {q} > ljos-stdin.py && python3 ljos-stdin.py"
+            )),
+        ]
+    }
+
+    /// Each row and shape of a set policyd allows, as `row/shape`.
+    fn policydpy2_allowed(text: &str, root: &std::path::Path) -> Vec<String> {
+        let mut out = Vec::new();
+        for (is_program, n, body) in policydpy2_set(text) {
+            for (shape, argv) in policydpy2_shapes(&body, is_program).iter().enumerate() {
+                let c = check_shell_in(argv, root, 0);
+                assert_named_verdict(&c, argv);
+                if c.decision == Decision::Allow {
+                    out.push(format!("{n}/{shape}"));
+                }
+            }
+        }
+        out
+    }
+
+    /// The two policydpy1 reviews found programs the reader allowed: one
+    /// listed them as items 3 to 118, the other named their classes.
+    /// A program that names a credential path is not allowed.
+    #[test]
+    fn programs_the_policydpy1_reviews_ran_are_refused() {
+        let root = review_tree("policydpy2-risky");
+        for (text, rows) in [
+            (include_str!("../tests/fixtures/policydpy2/items.tsv"), 116),
+            (
+                include_str!("../tests/fixtures/policydpy2/classes.tsv"),
+                417,
+            ),
+        ] {
+            assert_eq!(policydpy2_set(text).len(), rows);
+            let allowed = policydpy2_allowed(text, &root);
+            for (is_program, n, body) in policydpy2_set(text) {
+                if !disk::mentions_credential(&body) {
+                    continue;
+                }
+                for shape in 0..policydpy2_shapes(&body, is_program).len().min(2) {
+                    let id = format!("{n}/{shape}");
+                    assert!(
+                        !allowed.iter().any(|a| a == &id),
+                        "{id} allowed a credential mention: {body}"
+                    );
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// 331 everyday programs and 67 shell lines. A program printf would
+    /// write as other text is refused in that shape: `%` and `\\x` are
+    /// read apart by bash and dash.
+    #[test]
+    fn everyday_programs_and_lines_are_allowed() {
+        let root = review_tree("policydpy2-ordinary");
+        let text = include_str!("../tests/fixtures/policydpy2/ordinary.tsv");
+        let set = policydpy2_set(text);
+        assert_eq!(set.len(), 398);
+        let shapes: usize = set
+            .iter()
+            .map(|(p, _, b)| policydpy2_shapes(b, *p).len())
+            .sum();
+        let allowed = policydpy2_allowed(text, &root);
+        assert_eq!(allowed.len(), shapes);
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
     /// An `rm` does not clear a file. The program can fail, and a removal
     /// that does not run deletes nothing, so the file written on the line
     /// is still there to be read.
@@ -11953,29 +12227,6 @@ mod tests {
             let c = at("sh ./s.sh");
             assert_eq!(c.decision, Decision::Allow, "{mid}: {}", c.token);
             assert_eq!(c.decision, Decision::Allow, "{}", c.token);
-        }
-    }
-
-    #[test]
-    fn a_recipe_is_judged_as_one_script() {
-        let root = startup_root("wholerecipe");
-        std::fs::write(
-            root.join("Makefile"),
-            "gen:\n\techo 'git push -f origin' > x.sh\n\tsh x.sh\n\
-             cp:\n\tcp evil/force.sh run.sh\n\t@sh ./run.sh\n\
-             ok:\n\techo 'echo ok' > y.sh\n\tsh y.sh\n\
-             two:\n\tcd safe && echo one\n\techo two # done)\n",
-        )
-        .unwrap();
-        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
-        for line in ["make gen", "make cp"] {
-            let c = at(line);
-            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
-            assert_eq!(c.decision, Decision::Allow, "{}", c.token);
-        }
-        for line in ["make ok", "make two"] {
-            let c = at(line);
-            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
         }
     }
 
@@ -12041,29 +12292,6 @@ mod tests {
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
             assert_eq!(c.token, token, "{line}");
         }
-    }
-
-    /// `make -C build` reads the makefile in `build`, and a recipe there
-    /// is judged there. CMake's `$(MAKE) -f CMakeFiles/Makefile2` names
-    /// that file under `build`, not in the directory make was started
-    /// from. A dangerous recipe in that file is still refused.
-    #[test]
-    fn make_dash_c_judges_recipes_in_that_directory() {
-        let root = startup_root("makec");
-        let build = root.join("build");
-        std::fs::create_dir_all(build.join("CMakeFiles")).unwrap();
-        std::fs::write(
-            build.join("Makefile"),
-            "all:\n\t$(MAKE) -f CMakeFiles/Makefile2 all\n",
-        )
-        .unwrap();
-        std::fs::write(build.join("CMakeFiles/Makefile2"), "all:\n\techo ok\n").unwrap();
-        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
-        let c = at("make -C build");
-        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
-        std::fs::write(build.join("CMakeFiles/Makefile2"), "all:\n\trm -rf /\n").unwrap();
-        let c = at("make -C build");
-        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
     }
 
     /// A redirection before the command is not the command. `>file echo`

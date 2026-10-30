@@ -1,0 +1,1 @@
+Tests that only allowed make, npm and just recipes are removed. Those recipes are not read. A read only xargs line stays allowed, including one whose script redirects stderr. xargs into rm or a force push stays refused. An inline program that names a private key, a pgpass file or a secrets directory asks with credential-mention.
