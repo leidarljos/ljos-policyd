@@ -119,8 +119,13 @@ fn python_scripts_rewrite_to_uv_run() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The tests that set `LJOS_POLICYD_DENY_LOG` take this lock: the
+/// variable is process-wide and the test threads run at once.
+static DENY_LOG_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn a_deny_is_appended_to_the_deny_log() {
+    let _env = DENY_LOG_ENV.lock().unwrap_or_else(|e| e.into_inner());
     let path = std::env::temp_dir().join(format!("policyd-deny-{}-b.log", std::process::id()));
     let _ = std::fs::remove_file(&path);
     std::env::set_var("LJOS_POLICYD_DENY_LOG", &path);
@@ -379,6 +384,7 @@ fn mv_or_rsync_delete_outside_the_work_tree_is_refused() {
 /// is allowed, and nothing is logged as a deny.
 #[test]
 fn a_person_allow_rule_clears_the_check() {
+    let _env = DENY_LOG_ENV.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("policyd-person-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("ljos")).unwrap();
