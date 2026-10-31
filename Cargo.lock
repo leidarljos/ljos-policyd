@@ -188,7 +188,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "ljos-policyd"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "capnp",
  "cc",

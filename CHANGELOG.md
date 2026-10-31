@@ -2,6 +2,18 @@
 
 <!-- towncrier release notes start -->
 
+## 0.6.2 (2026-10-31)
+
+### Fixes
+
+- `git restore -S .` is `--staged` over the whole tree, which only unstages, and is allowed as the long form is; `-W`, alone or clustered as `-SW`, is `--worktree` and still asks.
+
+### Miscellaneous
+
+- Tests that only allowed make, npm and just recipes are removed. Those recipes are not read. A read only xargs line stays allowed, including one whose script redirects stderr. xargs into rm or a force push stays refused. An inline program that names a private key, a pgpass file or a secrets directory asks with credential-mention.
+- ljos-policyd links phronesis 0.2.7, whose pack reads `git restore --staged .`, `-S` included, as an unstage and not a discard; the table reads the short flags the same way.
+
+
 ## 0.6.1 (2026-10-30)
 
 ### Features
