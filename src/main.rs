@@ -13,6 +13,7 @@ use ljos_policyd::{
 fn usage() {
     eprintln!("usage: ljos-policyd check|exec|capnp|version -- argv...");
     eprintln!("usage: ljos-policyd check-mail --config PATH [--argv [--] RECIPIENT...]");
+    eprintln!("usage: ljos-policyd replay [DENY_LOG]");
 }
 
 fn main() {
@@ -79,6 +80,37 @@ fn main() {
             if v.is_refused() {
                 process::exit(2);
             }
+        }
+        "replay" => {
+            let path = args
+                .first()
+                .map(std::path::PathBuf::from)
+                .or_else(ljos_policyd::deny_log_path)
+                .unwrap_or_else(|| {
+                    eprintln!("replay: no deny log path");
+                    process::exit(2);
+                });
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                eprintln!("replay: {}: {e}", path.display());
+                process::exit(2);
+            });
+            let (mut seen, mut freed) = (0usize, 0usize);
+            for row in text.lines().filter(|l| !l.trim().is_empty()) {
+                let mut fields = row.splitn(3, '\t');
+                let (Some(_when), Some(was), Some(line)) =
+                    (fields.next(), fields.next(), fields.next())
+                else {
+                    continue;
+                };
+                seen += 1;
+                let argv = ljos_policyd::replay_argv(line);
+                let now = verdict(&argv);
+                if now.starts_with("allow") {
+                    freed += 1;
+                }
+                println!("was deny\t{was}\tnow {now}\t{line}");
+            }
+            println!("{freed} of {seen} refused lines would run now");
         }
         "version" | "--version" => {
             println!(

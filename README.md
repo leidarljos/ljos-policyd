@@ -123,6 +123,7 @@ without the library reports `host table`, and the doctor warns about it.
 | `exec -- ARGV` | runs ARGV only if the verdict is allow | ARGV's status; 2 on deny |
 | `capnp -- ARGV` | writes a packed Cap'n Proto `PolicyDecision` | 0 |
 | `check-mail --config PATH [--argv [--] RECIPIENT...]` | reads one RFC 5322 message on stdin and prints a JSON allow or deny | 0 when nothing was refused; 2 when it refuses |
+| `replay [DENY_LOG]` | re-judges every line of a deny log with this build and the person's rules, and counts how many would run now | 0 |
 | `version` | the version and the backend | 0 |
 
 `check` prints one line, fields separated by a tab:
@@ -146,7 +147,9 @@ The hook returns that line as the tool's updated input where the runner has one,
 | Cursor `preToolUse` and `beforeShellExecution` | `updatedInput.command` is the new line |
 | Codex and any runner without that field | a note whose text is the new line, so the agent runs that line |
 
-A deny is also appended to `$LJOS_POLICYD_DENY_LOG`, or `$XDG_STATE_HOME/ljos-policyd/deny.log` (default `~/.local/state/ljos-policyd/deny.log`). Each line is the unix time, a tab, the reason, a tab, and the command. A prompt is not a deny and is not logged.
+A deny is also appended to `$LJOS_POLICYD_DENY_LOG`, or `$XDG_STATE_HOME/ljos-policyd/deny.log` (default `~/.local/state/ljos-policyd/deny.log`). Each line is the unix time, a tab, the reason, a tab, and the command. A prompt is not a deny and is not logged. `ljos-policyd replay` reads that log back and prints, for each line, the reason it was refused and the verdict this build gives it now, then how many of them would run; a shell `-c` line is replayed as its script and any other line split on spaces, since the log keeps no quoting.
+
+The person's word comes first. A rule in `$XDG_CONFIG_HOME/ljos/user-rules.json` with the verdict `allow` and the basis `person`, which `ljos rule --user PATTERN --verdict allow --why ...` writes only at the person's own terminal, allows every line its pattern matches before the table or the pack is asked. The pattern is matched against the argv as one line, each of its pipelines, and a shell `-c` script and its pipelines, with the glob ljos uses. A runner cannot write such a rule.
 
 Makefile, npm, pnpm, yarn, bun and just recipes are not read. A python program is not analysed. Writing or mentioning an ordinary file is not a reason to refuse. `sudo`, a recursive `rm` outside `/tmp` and the build directories, a force push, a secret in an argument, a write of a hook or policy file, a remote shell, and a raw disk write still refuse. `find -delete`, `find -exec rm`, and `xargs` or `parallel` running `rm` refuse. So does `mv` onto `/dev/null` or another whole tree outside the work tree, and `rsync` with `--delete` over that tree. `git reset --hard`, `git clean -fd`, `git stash clear` or `drop`, and `git checkout -- .` or `git restore .` ask instead of refusing.
 

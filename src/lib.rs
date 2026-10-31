@@ -259,12 +259,21 @@ pub struct Checked {
     pub token: Cow<'static, str>,
 }
 
-/// Typed check: the table built into this crate, and with phronesis
-/// linked, `phronesis_check_shell` after it on the line and on every
-/// command the table reads inside it. A refusal from the table stands, so
-/// a phronesis build refuses at least what the table does.
+/// Typed check: the person's own allow rules first ([`person::allows`]),
+/// then the table built into this crate, and with phronesis linked,
+/// `phronesis_check_shell` after it on the line and on every command the
+/// table reads inside it. A refusal from the table stands, so a phronesis
+/// build refuses at least what the table does. A line the person allowed
+/// at their own terminal is allowed without either being asked.
 #[must_use]
 pub fn check_shell(argv: &[String]) -> Checked {
+    if let Some(rule) = person::allows(argv) {
+        return Checked {
+            decision: Decision::Allow,
+            code: PolicyReason::Unspecified,
+            token: Cow::Owned(format!("person-allow {}", rule.id)),
+        };
+    }
     let cwd = std::env::current_dir().unwrap_or_default();
     SPELLED.with(|s| s.borrow_mut().clear());
     start_line(argv);
@@ -6538,23 +6547,53 @@ fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
 
 mod ask;
 mod harm;
+pub mod person;
 mod rewrite;
 
-fn log_deny(argv: &[String], token: &str) {
-    let path = match std::env::var_os("LJOS_POLICYD_DENY_LOG") {
-        Some(p) => std::path::PathBuf::from(p),
-        None => {
-            let base = std::env::var_os("XDG_STATE_HOME")
-                .map(std::path::PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("HOME")
-                        .map(|h| std::path::PathBuf::from(h).join(".local/state"))
-                });
-            let Some(base) = base else {
-                return;
-            };
-            base.join("ljos-policyd/deny.log")
+/// Where a deny is appended: `$LJOS_POLICYD_DENY_LOG`, else
+/// `$XDG_STATE_HOME/ljos-policyd/deny.log`, else under `~/.local/state`.
+#[must_use]
+pub fn deny_log_path() -> Option<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os("LJOS_POLICYD_DENY_LOG") {
+        return Some(std::path::PathBuf::from(p));
+    }
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+        })?;
+    Some(base.join("ljos-policyd/deny.log"))
+}
+
+/// The argv a deny-log line stands for. The log keeps the words joined by
+/// one space, so a shell `-c` script is read back as that one script word
+/// and any other line is split on spaces; quoting inside a word is lost,
+/// and a replay is as close as the log allows.
+#[must_use]
+pub fn replay_argv(line: &str) -> Vec<String> {
+    let mut words = line.split(' ').filter(|w| !w.is_empty());
+    let Some(first) = words.next() else {
+        return Vec::new();
+    };
+    let shell = first.rsplit('/').next().unwrap_or(first);
+    if matches!(shell, "sh" | "bash" | "zsh" | "dash") {
+        let rest: Vec<&str> = words.collect();
+        if rest.first() == Some(&"-c") && rest.len() >= 2 {
+            return vec![first.to_string(), "-c".to_string(), rest[1..].join(" ")];
         }
+        let mut out = vec![first.to_string()];
+        out.extend(rest.into_iter().map(str::to_string));
+        return out;
+    }
+    std::iter::once(first)
+        .chain(words)
+        .map(str::to_string)
+        .collect()
+}
+
+fn log_deny(argv: &[String], token: &str) {
+    let Some(path) = deny_log_path() else {
+        return;
     };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);

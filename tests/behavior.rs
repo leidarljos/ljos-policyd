@@ -373,3 +373,36 @@ fn mv_or_rsync_delete_outside_the_work_tree_is_refused() {
     assert_eq!(verdict(&words("mv a.txt b.txt")), "allow");
     assert_eq!(verdict(&words("rsync -a src/ dest/")), "allow");
 }
+
+/// A rule the person wrote at their own terminal with the verdict allow
+/// clears the check for the line it names: a force push the table refuses
+/// is allowed, and nothing is logged as a deny.
+#[test]
+fn a_person_allow_rule_clears_the_check() {
+    let dir = std::env::temp_dir().join(format!("policyd-person-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("ljos")).unwrap();
+    std::fs::write(
+        dir.join("ljos/user-rules.json"),
+        r#"[{"id": "p1", "text": "my push", "author": "rohit", "reason": "mine", "pattern": "git push --force origin main", "verdict": "allow", "basis": "person", "written_at": "2026-10-31T12:00:00Z"}]"#,
+    )
+    .unwrap();
+    let log = dir.join("deny.log");
+    std::env::set_var("XDG_CONFIG_HOME", &dir);
+    std::env::set_var("LJOS_POLICYD_DENY_LOG", &log);
+    let allowed = verdict(&words("git push --force origin main"));
+    let other = verdict(&words("git push --force origin develop"));
+    std::env::remove_var("LJOS_POLICYD_DENY_LOG");
+    std::env::remove_var("XDG_CONFIG_HOME");
+    assert_eq!(allowed, "allow");
+    assert_eq!(other, "deny\tgit-force-push");
+    let logged = std::fs::read_to_string(&log).unwrap();
+    assert!(logged.contains("develop"), "{logged}");
+    assert!(!logged.contains("origin main"), "{logged}");
+    assert_eq!(
+        ljos_policyd::replay_argv("bash -c git push --force origin main"),
+        vec!["bash", "-c", "git push --force origin main"]
+    );
+    assert_eq!(ljos_policyd::replay_argv("sudo id"), vec!["sudo", "id"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
