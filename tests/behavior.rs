@@ -404,5 +404,12 @@ fn a_person_allow_rule_clears_the_check() {
         vec!["bash", "-c", "git push --force origin main"]
     );
     assert_eq!(ljos_policyd::replay_argv("sudo id"), vec!["sudo", "id"]);
+    // A replay re-judges without writing the deny again.
+    let quiet = dir.join("quiet.log");
+    std::env::set_var("LJOS_POLICYD_DENY_LOG", &quiet);
+    let said = ljos_policyd::verdict_quiet(&words("sudo id"));
+    std::env::remove_var("LJOS_POLICYD_DENY_LOG");
+    assert_eq!(said, "deny\tsudo");
+    assert!(!quiet.exists(), "a quiet check wrote the deny log");
     let _ = std::fs::remove_dir_all(&dir);
 }
