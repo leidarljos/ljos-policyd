@@ -23,40 +23,8 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
-
-  phronesis:
-    name: test with phronesis linked
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      # The commit the release links, so a test and a release build sit on
-      # the same phronesis: phronesis 0.2.9, the import of the recreated
-      # repository, which keeps no release tags.
-      PHRONESIS_REF: 7d115de79407a54e0be5050f95107cfa08fe6277
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.99.1
-        with:
-          components: clippy
-      - run: |
-          sudo apt-get update
-          sudo apt-get install -y meson ninja-build capnproto pkg-config
-      - name: Build phronesis
-        run: |
-          set -eu
-          # A commit, not a tag: the phronesis repository keeps no
-          # release tags. A branch name works too.
-          git init -q "$RUNNER_TEMP/phronesis"
-          cd "$RUNNER_TEMP/phronesis"
-          git remote add origin https://github.com/leidarljos/phronesis.git
-          git fetch --depth 1 origin "$PHRONESIS_REF"
-          git checkout --detach FETCH_HEAD
-          meson setup build --prefix="$RUNNER_TEMP/phronesis-prefix" -Dtests=disabled
-          meson compile -C build
-          meson install -C build
-          echo "PHRONESIS_DIR=$RUNNER_TEMP/phronesis-prefix" >> "$GITHUB_ENV"
-      - run: cargo clippy --locked --all-targets -- -D warnings
+      # phronesis comes in through the phronesis-sys crate: cargo compiles
+      # its vendored C, so no meson, capnp or pkg-config is installed here.
       - run: cargo test --locked
         env:
           PHRONESIS_STATE_DIR: ${{ runner.temp }}/policyd-state
@@ -64,7 +32,7 @@ jobs:
         run: |
           set -eu
           cargo build --locked --release
-          target/release/ljos-policyd version | grep -q '(phronesis)'
+          target/release/ljos-policyd version | tee /dev/stderr | grep -q '(phronesis 0\.'
           ! readelf -d target/release/ljos-policyd | grep -E 'RPATH|RUNPATH'
           ! ldd target/release/ljos-policyd | grep -E 'phronesis|capnp'
 

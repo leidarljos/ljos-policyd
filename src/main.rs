@@ -160,9 +160,10 @@ fn run() -> i32 {
         }
         "version" | "--version" => {
             println!(
-                "ljos-policyd {} ({})",
+                "ljos-policyd {} ({} {})",
                 env!("CARGO_PKG_VERSION"),
-                ljos_policyd::BACKEND
+                ljos_policyd::BACKEND,
+                ljos_policyd::phronesis_version()
             );
         }
         _ => return allow_open("unknown verb"),

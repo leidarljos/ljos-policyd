@@ -5,23 +5,13 @@ on:
     tags: ["v[0-9]+.[0-9]+.[0-9]+"]
   # Runs the build jobs on a branch without publishing a release.
   workflow_dispatch:
-    inputs:
-      phronesis_ref:
-        description: phronesis tag or branch to link (default below)
-        required: false
-        default: ""
 
 permissions:
   contents: write
 
-env:
-  # The phronesis release every tarball links, built from source per target.
-  # v0.2.3 keeps a shell word up to 128 KiB and up to 32768 words, and a
-  # longer word, count, or command body is fieldTooLong with a reason.
-  # v0.2.4 adds the download, setgid and lease-push law the table matches.
-  # v0.2.5 matches a vendor secret prefix only at a token boundary.
-  # v0.2.7 reads `git restore --staged .`, `-S` included, as an unstage.
-  PHRONESIS_REF: ${{ inputs.phronesis_ref || '7d115de79407a54e0be5050f95107cfa08fe6277' }}
+# phronesis comes in through the phronesis-sys crate, whose version
+# Cargo.lock pins: cargo compiles its vendored C for each target, so no
+# meson, capnp or pkg-config is installed and no phronesis build runs here.
 
 jobs:
   build:
@@ -43,55 +33,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Build tools (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y meson ninja-build capnproto pkg-config
-      - name: Build tools (macOS)
-        if: runner.os == 'macOS'
-        run: brew install meson ninja capnp pkg-config
-      - name: Build phronesis ${{ env.PHRONESIS_REF }}
-        run: |
-          set -eu
-          # A commit, not a tag: the phronesis repository keeps no
-          # release tags. A branch name works too.
-          git init -q "$RUNNER_TEMP/phronesis"
-          cd "$RUNNER_TEMP/phronesis"
-          git remote add origin https://github.com/leidarljos/phronesis.git
-          git fetch --depth 1 origin "$PHRONESIS_REF"
-          git checkout --detach FETCH_HEAD
-          cross=()
-          if [ -n "${{ matrix.cross }}" ]; then
-            # Intel macOS from the arm runner; Rosetta runs the test binaries.
-            cat > "$RUNNER_TEMP/cross.ini" <<'INI'
-          [binaries]
-          c = ['clang', '-arch', 'x86_64']
-          cpp = ['clang++', '-arch', 'x86_64']
-          ar = 'ar'
-          strip = 'strip'
-          [host_machine]
-          system = 'darwin'
-          cpu_family = 'x86_64'
-          cpu = 'x86_64'
-          endian = 'little'
-          [properties]
-          needs_exe_wrapper = false
-          INI
-            cross=(--cross-file "$RUNNER_TEMP/cross.ini")
-          fi
-          meson setup build ${cross[@]+"${cross[@]}"} --prefix="$RUNNER_TEMP/phronesis-prefix" \
-            --buildtype=release -Dtests=disabled
-          meson compile -C build
-          meson install -C build
-          echo "PHRONESIS_DIR=$RUNNER_TEMP/phronesis-prefix" >> "$GITHUB_ENV"
       - run: cargo build --locked --release --target ${{ matrix.target }}
       - name: The binary reports phronesis
         if: matrix.cross == ''
         run: |
           set -eu
           bin=target/${{ matrix.target }}/release/ljos-policyd
-          "$bin" version | tee /dev/stderr | grep -q '(phronesis)'
+          "$bin" version | tee /dev/stderr | grep -q '(phronesis 0\.'
           # Nothing from the build machine on the load path.
           if [ "$RUNNER_OS" = Linux ]; then
             ! readelf -d "$bin" | grep -E 'RPATH|RUNPATH'
@@ -142,4 +90,4 @@ jobs:
         with:
           files: dist/*
           append_body: true
-          body: Checks a shell command line and prints allow or deny. Links phronesis ${{ env.PHRONESIS_REF }}.
+          body: Checks a shell command line and prints allow or deny. phronesis is compiled in from the phronesis-sys crate; `ljos-policyd version` names its version.

@@ -100,37 +100,33 @@ system builds and then executes. The guard does not try to judge build
 scripts. A build script that runs `git push -f` is outside what a line
 check can see.
 
-## Two backends: phronesis, or the table built in
+## phronesis, compiled in
 
-When the [phronesis](https://github.com/leidarljos/phronesis) library
-(0.2.5 or later) is found at build time (`PHRONESIS_DIR`, or `pkg-config
-phronesis`), every check runs the table above and then
-`phronesis_check_shell`, on the line and on each command the table found
-inside it: past `env`, `nice` and the other wrappers, inside `sh -c`
-scripts and substitutions. A refusal from the table stands, and a refusal
-from phronesis carries the pack's own reason after the tab. Without the
-library the crate still builds and uses the table alone.
+Every build links [phronesis](https://github.com/leidarljos/phronesis)
+through the `phronesis-sys` crate, which carries the library's C, the
+Janet runtime, the Cap'n Proto C runtime and the default pack, and
+compiles them with cargo alone: no meson, capnp or pkg-config, and no
+phronesis install on the build or the running machine. Every check runs
+the table above and then `phronesis_check_shell`, on the line and on each
+command the table found inside it: past `env`, `nice` and the other
+wrappers, inside `sh -c` scripts and substitutions. A refusal from the
+table stands, and a refusal from phronesis carries the pack's own reason
+after the tab.
 
-The build links phronesis and the Cap'n Proto C runtime statically and
-embeds phronesis's default pack, so the binary needs no phronesis install
-and keeps no path from the machine that built it. The C shim follows the
-installed schema's bare-pointer or typed-list representation of `List(Text)`
-without changing the wire message. A word is handed to the
-pack whole, up to 128 KiB, and a line may carry up to 32768 words. Past
-either limit, or a command body over 512 KiB, the line is `field-too-long`
-and the reason, such as `field-too-long: argv word exceeds 131072 bytes`.
-On first use it writes the pack under `$PHRONESIS_STATE_DIR` (default
-`~/.local/state/ljos-policyd`) and loads it from there. The default pack
-refuses what the table refuses and also secrets written into the argv (a
-token in a URL or a header). `LJOS_POLICYD_PACK=seat` loads the seat pack
-instead, which adds uv-only Python and refuses `pip`, `npm`, `yarn`,
-`pnpm`, `bun` and `poetry`. A pack named in `PHRONESIS_JANET_PACK` replaces
-both.
+A word is handed to the pack whole, up to 128 KiB, and a line may carry
+up to 32768 words. Past either limit, or a command body over 512 KiB, the
+line is `field-too-long` and the reason, such as `field-too-long: argv
+word exceeds 131072 bytes`. On first use the binary writes the pack under
+`$PHRONESIS_STATE_DIR` (default `~/.local/state/ljos-policyd`) and loads
+it from there. The default pack refuses what the table refuses and also
+secrets written into the argv (a token in a URL or a header).
+`LJOS_POLICYD_PACK=seat` loads the seat pack instead, which adds uv-only
+Python and refuses `pip`, `npm`, `yarn`, `pnpm`, `bun` and `poetry`. A
+pack named in `PHRONESIS_JANET_PACK` replaces both.
 
-`ljos-policyd version` names the backend in parentheses, and
-`ljos doctor` shows it in its policy row. The binaries on the GitHub
-release are built with phronesis and report `phronesis`. A source build
-without the library reports `host table`, and the doctor warns about it.
+`ljos-policyd version` names the backend and the phronesis version in
+parentheses, `ljos-policyd 0.7.0 (phronesis 0.2.9)`, and `ljos doctor`
+shows it in its policy row.
 
 ## Verbs and exit status
 

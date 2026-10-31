@@ -199,25 +199,34 @@ mod phase {
     }
 }
 
+/// The pack phronesis-sys carries: `(path under policy/, bytes)`.
 #[cfg(has_phronesis)]
 mod embedded {
-    include!(concat!(env!("OUT_DIR"), "/pack.rs"));
+    pub(crate) fn pack() -> &'static [(&'static str, &'static [u8])] {
+        phronesis_sys::pack_files()
+    }
 }
 
 /// Slot this CLI binds so checkShell has a workspace root.
 #[cfg(has_phronesis)]
 const HOST_AGENT_LO: u64 = 1;
 
-/// Which law this build judges with: `phronesis` when the library was
-/// found at build time (`PHRONESIS_DIR` or `pkg-config phronesis`), else
-/// `host table`, the argv table compiled into this crate.
+/// Which law this build judges with: `phronesis`, the library every
+/// build links through the `phronesis-sys` crate, after the argv table
+/// compiled into this crate.
 #[cfg(has_phronesis)]
 pub const BACKEND: &str = "phronesis";
-/// Which law this build judges with: `phronesis` when the library was
-/// found at build time (`PHRONESIS_DIR` or `pkg-config phronesis`), else
-/// `host table`, the argv table compiled into this crate.
+/// The argv table alone. Unreachable since phronesis became a dependency;
+/// kept for the sources written while it was optional.
 #[cfg(not(has_phronesis))]
 pub const BACKEND: &str = "host table";
+
+/// The phronesis version the binary links.
+#[cfg(has_phronesis)]
+#[must_use]
+pub fn phronesis_version() -> String {
+    phronesis_sys::linked_version()
+}
 
 /// Hook line: `allow`, `allow\twarn\t<reason>`, `allow\tfail-open\t<reason>`,
 /// or `deny\t<reason>`. The reason is the table's token or the pack's own
@@ -7344,7 +7353,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 #[cfg(has_phronesis)]
 fn pack_hash() -> u64 {
     let mut all = Vec::new();
-    for (name, body) in embedded::PACK {
+    for (name, body) in embedded::pack() {
         all.extend_from_slice(name.as_bytes());
         all.push(0);
         all.extend_from_slice(body);
@@ -7355,7 +7364,7 @@ fn pack_hash() -> u64 {
 /// True when every embedded file sits under `policy` byte for byte.
 #[cfg(has_phronesis)]
 fn pack_matches(policy: &std::path::Path) -> bool {
-    embedded::PACK
+    embedded::pack()
         .iter()
         .all(|(name, body)| std::fs::read(policy.join(name)).is_ok_and(|b| b == *body))
 }
@@ -7433,7 +7442,7 @@ fn unpack_pack(root: &std::path::Path) -> Option<std::path::PathBuf> {
         let _ = std::fs::remove_dir_all(&tmp);
         return None;
     }
-    for (file, body) in embedded::PACK {
+    for (file, body) in embedded::pack() {
         if std::fs::write(tmp_policy.join(file), body).is_err() {
             let _ = std::fs::remove_dir_all(&tmp);
             return None;
