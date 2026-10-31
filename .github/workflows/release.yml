@@ -20,7 +20,8 @@ env:
   # longer word, count, or command body is fieldTooLong with a reason.
   # v0.2.4 adds the download, setgid and lease-push law the table matches.
   # v0.2.5 matches a vendor secret prefix only at a token boundary.
-  PHRONESIS_REF: ${{ inputs.phronesis_ref || 'v0.2.5' }}
+  # v0.2.7 reads `git restore --staged .`, `-S` included, as an unstage.
+  PHRONESIS_REF: ${{ inputs.phronesis_ref || 'v0.2.7' }}
 
 jobs:
   build:

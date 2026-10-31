@@ -31,10 +31,10 @@ jobs:
     timeout-minutes: 30
     env:
       # The tag the release links, so a test and a release build sit on the
-      # same phronesis. v0.2.5 matches a vendor secret prefix only at a
-      # token boundary, so `task-creation`, `disk-usage.rs` and `risk-notes`
-      # are allowed; v0.2.4 matched `sk-` inside those words.
-      PHRONESIS_REF: v0.2.5
+      # same phronesis. v0.2.7 reads `git restore --staged` over the whole
+      # tree, `-S` included, as an unstage and not a discard; v0.2.5 matches
+      # a vendor secret prefix only at a token boundary.
+      PHRONESIS_REF: v0.2.7
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.1
