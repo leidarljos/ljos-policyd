@@ -191,22 +191,24 @@ name = "ljos-policyd"
 version = "0.6.4"
 dependencies = [
  "capnp",
- "cc",
  "icu_casemap",
  "icu_locale_core",
  "icu_properties",
  "icu_properties_data",
  "idna",
  "libc",
- "pkg-config",
+ "phronesis-sys",
  "unicode-normalization",
 ]
 
 [[package]]
-name = "pkg-config"
-version = "0.3.34"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+name = "phronesis-sys"
+version = "0.2.9"
+source = "git+https://github.com/leidarljos/phronesis?tag=v0.2.9#df47f76467721f593d5cb094040afcb46bcef2b6"
+dependencies = [
+ "cc",
+ "libc",
+]
 
 [[package]]
 name = "potential_utf"

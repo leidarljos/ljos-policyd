@@ -10,7 +10,6 @@ homepage = "https://leidarljos.github.io/ljos-policyd/"
 readme = "README.md"
 keywords = ["policy", "argv", "ljos"]
 categories = ["command-line-utilities"]
-links = "phronesis"
 
 [lib]
 name = "ljos_policyd"
@@ -28,14 +27,11 @@ icu_properties = "=2.4.0"
 icu_properties_data = "=2.4.0"
 idna = "1"
 libc = "0.2"
+# phronesis itself, compiled from the crate's vendored C with its pack
+# embedded. The tag here moves to a crates.io version once the crate is
+# published; a git dependency keeps `cargo publish` from running.
+phronesis-sys = { git = "https://github.com/leidarljos/phronesis", tag = "v0.2.9" }
 unicode-normalization = "=0.1.26"
-
-[build-dependencies]
-cc = "1"
-pkg-config = "0.3"
-
-[package.metadata.phronesis]
-git = "https://github.com/leidarljos/phronesis"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/ljos-policyd-v{ version }-{ target }.tar.gz"

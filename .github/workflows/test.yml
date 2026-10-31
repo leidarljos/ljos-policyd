@@ -23,37 +23,8 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
-
-  phronesis:
-    name: test with phronesis linked
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      # The tag the release links, so a test and a release build sit on the
-      # same phronesis. v0.2.7 reads `git restore --staged` over the whole
-      # tree, `-S` included, as an unstage and not a discard; v0.2.5 matches
-      # a vendor secret prefix only at a token boundary.
-      PHRONESIS_REF: v0.2.7
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.99.1
-        with:
-          components: clippy
-      - run: |
-          sudo apt-get update
-          sudo apt-get install -y meson ninja-build capnproto pkg-config
-      - name: Build phronesis
-        run: |
-          set -eu
-          git clone --depth 1 --branch "$PHRONESIS_REF" \
-            https://github.com/leidarljos/phronesis "$RUNNER_TEMP/phronesis"
-          cd "$RUNNER_TEMP/phronesis"
-          meson setup build --prefix="$RUNNER_TEMP/phronesis-prefix" -Dtests=disabled
-          meson compile -C build
-          meson install -C build
-          echo "PHRONESIS_DIR=$RUNNER_TEMP/phronesis-prefix" >> "$GITHUB_ENV"
-      - run: cargo clippy --locked --all-targets -- -D warnings
+      # phronesis comes in through the phronesis-sys crate: cargo compiles
+      # its vendored C, so no meson, capnp or pkg-config is installed here.
       - run: cargo test --locked
         env:
           PHRONESIS_STATE_DIR: ${{ runner.temp }}/policyd-state
@@ -61,7 +32,7 @@ jobs:
         run: |
           set -eu
           cargo build --locked --release
-          target/release/ljos-policyd version | grep -q '(phronesis)'
+          target/release/ljos-policyd version | tee /dev/stderr | grep -q '(phronesis 0\.'
           ! readelf -d target/release/ljos-policyd | grep -E 'RPATH|RUNPATH'
           ! ldd target/release/ljos-policyd | grep -E 'phronesis|capnp'
 

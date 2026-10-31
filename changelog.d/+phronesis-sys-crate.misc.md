@@ -1,0 +1,1 @@
+phronesis is a cargo dependency, the `phronesis-sys` crate, so every build links it and compiles its vendored C itself: no meson, capnp or pkg-config at build time, no `PHRONESIS_DIR` probe, and no build without the library. `ljos-policyd version` names the phronesis version it links.
