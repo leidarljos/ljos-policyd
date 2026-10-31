@@ -200,6 +200,22 @@ fn a_credential_path_prints_credential_mention() {
     }
 }
 
+fn restore_argv(argv: &[&str]) -> Vec<String> {
+    argv.iter().map(|w| (*w).to_string()).collect()
+}
+
+fn restore_allows(argv: &[&str]) {
+    assert_eq!(verdict(&restore_argv(argv)), "allow", "{argv:?}");
+}
+
+fn restore_asks(argv: &[&str]) {
+    assert_eq!(
+        verdict(&restore_argv(argv)),
+        "prompt\tgit-discard-worktree",
+        "{argv:?}"
+    );
+}
+
 /// `git restore --staged` over the whole tree only unstages: the files
 /// in the tree stay as they are, and `-S` is the same flag. With
 /// `--worktree`, or `-W`, alone or clustered, it writes the tree back from
@@ -211,8 +227,7 @@ fn unstaging_the_whole_tree_discards_nothing() {
         &["git", "restore", "-S", "."],
         &["git", "-C", "repo", "restore", "--staged", ":/"],
     ] {
-        let words: Vec<String> = argv.iter().map(|w| (*w).to_string()).collect();
-        assert_eq!(verdict(&words), "allow", "{argv:?}");
+        restore_allows(argv);
     }
     for argv in [
         &["git", "restore", "."][..],
@@ -220,8 +235,103 @@ fn unstaging_the_whole_tree_discards_nothing() {
         &["git", "restore", "-SW", "."],
         &["git", "restore", "-W", "-S", ":/"],
     ] {
-        let words: Vec<String> = argv.iter().map(|w| (*w).to_string()).collect();
-        assert_eq!(verdict(&words), "prompt\tgit-discard-worktree", "{argv:?}");
+        restore_asks(argv);
+    }
+}
+
+/// `--worktree` and `-W` write the work tree. So do `-SW` and `-WS`, and
+/// so does a restore that names neither flag.
+#[test]
+fn restore_worktree_flags_still_ask() {
+    for argv in [
+        &["git", "restore", "--worktree", "."][..],
+        &["git", "restore", "-W", "."],
+        &["git", "restore", "-WS", "."],
+        &["git", "restore", "-SW", ":/"],
+        &["git", "restore", "."],
+        &["git", "restore", "--no-staged", "--worktree", "."],
+    ] {
+        restore_asks(argv);
+    }
+    restore_allows(&["git", "restore", "--staged", "--no-worktree", "."]);
+    restore_allows(&["git", "restore", "--no-worktree", "."]);
+    restore_allows(&["git", "restore", "--no-staged", "."]);
+}
+
+/// Short flags in one cluster keep their own meanings. `-s` takes the
+/// following letters as its tree, so those letters are not `-S`.
+#[test]
+fn clustered_restore_shorts_keep_each_flag() {
+    for argv in [
+        &["git", "restore", "-Sq", "."][..],
+        &["git", "restore", "-qS", "."],
+        &["git", "restore", "-S", "--source", "HEAD", "."],
+    ] {
+        restore_allows(argv);
+    }
+    for argv in [
+        &["git", "restore", "-Wq", "."][..],
+        &["git", "restore", "-qW", ":/"],
+        &["git", "restore", "-qSW", "."],
+        &["git", "restore", "-sS", "."],
+        &["git", "restore", "-s", "HEAD", "."],
+        &["git", "restore", "-WsHEAD", "."],
+    ] {
+        restore_asks(argv);
+    }
+}
+
+/// `--staged` takes no value. Gluing one on with `=` makes git reject
+/// the line, so the work tree stays as it is.
+#[test]
+fn staged_equals_value_discards_nothing() {
+    restore_allows(&["git", "restore", "--staged=true", "."]);
+    restore_allows(&["git", "restore", "--staged=."]);
+    restore_allows(&["git", "restore", "--staged=false", "."]);
+    restore_allows(&["git", "restore", "--worktree=true", "."]);
+}
+
+/// `--source` and `-s` name the tree the paths come from. They are not
+/// paths, and they do not by themselves keep the work tree.
+#[test]
+fn restore_source_names_a_tree() {
+    for argv in [
+        &["git", "restore", "--source=HEAD", "."][..],
+        &["git", "restore", "--source", "HEAD", "."],
+        &["git", "restore", "-s", "HEAD", "."],
+        &["git", "restore", "-sHEAD", "."],
+        &["git", "restore", "--source=HEAD", "-W", "."],
+    ] {
+        restore_asks(argv);
+    }
+    for argv in [
+        &["git", "restore", "--source=HEAD", "-S", "."][..],
+        &["git", "restore", "--source", "HEAD", "--staged", "."],
+        &["git", "restore", "-s", "HEAD", "-S", "src/a.rs"],
+    ] {
+        restore_allows(argv);
+    }
+}
+
+/// Words after `--` are paths, even when they look like flags.
+#[test]
+fn restore_paths_after_options_end_stay_paths() {
+    for argv in [
+        &["git", "restore", "--", "."][..],
+        &["git", "restore", "--", "-S", "."],
+        &["git", "restore", "--", "-A"],
+        &["git", "restore", "-W", "--", "."],
+    ] {
+        restore_asks(argv);
+    }
+    for argv in [
+        &["git", "restore", "-S", "--", "."][..],
+        &["git", "restore", "--staged", "--", "."],
+        &["git", "restore", "--", "src/a.rs"],
+        &["git", "restore", "--", "-S"],
+        &["git", "restore", "-S", "--", "-A"],
+    ] {
+        restore_allows(argv);
     }
 }
 

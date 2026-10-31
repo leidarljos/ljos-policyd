@@ -9721,9 +9721,9 @@ fn argv_for_pack(argv: &[String], bound: &Scratch, moved: bool) -> Vec<String> {
             }
         }
         // The host already allowed this command. The pack v0.2.5 still
-        // denies every `clean -f` and every `restore .`, including a dry
-        // run and an index-only `--staged` restore. Show it the form the
-        // host judged, so a secret later on the line is still visible.
+        // denies every `clean -f` and every whole-tree `restore`, and it
+        // reads restore flags on its own. Show it the paths the table
+        // parsed, so a secret later on the line is still visible.
         if harm::git_lost_work(&words).is_none() {
             if let Some((sub, rest)) = git_subcommand(&words) {
                 if sub == "clean" {
@@ -9758,7 +9758,33 @@ fn argv_for_pack(argv: &[String], bound: &Scratch, moved: bool) -> Vec<String> {
                         };
                     }
                 }
-                if matches!(sub, "restore" | "checkout") {
+                if sub == "restore" {
+                    // The pack keeps its own matcher. It does not read the
+                    // table's flags, so an index-only line and a path after
+                    // the end of options still look like a whole-tree
+                    // discard there. Rename the words that parse found.
+                    let expanded: Vec<String> = rest
+                        .iter()
+                        .map(|w| harm::expand_long(w, harm::GIT_RESTORE_LONG).into_owned())
+                        .collect();
+                    let parsed = harm::parse_restore(&expanded);
+                    let rest_at = words.len() - rest.len();
+                    let put = |out: &mut [String], slot: usize, name: &str| {
+                        let at = idx[slot];
+                        let semi = out[at].ends_with(';');
+                        out[at] = if semi {
+                            format!("{name};")
+                        } else {
+                            name.to_string()
+                        };
+                    };
+                    for (j, name) in parsed.pack_standins {
+                        put(&mut out, rest_at + j, name);
+                    }
+                    if let Some(j) = parsed.show_as_path {
+                        put(&mut out, rest_at + j, "named-file");
+                    }
+                } else if sub == "checkout" {
                     let expanded: Vec<String> = rest
                         .iter()
                         .map(|w| harm::expand_long(w, harm::GIT_RESTORE_LONG).into_owned())
