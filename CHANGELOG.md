@@ -2,6 +2,19 @@
 
 <!-- towncrier release notes start -->
 
+## 0.6.3 (2026-10-31)
+
+### Features
+
+- A rule the person wrote at their own terminal with the verdict `allow` (ljos's `user-rules.json`) clears the check for the lines it matches before the table or the pack is asked. The person's word is the verdict.
+- `ljos-policyd replay [DENY_LOG]` re-judges every line of a deny log with this build and the person's rules, prints the old reason beside the verdict now, and counts how many would run.
+
+### Fixes
+
+- Index-only `git restore` (`-S`, `--staged=...`, clustered shorts, `--source`, and paths after `--`) is allowed with phronesis linked the same way the table allows it.
+  `-W`, `--worktree`, `-SW`, and `-WS` still ask.
+
+
 ## 0.6.2 (2026-10-31)
 
 ### Fixes

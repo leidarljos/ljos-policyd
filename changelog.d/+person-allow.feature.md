@@ -1,1 +1,0 @@
-A rule the person wrote at their own terminal with the verdict `allow` (ljos's `user-rules.json`) clears the check for the lines it matches before the table or the pack is asked. The person's word is the verdict.
