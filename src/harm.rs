@@ -235,8 +235,14 @@ fn clean_fd(rest: &[String]) -> bool {
 /// `checkout -- .` and `restore .`. A named file, a new branch, or a
 /// patch is not the whole tree.
 fn discards_tree(rest: &[String]) -> bool {
-    let staged = rest.iter().any(|a| a == "--staged");
-    let worktree = rest.iter().any(|a| a == "--worktree");
+    // `-S` and `-W` are the short forms, alone or clustered as `-SW`.
+    let short = |flag: char| {
+        rest.iter().any(|a| {
+            a.len() > 1 && a.starts_with('-') && !a.starts_with("--") && a[1..].contains(flag)
+        })
+    };
+    let staged = rest.iter().any(|a| a == "--staged") || short('S');
+    let worktree = rest.iter().any(|a| a == "--worktree") || short('W');
     if staged && !worktree {
         return false;
     }

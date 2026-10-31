@@ -200,6 +200,31 @@ fn a_credential_path_prints_credential_mention() {
     }
 }
 
+/// `git restore --staged` over the whole tree only unstages: the files
+/// in the tree stay as they are, and `-S` is the same flag. With
+/// `--worktree`, or `-W`, alone or clustered, it writes the tree back from
+/// the index, and that is the whole-tree discard the gate asks about.
+#[test]
+fn unstaging_the_whole_tree_discards_nothing() {
+    for argv in [
+        &["git", "restore", "--staged", "."][..],
+        &["git", "restore", "-S", "."],
+        &["git", "-C", "repo", "restore", "--staged", ":/"],
+    ] {
+        let words: Vec<String> = argv.iter().map(|w| (*w).to_string()).collect();
+        assert_eq!(verdict(&words), "allow", "{argv:?}");
+    }
+    for argv in [
+        &["git", "restore", "."][..],
+        &["git", "restore", "--staged", "--worktree", "."],
+        &["git", "restore", "-SW", "."],
+        &["git", "restore", "-W", "-S", ":/"],
+    ] {
+        let words: Vec<String> = argv.iter().map(|w| (*w).to_string()).collect();
+        assert_eq!(verdict(&words), "prompt\tgit-discard-worktree", "{argv:?}");
+    }
+}
+
 #[test]
 fn find_and_feeders_do_not_hide_rm() {
     for (line, token) in [
