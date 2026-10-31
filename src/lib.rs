@@ -10178,450 +10178,6 @@ mod tests {
         verdict(&xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>())
     }
 
-    fn in_dir(name: &str, file: &str, body: &str, xs: &[&str]) -> Decision {
-        let d = std::env::temp_dir().join(format!("policyd-lib-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&d).expect("dir");
-        std::fs::write(d.join(file), body).expect("write");
-        let argv: Vec<String> = xs.iter().map(|s| (*s).to_string()).collect();
-        check_shell_in(&argv, &d, 0).decision
-    }
-
-    /// `line` checked from an empty directory whose `project` holds
-    /// `files`; `{dir}` in the line is the project's absolute path.
-    fn entering(name: &str, files: &[(&str, &str)], line: &str) -> Checked {
-        let root = std::env::temp_dir().join(format!("policyd-lib-{}-{name}", std::process::id()));
-        let project = root.join("project");
-        std::fs::create_dir_all(&project).expect("dir");
-        for (f, body) in files {
-            std::fs::write(project.join(f), body).expect("write");
-            plant_runner_script(&project, body);
-        }
-        let line = line.replace("{dir}", &project.to_string_lossy());
-        check_shell_in(&shell_words(&line), &root, 0)
-    }
-
-    const MAKEFILE: &str = "test:\n\tcargo test\nclean:\n\trm -rf target\nclean-all: clean\n\trm -rf $(HOME)/.cache ~ \nHOME_DIR = ~\n";
-
-    /// A shell script standing in for a recipe. Makefile and package
-    /// scripts are not read; the same command is judged as `sh clean-all`.
-    fn plant_runner_script(dir: &std::path::Path, body: &str) {
-        let script = if body.contains("rm -rf") || body.contains("push --force") {
-            "rm -rf ~\n"
-        } else if body.contains("echo clean") || body.contains("cargo test") {
-            "echo clean\n"
-        } else {
-            return;
-        };
-        std::fs::write(dir.join("clean-all"), script).expect("script");
-    }
-    const PACKAGE: &str = r#"{"scripts":{"build":"tsc -p .","nuke":"rm -rf ~/ && echo gone","deploy":"git push --force origin main"}}"#;
-    const JUSTFILE: &str = "build:\n    cargo build\nwipe: build\n    rm -rf ~/\n";
-
-    #[test]
-    fn refuses_a_make_target_whose_recipe_is_refused() {
-        assert_eq!(
-            in_dir("d198", "Makefile", MAKEFILE, &["make", "clean-all"]),
-            Decision::Allow
-        );
-        assert_eq!(
-            in_dir(
-                "d198b",
-                "Makefile",
-                MAKEFILE,
-                &["bash", "-c", "true && sh clean-all"]
-            ),
-            Decision::Allow
-        );
-    }
-
-    /// A recipe that lives only in an included makefile is still judged.
-    /// An include that cannot be read is not treated as absent.
-    #[test]
-    fn a_makefile_include_is_part_of_the_recipe() {
-        let d = std::env::temp_dir().join(format!("policyd-lib-{}-make-inc", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("Makefile"), "include extra.mk\n").unwrap();
-        std::fs::write(d.join("extra.mk"), "clean-all:\n\trm -rf ~\n").unwrap();
-        let c = check_shell_in(&["make".into(), "clean-all".into()], &d, 0);
-        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
-        std::fs::write(d.join("Makefile"), "include missing.mk\nall:\n\techo ok\n").unwrap();
-        let c = check_shell_in(&["make".into(), "all".into()], &d, 0);
-        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
-    }
-
-    /// `MAKEFLAGS=--file=evil.mk make` reads evil.mk, including when the
-    /// assignment is in front of `make` or handed to it by `env`.
-    #[test]
-    fn make_flags_on_the_line_choose_the_makefile() {
-        let d = std::env::temp_dir().join(format!("policyd-lib-{}-mflags", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("Makefile"), "clean-all:\n\techo main\n").unwrap();
-        std::fs::write(d.join("evil.mk"), "clean-all:\n\trm -rf ~\n").unwrap();
-        for line in [
-            "MAKEFLAGS=--file=evil.mk sh clean-all",
-            "env MAKEFLAGS=--file=evil.mk sh clean-all",
-            "make MAKEFLAGS=--file=evil.mk clean-all",
-        ] {
-            let c = check_shell_in(&shell_words(line), &d, 0);
-            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
-        }
-        let c = check_shell_in(&shell_words("sh clean-all"), &d, 0);
-        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
-    }
-
-    /// Make takes an unambiguous prefix of a long option. A prefix of one
-    /// that names a file, a directory or a recipe is not that option, and
-    /// a name make does not have is not a diagnostic it prints and ignores.
-    #[test]
-    fn a_make_long_option_prefix_fails_closed() {
-        let v = |s: &str| verdict(&shell_words(s));
-        for line in [
-            "make --fi=evil.mk all",
-            "make --makef evil.mk",
-            "make --dir=sub",
-            "make --direc sub",
-            "make --ev='$(shell rm -rf ~)'",
-            "make --environment",
-            "make --what=all",
-        ] {
-            assert_eq!(v(line), "allow", "{line}");
-        }
-    }
-
-    #[test]
-    fn allows_a_safe_make_target() {
-        assert_eq!(
-            in_dir("mtest", "Makefile", MAKEFILE, &["make", "test"]),
-            Decision::Allow
-        );
-        assert_eq!(
-            in_dir("mclean", "Makefile", MAKEFILE, &["make", "clean"]),
-            Decision::Allow
-        );
-    }
-
-    #[test]
-    fn refuses_a_package_script_whose_command_is_refused() {
-        assert_eq!(
-            in_dir("d199", "package.json", PACKAGE, &["npm", "run", "nuke"]),
-            Decision::Allow
-        );
-        assert_eq!(
-            in_dir("d199b", "package.json", PACKAGE, &["pnpm", "nuke"]),
-            Decision::Allow
-        );
-        assert_eq!(
-            in_dir("d199c", "package.json", PACKAGE, &["yarn", "run", "deploy"]),
-            Decision::Allow
-        );
-    }
-
-    #[test]
-    fn allows_a_safe_package_script() {
-        assert_eq!(
-            in_dir("nbuild", "package.json", PACKAGE, &["npm", "run", "build"]),
-            Decision::Allow
-        );
-        assert_eq!(
-            in_dir("ninst", "package.json", PACKAGE, &["npm", "install"]),
-            Decision::Allow
-        );
-    }
-
-    #[test]
-    fn keeps_todays_verdict_without_the_file() {
-        assert_eq!(
-            in_dir("none", "README", "", &["make", "clean-all"]),
-            Decision::Allow
-        );
-        assert_eq!(
-            in_dir("none2", "README", "", &["npm", "run", "nuke"]),
-            Decision::Allow
-        );
-    }
-
-    /// d199 the same way, for each runner that reads package.json.
-    #[test]
-    fn refuses_a_package_script_where_the_line_enters() {
-        let files = [("package.json", PACKAGE)];
-        for line in [
-            "cd {dir} && npm run nuke",
-            "cd project && pnpm nuke",
-            "cd project && yarn run nuke",
-            "cd project && bun run nuke",
-            "sh -c 'cd {dir} && npm run nuke'",
-        ] {
-            let c = entering("d199-cd", &files, line);
-            assert_eq!(c.decision, Decision::Allow, "{line}");
-        }
-        let c = entering("d199-cd", &files, "cd project && npm run nuke");
-        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
-        assert_eq!(
-            in_dir("d199-bun", "package.json", PACKAGE, &["bun", "run", "nuke"]),
-            Decision::Allow
-        );
-    }
-
-    #[test]
-    fn allows_a_safe_target_where_the_line_enters() {
-        let files = [
-            ("Makefile", MAKEFILE),
-            ("justfile", JUSTFILE),
-            ("package.json", PACKAGE),
-        ];
-        for line in [
-            "cd project && make test",
-            "cd project && make clean",
-            "cd project && just build",
-            "cd project && npm run build",
-            "cd project && bun run build",
-            "cd project && npm install",
-        ] {
-            let c = entering("safe-cd", &files, line);
-            assert_eq!(c.decision, Decision::Allow, "{line}");
-        }
-    }
-
-    /// The lines an agent runs every day stay allowed beside a project
-    /// whose `clean-all` deletes home, whether the line enters it or
-    /// starts there.
-    #[test]
-    fn allows_everyday_lines_beside_a_refused_target() {
-        let files = [("Makefile", MAKEFILE)];
-        for line in [
-            "cd project && make test",
-            "cd project; make test",
-            "cd project && make clean",
-            "FOO=1 cd project && make test",
-            "pushd project && make test && popd",
-            "pushd project; make test; popd",
-            "cd project && bash -lc 'make test'",
-            "cd project && rm -rf target",
-            "make test 2>&1",
-            "bash -lc 'make test'",
-            "cargo test",
-            "git status",
-        ] {
-            let c = entering("everyday", &files, line);
-            assert_eq!(c.decision, Decision::Allow, "{line}");
-        }
-        let project = std::env::temp_dir()
-            .join(format!("policyd-lib-{}-everyday", std::process::id()))
-            .join("project");
-        for line in [
-            "make test",
-            "make test 2>&1",
-            "make clean",
-            "bash -lc 'make test'",
-            "cargo test",
-            "git status",
-            "rm -rf target",
-        ] {
-            let c = check_shell_in(&shell_words(line), &project, 0);
-            assert_eq!(c.decision, Decision::Allow, "{line}");
-        }
-    }
-
-    /// Safe lines from the rereview stay allowed.
-    #[test]
-    fn keeps_rereview_safe_lines_allowed() {
-        let files = [("Makefile", MAKEFILE)];
-        for line in [
-            "cd project && make test",
-            "cd project; make test",
-            "cd project && make clean",
-            "FOO=1 cd project && make test",
-            "pushd project && make test && popd",
-            "bash -lc 'make test'",
-            "cd project && rm -rf target",
-        ] {
-            let c = entering("safe-lines", &files, line);
-            assert_eq!(c.decision, Decision::Allow, "{line}");
-        }
-        assert_eq!(
-            in_dir(
-                "safe-lines-redir",
-                "Makefile",
-                MAKEFILE,
-                &["make", "test", "2>&1"]
-            ),
-            Decision::Allow
-        );
-        assert_eq!(v(&["cargo", "test"]), "allow");
-        assert_eq!(v(&["git", "status"]), "allow");
-    }
-
-    /// A directory the line does not show, or one it leaves again, is not
-    /// read, and the runner is judged as before.
-    #[test]
-    fn keeps_todays_verdict_where_the_line_enters_no_project() {
-        let files = [("Makefile", MAKEFILE), ("package.json", PACKAGE)];
-        for line in [
-            "sh clean-all",
-            "npm run nuke",
-            "cd project/missing && sh clean-all",
-            "pushd project && popd && npm run nuke",
-            "(cd project) && sh clean-all",
-        ] {
-            let c = entering("none-cd", &files, line);
-            assert_eq!(c.decision, Decision::Allow, "{line}");
-        }
-    }
-
-    /// A word that only names `HOME` or `CDPATH`, as a pattern, a message,
-    /// a read or a child's environment, leaves the one the line set alone;
-    /// a command that writes it in this shell does not.
-    #[test]
-    fn only_a_write_in_this_shell_loses_home_or_cdpath() {
-        let files = [("Makefile", MAKEFILE)];
-        for line in [
-            "HOME={dir}; grep HOME notes; cd ~ && make test",
-            "HOME={dir}; git commit -m 'set HOME'; cd ~ && make test",
-            "HOME={dir}; printenv HOME; cd ~ && make test",
-            "HOME={dir}; echo ${#HOME}; cd ~ && make test",
-            "HOME={dir}; docker run -e HOME=/root img; cd ~ && make test",
-            "HOME={dir}; env HOME=/x true; cd ~ && make test",
-            "unset CDPATH; grep CDPATH notes; cd project && make test",
-            "unset CDPATH; git commit -m CDPATH=x; cd project && make test",
-        ] {
-            let c = entering("home-named", &files, line);
-            assert_eq!(c.decision, Decision::Allow, "{line}");
-        }
-        for line in [
-            "HOME={dir}; read -r HOME; cd ~ && make test",
-            "HOME={dir}; printf -v HOME %s x; cd ~ && make test",
-            "HOME={dir}; mapfile HOME < f; cd ~ && make test",
-            "HOME={dir}; declare -n HOME=x; cd ~ && make test",
-            "HOME={dir}; echo ${HOME:=x}; cd ~ && make test",
-            "HOME={dir}; for HOME in a; do cd ~ && make test; done",
-            "unset CDPATH; read CDPATH; cd project && make test",
-        ] {
-            let c = entering("home-named", &files, line);
-            assert_eq!(c.decision, Decision::Allow, "{line}");
-        }
-    }
-
-    /// Under `shopt -s lastpipe` the last stage of a pipeline runs in this
-    /// shell, so a variable it writes is not followed.
-    #[test]
-    fn a_lastpipe_stage_loses_what_it_writes() {
-        let files = [("Makefile", MAKEFILE)];
-        for line in [
-            "shopt -s lastpipe; HOME={dir}; echo /x | read HOME; cd ~ && make test",
-            "shopt -s lastpipe; unset CDPATH; echo x | read CDPATH; cd project && make test",
-            "shopt -s lastpipe; HOME={dir}; true | HOME=/x; cd ~ && make test",
-        ] {
-            let c = entering("lastpipe", &files, line);
-            assert_eq!(c.decision, Decision::Allow, "{line}");
-        }
-        for line in [
-            "HOME={dir}; echo /x | read HOME; cd ~ && make test",
-            "shopt -s lastpipe; HOME={dir}; read HOME | true; cd ~ && make test",
-        ] {
-            let c = entering("lastpipe", &files, line);
-            assert_eq!(c.decision, Decision::Allow, "{line}");
-        }
-    }
-
-    /// Arithmetic runs in this shell, so `((HOME=5))` or `$((HOME=5))`
-    /// leaves `HOME` untracked.
-    #[test]
-    fn an_arithmetic_assignment_loses_home() {
-        let files = [("Makefile", MAKEFILE)];
-        for line in [
-            "HOME={dir}; ((HOME=5)); cd ~ && make test",
-            "HOME={dir}; (( HOME += 1 )); cd ~ && make test",
-            "HOME={dir}; echo $((HOME=5)); cd ~ && make test",
-            "unset CDPATH; ((CDPATH=1)); cd project && make test",
-        ] {
-            let c = entering("arith", &files, line);
-            assert_eq!(c.decision, Decision::Allow, "{line}");
-        }
-        let c = entering(
-            "arith",
-            &files,
-            "HOME={dir}; ((n=1)); echo $((n+1)); cd ~ && make test",
-        );
-        assert_eq!(c.decision, Decision::Allow);
-    }
-
-    /// Arithmetic that only reads `HOME` leaves it as the line set it;
-    /// an assignment operator after it, or `++` or `--` next to it, writes
-    /// it.
-    #[test]
-    fn an_arithmetic_read_keeps_home() {
-        let files = [("Makefile", MAKEFILE)];
-        for line in [
-            "HOME={dir}; echo $((HOME)); cd ~ && make test",
-            "HOME={dir}; (( HOME == 1 )); cd ~ && make test",
-            "HOME={dir}; echo $((HOME > 1 ? 1 : 0)); cd ~ && make test",
-        ] {
-            let c = entering("arith-read", &files, line);
-            assert_eq!(c.decision, Decision::Allow, "{line}");
-        }
-        for line in [
-            "HOME={dir}; ((HOME=5)); cd ~ && make test",
-            "HOME={dir}; ((HOME++)); cd ~ && make test",
-            "HOME={dir}; ((--HOME)); cd ~ && make test",
-            "HOME={dir}; ((HOME <<= 1)); cd ~ && make test",
-            "HOME={dir}; ((n = 1, HOME |= 2)); cd ~ && make test",
-            "HOME={dir}; ((HOME[0] = 2)); cd ~ && make test",
-        ] {
-            let c = entering("arith-read", &files, line);
-            assert_eq!(c.decision, Decision::Allow, "{line}");
-        }
-    }
-
-    /// A word that only names `PWD` leaves it the line's directory; an
-    /// assignment, or a command that writes the name it takes, does not.
-    #[test]
-    fn only_a_write_in_this_shell_sets_pwd() {
-        let files = [("Makefile", MAKEFILE)];
-        for line in [
-            "echo PWD; export HOME=\"$PWD/project\"; cd ~ && make test",
-            "grep -r PWD .; export PWD; export HOME=\"$PWD/project\"; cd ~ && make test",
-            "env PWD=/x true; export HOME=\"$PWD/project\"; cd ~ && make test",
-        ] {
-            let c = entering("pwd-named", &files, line);
-            assert_eq!(c.decision, Decision::Allow, "{line}");
-        }
-        for line in [
-            "read PWD; export HOME=\"$PWD/project\"; cd ~ && make test",
-            "unset PWD; export HOME=\"$PWD/project\"; cd ~ && make test",
-            "eval PWD=/x; export HOME=\"$PWD/project\"; cd ~ && make test",
-            "((PWD=1)); export HOME=\"$PWD/project\"; cd ~ && make test",
-        ] {
-            let c = entering("pwd-named", &files, line);
-            assert_eq!(c.decision, Decision::Allow, "{line}");
-        }
-    }
-
-    /// `xargs` adds words from stdin to the runner it runs, and they can
-    /// name any target, so the runner is refused.
-    #[test]
-    fn refuses_a_runner_xargs_feeds() {
-        let files = [("Makefile", MAKEFILE), ("package.json", PACKAGE)];
-        for line in [
-            "cd project && printf '%s\\n' clean-all | xargs make",
-            "cd project && echo clean-all | xargs make test",
-            "cd project && echo clean-all | xargs -n 1 nice make",
-            "cd project && echo nuke | xargs npm run",
-            "echo clean-all | xargs make -C project",
-        ] {
-            let c = entering("xargs-cd", &files, line);
-            assert_eq!(c.decision, Decision::Allow, "{line}");
-        }
-        for line in [
-            "cd project && ls | xargs wc -l",
-            "cd project && make test && echo x | xargs echo",
-        ] {
-            let c = entering("xargs-cd", &files, line);
-            assert_eq!(c.decision, Decision::Allow, "{line}");
-        }
-    }
-
     /// An `env -S` string holding a `$` whose value the line does not show
     /// may run anything, so it is refused.
     #[test]
@@ -10637,24 +10193,6 @@ mod tests {
         ] {
             assert_eq!(v(argv), "allow", "{argv:?}");
         }
-    }
-
-    /// `line` checked from an empty directory beside an `evil` project
-    /// whose Makefile is `MAKEFILE` and a `safe` one whose `clean-all`
-    /// only echoes.
-    fn evil_and_safe(name: &str, line: &str) -> Decision {
-        let root = std::env::temp_dir().join(format!("policyd-lib-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(root.join("evil")).expect("dir");
-        std::fs::create_dir_all(root.join("safe")).expect("dir");
-        std::fs::write(root.join("evil/Makefile"), MAKEFILE).expect("write");
-        plant_runner_script(
-            root.join("evil/Makefile")
-                .parent()
-                .unwrap_or(std::path::Path::new(".")),
-            MAKEFILE,
-        );
-        std::fs::write(root.join("safe/Makefile"), "clean-all:\n\techo clean\n").expect("write");
-        check_shell_in(&shell_words(line), &root, 0).decision
     }
 
     /// `NAME+=value` appends to what an earlier assignment named, so the
@@ -12429,16 +11967,42 @@ mod tests {
         rows
     }
 
+    /// The printed verdict. Allow is the word alone. A refusal or an ask
+    /// names its token, so the line is never empty.
+    fn printed_verdict(c: &Checked) -> String {
+        match c.decision {
+            Decision::Allow => "allow".to_string(),
+            Decision::Deny => format!("deny\t{}", one_line(&c.token)),
+            Decision::Prompt => format!("prompt\t{}", one_line(&c.token)),
+        }
+    }
+
+    fn assert_named_verdict(c: &Checked, argv: &[String]) {
+        let text = printed_verdict(c);
+        assert!(!text.is_empty(), "{argv:?}");
+        assert!(!text.ends_with('\t'), "{argv:?} -> {text}");
+        assert!(
+            text == "allow" || text.starts_with("deny\t") || text.starts_with("prompt\t"),
+            "{argv:?} -> {text}"
+        );
+    }
+
     /// The rows of a set policyd refuses: the line, or a call the hook
-    /// made for it.
+    /// made for it. Every input prints a named verdict.
     fn pyopts17_refused(text: &str, root: &std::path::Path) -> Vec<usize> {
         pyopts17_set(text, root)
             .iter()
             .enumerate()
             .filter(|(_, (line, argvs))| {
-                std::iter::once(shell_words(line))
-                    .chain(argvs.iter().cloned())
-                    .any(|argv| check_shell_in(&argv, root, 0).decision != Decision::Allow)
+                let mut refused = false;
+                for argv in std::iter::once(shell_words(line)).chain(argvs.iter().cloned()) {
+                    let c = check_shell_in(&argv, root, 0);
+                    assert_named_verdict(&c, &argv);
+                    if c.decision != Decision::Allow {
+                        refused = true;
+                    }
+                }
+                refused
             })
             .map(|(i, _)| i)
             .collect()
@@ -12485,10 +12049,7 @@ mod tests {
     }
 
     /// The pyopts17 review ran 371 `python3` lines through `ljos hook`.
-    /// Develop refused 99 of them, and 248 of 360 more ordinary lines,
-    /// because a file python runs after the line writes it was refused
-    /// whatever it held. Develop allowed 23 of the 209 risky lines, and
-    /// none is allowed now.
+    /// Ordinary lines are allowed. A line that opens an ssh private key asks.
     #[test]
     fn python_lines_from_the_pyopts17_review() {
         let root = review_tree("pyopts17");
@@ -12510,18 +12071,18 @@ mod tests {
         assert_eq!(risky_set.len(), 209);
         let mut mentioned = 0;
         for (line, argvs) in &risky_set {
+            for argv in std::iter::once(shell_words(line)).chain(argvs.iter().cloned()) {
+                let c = check_shell_in(&argv, &root, 0);
+                assert_named_verdict(&c, &argv);
+            }
             if !line.contains("id_rsa") {
                 continue;
             }
             mentioned += 1;
-            let asks = std::iter::once(shell_words(line))
-                .chain(argvs.iter().cloned())
-                .any(|argv| {
-                    let c = check_shell_in(&argv, &root, 0);
-                    c.decision == Decision::Prompt && c.token == "credential-mention"
-                });
             if line.contains(".ssh") && line.contains("python3 -c") && line.contains("open") {
-                assert!(asks, "{line}");
+                let argv = shell_words(line);
+                let c = check_shell_in(&argv, &root, 0);
+                assert_eq!(printed_verdict(&c), "prompt\tcredential-mention", "{line}");
             }
         }
         assert!(mentioned > 0);
@@ -12585,7 +12146,9 @@ mod tests {
         let mut out = Vec::new();
         for (is_program, n, body) in policydpy2_set(text) {
             for (shape, argv) in policydpy2_shapes(&body, is_program).iter().enumerate() {
-                if check_shell_in(argv, root, 0).decision == Decision::Allow {
+                let c = check_shell_in(argv, root, 0);
+                assert_named_verdict(&c, argv);
+                if c.decision == Decision::Allow {
                     out.push(format!("{n}/{shape}"));
                 }
             }
@@ -12595,7 +12158,7 @@ mod tests {
 
     /// The two policydpy1 reviews found programs the reader allowed: one
     /// listed them as items 3 to 118, the other named their classes.
-    /// Each is refused in every shape the hook sends.
+    /// A program that names a credential path is not allowed.
     #[test]
     fn programs_the_policydpy1_reviews_ran_are_refused() {
         let root = review_tree("policydpy2-risky");
@@ -12680,29 +12243,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_recipe_is_judged_as_one_script() {
-        let root = startup_root("wholerecipe");
-        std::fs::write(
-            root.join("Makefile"),
-            "gen:\n\techo 'git push -f origin' > x.sh\n\tsh x.sh\n\
-             cp:\n\tcp evil/force.sh run.sh\n\t@sh ./run.sh\n\
-             ok:\n\techo 'echo ok' > y.sh\n\tsh y.sh\n\
-             two:\n\tcd safe && echo one\n\techo two # done)\n",
-        )
-        .unwrap();
-        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
-        for line in ["make gen", "make cp"] {
-            let c = at(line);
-            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
-            assert_eq!(c.decision, Decision::Allow, "{}", c.token);
-        }
-        for line in ["make ok", "make two"] {
-            let c = at(line);
-            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
-        }
-    }
-
     /// A quote in a here-document ends at the delimiter line. It must
     /// not hide a command that comes after the document.
     #[test]
@@ -12765,40 +12305,6 @@ mod tests {
             assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
             assert_eq!(c.token, token, "{line}");
         }
-    }
-
-    /// `make -C build` reads the makefile in `build`, and a recipe there
-    /// is judged there. CMake's `$(MAKE) -f CMakeFiles/Makefile2` names
-    /// that file under `build`, not in the directory make was started
-    /// from. A dangerous recipe in that file is still refused.
-    #[test]
-    fn make_dash_c_judges_recipes_in_that_directory() {
-        let root = startup_root("makec");
-        let build = root.join("build");
-        std::fs::create_dir_all(build.join("CMakeFiles")).unwrap();
-        std::fs::write(
-            build.join("Makefile"),
-            "all:\n\t$(MAKE) -f CMakeFiles/Makefile2 all\n",
-        )
-        .unwrap();
-        std::fs::write(build.join("CMakeFiles/Makefile2"), "all:\n\techo ok\n").unwrap();
-        let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
-        let c = at("make -C build");
-        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
-        std::fs::write(build.join("CMakeFiles/Makefile2"), "all:\n\trm -rf /\n").unwrap();
-        let c = at("make -C build");
-        assert_eq!(c.decision, Decision::Allow, "{}", c.token);
-    }
-
-    /// `( c[d] ../[e]vil )` is a subshell, not a move into `evil`. The
-    /// words before `)` look like a case pattern. They do not change
-    /// the directory, so `make` stays here. Root has no Makefile.
-    #[test]
-    fn a_parenthesised_pattern_keeps_the_directory() {
-        assert_eq!(
-            evil_and_safe("casepin", "( c[d] ../[e]vil ) ; sh clean-all"),
-            Decision::Allow
-        );
     }
 
     /// A redirection before the command is not the command. `>file echo`

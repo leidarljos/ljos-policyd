@@ -152,6 +152,54 @@ fn local_git_lost_work_asks() {
     assert!(verdict(&words("git push --force origin main")).starts_with("deny\t"));
 }
 
+fn shell(line: &str) -> Vec<String> {
+    vec!["bash".into(), "-c".into(), line.into()]
+}
+
+#[test]
+fn read_only_xargs_lines_are_allowed() {
+    for line in [
+        "rg -l foo src | xargs rg -n bar",
+        "rg --files | xargs wc -l",
+        "fd -e rs | xargs grep -n x",
+        "fd | xargs -I{} sh -c 'grep -n x {} 2>/dev/null'",
+        "printf main | xargs git push origin",
+        "printf a.txt | xargs chmod 644",
+    ] {
+        assert_eq!(verdict(&shell(line)), "allow", "{line}");
+    }
+    assert_eq!(verdict(&words("git push origin main")), "allow");
+    assert_eq!(verdict(&words("chmod 644 f")), "allow");
+    assert_eq!(verdict(&words("mv a b")), "allow");
+}
+
+#[test]
+fn xargs_into_rm_or_a_force_push_is_refused() {
+    assert_eq!(
+        verdict(&shell("printf x | xargs rm -rf")),
+        "deny\tfeeder-rm"
+    );
+    assert_eq!(
+        verdict(&shell("printf main | xargs git push -f origin")),
+        "deny\tgit-force-push"
+    );
+}
+
+#[test]
+fn a_credential_path_prints_credential_mention() {
+    for program in [
+        "print(open('/home/u/.ssh/id_rsa').read())",
+        "print(open('/tmp/fake/.pgpass').read())",
+        "print(open('/tmp/fake/.secrets/gh_fake').read())",
+    ] {
+        assert_eq!(
+            verdict(&["python3".into(), "-c".into(), program.into()]),
+            "prompt\tcredential-mention",
+            "{program}"
+        );
+    }
+}
+
 #[test]
 fn find_and_feeders_do_not_hide_rm() {
     for (line, token) in [
