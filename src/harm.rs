@@ -197,7 +197,7 @@ pub(crate) fn git_lost_work(argv: &[String]) -> Option<&'static str> {
         "checkout" | "switch" if has("--force") || short('f') || has("--discard-changes") => {
             Some("git-discard-worktree")
         }
-        "checkout" | "restore" if discards_tree(&owned) => Some("git-discard-worktree"),
+        "checkout" | "restore" if discards_tree(sub, &owned) => Some("git-discard-worktree"),
         _ => None,
     }
 }
@@ -233,9 +233,17 @@ fn clean_fd(rest: &[String]) -> bool {
 }
 
 /// `checkout -- .` and `restore .`. A named file, a new branch, or a
-/// patch is not the whole tree.
-fn discards_tree(rest: &[String]) -> bool {
-    // `-S` and `-W` are the short forms, alone or clustered as `-SW`.
+/// patch is not the whole tree. `restore` reads its own flags; `checkout`
+/// keeps the shapes it had.
+fn discards_tree(sub: &str, rest: &[String]) -> bool {
+    if sub == "restore" {
+        parse_restore(rest).drops_worktree
+    } else {
+        checkout_discards_tree(rest)
+    }
+}
+
+fn checkout_discards_tree(rest: &[String]) -> bool {
     let short = |flag: char| {
         rest.iter().any(|a| {
             a.len() > 1 && a.starts_with('-') && !a.starts_with("--") && a[1..].contains(flag)
@@ -262,6 +270,177 @@ fn discards_tree(rest: &[String]) -> bool {
         }
     }
     paths.iter().any(|p| whole_tree(p))
+}
+
+/// How one `git restore` line relates to the work tree, and which words
+/// the linked pack would misread.
+pub(crate) struct ParsedRestore {
+    pub drops_worktree: bool,
+    /// Indexes into the restore arguments. The pack treats a whole-tree
+    /// path as a discard and skips a path that looks like a flag. The
+    /// plain build leaves these unread; the linked build applies them.
+    #[cfg_attr(not(has_phronesis), allow(dead_code))]
+    pub pack_standins: Vec<(usize, &'static str)>,
+    /// An option git rejects, when the line has no path the pack can see.
+    #[cfg_attr(not(has_phronesis), allow(dead_code))]
+    pub show_as_path: Option<usize>,
+}
+
+struct RestoreScan {
+    staged: Option<bool>,
+    worktree: Option<bool>,
+    patch: bool,
+    branch: bool,
+    rejected: bool,
+    paths: Vec<usize>,
+    show_as_path: Option<usize>,
+}
+
+/// `git restore` writes the work tree for a whole-tree path unless the
+/// line only stages, or git rejects it. `-S` and `--staged` touch the
+/// index. `-W` and `--worktree` write the work tree, and so does a line
+/// with neither, because the work tree is the default. Letters after
+/// `-s` in one cluster are the source tree. `--` ends options. A flag
+/// that takes no value, given one with `=`, makes git reject the line.
+pub(crate) fn parse_restore(rest: &[String]) -> ParsedRestore {
+    let mut scan = RestoreScan {
+        staged: None,
+        worktree: None,
+        patch: false,
+        branch: false,
+        rejected: false,
+        paths: Vec::new(),
+        show_as_path: None,
+    };
+    let mut opts = true;
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i].as_str();
+        if !opts {
+            scan.paths.push(i);
+            i += 1;
+            continue;
+        }
+        if a == "--" {
+            opts = false;
+            i += 1;
+            continue;
+        }
+        if a == "-b" || a == "-B" {
+            scan.branch = true;
+            i += 1;
+            continue;
+        }
+        if let Some(cluster) = a
+            .strip_prefix('-')
+            .filter(|c| !c.is_empty() && !c.starts_with('-'))
+        {
+            i = read_restore_shorts(cluster, rest, i, &mut scan);
+            continue;
+        }
+        if a.starts_with("--") {
+            i = read_restore_long(a, i, &mut scan);
+            continue;
+        }
+        scan.paths.push(i);
+        i += 1;
+    }
+    if !scan.paths.is_empty() {
+        scan.show_as_path = None;
+    }
+    let worktree_on = scan.worktree.unwrap_or(scan.staged.is_none());
+    let drops_worktree = !scan.rejected
+        && !scan.patch
+        && !scan.branch
+        && worktree_on
+        && scan.paths.iter().any(|&j| whole_tree(&rest[j]));
+    let pack_standins = scan
+        .paths
+        .iter()
+        .filter_map(|&j| {
+            let p = rest[j].as_str();
+            if whole_tree(p) {
+                Some((j, "index-file"))
+            } else if p.starts_with('-') {
+                Some((j, "named-file"))
+            } else {
+                None
+            }
+        })
+        .collect();
+    ParsedRestore {
+        drops_worktree,
+        pack_standins,
+        show_as_path: scan.show_as_path,
+    }
+}
+
+/// One cluster of short restore flags. `-s` takes the rest of the cluster,
+/// or the next word, as its tree.
+fn read_restore_shorts(cluster: &str, rest: &[String], i: usize, scan: &mut RestoreScan) -> usize {
+    let chars: Vec<char> = cluster.chars().collect();
+    let mut c = 0;
+    let mut next = i + 1;
+    while c < chars.len() {
+        match chars[c] {
+            's' => {
+                if chars[c + 1..].is_empty() && next < rest.len() {
+                    next += 1;
+                }
+                break;
+            }
+            'S' => scan.staged = Some(true),
+            'W' => scan.worktree = Some(true),
+            'p' => scan.patch = true,
+            _ => {}
+        }
+        c += 1;
+    }
+    next
+}
+
+fn read_restore_long(word: &str, i: usize, scan: &mut RestoreScan) -> usize {
+    let (name, val) = match word.split_once('=') {
+        Some((n, v)) if n.starts_with("--") => (n, Some(v)),
+        _ => (word, None),
+    };
+    let (negated, body) = match name.strip_prefix("--no-") {
+        Some(body) => (true, body),
+        None => (false, name.strip_prefix("--").unwrap_or(name)),
+    };
+    let takes_value = matches!(body, "source" | "conflict" | "pathspec-from-file");
+    let no_value = matches!(
+        body,
+        "staged"
+            | "worktree"
+            | "quiet"
+            | "patch"
+            | "merge"
+            | "ours"
+            | "theirs"
+            | "overlay"
+            | "ignore-unmerged"
+            | "ignore-skip-worktree-bits"
+            | "progress"
+            | "pathspec-file-nul"
+    );
+    if no_value && val.is_some() {
+        scan.rejected = true;
+        if scan.show_as_path.is_none() {
+            scan.show_as_path = Some(i);
+        }
+        return i + 1;
+    }
+    if takes_value && !negated && val.is_none() {
+        return i + 2;
+    }
+    match body {
+        "staged" => scan.staged = Some(!negated),
+        "worktree" => scan.worktree = Some(!negated),
+        "patch" => scan.patch = !negated,
+        _ => {}
+    }
+    i + 1
 }
 
 /// `find -delete`, `find -exec rm`, and `xargs` or `parallel` whose
