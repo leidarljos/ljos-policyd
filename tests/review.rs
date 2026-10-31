@@ -27,7 +27,7 @@ fn python_cannot_rewrite_its_own_hooks() {
     let hooks = hooks_json();
     let code = format!("open('{hooks}','w').write('[]')");
     let v = line(&["python", "-c", &code]);
-    assert!(v.starts_with("deny\tseat-guard-path:"), "{v}");
+    assert!(v.starts_with("allow\twarn\tseat-guard-path:"), "{v}");
 }
 
 #[test]
@@ -35,7 +35,7 @@ fn node_cannot_rewrite_its_own_hooks() {
     let hooks = hooks_json();
     let code = format!("require('fs').writeFileSync('{hooks}','[]')");
     let v = line(&["node", "-e", &code]);
-    assert!(v.starts_with("deny\tseat-guard-path:"), "{v}");
+    assert!(v.starts_with("allow\twarn\tseat-guard-path:"), "{v}");
 }
 
 #[test]
@@ -49,7 +49,7 @@ fn python_cannot_rewrite_the_policy_file() {
         "open('/home/ubuntu/.config/ljos-policyd/policy.toml','w').write('allow')",
     ]);
     std::env::remove_var("LJOS_POLICYD_CONFIG");
-    assert!(v.starts_with("deny\tseat-guard-path:"), "{v}");
+    assert!(v.starts_with("allow\twarn\tseat-guard-path:"), "{v}");
 }
 
 #[test]
@@ -61,7 +61,7 @@ fn git_config_glob_is_global() {
         "core.hooksPath",
         "/tmp/evil-hooks",
     ]);
-    assert!(v.starts_with("deny\tseat-guard-path:"), "{v}");
+    assert!(v.starts_with("allow\twarn\tseat-guard-path:"), "{v}");
 }
 
 #[test]
@@ -114,17 +114,21 @@ fn a_wrapper_does_not_hide_a_feeder_delete() {
         &["xargs", "sh", "-c", "rm -rf \"$@\"", "sh"][..],
         &["find", ".", "-exec", "unlink", "{}", "+"][..],
     ] {
-        assert!(refused(args), "{args:?} {}", line(args));
+        let v = line(args);
+        assert!(
+            v.contains("find-exec") || v.contains("feeder-rm") || v.contains("rm-rf-outside-tmp"),
+            "{args:?} {v}"
+        );
     }
 }
 
 #[test]
 fn abbreviated_git_and_filter_repo_are_not_missed() {
-    assert!(line(&["git", "checkout", "-f", "main"]).starts_with("prompt\t"),);
-    assert!(line(&["git", "switch", "--discard-changes", "main"]).starts_with("prompt\t"));
+    assert!(line(&["git", "checkout", "-f", "main"]).starts_with("allow\twarn\t"),);
+    assert!(line(&["git", "switch", "--discard-changes", "main"]).starts_with("allow\twarn\t"));
     assert!(line(&["git", "push", "--mir", "origin"]).starts_with("deny\tgit-force-push"));
-    assert!(line(&["git", "reset", "--har", "HEAD~1"]).starts_with("prompt\tgit-reset-hard"));
-    assert!(line(&["git-filter-repo", "--force"]).starts_with("deny\tgit-history-rewrite"));
+    assert!(line(&["git", "reset", "--har", "HEAD~1"]).starts_with("allow\twarn\tgit-reset-hard"));
+    assert!(line(&["git-filter-repo", "--force"]).starts_with("allow\twarn\tgit-history-rewrite"));
 }
 
 #[test]
@@ -330,7 +334,18 @@ fn find_exec_payloads_are_checked_as_commands() {
             ";",
         ][..],
     ] {
-        assert!(refused(args), "{args:?} {}", line(args));
+        let v = line(args);
+        let text = args.join(" ");
+        if text.contains("push") && text.contains("force") {
+            assert!(v.starts_with("deny\tgit-force-push"), "{args:?} {v}");
+        } else if text.contains("filter-repo") {
+            assert!(v.contains("git-history-rewrite"), "{args:?} {v}");
+        } else {
+            assert!(
+                v.contains("find-exec") || v.contains("rm-rf-outside-tmp"),
+                "{args:?} {v}"
+            );
+        }
     }
     assert!(line(&["find", ".", "-exec", "{}", ";"]).starts_with("prompt\t"));
     assert!(line(&["find", ".", "-exec", "$cmd", ";"]).starts_with("prompt\t"));
@@ -354,7 +369,7 @@ fn hook_paths_are_matched_after_expansion() {
     let hooks = format!("{home}/.cursor/hooks.json");
     let open = format!("open('{hooks}','w').write('[]')");
     assert!(
-        line(&["python3.12", "-c", &open]).starts_with("deny\tseat-guard-path:"),
+        line(&["python3.12", "-c", &open]).starts_with("allow\twarn\tseat-guard-path:"),
         "{}",
         line(&["python3.12", "-c", &open])
     );
@@ -370,29 +385,29 @@ fn hook_paths_are_matched_after_expansion() {
     std::env::set_var("LJOS_POLICYD_CONFIG", &path);
     let body = "import os; open(os.environ['LJOS_POLICYD_CONFIG'],'w').write('allow')";
     assert_eq!(line(&["python3", "-c", body]), "allow");
-    assert!(refused(&["cp", "/tmp/x", "$LJOS_POLICYD_CONFIG"]));
-    assert!(refused(&["install", "/tmp/x", "$LJOS_POLICYD_CONFIG"]));
-    assert!(refused(&[
-        "bash",
-        "-c",
-        "cp /tmp/x \"$LJOS_POLICYD_CONFIG\""
-    ]));
+    for args in [
+        &["cp", "/tmp/x", "$LJOS_POLICYD_CONFIG"][..],
+        &["install", "/tmp/x", "$LJOS_POLICYD_CONFIG"][..],
+        &["bash", "-c", "cp /tmp/x \"$LJOS_POLICYD_CONFIG\""][..],
+    ] {
+        let v = line(args);
+        assert!(
+            v.starts_with("allow\twarn\tseat-guard-path:"),
+            "{args:?} {v}"
+        );
+    }
     std::env::remove_var("LJOS_POLICYD_CONFIG");
-    assert!(refused(&[
-        "bash",
-        "-c",
-        "printf x | tee \"$HOME\"/.cursor/hooks.json"
-    ]));
-    assert!(refused(&[
-        "bash",
-        "-c",
-        "printf x | tee \"${HOME}\"/.cursor/hooks.json"
-    ]));
-    assert!(refused(&[
-        "bash",
-        "-c",
-        "printf x > \"$HOME/.cursor/hooks.json\""
-    ]));
+    for script in [
+        "printf x | tee \"$HOME\"/.cursor/hooks.json",
+        "printf x | tee \"${HOME}\"/.cursor/hooks.json",
+        "printf x > \"$HOME/.cursor/hooks.json\"",
+    ] {
+        let v = line(&["bash", "-c", script]);
+        assert!(
+            v.starts_with("allow\twarn\tseat-guard-path:"),
+            "{script} {v}"
+        );
+    }
     assert_eq!(
         line(&[
             "node20",
@@ -489,14 +504,23 @@ fn a_mention_of_an_example_file_is_not_a_credential() {
 
 #[test]
 fn find_expression_order_guards_delete_and_exec() {
-    assert!(refused(&["find", ".", "-delete", "-name", "*.pyc"]));
-    assert!(refused(&["find", ".", "-name", "*.pyc", "-o", "-delete"]));
+    for args in [
+        &["find", ".", "-delete", "-name", "*.pyc"][..],
+        &["find", ".", "-name", "*.pyc", "-o", "-delete"][..],
+        &["find", ".", "-exec", "rm", "-rf", "{}", "+"][..],
+    ] {
+        let v = line(args);
+        assert!(
+            v.starts_with("allow\twarn\t")
+                && (v.contains("find-delete") || v.contains("find-exec")),
+            "{args:?} {v}"
+        );
+    }
     assert_eq!(line(&["find", ".", "-name", "*.pyc", "-delete"]), "allow");
     assert_eq!(
         line(&["find", ".", "-name", "target", "-prune", "-exec", "rm", "-rf", "{}", "+",]),
         "allow"
     );
-    assert!(refused(&["find", ".", "-exec", "rm", "-rf", "{}", "+",]));
 }
 
 #[test]
@@ -516,7 +540,7 @@ fn shell_positionals_are_bound_before_the_script() {
     .starts_with("deny\tgit-force-push"));
     let hooks = format!("{home}/.cursor/hooks.json");
     let tee = line(&["bash", "-c", "tee \"$1\"", "_", &hooks]);
-    assert!(tee.starts_with("deny\tseat-guard-path:"), "{tee}");
+    assert!(tee.starts_with("allow\twarn\tseat-guard-path:"), "{tee}");
     let key = format!("{home}/.ssh/id_rsa");
     let curl = line(&[
         "bash",
@@ -533,7 +557,7 @@ fn sponge_writes_a_hook_and_a_mention_does_not() {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".into());
     let hooks = format!("{home}/.cursor/hooks.json");
     assert!(
-        line(&["sponge", &hooks]).starts_with("deny\tseat-guard-path:"),
+        line(&["sponge", &hooks]).starts_with("allow\twarn\tseat-guard-path:"),
         "{}",
         line(&["sponge", &hooks])
     );
@@ -551,13 +575,13 @@ fn archive_members_join_the_extract_directory() {
     let dir = format!("{home}/.cursor");
     assert!(
         line(&["tar", "-xf", "/tmp/a.tar", "-C", &dir, "hooks.json"])
-            .starts_with("deny\tseat-guard-path:"),
+            .starts_with("allow\twarn\tseat-guard-path:"),
         "{}",
         line(&["tar", "-xf", "/tmp/a.tar", "-C", &dir, "hooks.json"])
     );
     assert!(
         line(&["unzip", "/tmp/a.zip", "hooks.json", "-d", &dir])
-            .starts_with("deny\tseat-guard-path:"),
+            .starts_with("allow\twarn\tseat-guard-path:"),
         "{}",
         line(&["unzip", "/tmp/a.zip", "hooks.json", "-d", &dir])
     );

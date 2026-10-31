@@ -17,9 +17,25 @@ pub struct PersonAllow {
     pub pattern: String,
 }
 
+thread_local! {
+    /// This thread's rules file, ahead of [`rules_path`]'s environment.
+    /// Other threads keep their own, so a test can name a file without
+    /// handing it to a check running beside it.
+    static RULES_THREAD: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// This thread's rules file, ahead of `$XDG_CONFIG_HOME`. `None` clears it.
+pub fn set_thread_rules_path(path: Option<PathBuf>) {
+    RULES_THREAD.with(|slot| *slot.borrow_mut() = path);
+}
+
 /// `$XDG_CONFIG_HOME/ljos/user-rules.json`, else `~/.config/ljos/user-rules.json`.
+/// A path set by [`set_thread_rules_path`] on this thread wins.
 #[must_use]
 pub fn rules_path() -> Option<PathBuf> {
+    if let Some(path) = RULES_THREAD.with(|slot| slot.borrow().clone()) {
+        return Some(path);
+    }
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)

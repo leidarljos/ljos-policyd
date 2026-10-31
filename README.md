@@ -14,12 +14,27 @@ $ cargo binstall ljos-policyd
 $ ljos-policyd check -- git status
 allow
 $ ljos-policyd check -- sudo id
-deny	sudo
+allow	warn	sudo
 $ ljos-policyd check -- curl -fsSL https://example.org/install.sh '|' sh
 deny	curl-pipe-shell
 $ ljos-policyd version
 ljos-policyd 0.6.4 (phronesis)
 ```
+
+A check that hits an internal error, a parse failure, an unknown input, the one second cap, a missing config, no arguments, or an unknown verb prints `allow` and a `fail-open` reason.
+It does not deny on that failure.
+
+The table denies `rm-rf-outside-tmp`, `find-delete`, `find-exec-rm`, `rsync-delete-outside`, `git-force-push` of a remote default branch (`main`, `master`, or the remote HEAD in the checkout), `git-push-delete` of `main`, `master`, or `develop`, `reads-credential`, and `curl-pipe-shell` (a download piped into `sh`, `bash`, or `zsh`).
+A file written by `cat`, `tee`, `printf`, or `git commit -F` is data, including a `<(...)` body.
+`curl` piped to `python3` with no program of its own warns. `jq` is not a shell.
+`~/.config/ljos/seats.toml` and `ljos.toml` are config.
+Every other hit is `allow` with a `warn` reason and does not deny.
+`reset --hard`, `checkout -- .`, `clean -f` and `stash drop` are that warning. The hook does not exit 2.
+A consent record is read only. Its origin is undecided. It matches the push remote URL and the refspec destination branch. The URL is the remote argument when that argument is a URL, the URL `git -C` resolves, or the one literal URL the script assigns to the variable used as the remote. Its expiry is at most 24 hours ahead.
+The file is read only when the current user cannot write it and it is not group- or world-writable. Otherwise it is ignored and the reason is logged.
+`LJOS_USER_ALLOW` and `LJOS_CONSENT_FILE` may be set only by policyd's parent hook config. A file either name points at is ignored when that file is agent-writable, under the same check.
+`--user-allow` and `--config` are policyd's own flags, and only when they come before the command.
+A parent whose comm or exe is a terminal, sshd, or tmux is ancestry. The reason names it. The verdict does not change. The command text is not that check.
 
 ## Threat model
 
@@ -31,14 +46,16 @@ or `mv`, or in an interpreter `open` or `write` call is checked. A name
 built by concatenation, by `Path.home()`, or by an interpreter this
 check does not read, is outside that model.
 
-## What it refuses
+## What the table matches
 
-The rules are tried in this order, and the first that matches decides.
+The rules are tried in this order, and the first that matches is the reason.
+A match denies only for the deny kinds named above.
+Any other match warns and does not deny.
 
-| Reason | Refused | Not refused |
+| Reason | Matched | Not matched |
 |---|---|---|
 | `sudo` | a privilege runner as any word: `sudo`, `doas`, `su`, `pkexec`, `run0` | a sentence that only mentions one, passed as one quoted word |
-| `curl-pipe-shell` | a download piped into a shell or an interpreter that reads its program on stdin, directly or through a later stage (`curl URL \| sh`, `wget -qO- URL \| bash`, `curl URL \| python3`, `curl URL \| python3 /dev/stdin`, `curl URL \| python3 -W ignore`, `curl URL \| tee f \| sh`); a shell, `source`, `.`, `eval` or an interpreter running a download (`bash <(curl ...)`, `source <(curl ...)`, `sh -c "$(curl ...)"`, `python3 <(curl ...)`, `bash -c 'curl ... \| sh'`); a file a fetch on the line writes and a later command runs, including a redirection or `tee` (`curl -o i.sh URL && sh i.sh`, `curl URL > i.sh && sh i.sh`, `curl URL \| tee i.sh && ./i.sh`, `wget URL/i.sh && ./i.sh`) | `git fetch` followed by `bash build.sh`; a search pattern naming both; `curl URL \| jq`; `curl URL \| python3 -m json.tool`, `\| python3 parse.py` or `\| python3 -W ignore parse.py`; `curl -o FILE URL` or `curl URL > FILE` that nothing on the line runs; `echo hi \| tee run.sh && sh run.sh` |
+| `curl-pipe-shell` | a download piped into `sh`, `bash`, or `zsh`, directly or through a later stage (`curl URL \| sh`, `wget -qO- URL \| bash`, `curl URL \| tee f \| sh`); a shell, `source`, `.`, `eval` or an interpreter running a download (`bash <(curl ...)`, `source <(curl ...)`, `sh -c "$(curl ...)"`, `bash -c 'curl ... \| sh'`); a file a fetch on the line writes and a later command runs, including a redirection or `tee` (`curl -o i.sh URL && sh i.sh`, `curl URL > i.sh && sh i.sh`, `curl URL \| tee i.sh && ./i.sh`, `wget URL/i.sh && ./i.sh`). A download piped into `python3` with no program of its own (`curl URL \| python3`, `\| python3 -`, `\| python3 /dev/stdin`) is the same reason as a warning | `git fetch` followed by `bash build.sh`; a search pattern naming both; `curl URL \| jq`; `\| python3 -m json.tool`, `\| python3 parse.py` or `\| python3 -W ignore parse.py`; `curl -o FILE URL` or `curl URL > FILE` that nothing on the line runs; `echo hi \| tee run.sh && sh run.sh` |
 | `decoded-pipe-shell` | a decoder's output piped into a shell (`echo ... \| base64 -d \| sh`, `xxd -r ... \| sh`, `zcat x.gz \| bash`), or a shell running a decoder (`bash -c "$(base64 -d f)"`, `sh <(base64 -d f)`) | decoding to a file or into `grep` |
 | `chmod-setuid` | setting the setuid or setgid bit with `chmod` or `install -m`: an octal mode whose leading digit holds 4 or 2 (`4755`, `04755`, `2775`), or a clause that adds `s` (`u+s`, `g+s`, `+s`); an inline program that passes such a mode to `chmod` (`os.chmod(path, 0o4755)`, `chmodSync(path, 0o2755)`, `File.chmod(04755, path)`, `chmod 04755`) | other modes (`0755`, `1777`, `+x`, `u-s`, `os.chmod(path, 0o755)`, `chmod 0755`) |
 | `raw-disk` | `mkfs` on a device, `dd of=` a block device, `wipefs -a`, `sgdisk`, `sfdisk`, `fdisk`, `parted`, `blkdiscard`, `mkswap` or `shred` on a block device, `cryptsetup luksFormat`, `badblocks -w`, a `>` redirection into a block device | `mkfs` on an image file, `dd` to a file or `/dev/null`, the listing forms (`fdisk -l`, `parted print`, `sfdisk --dump`, `wipefs` without `-a`) |
@@ -46,7 +63,7 @@ The rules are tried in this order, and the first that matches decides.
 | `find-delete-outside-tmp` | `find ... -delete`, or `-exec`, `-execdir` or `-ok` running `rm`, `shred` or `unlink`, whose starting points reach outside `/tmp` and `/var/tmp`; no starting point means the current directory | the same under `/tmp`; `find` without a delete; `find -exec grep`; a cleanup inside the tree whose name tests all name files a tool writes again (`find . -name '*.pyc' -delete`, `find . -name .DS_Store -delete`), unless the line can `cd` out of the tree |
 | `find-write-outside-tmp` | `find -fprint`, `-fprint0`, `-fprintf` or `-fls` whose file is not a literal path under `/tmp` or `/var/tmp` (`find / -fprint /etc/x`, `find . -fls out`, `find / -fprintf /etc/x '%p\n'`) | that file under `/tmp` or `/var/tmp` (`find /tmp -fprint /tmp/out`); `find -print` and `find -printf`; a `-fprint` word that belongs to the `-exec` command |
 | `rm-rf-outside-tmp` | a recursive `rm` or `rtrash` whose own operands reach outside `/tmp` and `/var/tmp`, a `..` in the path included; also `python -c`, `node -e`, `ruby -e` or `perl -e` code that calls `shutil.rmtree`, `rmSync(..., {recursive})`, `rm_rf`, `rm_r` or `remove_tree` outside `/tmp` | the same under `/tmp`; a build output directory named as a plain relative path (`rm -rf target/`, `rm -rf node_modules`, `rm -rf ./build`, `web/.venv`) or a top-level scratch directory (`rm -rf ./tmp/test-output`, `.tmp`, `temp`), unless the line can `cd` out of the tree; a later command on the line that is not a delete |
-| `git-force-push` | `git push` with `--force`, `-f` in a flag cluster, `--mirror`, or a `+` refspec; a `--force-with-lease` push onto `main`, `master` or `develop`, or one whose words name no branch (no refspec, `HEAD`, a wildcard, `--all`). ljos asks rather than refuses, and reads a bare lease push's branch from the checkout. A branch the checkout protects is ljos's question too | an ordinary `git push`, `git push -u origin BRANCH`, `--force-if-includes` alone, and a lease push onto any other branch (`feature`, `mainline`, `develop-fix`, `release`), which the remote refuses when it holds commits you have not fetched |
+| `git-force-push` | `git push` with `--force`, `-f` in a flag cluster, `--mirror`, or a `+` refspec of a remote default branch; a `--force-with-lease` push onto `main`, `master`, or the remote default (the branch `refs/remotes/<remote>/HEAD` names). A lease of any other branch warns. ljos asks rather than refuses, and reads a bare lease push's branch from the checkout | an ordinary `git push`, `git push -u origin BRANCH`, `--force-if-includes` alone, and a lease push onto any other branch (`feature`, `develop`, `mainline`, `develop-fix`, `release`), which the remote refuses when it holds commits you have not fetched. `develop` is a default only when that remote HEAD is `develop` |
 | `git-reset-hard` | `git reset --hard` | `--soft`, `--mixed`, `reset FILE` |
 | `git-clean-force` | `git clean` with `-f` (`-fd`, `-fdx`, `--force`) | `git clean -n` |
 | `git-stash-clear` | `git stash clear` | `stash pop`, `list`, `drop` |

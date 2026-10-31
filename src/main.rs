@@ -6,9 +6,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{self, Command};
 
-use ljos_policyd::{
-    check_mail_argv, check_shell, encode_decision, verdict, MailVerdict, MAIL_MESSAGE_MAX,
-};
+use ljos_policyd::{check_mail_argv, check_shell, encode_decision, verdict, MAIL_MESSAGE_MAX};
 
 fn usage() {
     eprintln!("usage: ljos-policyd check|exec|capnp|version -- argv...");
@@ -17,10 +15,45 @@ fn usage() {
 }
 
 fn main() {
+    process::exit(enter());
+}
+
+/// The process entry. A panic, a parse error, a missing rules file, or an
+/// I/O failure inside the check prints `allow` and exits 0.
+fn enter() -> i32 {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(code) => code,
+        Err(_) => {
+            println!("allow\tfail-open\tmain");
+            0
+        }
+    }
+}
+
+fn allow_open(reason: &str) -> i32 {
+    println!("allow\tfail-open\t{reason}");
+    0
+}
+
+/// `LJOS_POLICYD_FAULT` is read only while this binary is built for its
+/// own tests. The release binary does not read it.
+fn entry_fault(site: &str) {
+    #[cfg(test)]
+    if std::env::var("LJOS_POLICYD_FAULT").ok().as_deref() == Some(site) {
+        panic!("fault {site}");
+    }
+    #[cfg(not(test))]
+    {
+        let _ = site;
+    }
+}
+
+fn run() -> i32 {
+    entry_fault("main");
+    ljos_policyd::fault("main");
     let mut args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
-        usage();
-        process::exit(2);
+        return allow_open("no args");
     }
     let verb = args.remove(0);
     if args.first().map(String::as_str) == Some("--") {
@@ -28,22 +61,37 @@ fn main() {
     }
     match verb.as_str() {
         "check" => {
-            let v = verdict(&args);
+            let (rules, config, argv) =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| user_allows(&args)))
+                {
+                    Ok(parsed) => parsed,
+                    Err(_) => return allow_open("user_allows"),
+                };
+            let mut ctx = ljos_policyd::Context::from_env();
+            ctx.user_allow.extend(rules);
+            if config.is_some() {
+                ctx.config_path = config;
+            }
+            let v = ljos_policyd::verdict_with(&argv, &ctx);
             println!("{v}");
             if v.starts_with("deny") {
-                process::exit(2);
+                return 2;
             }
+            return 0;
         }
         "capnp" => {
             let c = check_shell(&args);
-            let bytes = encode_decision(&c).unwrap_or_else(|e| {
-                eprintln!("capnp: {e}");
-                process::exit(2);
-            });
-            io::stdout().write_all(&bytes).ok();
-            if c.decision != ljos_policyd::policy_capnp::Decision::Allow {
-                process::exit(2);
+            let bytes = match encode_decision(&c) {
+                Ok(bytes) => bytes,
+                Err(_) => return allow_open("internal error"),
+            };
+            if io::stdout().write_all(&bytes).is_err() {
+                return allow_open("io");
             }
+            if c.decision != ljos_policyd::policy_capnp::Decision::Allow {
+                return 2;
+            }
+            return 0;
         }
         "exec" => {
             let v = verdict(&args);
@@ -71,9 +119,7 @@ fn main() {
             let mut buf = Vec::new();
             let mut input = io::stdin().take(MAIL_MESSAGE_MAX as u64 + 1);
             if input.read_to_end(&mut buf).is_err() {
-                let v = MailVerdict::refusal("message-invalid", "could not read stdin");
-                println!("{}", v.json());
-                process::exit(2);
+                return allow_open("io");
             }
             let v = check_mail_argv(&buf, Path::new(&mail.config), &mail.recipients);
             println!("{}", v.json());
@@ -119,11 +165,62 @@ fn main() {
                 ljos_policyd::BACKEND
             );
         }
-        _ => {
-            usage();
-            process::exit(2);
-        }
+        _ => return allow_open("unknown verb"),
     }
+    0
+}
+
+/// `--user-allow PATTERN` and `--config PATH` are policyd's own flags,
+/// and only when they lead the command. A `--` ends those flags. Nothing
+/// after it, and no `--` inside the command, is read as a policyd flag.
+/// The pattern is the line `ljos rule --user` wrote with verdict allow.
+/// A `--config` file that is not there allows the command.
+fn user_allows(args: &[String]) -> (Vec<String>, Option<String>, Vec<String>) {
+    entry_fault("user_allows");
+    ljos_policyd::fault("user_allows");
+    let mut rules = Vec::new();
+    let mut config = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if let Some(pattern) = arg.strip_prefix("--user-allow=") {
+            if !pattern.is_empty() {
+                rules.push(pattern.to_string());
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(path) = arg.strip_prefix("--config=") {
+            config = Some(path.to_string());
+            i += 1;
+            continue;
+        }
+        if arg == "--user-allow" {
+            if let Some(pattern) = args
+                .get(i + 1)
+                .filter(|p| !p.is_empty() && !p.starts_with('-'))
+            {
+                rules.push(pattern.clone());
+                i += 2;
+                continue;
+            }
+        }
+        if arg == "--config" {
+            if let Some(path) = args
+                .get(i + 1)
+                .filter(|p| !p.is_empty() && !p.starts_with('-'))
+            {
+                config = Some(path.clone());
+                i += 2;
+                continue;
+            }
+        }
+        if arg == "--" {
+            return (rules, config, args[i + 1..].to_vec());
+        }
+        return (rules, config, args[i..].to_vec());
+    }
+    (rules, config, Vec::new())
 }
 
 struct MailArgs {
@@ -204,5 +301,44 @@ mod tests {
         assert!(got.recipients.is_empty());
         assert!(mail_args(&args(&["--config", "mail.conf", "evil@blocked.test"])).is_none());
         assert!(mail_args(&args(&["--argv", "evil@blocked.test"])).is_none());
+    }
+
+    #[test]
+    fn the_entry_point_allows_on_a_panic() {
+        std::env::set_var("LJOS_POLICYD_FAULT", "main");
+        let code = enter();
+        std::env::remove_var("LJOS_POLICYD_FAULT");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn flags_stop_at_the_command() {
+        let (rules, config, argv) = user_allows(&args(&[
+            "--user-allow",
+            "rm -rf /srv/x",
+            "--config",
+            "/nope",
+            "--",
+            "rm",
+            "-rf",
+            "--",
+            "/srv/x",
+            "--config",
+            "/nope",
+        ]));
+        assert_eq!(rules, vec!["rm -rf /srv/x".to_string()]);
+        assert_eq!(config.as_deref(), Some("/nope"));
+        assert_eq!(
+            argv,
+            args(&["rm", "-rf", "--", "/srv/x", "--config", "/nope"])
+        );
+        let (rules, config, argv) =
+            user_allows(&args(&["rm", "-rf", "--", "/srv/x", "--config", "/nope"]));
+        assert!(rules.is_empty());
+        assert!(config.is_none());
+        assert_eq!(
+            argv,
+            args(&["rm", "-rf", "--", "/srv/x", "--config", "/nope"])
+        );
     }
 }

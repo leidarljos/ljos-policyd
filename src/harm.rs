@@ -198,8 +198,41 @@ pub(crate) fn git_lost_work(argv: &[String]) -> Option<&'static str> {
             Some("git-discard-worktree")
         }
         "checkout" | "restore" if discards_tree(sub, &owned) => Some("git-discard-worktree"),
+        "restore" if explicit_worktree(&owned) => Some("git-discard-worktree"),
+        "worktree" if rest.first() == Some(&"remove") && (has("--force") || short('f')) => {
+            Some("git-worktree-force-remove")
+        }
+        "branch" if branch_force_delete(&rest) => Some("git-branch-force-delete"),
         _ => None,
     }
+}
+
+/// `--worktree` or `--worktree=true`. A named file with that flag still
+/// writes the work tree. `--worktree=false` does not.
+fn explicit_worktree(rest: &[String]) -> bool {
+    rest.iter().any(|a| {
+        if a == "--worktree" || a == "-W" {
+            return true;
+        }
+        a.strip_prefix("--worktree=")
+            .is_some_and(|v| !matches!(v, "false" | "no" | "0" | ""))
+    })
+}
+
+/// `git branch -D`, or `--delete` together with `--force`.
+fn branch_force_delete(rest: &[&str]) -> bool {
+    let short_d = rest
+        .iter()
+        .any(|a| a.len() > 1 && a.starts_with('-') && !a.starts_with("--") && a.contains('D'));
+    let delete = rest
+        .iter()
+        .any(|a| *a == "--delete" || a.starts_with("--delete="));
+    let force = rest.iter().any(|a| {
+        *a == "--force"
+            || *a == "-f"
+            || (a.len() > 1 && a.starts_with('-') && !a.starts_with("--") && a[1..].contains('f'))
+    });
+    short_d || (delete && force)
 }
 
 /// `clean -fd` and `clean -fdx`: force and directories, in one cluster
