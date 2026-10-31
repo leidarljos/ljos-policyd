@@ -104,7 +104,7 @@ fn main() {
                 };
                 seen += 1;
                 let argv = ljos_policyd::replay_argv(line);
-                let now = verdict(&argv);
+                let now = ljos_policyd::verdict_quiet(&argv);
                 if now.starts_with("allow") {
                     freed += 1;
                 }

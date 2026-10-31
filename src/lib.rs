@@ -267,6 +267,23 @@ pub struct Checked {
 /// at their own terminal is allowed without either being asked.
 #[must_use]
 pub fn check_shell(argv: &[String]) -> Checked {
+    check_shell_logged(argv, true)
+}
+
+/// [`check_shell`] without the deny log: a replay re-judges lines the log
+/// already holds, and must not write them again.
+#[must_use]
+pub fn check_shell_quiet(argv: &[String]) -> Checked {
+    check_shell_logged(argv, false)
+}
+
+/// The hook line of [`check_shell_quiet`].
+#[must_use]
+pub fn verdict_quiet(argv: &[String]) -> String {
+    verdict_line(argv, &check_shell_quiet(argv))
+}
+
+fn check_shell_logged(argv: &[String], log: bool) -> Checked {
     if let Some(rule) = person::allows(argv) {
         return Checked {
             decision: Decision::Allow,
@@ -284,7 +301,7 @@ pub fn check_shell(argv: &[String]) -> Checked {
     });
     bump_spell_gen();
     let checked = check_shell_in(argv, &cwd, 0);
-    if checked.decision == Decision::Deny {
+    if log && checked.decision == Decision::Deny {
         log_deny(argv, checked.token.as_ref());
     }
     checked
