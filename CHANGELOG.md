@@ -2,6 +2,13 @@
 
 <!-- towncrier release notes start -->
 
+## 0.6.4 (2026-10-31)
+
+### Fixes
+
+- `ljos-policyd replay` re-judges without appending to the deny log; it wrote every refused line it replayed back into the log it was reading.
+
+
 ## 0.6.3 (2026-10-31)
 
 ### Features
