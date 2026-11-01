@@ -1487,22 +1487,6 @@ fn host_argv_table_run(argv: &[String], depth: usize, moved: bool, parent: &Scra
     let _span = phase::enter(phase::TABLE);
     let mut bound = parent.clone();
     bound.observe(argv);
-    match credential_read(argv) {
-        CredRead::Deny(by, path) => {
-            return Checked {
-                decision: Decision::Deny,
-                code: PolicyReason::PathSensitiveDeny,
-                token: Cow::Owned(format!("reads-credential: {by} with {path}")),
-            };
-        }
-        // `wc -c`, `-l`, `-m` or `-w` prints a count, not the file.
-        // The same warning covers that count with `head -c` of at most
-        // 4 bytes of the same path. Any other content read still denies.
-        CredRead::Count(by, path) => {
-            return open::warn_checked(&format!("reads-credential: {by} with {path}"));
-        }
-        CredRead::None => {}
-    }
     // `touch` and `mkdir` write a path and still return here. The seat
     // files are checked first, so a plain `echo` does not pay for that.
     if inert_argv(argv) {
@@ -7556,8 +7540,22 @@ fn named_token(name: &str, reason: &str) -> String {
 /// text when one was written, as `path-outside-workspace: path outside
 /// workspace` and `field-too-long: argv word exceeds 131072 bytes`. A
 /// decision that wrote no text still names its code.
+///
+/// A reason the pack opens with its own rule id (`rm-rf-outside-tmp: ...`,
+/// `reads-credential: cat with ...`) is the token as written: the rule id
+/// is what the publish step and a reader of the log match on, and the
+/// code's name is a family several rules share.
 #[must_use]
 pub fn token_for(code: PolicyReason, reason: &str) -> String {
+    if let Some((head, _)) = reason.trim().split_once(": ") {
+        let rule_id = !head.is_empty()
+            && head
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if rule_id {
+            return reason.trim().to_string();
+        }
+    }
     named_token(code_name(code), reason)
 }
 
@@ -9420,447 +9418,6 @@ fn quoted_strings(s: &str) -> Vec<String> {
     out
 }
 
-/// Programs whose words name files they read out to the line.
-const FILE_READERS: &[&str] = &[
-    "cat",
-    "tac",
-    "head",
-    "tail",
-    "less",
-    "more",
-    "most",
-    "bat",
-    "batcat",
-    "nl",
-    "od",
-    "xxd",
-    "hexdump",
-    "strings",
-    "base64",
-    "base32",
-    "cp",
-    "scp",
-    "rsync",
-    "tar",
-    "zip",
-    "gzip",
-    "zcat",
-    "bzcat",
-    "xzcat",
-    "dd",
-    "install",
-    "diff",
-    "cmp",
-    "sort",
-    "uniq",
-    "cut",
-    "paste",
-    "wc",
-    "md5sum",
-    "sha1sum",
-    "sha256sum",
-    "sha512sum",
-    "b2sum",
-    "cksum",
-    "grep",
-    "egrep",
-    "fgrep",
-    "sed",
-    "awk",
-    "gawk",
-    "jq",
-    "yq",
-];
-
-/// A credential read on the line. A `wc` that only counts (`-c`, `-l`,
-/// `-m`, `-w`) warns. So does that count together with `head -c` of at
-/// most 4 bytes of the same path. Any other reader denies, including
-/// `head -c` of 5 or more, `head -n`, plain `head`, and `head -c` of 4
-/// bytes with no count of that path on the line.
-enum CredRead {
-    None,
-    Count(String, String),
-    Deny(String, String),
-}
-
-/// A pure `head -c N` (or `--bytes N`). Anything else `head` does is not
-/// this, so a line count or a plain `head` stays a content read.
-#[derive(Clone, Copy)]
-enum HeadBytes {
-    NotHead,
-    Bytes(u64),
-    Other,
-}
-
-/// A credential path the line reads, with what reads it: a file reader's
-/// word, an input redirect, or a string an inline perl, ruby or node
-/// program spells. Python, perl, ruby and node inline text that names a credential path asks.
-fn credential_read(argv: &[String]) -> CredRead {
-    let named = |w: &str| credential_named(w).then(|| w.to_string());
-    let mut counts: Vec<(String, String)> = Vec::new();
-    let mut prefixes: Vec<(String, String, u64)> = Vec::new();
-    let mut deny: Option<(String, String)> = None;
-    let mut note_deny = |by: String, path: String| {
-        if deny.is_none() {
-            deny = Some((by, path));
-        }
-    };
-    for cmd in commands(argv) {
-        let counting = wc_count_command(&cmd);
-        let prefix = head_bytes(&cmd);
-        let mut words = cmd.iter().copied().peekable();
-        while let Some(w) = words.next() {
-            let body = redirection_body(w);
-            if body.starts_with("<(") || body.starts_with(">(") {
-                continue;
-            }
-            if body.starts_with('<') && !body.starts_with("<<") {
-                let target = body.trim_start_matches(['<', '>']);
-                let target = if target.is_empty() {
-                    words.peek().copied().unwrap_or("")
-                } else {
-                    target
-                };
-                if let Some(p) = named(target) {
-                    if counting {
-                        counts.push(("<".into(), p));
-                    } else if let HeadBytes::Bytes(n) = prefix {
-                        prefixes.push(("<".into(), p, n));
-                    } else {
-                        note_deny("<".into(), p);
-                    }
-                }
-            }
-        }
-        let Some(at) = cmd
-            .iter()
-            .position(|w| !is_assignment(w) && !is_redirection(w))
-        else {
-            continue;
-        };
-        let head = base_of(cmd[at]);
-        if FILE_READERS.contains(&head) {
-            if let Some(p) = read_sources(head, &cmd[at + 1..])
-                .into_iter()
-                .find_map(named)
-            {
-                if counting && head == "wc" {
-                    counts.push((head.to_string(), p));
-                } else if head == "head" {
-                    if let HeadBytes::Bytes(n) = prefix {
-                        prefixes.push((head.to_string(), p, n));
-                    } else {
-                        note_deny(head.to_string(), p);
-                    }
-                } else {
-                    note_deny(head.to_string(), p);
-                }
-            }
-        }
-        if matches!(head, "curl" | "wget") {
-            if let Some(p) = upload_files(head, &cmd[at + 1..])
-                .into_iter()
-                .find_map(named)
-            {
-                note_deny(head.to_string(), p);
-            }
-        }
-    }
-    if let Some((by, path)) = deny {
-        return CredRead::Deny(by, path);
-    }
-    for (by, path, n) in prefixes {
-        let counted = counts
-            .iter()
-            .any(|(_, counted)| same_cred_path(counted, &path));
-        if n > 4 || !counted {
-            return CredRead::Deny(by, path);
-        }
-    }
-    match counts.into_iter().next() {
-        Some((by, path)) => CredRead::Count(by, path),
-        None => CredRead::None,
-    }
-}
-
-/// The spelled path, so `file` and `"file"` name one secrets file.
-fn same_cred_path(a: &str, b: &str) -> bool {
-    a.trim_matches(['"', '\'']) == b.trim_matches(['"', '\''])
-}
-
-/// `head -c N` or `head --bytes N`, and only that. `N` is the byte count.
-/// A line count, a second mode, or a bare `head` is [`HeadBytes::Other`].
-fn head_bytes(cmd: &[&str]) -> HeadBytes {
-    let Some(at) = cmd
-        .iter()
-        .position(|w| !is_assignment(w) && !is_redirection(w))
-    else {
-        return HeadBytes::NotHead;
-    };
-    if base_of(cmd[at]) != "head" {
-        return HeadBytes::NotHead;
-    }
-    let args = &cmd[at + 1..];
-    let mut n: Option<u64> = None;
-    let mut i = 0;
-    let mut opts = true;
-    while i < args.len() {
-        let w = args[i];
-        if is_redirection(w) || is_assignment(w) {
-            i += 1;
-            continue;
-        }
-        if opts && w == "--" {
-            opts = false;
-            i += 1;
-            continue;
-        }
-        if opts && w.starts_with('-') {
-            let take = |raw: &str, n: &mut Option<u64>| -> bool {
-                match byte_count(raw) {
-                    Some(k) if n.is_none() => {
-                        *n = Some(k);
-                        true
-                    }
-                    _ => false,
-                }
-            };
-            if let Some(rest) = w.strip_prefix("--bytes=") {
-                if !take(rest, &mut n) {
-                    return HeadBytes::Other;
-                }
-            } else if w == "--bytes" || w == "-c" {
-                let Some(raw) = args.get(i + 1).copied() else {
-                    return HeadBytes::Other;
-                };
-                if !take(raw, &mut n) {
-                    return HeadBytes::Other;
-                }
-                i += 2;
-                continue;
-            } else if let Some(rest) = w.strip_prefix("-c").filter(|r| !r.is_empty()) {
-                if !take(rest, &mut n) {
-                    return HeadBytes::Other;
-                }
-            } else {
-                return HeadBytes::Other;
-            }
-            i += 1;
-            continue;
-        }
-        i += 1;
-    }
-    match n {
-        Some(k) => HeadBytes::Bytes(k),
-        None => HeadBytes::Other,
-    }
-}
-
-/// A decimal byte count, with no suffix.
-fn byte_count(raw: &str) -> Option<u64> {
-    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    raw.parse().ok()
-}
-
-/// `wc` with only a count flag: `-c`, `-l`, `-m`, `-w`, or the long form
-/// of one of those. `wc FILE` with no such flag prints three counts and
-/// stays a deny. `--` ends the flags and is not itself a count.
-fn wc_count_command(cmd: &[&str]) -> bool {
-    let Some(at) = cmd
-        .iter()
-        .position(|w| !is_assignment(w) && !is_redirection(w))
-    else {
-        return false;
-    };
-    if base_of(cmd[at]) != "wc" {
-        return false;
-    }
-    let mut saw = false;
-    let mut opts = true;
-    for w in &cmd[at + 1..] {
-        if is_redirection(w) || is_assignment(w) {
-            continue;
-        }
-        if opts && *w == "--" {
-            opts = false;
-            continue;
-        }
-        if opts && w.starts_with('-') {
-            if !wc_count_flag(w) {
-                return false;
-            }
-            saw = true;
-        }
-    }
-    saw
-}
-
-/// One `wc` option that only asks for bytes, lines, characters or words.
-fn wc_count_flag(w: &str) -> bool {
-    match w {
-        "--bytes" | "--lines" | "--chars" | "--words" => true,
-        s if s.starts_with("--") => false,
-        s if s.starts_with('-') && s.len() > 1 => {
-            s[1..].chars().all(|c| matches!(c, 'c' | 'l' | 'm' | 'w'))
-        }
-        _ => false,
-    }
-}
-
-/// Files a curl or wget invocation uploads. `@file` and `<file` are file
-/// reads. A literal data string is not.
-fn upload_files<'a>(head: &str, args: &[&'a str]) -> Vec<&'a str> {
-    let flags: &[&str] = if head == "wget" {
-        &["--post-file", "--body-file"]
-    } else {
-        &[
-            "--upload-file",
-            "-T",
-            "-d",
-            "--data",
-            "--data-binary",
-            "--data-urlencode",
-            "-F",
-            "--form",
-        ]
-    };
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        let a = args[i];
-        if flags.contains(&a) {
-            if let Some(v) = args.get(i + 1).copied() {
-                if head == "wget" || matches!(a, "-T" | "--upload-file") {
-                    out.push(v.trim_start_matches('@'));
-                } else if let Some(p) = file_upload(v) {
-                    out.push(p);
-                }
-            }
-            i += 2;
-            continue;
-        }
-        if head == "curl" {
-            if let Some(v) = a.strip_prefix("-T").filter(|v| !v.is_empty()) {
-                out.push(
-                    v.trim_start_matches('@')
-                        .trim_matches(|c| c == '"' || c == '\''),
-                );
-                i += 1;
-                continue;
-            }
-            if let Some(v) = a.strip_prefix("--upload-file=") {
-                out.push(v.trim_start_matches('@'));
-                i += 1;
-                continue;
-            }
-            if let Some(v) = a
-                .strip_prefix("--data=")
-                .or_else(|| a.strip_prefix("--data-binary="))
-                .or_else(|| a.strip_prefix("--data-urlencode="))
-                .or_else(|| a.strip_prefix("--form="))
-                .or_else(|| a.strip_prefix("-d"))
-                .or_else(|| a.strip_prefix("-F"))
-                .filter(|v| !v.is_empty())
-            {
-                if let Some(p) = file_upload(v) {
-                    out.push(p);
-                }
-            }
-        } else if let Some(v) = a
-            .strip_prefix("--post-file=")
-            .or_else(|| a.strip_prefix("--body-file="))
-        {
-            out.push(v);
-        }
-        i += 1;
-    }
-    out
-}
-
-/// `@path`, `<path`, or `field=@path` from a curl upload or form.
-fn file_upload(v: &str) -> Option<&str> {
-    let body = v.split(';').next().unwrap_or(v);
-    let spec = body.rsplit('=').next().unwrap_or(body);
-    let spec = spec.trim_matches(|c| c == '\'' || c == '"');
-    spec.strip_prefix('@')
-        .or_else(|| spec.strip_prefix('<'))
-        .filter(|p| !p.is_empty())
-}
-
-/// The word names a credential path, or a symlink whose target does.
-fn credential_named(w: &str) -> bool {
-    let w = w.trim_matches(|c| c == '"' || c == '\'');
-    if disk::names_credential_path(w) {
-        return true;
-    }
-    let path = std::path::Path::new(w);
-    if let Ok(target) = std::fs::read_link(path) {
-        let abs = if target.is_absolute() {
-            target
-        } else {
-            path.parent()
-                .unwrap_or(std::path::Path::new("/"))
-                .join(target)
-        };
-        if disk::names_credential_path(&abs.to_string_lossy()) {
-            return true;
-        }
-    }
-    std::fs::canonicalize(path)
-        .ok()
-        .is_some_and(|p| disk::names_credential_path(&p.to_string_lossy()))
-}
-
-/// The words of a [`FILE_READERS`] call that name what it reads. The
-/// place a copy, an archive or `dd` writes to is left to the write checks.
-fn read_sources<'a>(head: &str, args: &[&'a str]) -> Vec<&'a str> {
-    let mut out: Vec<&'a str> = Vec::new();
-    let mut skip_next = false;
-    for (i, w) in args.iter().copied().enumerate() {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-        if is_redirection(w) {
-            continue;
-        }
-        let takes_value = match head {
-            "cp" | "install" | "rsync" | "scp" => matches!(w, "-t" | "--target-directory"),
-            "tar" => matches!(w, "-C" | "--directory"),
-            "sort" => matches!(w, "-o" | "--output"),
-            _ => false,
-        };
-        if takes_value {
-            skip_next = true;
-            continue;
-        }
-        let write_opt = w.starts_with("--target-directory=")
-            || w.starts_with("--directory=")
-            || w.starts_with("--output=")
-            || (head == "dd" && !w.starts_with("if="));
-        if !(write_opt || (i > 0 && is_redirection(args[i - 1]))) {
-            out.push(w);
-        }
-    }
-    if matches!(head, "cp" | "install" | "rsync" | "scp")
-        && !args
-            .iter()
-            .any(|w| *w == "-t" || w.starts_with("--target-directory"))
-    {
-        if let Some(last) = out.iter().rposition(|w| !w.starts_with('-')) {
-            out.remove(last);
-        }
-    }
-    if head == "zip" {
-        if let Some(first) = out.iter().position(|w| !w.starts_with('-')) {
-            out.remove(first);
-        }
-    }
-    out
-}
-
 /// An inline program that deletes a tree recursively outside `/tmp`:
 /// Python's `shutil.rmtree`, Node's `rmSync`/`rm` with `recursive`, Ruby's
 /// `FileUtils.rm_rf`/`rm_r`, Perl's `remove_tree`/`rmtree`.
@@ -11055,9 +10612,63 @@ fn argv_for_pack(argv: &[String], bound: &Scratch, moved: bool) -> Vec<String> {
         }
         place.finish(&refs, in_pipe);
         prev = end;
+        // The pack reads words, not the file system: a word that is a
+        // symlink reaches it as the path it points at, so a link to a
+        // credential store reads as that store. A command that acts on
+        // the link itself keeps the word.
+        let head = refs
+            .iter()
+            .find(|w| !is_assignment(w) && !is_redirection(w))
+            .map(|w| base_of(w))
+            .unwrap_or("");
+        if !matches!(
+            head,
+            "rm" | "rmdir" | "unlink" | "mv" | "ln" | "readlink" | "ls" | "stat"
+        ) {
+            for &i in &idx {
+                if let Some(resolved) = link_resolved(&out[i]) {
+                    out[i] = resolved;
+                }
+            }
+        }
     }
     out.retain(|w| !w.is_empty());
     out
+}
+
+/// `w` with a symlink in it named by the path it points at: the whole
+/// word, the part after `@` or `<` in an upload value (`key=@file`,
+/// `-T@file`), or the part after `if=`. `None` when nothing in the word is
+/// a symlink.
+fn link_resolved(w: &str) -> Option<String> {
+    let semi = w.ends_with(';');
+    let bare = w.trim_end_matches(';');
+    let quoted = bare.trim_matches(|c| c == '"' || c == '\'');
+    let split = ["if=", "@", "<"]
+        .iter()
+        .filter_map(|m| quoted.rfind(m).map(|at| at + m.len()))
+        .max()
+        .unwrap_or(0);
+    let (lead, path) = quoted.split_at(split);
+    if path.is_empty() || !std::path::Path::new(path).is_symlink() {
+        return None;
+    }
+    let target = std::fs::canonicalize(path).ok().or_else(|| {
+        let link = std::fs::read_link(path).ok()?;
+        Some(if link.is_absolute() {
+            link
+        } else {
+            std::path::Path::new(path)
+                .parent()
+                .unwrap_or(std::path::Path::new("/"))
+                .join(link)
+        })
+    })?;
+    let mut out = format!("{lead}{}", target.display());
+    if semi {
+        out.push(';');
+    }
+    Some(out)
 }
 
 /// Shell words in front of the command `do` and `then` introduce.
@@ -11515,6 +11126,20 @@ mod tests {
             "field-too-long: command body exceeds 524288 bytes"
         );
         assert_eq!(token_for(PolicyReason::FieldTooLong, ""), "field-too-long");
+        assert_eq!(
+            token_for(
+                PolicyReason::ShellDangerousRunner,
+                "rm-rf-outside-tmp: recursive delete outside /tmp denied"
+            ),
+            "rm-rf-outside-tmp: recursive delete outside /tmp denied"
+        );
+        assert_eq!(
+            token_for(
+                PolicyReason::ShellSecretInArgv,
+                "secret material in argv denied (must not leave seat)"
+            ),
+            "shell-secret-in-argv: secret material in argv denied (must not leave seat)"
+        );
         assert_eq!(
             token_for(PolicyReason::FieldTooLong, "   "),
             "field-too-long"
@@ -13881,15 +13506,17 @@ mod tests {
             "wc -c ~/.secrets/x && head -c4 ~/.secrets/x",
         ] {
             let c = at(line);
-            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
+            // The pack names a count apart from a read; the publish step
+            // makes it a warning, which the verdict below shows.
+            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
             assert!(
-                c.token.starts_with("warn\treads-credential"),
+                c.token.starts_with("credential-count: "),
                 "{line}: {}",
                 c.token
             );
             let v = verdict(&["bash".into(), "-c".into(), line.into()]);
             assert!(
-                v.starts_with("allow\twarn\treads-credential"),
+                v.starts_with("allow\twarn\tcredential-count"),
                 "{line}: {v}"
             );
         }

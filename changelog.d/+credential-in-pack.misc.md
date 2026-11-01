@@ -1,0 +1,1 @@
+A credential read is the pack's verdict: the built-in table's rule and its helpers are gone, phronesis carries the same cases, and a symlink reaches the pack as the store it points at. A pack reason that opens with its rule id is the token as written, so `reads-credential` stays a deny and a count that prints nothing is `credential-count`, a warning.
