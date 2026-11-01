@@ -10251,7 +10251,8 @@ impl Place {
         };
         match std::fs::symlink_metadata(&next) {
             // A `cd` through a link leaves the shell in the link's target.
-            Ok(m) if m.file_type().is_symlink() => self.root = next.canonicalize().ok(),
+            // The target need not exist yet for a write there to land.
+            Ok(m) if m.file_type().is_symlink() => self.root = Some(disk::on_disk(&next)),
             Ok(m) if m.is_dir() => self.root = Some(next),
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !self.strict => {}
