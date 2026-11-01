@@ -10532,6 +10532,16 @@ fn argv_for_pack(argv: &[String], bound: &Scratch, _moved: bool) -> Vec<String> 
         let bare = unquote(w.trim_end_matches(';'))
             .trim_end_matches('/')
             .to_string();
+        // The policyd config the process names is a path the pack reads
+        // by its spelling, unless the line assigns the name itself.
+        let config = bare_var(&bare)
+            .filter(|name| *name == "LJOS_POLICYD_CONFIG" && !bound.vars.contains_key(*name))
+            .and_then(|name| std::env::var(name).ok())
+            .filter(|v| v.starts_with('/'));
+        if let Some(path) = config {
+            *w = if semi { format!("{path};") } else { path };
+            continue;
+        }
         let temp = bare_var(&bare)
             .is_some_and(|name| bound.vars.get(name).copied().flatten() == Some(Hold::Temp))
             || configure_scratch(&bare)
@@ -10569,7 +10579,9 @@ fn argv_for_pack(argv: &[String], bound: &Scratch, _moved: bool) -> Vec<String> 
             if on_link && !under_tmp(unquote(out[i].trim_end_matches(';'))) {
                 continue;
             }
-            if let Some(resolved) = link_resolved(&out[i]) {
+            if let Some(resolved) = link_resolved(&out[i])
+                .or_else(|| escaping_link(&out[i], bound.root.as_deref(), bound.work.as_deref()))
+            {
                 out[i] = resolved;
             }
         }
@@ -10600,6 +10612,52 @@ fn inside_as_relative(w: &str, root: &std::path::Path) -> Option<String> {
     // one the host made relative.
     let rel = rest.to_string();
     Some(if semi { format!("{rel};") } else { rel })
+}
+
+/// `w` named by where it lands on the disk when a link on its way leads
+/// out of /tmp and out of the work tree: with `/tmp/l` a link to
+/// `~/.cursor`, `/tmp/l/hooks.json` is that hook file. A relative word is
+/// read from `root`, the directory the line has moved to. A redirection
+/// (`>F`, `>>F`) or `of=F` keeps its lead. `None` for any other word.
+fn escaping_link(
+    w: &str,
+    root: Option<&std::path::Path>,
+    work: Option<&std::path::Path>,
+) -> Option<String> {
+    let semi = w.ends_with(';');
+    let bare = w.trim_end_matches(';');
+    let lead = [">>", ">", "of="]
+        .iter()
+        .find(|m| bare.starts_with(**m))
+        .map_or(0, |m| m.len());
+    let (lead, path) = bare.split_at(lead);
+    let path = unquote(path);
+    if path.is_empty()
+        || path.starts_with('-')
+        || path.starts_with('~')
+        || path.contains(['$', '`', '*', '?', '=', '\n'])
+    {
+        return None;
+    }
+    let spelled = if path.starts_with('/') {
+        std::path::PathBuf::from(path)
+    } else {
+        root?.join(path)
+    };
+    let tmp = |p: &std::path::Path| p.starts_with("/tmp") || p.starts_with("/var/tmp");
+    let held = |p: &std::path::Path| tmp(p) || work.is_some_and(|w| p.starts_with(w));
+    if !held(&spelled) {
+        return None;
+    }
+    let landed = disk::on_disk(&spelled);
+    if held(&landed) {
+        return None;
+    }
+    let mut out = format!("{lead}{}", landed.display());
+    if semi {
+        out.push(';');
+    }
+    Some(out)
 }
 
 /// `w` with a symlink in it named by the path it points at: the whole
