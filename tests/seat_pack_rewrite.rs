@@ -2,7 +2,6 @@
 //! verdict hands back the `uv run` line. The default pack rewrites only
 //! when the tree asks for uv.
 
-#[cfg(has_phronesis)]
 #[test]
 fn the_seat_packs_uv_refusal_is_answered_with_the_uv_line() {
     let base = std::env::temp_dir().join(format!("ljos-policyd-seat-uv-{}", std::process::id()));

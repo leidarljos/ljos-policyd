@@ -1,7 +1,6 @@
 //! A phronesis build judges lines in more than one workspace with one
 //! state directory: the first workspace does not claim the seat.
 
-#[cfg(has_phronesis)]
 #[test]
 fn a_second_workspace_is_judged_like_the_first() {
     let base = std::env::temp_dir().join(format!("ljos-policyd-ws-{}", std::process::id()));
@@ -37,7 +36,6 @@ fn a_second_workspace_is_judged_like_the_first() {
 /// directory against the bound workspace, so a line run in another directory
 /// is refused as `path-outside-workspace`, and a line run inside the
 /// workspace may name any path.
-#[cfg(has_phronesis)]
 #[test]
 fn a_refusal_names_its_code_and_the_pack_reason() {
     let base = std::env::temp_dir().join(format!("ljos-policyd-code-{}", std::process::id()));

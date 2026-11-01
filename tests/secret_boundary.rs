@@ -1,7 +1,6 @@
 //! A vendor prefix matches only at a token boundary. Ordinary words that
 //! contain the same letters are allowed, and a key in a header is denied.
 
-#[cfg(has_phronesis)]
 fn check(dir: &std::path::Path, argv: &[&str]) -> String {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_ljos-policyd"))
         .arg("check")
@@ -21,7 +20,6 @@ fn check(dir: &std::path::Path, argv: &[&str]) -> String {
 /// `git commit -m 'fix task-creation'`, `cat disk-usage.rs` and
 /// `git checkout risk-notes` are ordinary words. A bearer key in a header
 /// is still a secret.
-#[cfg(has_phronesis)]
 #[test]
 fn a_prefix_inside_a_word_is_allowed_and_a_bearer_key_is_denied() {
     let base = std::env::temp_dir().join(format!("ljos-policyd-secret-{}", std::process::id()));

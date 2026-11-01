@@ -2,7 +2,6 @@
 //! Unpacking the embedded pack must not delete the copy another check is
 //! reading, and a refusal must carry a reason.
 
-#[cfg(has_phronesis)]
 fn check(dir: &std::path::Path, state: &std::path::Path, argv: &[&str]) -> String {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_ljos-policyd"))
         .arg("check")
@@ -21,7 +20,6 @@ fn check(dir: &std::path::Path, state: &std::path::Path, argv: &[&str]) -> Strin
 
 /// `deny` with nothing after the tab, or the old stand-in for an empty
 /// phronesis reason.
-#[cfg(has_phronesis)]
 fn empty_reason_denial(line: &str) -> bool {
     if line == "deny" || line == "deny\tphronesis" {
         return true;
@@ -32,7 +30,6 @@ fn empty_reason_denial(line: &str) -> bool {
     }
 }
 
-#[cfg(has_phronesis)]
 #[test]
 fn concurrent_checks_do_not_deny_with_an_empty_reason() {
     const CHECKS: usize = 16;
@@ -73,7 +70,6 @@ fn concurrent_checks_do_not_deny_with_an_empty_reason() {
 
 /// A pack that cannot be loaded allows and names `pack-unavailable`, not
 /// an empty reason and not the generic `phronesis` stand-in.
-#[cfg(has_phronesis)]
 #[test]
 fn an_unloadable_pack_names_itself() {
     let base = std::env::temp_dir().join(format!("ljos-policyd-nopack-{}", std::process::id()));
@@ -101,10 +97,8 @@ fn an_unloadable_pack_names_itself() {
     assert_eq!(line, "allow\tfail-open\tpack-unavailable");
 }
 
-#[cfg(has_phronesis)]
 struct Clean(std::path::PathBuf);
 
-#[cfg(has_phronesis)]
 impl Drop for Clean {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
