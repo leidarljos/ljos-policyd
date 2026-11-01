@@ -3976,9 +3976,9 @@ enum Fed<'a> {
     Text(&'a str),
     /// A heredoc, whose lines are already commands of the line.
     Heredoc,
-    /// The file a `<`, `0<` or `<>` redirection opens, which the walk
-    /// reads.
-    File(&'a str),
+    /// A file a `<`, `0<` or `<>` redirection opens. Its text is not on
+    /// the line.
+    File,
     /// Nothing the line shows: a pipe, or the stdin it inherits.
     Unshown,
 }
@@ -4021,11 +4021,11 @@ fn shell_stdin(run: &[String]) -> Option<(Fed<'_>, bool)> {
             });
         } else if body.starts_with("<<") {
             fed = Fed::Heredoc;
-        } else if let Some((file, ate)) = stdin_redirect(a, it.peek().copied()) {
+        } else if let Some((_, ate)) = stdin_redirect(a, it.peek().copied()) {
             if ate {
                 it.next();
             }
-            fed = Fed::File(file);
+            fed = Fed::File;
         }
     }
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
