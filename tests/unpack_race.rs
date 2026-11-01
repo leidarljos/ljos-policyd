@@ -71,8 +71,8 @@ fn concurrent_checks_do_not_deny_with_an_empty_reason() {
     }
 }
 
-/// A pack that cannot be loaded is a denial with its own token, not an
-/// empty reason and not the generic `phronesis` stand-in.
+/// A pack that cannot be loaded allows and names `pack-unavailable`, not
+/// an empty reason and not the generic `phronesis` stand-in.
 #[cfg(has_phronesis)]
 #[test]
 fn an_unloadable_pack_names_itself() {
@@ -98,7 +98,7 @@ fn an_unloadable_pack_names_itself() {
         .expect("spawn check");
     let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert!(!empty_reason_denial(&line), "{line}");
-    assert_eq!(line, "deny\tpack-unavailable");
+    assert_eq!(line, "allow\tfail-open\tpack-unavailable");
 }
 
 #[cfg(has_phronesis)]

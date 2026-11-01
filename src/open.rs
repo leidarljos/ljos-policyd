@@ -469,6 +469,8 @@ pub fn irreversible(token: &str) -> bool {
             | "git-push-delete"
             | "curl-pipe-shell"
             | "reads-credential"
+            | "shell-secret-in-argv"
+            | "python-missing-pep723"
     ) || head.starts_with("reads-credential")
 }
 
