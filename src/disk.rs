@@ -117,39 +117,6 @@ pub(crate) fn writes_outside(p: &Path, work: Option<&Path>) -> bool {
     !inside(&on_disk(p), tree.as_deref())
 }
 
-/// Whether `s` names a credential store by a path part such as `.ssh`.
-pub(crate) fn names_credential_path(s: &str) -> bool {
-    let low = s.to_ascii_lowercase().replace('\\', "/");
-    if ljos_config_file(&low) {
-        return false;
-    }
-    let parts: Vec<&str> = low.split('/').collect();
-    parts.iter().any(|p| CREDENTIAL_PARTS.contains(p))
-        || CREDENTIAL_PATHS.iter().any(|c| low.contains(c))
-        || low.ends_with(".config/ljos")
-        || (low.starts_with("/proc/") && low.ends_with("/environ"))
-}
-
-/// `seats.toml` and `ljos.toml` under `~/.config/ljos`. A glob of that directory is a credential read.
-fn ljos_config_file(low: &str) -> bool {
-    if !low.contains(".config/ljos") {
-        return false;
-    }
-    let trimmed = low.trim_end_matches('/');
-    let name = trimmed.rsplit('/').next().unwrap_or("");
-    let named = matches!(name, "seats.toml" | "ljos.toml");
-    if !named {
-        return false;
-    }
-    let rest = low
-        .replace(".config/ljos/", " ")
-        .replace(".config/ljos", " ");
-    !CREDENTIAL_PARTS.iter().any(|p| rest.contains(p))
-        && !CREDENTIAL_PATHS
-            .iter()
-            .any(|c| *c != ".config/ljos/" && rest.contains(c))
-}
-
 /// Whether inline program text mentions a credential path. A part has to
 /// stand on its own, so `.secrets.example` and `os.environ` do not.
 pub(crate) fn mentions_credential(code: &str) -> bool {
