@@ -312,10 +312,8 @@ pub(crate) struct ParsedRestore {
     /// Indexes into the restore arguments. The pack treats a whole-tree
     /// path as a discard and skips a path that looks like a flag. The
     /// plain build leaves these unread; the linked build applies them.
-    #[cfg_attr(not(has_phronesis), allow(dead_code))]
     pub pack_standins: Vec<(usize, &'static str)>,
     /// An option git rejects, when the line has no path the pack can see.
-    #[cfg_attr(not(has_phronesis), allow(dead_code))]
     pub show_as_path: Option<usize>,
 }
 

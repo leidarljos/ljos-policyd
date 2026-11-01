@@ -200,7 +200,6 @@ mod phase {
 }
 
 /// The pack phronesis-sys carries: `(path under policy/, bytes)`.
-#[cfg(has_phronesis)]
 mod embedded {
     pub(crate) fn pack() -> &'static [(&'static str, &'static [u8])] {
         phronesis_sys::pack_files()
@@ -208,21 +207,13 @@ mod embedded {
 }
 
 /// Slot this CLI binds so checkShell has a workspace root.
-#[cfg(has_phronesis)]
 const HOST_AGENT_LO: u64 = 1;
 
 /// Which law this build judges with: `phronesis`, the library every
 /// build links through the `phronesis-sys` crate, after the argv table
 /// compiled into this crate.
-#[cfg(has_phronesis)]
 pub const BACKEND: &str = "phronesis";
-/// The argv table alone. Unreachable since phronesis became a dependency;
-/// kept for the sources written while it was optional.
-#[cfg(not(has_phronesis))]
-pub const BACKEND: &str = "host table";
-
 /// The phronesis version the binary links.
-#[cfg(has_phronesis)]
 #[must_use]
 pub fn phronesis_version() -> String {
     phronesis_sys::linked_version()
@@ -463,7 +454,6 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
     let table = host_argv_table_at(argv, 0, leaves_tree(argv, 0), &parent);
     // A host refusal stands, including a warning. The pack is asked only
     // for a plain allow, so it can add a refusal and cannot erase one.
-    #[cfg(has_phronesis)]
     let table = if table.decision == Decision::Allow && open::noted(&table.token).is_none() {
         check_shell_phronesis(argv, cwd)
     } else {
@@ -7265,7 +7255,7 @@ pub fn encode_decision(c: &Checked) -> capnp::Result<Vec<u8>> {
     Ok(out)
 }
 
-#[cfg(all(has_phronesis, test))]
+#[cfg(test)]
 fn encode_shell_check(argv: &[String], cwd: &str) -> capnp::Result<Vec<u8>> {
     let mut message = capnp::message::Builder::new_default();
     let mut root = message.init_root::<policy_capnp::shell_check::Builder>();
@@ -7286,13 +7276,11 @@ fn encode_shell_check(argv: &[String], cwd: &str) -> capnp::Result<Vec<u8>> {
     Ok(out)
 }
 
-#[cfg(has_phronesis)]
 #[repr(C)]
 struct Supervisor {
     _private: [u8; 0],
 }
 
-#[cfg(has_phronesis)]
 extern "C" {
     fn phronesis_supervisor_open(
         out: *mut *mut Supervisor,
@@ -7325,7 +7313,6 @@ extern "C" {
     ) -> libc::c_int;
 }
 
-#[cfg(has_phronesis)]
 fn host_agent_hex() -> String {
     format!("{:016x}{:016x}", 0u64, HOST_AGENT_LO)
 }
@@ -7333,7 +7320,6 @@ fn host_agent_hex() -> String {
 /// Which embedded entry the seat loads: `shell.janet`, the default law, or
 /// `seat.janet` (the default law plus package and Python rules) when
 /// `LJOS_POLICYD_PACK=seat`.
-#[cfg(has_phronesis)]
 fn embedded_entry() -> &'static str {
     match std::env::var("LJOS_POLICYD_PACK").as_deref() {
         Ok("seat") => "seat.janet",
@@ -7342,7 +7328,6 @@ fn embedded_entry() -> &'static str {
 }
 
 /// FNV-1a: names the directories the pack and each workspace use.
-#[cfg(has_phronesis)]
 fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| {
         (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
@@ -7350,7 +7335,6 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 /// The hash of the embedded pack, naming the directory it unpacks to.
-#[cfg(has_phronesis)]
 fn pack_hash() -> u64 {
     let mut all = Vec::new();
     for (name, body) in embedded::pack() {
@@ -7362,7 +7346,6 @@ fn pack_hash() -> u64 {
 }
 
 /// True when every embedded file sits under `policy` byte for byte.
-#[cfg(has_phronesis)]
 fn pack_matches(policy: &std::path::Path) -> bool {
     embedded::pack()
         .iter()
@@ -7371,12 +7354,10 @@ fn pack_matches(policy: &std::path::Path) -> bool {
 
 /// Holds an exclusive `flock` on the state directory for the duration of
 /// a pack swap. The kernel drops the lock when this file is closed.
-#[cfg(has_phronesis)]
 struct PackSwapLock {
     file: std::fs::File,
 }
 
-#[cfg(has_phronesis)]
 impl PackSwapLock {
     fn acquire(root: &std::path::Path) -> Option<Self> {
         use std::os::fd::AsRawFd;
@@ -7398,7 +7379,6 @@ impl PackSwapLock {
     }
 }
 
-#[cfg(has_phronesis)]
 impl Drop for PackSwapLock {
     fn drop(&mut self) {
         use std::os::fd::AsRawFd;
@@ -7410,7 +7390,6 @@ impl Drop for PackSwapLock {
 
 /// A private directory name for one unpack. The pid keeps concurrent
 /// processes apart; the counter keeps two attempts in one process apart.
-#[cfg(has_phronesis)]
 fn unique_pack_tmp(root: &std::path::Path, name: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -7423,7 +7402,6 @@ fn unique_pack_tmp(root: &std::path::Path, name: &str) -> std::path::PathBuf {
 /// is kept. Otherwise the bytes are written to a private directory and
 /// renamed into place while an flock is held. The live directory is never
 /// removed: another check may be reading it.
-#[cfg(has_phronesis)]
 fn unpack_pack(root: &std::path::Path) -> Option<std::path::PathBuf> {
     let name = format!("pack-{:016x}", pack_hash());
     let prefix = root.join(&name);
@@ -7467,7 +7445,6 @@ fn unpack_pack(root: &std::path::Path) -> Option<std::path::PathBuf> {
 /// with `PHRONESIS_JANET_PACK` (then its own `PHRONESIS_PACK_ROOT` or
 /// prefix has to be trusted, as phronesis requires). False when the
 /// embedded pack could not be published.
-#[cfg(has_phronesis)]
 fn ensure_pack_env(root: &std::path::Path) -> bool {
     if std::env::var_os("PHRONESIS_JANET_PACK").is_some() {
         return true;
@@ -7489,7 +7466,6 @@ fn ensure_pack_env(root: &std::path::Path) -> bool {
 /// it the `state` and `runtime` directories for `workspace`. phronesis
 /// keeps the first workspace a slot is bound to, so each workspace has
 /// its own pair; one shared pair refused every line outside the first.
-#[cfg(has_phronesis)]
 fn seat_dirs(
     workspace: &str,
 ) -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
@@ -7508,13 +7484,11 @@ fn seat_dirs(
 }
 
 /// A phronesis supervisor bound to the workspace for one hooked line.
-#[cfg(has_phronesis)]
 struct Seat {
     sup: *mut Supervisor,
     cwd: std::ffi::CString,
 }
 
-#[cfg(has_phronesis)]
 impl Drop for Seat {
     fn drop(&mut self) {
         if !self.sup.is_null() {
@@ -7587,7 +7561,6 @@ pub fn token_for(code: PolicyReason, reason: &str) -> String {
     named_token(code_name(code), reason)
 }
 
-#[cfg(has_phronesis)]
 fn refused(token: &'static str) -> Checked {
     Checked {
         decision: Decision::Deny,
@@ -7598,7 +7571,6 @@ fn refused(token: &'static str) -> Checked {
 
 /// Host decisions for a pack that is missing or could not be loaded.
 /// Those carry an empty reason string.
-#[cfg(has_phronesis)]
 fn pack_load_failed(code: PolicyReason) -> bool {
     matches!(
         code,
@@ -7610,7 +7582,6 @@ fn pack_load_failed(code: PolicyReason) -> bool {
     )
 }
 
-#[cfg(has_phronesis)]
 impl Seat {
     fn open() -> Result<Self, Checked> {
         let cwd = std::env::current_dir()
@@ -7776,7 +7747,6 @@ impl Seat {
     }
 }
 
-#[cfg(has_phronesis)]
 type Job = (
     Vec<String>,
     std::path::PathBuf,
@@ -7787,7 +7757,6 @@ type Job = (
 /// so every check in the process runs on one worker thread. The directory
 /// is the one the host already checked: a relative scratch name is a
 /// symlink only when that directory says so.
-#[cfg(has_phronesis)]
 fn check_shell_phronesis(argv: &[String], cwd: &std::path::Path) -> Checked {
     static WORKER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<Job>>> =
         std::sync::OnceLock::new();
@@ -10818,7 +10787,6 @@ fn concrete_path(p: &str, root: &std::path::Path) -> Option<std::path::PathBuf> 
 /// under `/tmp` or `/var/tmp`. It has no mktemp binding and no configure
 /// scratch name (`conftest*`). A build directory the host already allowed
 /// is rewritten to a `/tmp` name before the pack sees it.
-#[cfg(has_phronesis)]
 fn pack_delete_ok(p: &str, _moved: bool) -> bool {
     under_tmp(p)
 }
@@ -10857,7 +10825,6 @@ fn rm_recursive(cmd: &[&str]) -> bool {
 /// after `cd`, the same one [`delete_ok`] uses.
 /// Whether command `i` is an `xargs` or `parallel`. Its unwrapped body
 /// still carries the replace mark; a later command does not.
-#[cfg(has_phronesis)]
 fn command_is_feeder(argv: &[String], i: usize) -> bool {
     commands(argv).into_iter().nth(i).is_some_and(|cmd| {
         cmd.iter()
@@ -10868,7 +10835,6 @@ fn command_is_feeder(argv: &[String], i: usize) -> bool {
 /// Words a replace mark may be rewritten in. On a line, only the feeder's
 /// own words. On the unwrapped command the walk hands down alone, every
 /// word, because that argv is the command.
-#[cfg(any(test, has_phronesis))]
 fn mark_rewrite_mask(argv: &[String], has_marks: bool) -> Vec<bool> {
     let feed = feeder_word(argv);
     if feed.iter().any(|f| *f) || !has_marks {
@@ -10880,7 +10846,6 @@ fn mark_rewrite_mask(argv: &[String], has_marks: bool) -> Vec<bool> {
 
 /// Words that belong to an `xargs` or `parallel` command. A replace mark
 /// is one of those words. The same text later on the line is not.
-#[cfg(any(test, has_phronesis))]
 fn feeder_word(argv: &[String]) -> Vec<bool> {
     let mut flags = vec![false; argv.len()];
     let mut cur: Vec<usize> = Vec::new();
@@ -10912,7 +10877,6 @@ fn feeder_word(argv: &[String]) -> Vec<bool> {
     flags
 }
 
-#[cfg(has_phronesis)]
 /// The pack v0.2.5 refuses every `find -delete` and `find -exec rm`
 /// outside `/tmp`. A cleanup the host already allowed is shown as
 /// `-print` or `echo`, so a secret later on the line is still visible.
@@ -10948,7 +10912,6 @@ fn relax_find_for_pack(idx: &[usize], out: &mut [String]) {
     }
 }
 
-#[cfg(has_phronesis)]
 fn argv_for_pack(argv: &[String], bound: &Scratch, moved: bool) -> Vec<String> {
     let mut out = argv.to_vec();
     let feed = mark_rewrite_mask(argv, !bound.fed_marks.is_empty());
@@ -11130,7 +11093,6 @@ fn command_after_keywords<'a>(words: &'a [&'a str]) -> &'a [&'a str] {
 }
 
 /// [`ended_commands`], each as the indexes of its words in `argv`.
-#[cfg(has_phronesis)]
 fn ended_indices(argv: &[String]) -> Vec<(Vec<usize>, &str)> {
     let mut out: Vec<(Vec<usize>, &str)> = vec![(Vec::new(), "")];
     for (i, a) in argv.iter().enumerate() {
@@ -11562,7 +11524,6 @@ mod tests {
     /// A word is judged on what it says. 511 bytes is the last length the
     /// old path slot accepted; 512, 4 KiB and 64 KiB used to be refused
     /// before the pack read them.
-    #[cfg(has_phronesis)]
     #[test]
     fn a_long_argument_is_judged_on_its_content() {
         for n in [511, 512, 4 * 1024, 64 * 1024] {
@@ -11577,7 +11538,6 @@ mod tests {
     /// from the longer ones. Either cut would allow the line. The slash
     /// is the token boundary and the last byte is the payload: a prefix
     /// with nothing after it is not a credential.
-    #[cfg(has_phronesis)]
     #[test]
     fn a_long_argument_that_carries_a_secret_is_still_refused() {
         let marker = format!("/{}{}", "glpat-", "B");
@@ -11610,7 +11570,6 @@ mod tests {
 
     /// A few hundred paths, and a few thousand, are an ordinary command.
     /// The old cap was 256 words.
-    #[cfg(has_phronesis)]
     #[test]
     fn many_words_are_judged_on_the_line() {
         for n in [300, 5000] {
@@ -11624,7 +11583,6 @@ mod tests {
 
     /// One byte past 128 KiB is the host's `fieldTooLong` and its reason,
     /// named on the line. The reason is the library's, not a stand-in.
-    #[cfg(has_phronesis)]
     #[test]
     fn an_argument_past_the_word_limit_names_field_too_long() {
         let arg = "a".repeat(128 * 1024 + 1);
@@ -11634,7 +11592,6 @@ mod tests {
         );
     }
 
-    #[cfg(has_phronesis)]
     #[test]
     fn encodes_a_shell_check_for_phronesis() {
         let bytes = encode_shell_check(&["sudo".into(), "id".into()], "/").expect("encode");
@@ -12515,7 +12472,6 @@ mod tests {
 
     /// A secret in argv is the pack's rule alone; the refusal carries the
     /// pack's words, on the line and inside a `sh -c` script.
-    #[cfg(has_phronesis)]
     #[test]
     fn the_pack_refuses_with_its_own_reason_inside_scripts_too() {
         let url = format!(
