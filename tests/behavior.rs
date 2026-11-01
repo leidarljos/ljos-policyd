@@ -223,6 +223,27 @@ fn xargs_into_rm_or_a_force_push_is_refused() {
         "{}",
         String::from_utf8_lossy(&init.stderr)
     );
+    // An unborn branch has no name `rev-parse --abbrev-ref HEAD` can read.
+    let commit = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.org",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "x",
+        ])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        commit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
     assert_eq!(
         verdict(&shell(&format!(
             "printf main | xargs git -C {} push -f origin",
