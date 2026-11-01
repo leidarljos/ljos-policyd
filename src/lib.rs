@@ -7772,9 +7772,15 @@ impl Seat {
                     token: Cow::Borrowed("exec-unresolved"),
                 };
             }
-            // `{}` is a path find found under its starting points, which
-            // the line itself was judged on: a name in the tree here.
-            let payload: Vec<String> = payload.iter().map(|w| w.replace("{}", "found")).collect();
+            // A delete of what find found was judged with the find:
+            // `find-delete` and `find-exec-rm` read its starting points.
+            let (run, _) = unwrap_wrappers(&payload);
+            if run
+                .first()
+                .is_some_and(|h| matches!(base_of(h), "rm" | "rmdir" | "unlink" | "shred" | "srm"))
+            {
+                continue;
+            }
             let c = self.check_at(&payload, depth + 1, &bound, moved);
             if c.decision != Decision::Allow {
                 return c;

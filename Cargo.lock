@@ -204,7 +204,7 @@ dependencies = [
 [[package]]
 name = "phronesis-sys"
 version = "0.2.9"
-source = "git+https://github.com/leidarljos/phronesis?rev=f6109d8b4fcf5b2fe86bd1c7e858d97c64f20a99#f6109d8b4fcf5b2fe86bd1c7e858d97c64f20a99"
+source = "git+https://github.com/leidarljos/phronesis?rev=a48145324fbc7e15c0e5b6a5fbf4c9b58060b98b#a48145324fbc7e15c0e5b6a5fbf4c9b58060b98b"
 dependencies = [
  "cc",
  "libc",
