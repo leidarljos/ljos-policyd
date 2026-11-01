@@ -7772,6 +7772,9 @@ impl Seat {
                     token: Cow::Borrowed("exec-unresolved"),
                 };
             }
+            // `{}` is a path find found under its starting points, which
+            // the line itself was judged on: a name in the tree here.
+            let payload: Vec<String> = payload.iter().map(|w| w.replace("{}", "found")).collect();
             let c = self.check_at(&payload, depth + 1, &bound, moved);
             if c.decision != Decision::Allow {
                 return c;
