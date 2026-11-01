@@ -1495,7 +1495,8 @@ fn host_argv_table_run(argv: &[String], depth: usize, moved: bool, parent: &Scra
             };
         }
         // `wc -c`, `-l`, `-m` or `-w` prints a count, not the file.
-        // A content reader anywhere on the line still denies.
+        // The same warning covers that count with `head -c` of at most
+        // 4 bytes of the same path. Any other content read still denies.
         CredRead::Count(by, path) => {
             return open::warn_checked(&format!("reads-credential: {by} with {path}"));
         }
@@ -9492,12 +9493,23 @@ const FILE_READERS: &[&str] = &[
 ];
 
 /// A credential read on the line. A `wc` that only counts (`-c`, `-l`,
-/// `-m`, `-w`) warns. Any other reader, including `wc` with no such flag,
-/// denies. One content read denies the line even when a count is there too.
+/// `-m`, `-w`) warns. So does that count together with `head -c` of at
+/// most 4 bytes of the same path. Any other reader denies, including
+/// `head -c` of 5 or more, `head -n`, plain `head`, and `head -c` of 4
+/// bytes with no count of that path on the line.
 enum CredRead {
     None,
     Count(String, String),
     Deny(String, String),
+}
+
+/// A pure `head -c N` (or `--bytes N`). Anything else `head` does is not
+/// this, so a line count or a plain `head` stays a content read.
+#[derive(Clone, Copy)]
+enum HeadBytes {
+    NotHead,
+    Bytes(u64),
+    Other,
 }
 
 /// A credential path the line reads, with what reads it: a file reader's
@@ -9505,9 +9517,17 @@ enum CredRead {
 /// program spells. Python, perl, ruby and node inline text that names a credential path asks.
 fn credential_read(argv: &[String]) -> CredRead {
     let named = |w: &str| credential_named(w).then(|| w.to_string());
-    let mut count: Option<(String, String)> = None;
+    let mut counts: Vec<(String, String)> = Vec::new();
+    let mut prefixes: Vec<(String, String, u64)> = Vec::new();
+    let mut deny: Option<(String, String)> = None;
+    let mut note_deny = |by: String, path: String| {
+        if deny.is_none() {
+            deny = Some((by, path));
+        }
+    };
     for cmd in commands(argv) {
         let counting = wc_count_command(&cmd);
+        let prefix = head_bytes(&cmd);
         let mut words = cmd.iter().copied().peekable();
         while let Some(w) = words.next() {
             let body = redirection_body(w);
@@ -9523,9 +9543,11 @@ fn credential_read(argv: &[String]) -> CredRead {
                 };
                 if let Some(p) = named(target) {
                     if counting {
-                        count.get_or_insert(("<".into(), p));
+                        counts.push(("<".into(), p));
+                    } else if let HeadBytes::Bytes(n) = prefix {
+                        prefixes.push(("<".into(), p, n));
                     } else {
-                        return CredRead::Deny("<".into(), p);
+                        note_deny("<".into(), p);
                     }
                 }
             }
@@ -9543,9 +9565,15 @@ fn credential_read(argv: &[String]) -> CredRead {
                 .find_map(named)
             {
                 if counting && head == "wc" {
-                    count.get_or_insert((head.to_string(), p));
+                    counts.push((head.to_string(), p));
+                } else if head == "head" {
+                    if let HeadBytes::Bytes(n) = prefix {
+                        prefixes.push((head.to_string(), p, n));
+                    } else {
+                        note_deny(head.to_string(), p);
+                    }
                 } else {
-                    return CredRead::Deny(head.to_string(), p);
+                    note_deny(head.to_string(), p);
                 }
             }
         }
@@ -9554,14 +9582,106 @@ fn credential_read(argv: &[String]) -> CredRead {
                 .into_iter()
                 .find_map(named)
             {
-                return CredRead::Deny(head.to_string(), p);
+                note_deny(head.to_string(), p);
             }
         }
     }
-    match count {
+    if let Some((by, path)) = deny {
+        return CredRead::Deny(by, path);
+    }
+    for (by, path, n) in prefixes {
+        let counted = counts
+            .iter()
+            .any(|(_, counted)| same_cred_path(counted, &path));
+        if n > 4 || !counted {
+            return CredRead::Deny(by, path);
+        }
+    }
+    match counts.into_iter().next() {
         Some((by, path)) => CredRead::Count(by, path),
         None => CredRead::None,
     }
+}
+
+/// The spelled path, so `file` and `"file"` name one secrets file.
+fn same_cred_path(a: &str, b: &str) -> bool {
+    a.trim_matches(['"', '\'']) == b.trim_matches(['"', '\''])
+}
+
+/// `head -c N` or `head --bytes N`, and only that. `N` is the byte count.
+/// A line count, a second mode, or a bare `head` is [`HeadBytes::Other`].
+fn head_bytes(cmd: &[&str]) -> HeadBytes {
+    let Some(at) = cmd
+        .iter()
+        .position(|w| !is_assignment(w) && !is_redirection(w))
+    else {
+        return HeadBytes::NotHead;
+    };
+    if base_of(cmd[at]) != "head" {
+        return HeadBytes::NotHead;
+    }
+    let args = &cmd[at + 1..];
+    let mut n: Option<u64> = None;
+    let mut i = 0;
+    let mut opts = true;
+    while i < args.len() {
+        let w = args[i];
+        if is_redirection(w) || is_assignment(w) {
+            i += 1;
+            continue;
+        }
+        if opts && w == "--" {
+            opts = false;
+            i += 1;
+            continue;
+        }
+        if opts && w.starts_with('-') {
+            let take = |raw: &str, n: &mut Option<u64>| -> bool {
+                match byte_count(raw) {
+                    Some(k) if n.is_none() => {
+                        *n = Some(k);
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if let Some(rest) = w.strip_prefix("--bytes=") {
+                if !take(rest, &mut n) {
+                    return HeadBytes::Other;
+                }
+            } else if w == "--bytes" || w == "-c" {
+                let Some(raw) = args.get(i + 1).copied() else {
+                    return HeadBytes::Other;
+                };
+                if !take(raw, &mut n) {
+                    return HeadBytes::Other;
+                }
+                i += 2;
+                continue;
+            } else if let Some(rest) = w.strip_prefix("-c").filter(|r| !r.is_empty()) {
+                if !take(rest, &mut n) {
+                    return HeadBytes::Other;
+                }
+            } else {
+                return HeadBytes::Other;
+            }
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    match n {
+        Some(k) => HeadBytes::Bytes(k),
+        None => HeadBytes::Other,
+    }
+}
+
+/// A decimal byte count, with no suffix.
+fn byte_count(raw: &str) -> Option<u64> {
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse().ok()
 }
 
 /// `wc` with only a count flag: `-c`, `-l`, `-m`, `-w`, or the long form
@@ -13759,6 +13879,14 @@ mod tests {
             "xxd ~/.secrets/x",
             "tr 'a' 'b' < ~/.secrets/x",
             "head -c 4 ~/.secrets/x",
+            "head -c 5 ~/.secrets/x",
+            "head -c 4096 ~/.secrets/x",
+            "head -n 1 ~/.secrets/x",
+            "head ~/.secrets/x",
+            "wc -c ~/.secrets/x && head -c 5 ~/.secrets/x",
+            "wc -c ~/.secrets/x && head -c 4096 ~/.secrets/x",
+            "wc -c ~/.secrets/x && head -n 1 ~/.secrets/x",
+            "wc -c ~/.secrets/x && head ~/.secrets/x",
             "wc ~/.secrets/x; cat ~/.secrets/x",
             "wc -c ~/.secrets/x; cat ~/.secrets/x",
         ] {
@@ -13777,6 +13905,8 @@ mod tests {
             "wc --bytes ~/.secrets/x",
             "wc -c < ~/.secrets/x",
             "wc -c ~/.secrets/x | tee /tmp/x",
+            "wc -c ~/.secrets/x && head -c 4 ~/.secrets/x",
+            "wc -c ~/.secrets/x && head -c4 ~/.secrets/x",
         ] {
             let c = at(line);
             assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
