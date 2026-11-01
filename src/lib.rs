@@ -7737,7 +7737,11 @@ impl Seat {
             // directory, was judged with the rest of the line: a count
             // next to a read is that count, not a read alone.
             let same_root = roots.get(i).is_none_or(|r| *r == bound.root);
-            if same_root && argv.windows(inner.len()).any(|w| w == inner.as_slice()) {
+            if same_root
+                && commands(argv)
+                    .iter()
+                    .any(|c| c.len() == inner.len() && c.iter().zip(&inner).all(|(a, b)| *a == b.as_str()))
+            {
                 continue;
             }
             let mut next = bound.clone();
@@ -10228,7 +10232,8 @@ impl Place {
             return;
         };
         match std::fs::symlink_metadata(&next) {
-            Ok(m) if m.file_type().is_symlink() => self.root = None,
+            // A `cd` through a link leaves the shell in the link's target.
+            Ok(m) if m.file_type().is_symlink() => self.root = next.canonicalize().ok(),
             Ok(m) if m.is_dir() => self.root = Some(next),
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound && !self.strict => {}
@@ -10586,6 +10591,31 @@ fn argv_for_pack(argv: &[String], bound: &Scratch, _moved: bool) -> Vec<String> 
             }
         }
     }
+    // A redirection's relative target, after a `cd` out of /tmp and the
+    // work tree, is the file there.
+    if let Some(root) = bound.root.as_deref().filter(|r| {
+        !(r.starts_with("/tmp") || r.starts_with("/var/tmp"))
+            && bound.work.as_deref().is_none_or(|w| !r.starts_with(w))
+    }) {
+        for i in 0..out.len() {
+            let after = i > 0 && matches!(out[i - 1].as_str(), ">" | ">>" | ">|");
+            let lead = if after {
+                0
+            } else if out[i].starts_with(">>") {
+                2
+            } else if out[i].starts_with('>') && !out[i].starts_with(">(") {
+                1
+            } else {
+                continue;
+            };
+            let (head, target) = out[i].split_at(lead);
+            let bare = unquote(target);
+            if bare.is_empty() || bare.starts_with(['/', '~', '$', '&', '(']) {
+                continue;
+            }
+            out[i] = format!("{head}{}", root.join(bare).display());
+        }
+    }
     out.retain(|w| !w.is_empty());
     out
 }
@@ -10633,6 +10663,8 @@ fn escaping_link(
     let (lead, path) = bare.split_at(lead);
     let path = unquote(path);
     if path.is_empty()
+        || path.starts_with("/dev/")
+        || path.starts_with("/proc/")
         || path.starts_with('-')
         || path.starts_with('~')
         || path.contains(['$', '`', '*', '?', '=', '\n'])
@@ -10674,7 +10706,12 @@ fn link_resolved(w: &str) -> Option<String> {
         .max()
         .unwrap_or(0);
     let (lead, path) = quoted.split_at(split);
-    if path.is_empty() || !std::path::Path::new(path).is_symlink() {
+    // `/dev/fd/0` and `/proc/self/fd/0` name a stream, not a file.
+    if path.is_empty()
+        || path.starts_with("/dev/")
+        || path.starts_with("/proc/")
+        || !std::path::Path::new(path).is_symlink()
+    {
         return None;
     }
     let target = std::fs::canonicalize(path).ok().or_else(|| {
