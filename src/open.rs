@@ -427,6 +427,34 @@ fn annotate(checked: Checked, person: bool) -> Checked {
     }
 }
 
+/// The pack's raw verdict on `argv` as the table gave it: a deny outside
+/// [`irreversible`] is a warning, a lost-work prompt is a warning, and a
+/// force push that rewrites no default branch of this checkout is a
+/// warning. The pack cannot see the checkout, so that last one is the
+/// host's.
+#[must_use]
+pub(crate) fn soften(checked: Checked, argv: &[String]) -> Checked {
+    let head = checked.token.split(':').next().unwrap_or("").trim();
+    if checked.decision == Decision::Deny
+        && head == "git-force-push"
+        && !crate::push_rewrites_default(argv)
+        && argv.iter().any(|w| w == "push")
+    {
+        return warn_checked(&checked.token);
+    }
+    if checked.decision == Decision::Deny
+        && !irreversible(&checked.token)
+        && !engine_fault(&checked.token)
+        && !matches!(checked.code, PolicyReason::PythonRequiresUvRun)
+    {
+        return warn_checked(&checked.token);
+    }
+    if checked.decision == Decision::Prompt && lost_work(&checked.token) {
+        return warn_checked(&checked.token);
+    }
+    checked
+}
+
 /// `reset --hard`, `checkout -- .`, `clean -f`, `stash drop`. The hook
 /// receives `allow` and a warning. It does not exit 2.
 fn lost_work(token: &str) -> bool {

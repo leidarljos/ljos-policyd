@@ -7536,6 +7536,14 @@ fn named_token(name: &str, reason: &str) -> String {
 /// code's name is a family several rules share.
 #[must_use]
 pub fn token_for(code: PolicyReason, reason: &str) -> String {
+    let is_id = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    if is_id(reason.trim()) {
+        return reason.trim().to_string();
+    }
     if let Some((head, _)) = reason.trim().split_once(": ") {
         let rule_id = !head.is_empty()
             && head
@@ -7705,10 +7713,13 @@ impl Seat {
         let mut bound = parent.clone();
         bound.observe(argv);
         let shown = argv_for_pack(argv, &bound, moved);
-        let own = self.check(&shown);
+        let own = open::soften(self.check(&shown), argv);
+        // A deny or a prompt is final. A warning is not: a command inside
+        // it may still be a deny, and that verdict is the one to give.
         if own.decision != Decision::Allow || depth >= MAX_DEPTH {
             return own;
         }
+        let mut warned = open::noted(&own.token).is_some().then(|| own.clone());
         let expanded = expand_aliases(argv);
         let roots = command_roots(&expanded, bound.root.clone());
         for (i, inner) in inner_commands_expanded(&expanded) {
@@ -7729,8 +7740,11 @@ impl Seat {
             if c.decision != Decision::Allow {
                 return c;
             }
+            if warned.is_none() && open::noted(&c.token).is_some() {
+                warned = Some(c);
+            }
         }
-        own
+        warned.unwrap_or(own)
     }
 }
 
@@ -9104,7 +9118,7 @@ fn git_dangerous(argv: &[String]) -> Option<GitHit> {
 /// A force or lease push whose remote side is `main`, `master`, or
 /// `develop`, a mirror, or a push that names no other branch while the
 /// checkout is on a default branch.
-fn push_rewrites_default(argv: &[String]) -> bool {
+pub(crate) fn push_rewrites_default(argv: &[String]) -> bool {
     let Some(at) = argv.iter().position(|a| a == "push") else {
         return false;
     };
@@ -10465,6 +10479,23 @@ fn relax_find_for_pack(idx: &[usize], out: &mut [String]) {
 /// for a command that acts on the link itself.
 fn argv_for_pack(argv: &[String], bound: &Scratch, _moved: bool) -> Vec<String> {
     let mut out = argv.to_vec();
+    // A variable this script assigns only to a fresh temp (`tmp=$(mktemp
+    // -d)`) is that temp: the pack reads it as a path under /tmp.
+    for w in out.iter_mut() {
+        let semi = w.ends_with(';');
+        let bare = unquote(w.trim_end_matches(';'))
+            .trim_end_matches('/')
+            .to_string();
+        let temp = bare_var(&bare)
+            .is_some_and(|name| bound.vars.get(name).copied().flatten() == Some(Hold::Temp));
+        if temp {
+            *w = if semi {
+                "/tmp/policyd-scratch;".into()
+            } else {
+                "/tmp/policyd-scratch".into()
+            };
+        }
+    }
     for (idx, _end) in ended_indices(argv) {
         let head = idx
             .iter()
@@ -12382,27 +12413,21 @@ mod tests {
         ] {
             assert_eq!(v(argv), "allow", "{argv:?}");
         }
-        assert!(
-            v(&["mv", "~/projects", "/dev/null"]).starts_with("allow\twarn\tmv-tree-outside: "),
-            "{}",
-            v(&["mv", "~/projects", "/dev/null"])
+        assert_eq!(
+            v(&["mv", "~/projects", "/dev/null"]),
+            "allow\twarn\tmv-tree-outside"
         );
-        assert!(
-            v(&["mv", "-t", "/dev/null", "src"]).starts_with("allow\twarn\tmv-tree-outside: "),
-            "{}",
-            v(&["mv", "-t", "/dev/null", "src"])
+        assert_eq!(
+            v(&["mv", "-t", "/dev/null", "src"]),
+            "allow\twarn\tmv-tree-outside"
         );
-        assert!(
-            v(&["rsync", "-a", "--delete", "build/", "host:/var/www/"])
-                .starts_with("deny\trsync-delete-outside: "),
-            "{}",
-            v(&["rsync", "-a", "--delete", "build/", "host:/var/www/"])
+        assert_eq!(
+            v(&["rsync", "-a", "--delete", "build/", "host:/var/www/"]),
+            "deny\trsync-delete-outside"
         );
-        assert!(
-            v(&["rsync", "-a", "--delete", "build/", "/mnt/backup/build/"])
-                .starts_with("deny\trsync-delete-outside: "),
-            "{}",
-            v(&["rsync", "-a", "--delete", "build/", "/mnt/backup/build/"])
+        assert_eq!(
+            v(&["rsync", "-a", "--delete", "build/", "/mnt/backup/build/"]),
+            "deny\trsync-delete-outside"
         );
     }
 
@@ -13394,11 +13419,9 @@ mod tests {
             "wc -c ~/.secrets/x && head -c4 ~/.secrets/x",
         ] {
             let c = at(line);
-            // The pack names a count apart from a read; the publish step
-            // makes it a warning, which the verdict below shows.
-            assert_eq!(c.decision, Decision::Deny, "{line}: {}", c.token);
+            assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
             assert!(
-                c.token.starts_with("credential-count: "),
+                c.token.starts_with("warn\tcredential-count: "),
                 "{line}: {}",
                 c.token
             );

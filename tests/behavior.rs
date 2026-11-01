@@ -437,31 +437,24 @@ fn mv_or_rsync_delete_outside_the_work_tree_is_refused() {
         ("mv ~/projects /dev/null", "mv-tree-outside"),
         ("mv -t /dev/null src", "mv-tree-outside"),
     ] {
-        let got = verdict(&words(line));
-        assert!(
-            got.starts_with(&format!("allow\twarn\t{token}: ")),
-            "{line}: {got}"
+        assert_eq!(
+            verdict(&words(line)),
+            format!("allow\twarn\t{token}"),
+            "{line}"
         );
     }
     for (line, token) in [
         ("rsync -a --delete empty/ ~/", "rsync-delete-outside"),
         ("rsync -a --delete-after x/ /etc/", "rsync-delete-outside"),
     ] {
-        let got = verdict(&words(line));
-        assert!(
-            got.starts_with(&format!("deny\t{token}: ")),
-            "{line}: {got}"
-        );
+        assert_eq!(verdict(&words(line)), format!("deny\t{token}"), "{line}");
     }
     let script = verdict(&[
         "sh".into(),
         "-c".into(),
         "rsync -a --delete empty/ ~/".into(),
     ]);
-    assert!(
-        script.starts_with("deny\trsync-delete-outside: "),
-        "{script}"
-    );
+    assert_eq!(script, "deny\trsync-delete-outside");
     assert_eq!(verdict(&words("mv a.txt b.txt")), "allow");
     assert_eq!(verdict(&words("rsync -a src/ dest/")), "allow");
 }
