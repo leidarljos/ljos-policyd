@@ -7762,6 +7762,24 @@ impl Seat {
                 warned = Some(c);
             }
         }
+        // Each `find -exec` payload is a command line of its own. A
+        // command word the walk cannot name asks.
+        for payload in find_payloads(argv) {
+            if exec_word_unresolved(&payload) {
+                return Checked {
+                    decision: Decision::Prompt,
+                    code: PolicyReason::HighRiskPrompt,
+                    token: Cow::Borrowed("exec-unresolved"),
+                };
+            }
+            let c = self.check_at(&payload, depth + 1, &bound, moved);
+            if c.decision != Decision::Allow {
+                return c;
+            }
+            if warned.is_none() && open::noted(&c.token).is_some() {
+                warned = Some(c);
+            }
+        }
         warned.unwrap_or(own)
     }
 }
@@ -10559,7 +10577,11 @@ fn argv_for_pack(argv: &[String], bound: &Scratch, _moved: bool) -> Vec<String> 
             };
         }
     }
-    for (idx, _end) in ended_indices(argv) {
+    let roots = command_roots(argv, bound.root.clone());
+    for (k, (idx, _end)) in ended_indices(argv).into_iter().enumerate() {
+        // The directory this command runs in: a `cd` earlier on the line
+        // moves it.
+        let here = roots.get(k).cloned().unwrap_or_else(|| bound.root.clone());
         let head = idx
             .iter()
             .map(|&i| argv[i].trim_end_matches(';'))
@@ -10580,24 +10602,29 @@ fn argv_for_pack(argv: &[String], bound: &Scratch, _moved: bool) -> Vec<String> 
             head,
             "rm" | "rmdir" | "unlink" | "mv" | "ln" | "readlink" | "ls" | "stat"
         );
+        let spelled_tmp = |w: &str| {
+            let p = unquote(w.trim_end_matches(';'));
+            !climbs(p) && (p.starts_with("/tmp/") || p.starts_with("/var/tmp/"))
+        };
         for &i in &idx {
-            if on_link && !under_tmp(unquote(out[i].trim_end_matches(';'))) {
+            if on_link && !spelled_tmp(&out[i]) {
                 continue;
             }
             if let Some(resolved) = link_resolved(&out[i])
-                .or_else(|| escaping_link(&out[i], bound.root.as_deref(), bound.work.as_deref()))
+                .or_else(|| escaping_link(&out[i], here.as_deref(), bound.work.as_deref()))
             {
                 out[i] = resolved;
             }
         }
-    }
-    // A redirection's relative target, after a `cd` out of /tmp and the
-    // work tree, is the file there.
-    if let Some(root) = bound.root.as_deref().filter(|r| {
-        !(r.starts_with("/tmp") || r.starts_with("/var/tmp"))
-            && bound.work.as_deref().is_none_or(|w| !r.starts_with(w))
-    }) {
-        for i in 0..out.len() {
+        // A redirection's relative target, after a `cd` out of /tmp and
+        // the work tree, is the file there.
+        let Some(root) = here.as_deref().filter(|r| {
+            !(r.starts_with("/tmp") || r.starts_with("/var/tmp"))
+                && bound.work.as_deref().is_none_or(|w| !r.starts_with(w))
+        }) else {
+            continue;
+        };
+        for &i in &idx {
             let after = i > 0 && matches!(out[i - 1].as_str(), ">" | ">>" | ">|");
             let lead = if after {
                 0
