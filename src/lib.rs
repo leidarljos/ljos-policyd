@@ -7738,9 +7738,9 @@ impl Seat {
             // next to a read is that count, not a read alone.
             let same_root = roots.get(i).is_none_or(|r| *r == bound.root);
             if same_root
-                && commands(argv)
-                    .iter()
-                    .any(|c| c.len() == inner.len() && c.iter().zip(&inner).all(|(a, b)| *a == b.as_str()))
+                && commands(argv).iter().any(|c| {
+                    c.len() == inner.len() && c.iter().zip(&inner).all(|(a, b)| *a == b.as_str())
+                })
             {
                 continue;
             }
