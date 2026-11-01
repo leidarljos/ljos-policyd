@@ -201,16 +201,36 @@ fn read_only_xargs_lines_are_allowed() {
     assert_eq!(verdict(&words("mv a b")), "allow");
 }
 
+/// The branch a force push rewrites comes through xargs here, so the
+/// table reads the checkout's own branch; a checkout on `main` makes it a
+/// default-branch push wherever the suite runs.
 #[test]
 fn xargs_into_rm_or_a_force_push_is_refused() {
     assert_eq!(
         verdict(&shell("printf x | xargs rm -rf")),
         "allow\twarn\tfeeder-rm"
     );
+    let repo = std::env::temp_dir().join(format!("policyd-xargs-main-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&repo);
+    std::fs::create_dir_all(&repo).unwrap();
+    let init = std::process::Command::new("git")
+        .args(["init", "-q", "-b", "main"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "{}",
+        String::from_utf8_lossy(&init.stderr)
+    );
     assert_eq!(
-        verdict(&shell("printf main | xargs git push -f origin")),
+        verdict(&shell(&format!(
+            "printf main | xargs git -C {} push -f origin",
+            repo.display()
+        ))),
         "deny\tgit-force-push"
     );
+    let _ = std::fs::remove_dir_all(&repo);
 }
 
 #[test]
