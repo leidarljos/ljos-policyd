@@ -21,7 +21,7 @@ env:
   # v0.2.4 adds the download, setgid and lease-push law the table matches.
   # v0.2.5 matches a vendor secret prefix only at a token boundary.
   # v0.2.7 reads `git restore --staged .`, `-S` included, as an unstage.
-  PHRONESIS_REF: ${{ inputs.phronesis_ref || 'v0.2.7' }}
+  PHRONESIS_REF: ${{ inputs.phronesis_ref || '7d115de79407a54e0be5050f95107cfa08fe6277' }}
 
 jobs:
   build:
@@ -54,9 +54,13 @@ jobs:
       - name: Build phronesis ${{ env.PHRONESIS_REF }}
         run: |
           set -eu
-          git clone --depth 1 --branch "$PHRONESIS_REF" \
-            https://github.com/leidarljos/phronesis "$RUNNER_TEMP/phronesis"
+          # A commit, not a tag: the phronesis repository keeps no
+          # release tags. A branch name works too.
+          git init -q "$RUNNER_TEMP/phronesis"
           cd "$RUNNER_TEMP/phronesis"
+          git remote add origin https://github.com/leidarljos/phronesis.git
+          git fetch --depth 1 origin "$PHRONESIS_REF"
+          git checkout --detach FETCH_HEAD
           cross=()
           if [ -n "${{ matrix.cross }}" ]; then
             # Intel macOS from the arm runner; Rosetta runs the test binaries.

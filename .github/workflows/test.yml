@@ -30,11 +30,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      # The tag the release links, so a test and a release build sit on the
-      # same phronesis. v0.2.7 reads `git restore --staged` over the whole
-      # tree, `-S` included, as an unstage and not a discard; v0.2.5 matches
-      # a vendor secret prefix only at a token boundary.
-      PHRONESIS_REF: v0.2.7
+      # The commit the release links, so a test and a release build sit on
+      # the same phronesis: phronesis 0.2.9, the import of the recreated
+      # repository, which keeps no release tags.
+      PHRONESIS_REF: 7d115de79407a54e0be5050f95107cfa08fe6277
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.1
@@ -46,9 +45,13 @@ jobs:
       - name: Build phronesis
         run: |
           set -eu
-          git clone --depth 1 --branch "$PHRONESIS_REF" \
-            https://github.com/leidarljos/phronesis "$RUNNER_TEMP/phronesis"
+          # A commit, not a tag: the phronesis repository keeps no
+          # release tags. A branch name works too.
+          git init -q "$RUNNER_TEMP/phronesis"
           cd "$RUNNER_TEMP/phronesis"
+          git remote add origin https://github.com/leidarljos/phronesis.git
+          git fetch --depth 1 origin "$PHRONESIS_REF"
+          git checkout --detach FETCH_HEAD
           meson setup build --prefix="$RUNNER_TEMP/phronesis-prefix" -Dtests=disabled
           meson compile -C build
           meson install -C build
