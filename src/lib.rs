@@ -6947,12 +6947,6 @@ fn host_argv_rules(argv: &[String], moved: bool, bound: &Scratch) -> Checked {
         }
         notes.push(token.to_string());
     }
-    if let Some(token) = harm::tree_outside(argv, bound.work.as_deref()) {
-        if token == "rsync-delete-outside" {
-            return deny_shell(PolicyReason::ShellDangerousRunner, token);
-        }
-        notes.push(token.to_string());
-    }
     if base == "git-filter-repo" || base == "git-filter-branch" {
         notes.push("git-history-rewrite".to_string());
     }
@@ -10621,6 +10615,15 @@ fn argv_for_pack(argv: &[String], bound: &Scratch, moved: bool) -> Vec<String> {
             .find(|w| !is_assignment(w) && !is_redirection(w))
             .map(|w| base_of(w))
             .unwrap_or("");
+        // A path inside the work tree reaches the pack as a relative one,
+        // so the pack reads an absolute path as one outside the tree.
+        if let Some(root) = bound.root.as_deref() {
+            for &i in &idx {
+                if let Some(rel) = inside_as_relative(&out[i], root) {
+                    out[i] = rel;
+                }
+            }
+        }
         if !matches!(
             head,
             "rm" | "rmdir" | "unlink" | "mv" | "ln" | "readlink" | "ls" | "stat"
@@ -10634,6 +10637,32 @@ fn argv_for_pack(argv: &[String], bound: &Scratch, moved: bool) -> Vec<String> {
     }
     out.retain(|w| !w.is_empty());
     out
+}
+
+/// `w` as a path relative to `root` when it is an absolute path inside
+/// it: `/work/src` under `/work` is `./src`, and `/work` itself is `.`.
+/// `None` for any other word.
+fn inside_as_relative(w: &str, root: &std::path::Path) -> Option<String> {
+    let semi = w.ends_with(';');
+    let bare = w.trim_end_matches(';');
+    if !bare.starts_with('/') {
+        return None;
+    }
+    let root = root.to_str()?.trim_end_matches('/');
+    if root.is_empty() {
+        return None;
+    }
+    let rest = if bare == root || bare == format!("{root}/") {
+        "."
+    } else {
+        bare.strip_prefix(root)?.strip_prefix('/')?
+    };
+    let rel = if rest == "." {
+        ".".to_string()
+    } else {
+        format!("./{rest}")
+    };
+    Some(if semi { format!("{rel};") } else { rel })
 }
 
 /// `w` with a symlink in it named by the path it points at: the whole
@@ -12500,21 +12529,27 @@ mod tests {
         ] {
             assert_eq!(v(argv), "allow", "{argv:?}");
         }
-        assert_eq!(
-            v(&["mv", "~/projects", "/dev/null"]),
-            "allow\twarn\tmv-tree-outside"
+        assert!(
+            v(&["mv", "~/projects", "/dev/null"]).starts_with("allow\twarn\tmv-tree-outside: "),
+            "{}",
+            v(&["mv", "~/projects", "/dev/null"])
         );
-        assert_eq!(
-            v(&["mv", "-t", "/dev/null", "src"]),
-            "allow\twarn\tmv-tree-outside"
+        assert!(
+            v(&["mv", "-t", "/dev/null", "src"]).starts_with("allow\twarn\tmv-tree-outside: "),
+            "{}",
+            v(&["mv", "-t", "/dev/null", "src"])
         );
-        assert_eq!(
-            v(&["rsync", "-a", "--delete", "build/", "host:/var/www/"]),
-            "deny\trsync-delete-outside"
+        assert!(
+            v(&["rsync", "-a", "--delete", "build/", "host:/var/www/"])
+                .starts_with("deny\trsync-delete-outside: "),
+            "{}",
+            v(&["rsync", "-a", "--delete", "build/", "host:/var/www/"])
         );
-        assert_eq!(
-            v(&["rsync", "-a", "--delete", "build/", "/mnt/backup/build/"]),
-            "deny\trsync-delete-outside"
+        assert!(
+            v(&["rsync", "-a", "--delete", "build/", "/mnt/backup/build/"])
+                .starts_with("deny\trsync-delete-outside: "),
+            "{}",
+            v(&["rsync", "-a", "--delete", "build/", "/mnt/backup/build/"])
         );
     }
 
