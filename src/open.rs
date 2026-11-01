@@ -471,6 +471,7 @@ pub fn irreversible(token: &str) -> bool {
             | "reads-credential"
             | "shell-secret-in-argv"
             | "python-missing-pep723"
+            | "path-outside-workspace"
     ) || head.starts_with("reads-credential")
 }
 
