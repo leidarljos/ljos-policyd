@@ -3,19 +3,20 @@ Why a binary and not a prompt
 
 A model that is asked "may this run?" will sometimes say yes. The
 gate reads argv. This crate is that process: argv in, a one-line
-verdict out. The harness hook calls it. A Janet pack can deny more
-after this verdict.
+verdict out. The harness hook calls it. The verdict is the phronesis
+pack's: a Janet law compiled into the binary, with the host supplying
+only facts the pack cannot see.
 
 A model cannot be the mediator. An agent that can talk its way past
 the check is the threat, and indirect prompt injection shows that
 instructions carried in data change what a model permits (Greshake et
-al., doi:10.48550/arXiv.2302.12173). No matching rule in this table is
-an allow. This table judges the argv it is given. Saltzer and
+al., doi:10.48550/arXiv.2302.12173). No matching rule in this pack is
+an allow. This pack judges the argv it is given. Saltzer and
 Schroeder would deny in that case
 (`Saltzer and Schroeder, 1975 <https://doi.org/10.1109/PROC.1975.9939>`__).
-This table does not. The fail-closed switch is
+This pack does not. The fail-closed switch is
 ``POLICYD_REQUIRED=1``, and it covers a missing binary. The next layer
-may deny more. It cannot allow what this table refused.
+may deny more. It cannot allow what this pack refused.
 
 First deny wins
 ===============

@@ -24,12 +24,13 @@ ljos-policyd 0.6.4 (phronesis)
 A check that hits an internal error, a parse failure, an unknown input, the one second cap, a missing config, no arguments, or an unknown verb prints `allow` and a `fail-open` reason.
 It does not deny on that failure.
 
-The table denies `rm-rf-outside-tmp`, `find-delete`, `find-exec-rm`, `rsync-delete-outside`, `git-force-push` of a remote default branch (`main`, `master`, or the remote HEAD in the checkout), `git-push-delete` of `main`, `master`, or `develop`, `reads-credential` except a `wc` count of a secrets path and that count with `head -c` of at most 4 bytes of the same path, and `curl-pipe-shell` (a download piped into `sh`, `bash`, or `zsh`).
+The pack denies `rm-rf-outside-tmp`, `find-delete` and `find-exec-rm` outside the work tree, `rsync-delete-outside`, `git-force-push` of a remote default branch (`main`, `master`, or the remote HEAD in the checkout), `git-push-delete` of `main`, `master`, or `develop`, `reads-credential` except a `wc` count of a secrets path and that count with `head -c` of at most 4 bytes of the same path, and `curl-pipe-shell` (a download piped into `sh`, `bash`, or `zsh`).
 A file written by `cat`, `tee`, `printf`, or `git commit -F` is data, including a `<(...)` body.
 `curl` piped to `python3` with no program of its own warns. `jq` is not a shell.
 `~/.config/ljos/seats.toml` and `ljos.toml` are config.
 Every other hit is `allow` with a `warn` reason and does not deny.
-`reset --hard`, `checkout -- .`, `clean -f` and `stash drop` are that warning. The hook does not exit 2.
+`reset --hard`, `checkout -- .`, `clean -fd` and `stash drop` are that warning. The hook does not exit 2.
+An inline program that names a credential store asks (`prompt\tcredential-mention`).
 A consent record is read only. Its origin is undecided. It matches the push remote URL and the refspec destination branch. The URL is the remote argument when that argument is a URL, the URL `git -C` resolves, or the one literal URL the script assigns to the variable used as the remote. Its expiry is at most 24 hours ahead.
 The file is read only when the current user cannot write it and it is not group- or world-writable. Otherwise it is ignored and the reason is logged.
 `LJOS_USER_ALLOW` and `LJOS_CONSENT_FILE` may be set only by policyd's parent hook config. A file either name points at is ignored when that file is agent-writable, under the same check.
@@ -46,34 +47,40 @@ or `mv`, or in an interpreter `open` or `write` call is checked. A name
 built by concatenation, by `Path.home()`, or by an interpreter this
 check does not read, is outside that model.
 
-## What the table matches
+## What the pack matches
 
-The rules are tried in this order, and the first that matches is the reason.
-A match denies only for the deny kinds named above.
-Any other match warns and does not deny.
+The phronesis pack is the law; ljos-policyd hands it each line and each
+command found inside the line. A refusal anywhere on a line wins over a
+warning. A match denies only for the deny kinds named above. Any other
+match warns and does not deny.
 
 | Reason | Matched | Not matched |
 |---|---|---|
-| `sudo` | a privilege runner as any word: `sudo`, `doas`, `su`, `pkexec`, `run0` | a sentence that only mentions one, passed as one quoted word |
-| `curl-pipe-shell` | a download piped into `sh`, `bash`, or `zsh`, directly or through a later stage (`curl URL \| sh`, `wget -qO- URL \| bash`, `curl URL \| tee f \| sh`); a shell, `source`, `.`, `eval` or an interpreter running a download (`bash <(curl ...)`, `source <(curl ...)`, `sh -c "$(curl ...)"`, `bash -c 'curl ... \| sh'`); a file a fetch on the line writes and a later command runs, including a redirection or `tee` (`curl -o i.sh URL && sh i.sh`, `curl URL > i.sh && sh i.sh`, `curl URL \| tee i.sh && ./i.sh`, `wget URL/i.sh && ./i.sh`). A download piped into `python3` with no program of its own (`curl URL \| python3`, `\| python3 -`, `\| python3 /dev/stdin`) is the same reason as a warning | `git fetch` followed by `bash build.sh`; a search pattern naming both; `curl URL \| jq`; `\| python3 -m json.tool`, `\| python3 parse.py` or `\| python3 -W ignore parse.py`; `curl -o FILE URL` or `curl URL > FILE` that nothing on the line runs; `echo hi \| tee run.sh && sh run.sh` |
-| `decoded-pipe-shell` | a decoder's output piped into a shell (`echo ... \| base64 -d \| sh`, `xxd -r ... \| sh`, `zcat x.gz \| bash`), or a shell running a decoder (`bash -c "$(base64 -d f)"`, `sh <(base64 -d f)`) | decoding to a file or into `grep` |
-| `chmod-setuid` | setting the setuid or setgid bit with `chmod` or `install -m`: an octal mode whose leading digit holds 4 or 2 (`4755`, `04755`, `2775`), or a clause that adds `s` (`u+s`, `g+s`, `+s`); an inline program that passes such a mode to `chmod` (`os.chmod(path, 0o4755)`, `chmodSync(path, 0o2755)`, `File.chmod(04755, path)`, `chmod 04755`) | other modes (`0755`, `1777`, `+x`, `u-s`, `os.chmod(path, 0o755)`, `chmod 0755`) |
-| `raw-disk` | `mkfs` on a device, `dd of=` a block device, `wipefs -a`, `sgdisk`, `sfdisk`, `fdisk`, `parted`, `blkdiscard`, `mkswap` or `shred` on a block device, `cryptsetup luksFormat`, `badblocks -w`, a `>` redirection into a block device | `mkfs` on an image file, `dd` to a file or `/dev/null`, the listing forms (`fdisk -l`, `parted print`, `sfdisk --dump`, `wipefs` without `-a`) |
-| `recursive-chmod-chown` | a recursive `chmod`, `chown`, `chgrp` or `setfacl` from `/`, a home directory or a system tree (`/etc`, `/usr`, `/var`, ...), or a recursive `chmod` to `000`, `a-rwx`, `777` or `o+w` outside `/tmp` | `chmod -R u+w target`, `chown -R $USER ./build`, `chmod -R 700 ~/.ssh` |
-| `find-delete-outside-tmp` | `find ... -delete`, or `-exec`, `-execdir` or `-ok` running `rm`, `shred` or `unlink`, whose starting points reach outside `/tmp` and `/var/tmp`; no starting point means the current directory | the same under `/tmp`; `find` without a delete; `find -exec grep`; a cleanup inside the tree whose name tests all name files a tool writes again (`find . -name '*.pyc' -delete`, `find . -name .DS_Store -delete`), unless the line can `cd` out of the tree |
-| `find-write-outside-tmp` | `find -fprint`, `-fprint0`, `-fprintf` or `-fls` whose file is not a literal path under `/tmp` or `/var/tmp` (`find / -fprint /etc/x`, `find . -fls out`, `find / -fprintf /etc/x '%p\n'`) | that file under `/tmp` or `/var/tmp` (`find /tmp -fprint /tmp/out`); `find -print` and `find -printf`; a `-fprint` word that belongs to the `-exec` command |
-| `rm-rf-outside-tmp` | a recursive `rm` or `rtrash` whose own operands reach outside `/tmp` and `/var/tmp`, a `..` in the path included; also `python -c`, `node -e`, `ruby -e` or `perl -e` code that calls `shutil.rmtree`, `rmSync(..., {recursive})`, `rm_rf`, `rm_r` or `remove_tree` outside `/tmp` | the same under `/tmp`; a build output directory named as a plain relative path (`rm -rf target/`, `rm -rf node_modules`, `rm -rf ./build`, `web/.venv`) or a top-level scratch directory (`rm -rf ./tmp/test-output`, `.tmp`, `temp`), unless the line can `cd` out of the tree; a later command on the line that is not a delete |
-| `git-force-push` | `git push` with `--force`, `-f` in a flag cluster, `--mirror`, or a `+` refspec of a remote default branch; a plain force push of `develop` always denies, and whether that should stay is an open policy question; a `--force-with-lease` push onto `main`, `master`, or the remote default (the branch `refs/remotes/<remote>/HEAD` names). A lease of any other branch warns. ljos asks rather than refuses, and reads a bare lease push's branch from the checkout | an ordinary `git push`, `git push -u origin BRANCH`, `--force-if-includes` alone, and a lease push onto any other branch (`feature`, `mainline`, `develop-fix`, `release`), which the remote refuses when it holds commits you have not fetched. A lease of `develop` warns unless `develop` is that remote's default branch. A plain force push of `develop` always denies, and whether that should stay is an open policy question |
-| `git-reset-hard` | `git reset --hard` | `--soft`, `--mixed`, `reset FILE` |
-| `git-clean-force` | `git clean` with `-f` (`-fd`, `-fdx`, `--force`) | `git clean -n` |
-| `git-stash-clear` | `git stash clear` | `stash pop`, `list`, `drop` |
-| `git-discard-worktree` | `git checkout -- .` or `git checkout .`, `git restore .` or `:/`, and `git restore` with no path | `checkout BRANCH`, `checkout -- FILE`, `restore FILE`, `restore --patch` |
-| `git-push-delete` | `git push --delete`, `-d` in a flag cluster, or a refspec with an empty source (`:main`, `:refs/tags/v1.0`) | `push origin main:main`, `push --dry-run` |
-| `git-branch-force-delete` | `git branch -D`, `--delete --force` | `branch -d`, which refuses an unmerged branch |
-| `git-reflog-expire` | `git reflog expire` with `--expire=now` or `=all`, `git reflog delete` | `reflog expire` with a date, `reflog show` |
-| `git-history-rewrite` | `git filter-branch`, `git filter-repo` | `git rebase` |
+| `sudo` | a privilege runner as any word: `sudo`, `doas`, `su`, `pkexec`, `run0`; the command it runs is judged first | a sentence that only mentions one, passed as one quoted word |
+| `curl-pipe-shell` | a download piped into `sh`, `bash`, `zsh`, `perl`, `ruby`, `node` or `php` with no program of its own, directly or through a later stage (`curl URL \| sh`, `curl URL \| tee f \| sh`, `\| perl /proc/self/fd/0`); a shell, `source`, `.`, `eval` or an interpreter running a download (`bash <(curl ...)`, `sh -c "$(curl ...)"`); a file a fetch on the line writes and a later command runs, including through a redirection, `tee`, `busybox`, `eval` or `sh -c` (`curl -o i.sh URL && sh i.sh`, `curl URL > i.sh && sh i.sh`). A download piped into `python3` with no program of its own (`\| python3`, `\| python3 -W ignore`) warns under this reason | `git fetch` followed by `bash build.sh`; `curl URL \| jq`; `\| python3 -m json.tool`, `\| python3 parse.py`, `\| node -r dotenv app.js`; `curl -o FILE URL` that nothing on the line runs |
+| `decoded-pipe-shell` | a decoder's output piped into a shell, or a shell running a decoder | decoding to a file or into `grep` |
+| `chmod-setuid` | setting the setuid or setgid bit with `chmod` or `install -m` | other modes (`0755`, `1777`, `+x`, `u-s`) |
+| `raw-disk` | `mkfs` on a device, `dd of=` a block device, `wipefs -a`, partitioners and `shred` on a block device, also behind `env` and other wrappers | `mkfs` on an image file, `dd` to a file, the listing forms |
+| `recursive-chmod-chown` | a recursive `chmod`, `chown`, `chgrp` or `setfacl` from `/`, a home directory or a system tree, or a recursive sweeping mode outside `/tmp` | `chmod -R u+w target`, `chown -R $USER ./build` |
+| `rm-rf-outside-tmp` | a recursive `rm`, `srm`, `wipe` or trash, behind a wrapper or a tracer or as `parallel rm -rf ::: ARGS`, whose operands reach outside `/tmp` and `/var/tmp`; long options by their abbreviations (`rm --rec --for ~/`) | the same under `/tmp`; a build output directory named as a plain relative path (`rm -rf target/`, `node_modules`); configure's scratch (`rm -rf conftest*`) |
+| `find-delete`, `find-exec-rm` | `find -delete`, or `-exec`, `-execdir` or `-ok` running a delete behind any wrapper or `sh -c`; outside the work tree it denies, inside it or under `/tmp` it warns | a cleanup inside the tree whose name tests all name regenerable files, with the action after them (`find . -name '*.pyc' -delete`) |
+| `feeder-rm` | `xargs` or `parallel` running a delete, behind a wrapper or `sh -c` | `xargs echo` |
+| `rsync-delete-outside`, `mv-tree-outside` | `rsync --delete` over, or `mv` of a whole tree onto, a tree outside the work tree (`~`, an absolute path, `/dev/null`, a remote); the `mv` form warns | a relative destination, a dry run |
+| `reads-credential`, `credential-count` | a reader, copier or upload of a credential store (`.ssh`, `.aws`, `.netrc`, `/etc/shadow`, ...); a count that prints no content is `credential-count` and warns | `~/.config/ljos/seats.toml` and `ljos.toml` |
+| `credential-mention` | an inline `python`, `perl`, `ruby`, `node`, `deno` or `bun` program whose text names a credential store; it asks | `.secrets.example`, `os.environ` |
+| `seat-guard-path` | a write onto a seat file: the agent hook files, `~/.config/ljos`, `~/.config/ljos-policyd`, the ljos git hooks and the global git config, by a redirection, `tee`, a copy, `dd`, an in-place editor, an archive extracted there, an inline program, or `core.hooksPath` set globally; it warns | reading those files; a relative path |
+| `shell-secret-in-argv` | a token or secret written into the argv, such as a token in a URL | |
+| `git-force-push` | `git push` with `--force`, `-f`, `--mirror` (abbreviations included) or a `+` refspec of a remote default branch; a `--force-with-lease` push onto `main`, `master`, `develop` or an unnamed branch. A force or lease push of any other branch warns | an ordinary `git push`, `git push -u origin BRANCH` |
+| `git-push-delete` | `git push --delete`, `-d`, or an empty-source refspec of a default branch; a tag delete warns | `push origin main:main`, `push --dry-run` |
+| `git-reset-hard` | `git reset --hard` (`--har`) | `--soft`, `--mixed`, `reset FILE` |
+| `git-clean-force` | `git clean` with force and directories (`-fd`, `-fdx`) | `git clean -n`, `git clean --force` alone |
+| `git-stash-clear`, `git-stash-drop` | `git stash clear`, `git stash drop` | `stash pop`, `list` |
+| `git-discard-worktree` | `git checkout -- .`, `git checkout -f`, `git switch --discard-changes`, `git restore` of a whole-tree path writing the work tree, and `git restore --worktree=VALUE` | `checkout BRANCH`, `restore FILE`, `restore --staged .`, `restore --patch` |
+| `git-branch-force-delete` | `git branch -D`, `--delete --force` | `branch -d` |
+| `git-reflog-expire` | `git reflog expire` with `--expire=now` or `=all`, `git reflog delete` | `reflog expire` with a date |
+| `git-history-rewrite` | `git filter-branch`, `git filter-repo`, `git-filter-repo` | `git rebase` |
 | `git-update-ref-delete` | `git update-ref -d` | `update-ref REF VALUE` |
-| `git-worktree-force-remove` | `git worktree remove --force` | `worktree remove` without `--force`, which refuses a dirty tree |
+| `git-worktree-force-remove` | `git worktree remove --force` | `worktree remove` without `--force` |
 
 The git rules also apply when the command word is a variable: `g=git;
 $g push -f` reads `$g` as `git`, and `$GIT reset --hard` with no
@@ -107,19 +114,20 @@ through the `phronesis-sys` crate, which carries the library's C, the
 Janet runtime, the Cap'n Proto C runtime and the default pack, and
 compiles them with cargo alone: no meson, capnp or pkg-config, and no
 phronesis install on the build or the running machine. Every check runs
-the table above and then `phronesis_check_shell`, on the line and on each
-command the table found inside it: past `env`, `nice` and the other
-wrappers, inside `sh -c` scripts and substitutions. A refusal from the
-table stands, and a refusal from phronesis carries the pack's own reason
-after the tab.
+`phronesis_check_shell` on the line and on each command found inside
+it: past `env`, `nice` and the other wrappers, inside `sh -c` scripts,
+substitutions and `find -exec` payloads. The pack is the only law. The
+host hands it facts it cannot see: a path inside the work tree as a
+relative one, a link out of `/tmp` by its target, a fresh temp as a
+temp, and whether a push rewrites the checkout's default branch. A
+refusal carries the pack's own reason after the tab.
 
 A word is handed to the pack whole, up to 128 KiB, and a line may carry
 up to 32768 words. Past either limit, or a command body over 512 KiB, the
 line is `field-too-long` and the reason, such as `field-too-long: argv
 word exceeds 131072 bytes`. On first use the binary writes the pack under
 `$PHRONESIS_STATE_DIR` (default `~/.local/state/ljos-policyd`) and loads
-it from there. The default pack refuses what the table refuses and also
-secrets written into the argv (a token in a URL or a header).
+it from there.
 `LJOS_POLICYD_PACK=seat` loads the seat pack instead, which adds uv-only
 Python and refuses `pip`, `npm`, `yarn`, `pnpm`, `bun` and `poetry`. A
 pack named in `PHRONESIS_JANET_PACK` replaces both.

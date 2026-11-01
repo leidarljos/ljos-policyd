@@ -13,7 +13,7 @@ Verb             Meaning
 ``capnp``        write a packed Cap'n ``PolicyDecision`` to stdout; exit 2 on deny
 ``exec``         same text verdict; on allow, run argv; on deny, print the verdict on stderr and exit 2
 ``check-mail``   JSON ``allow`` or ``deny`` for one message on stdin; exit 2 when it refuses
-``version``      print ``ljos-policyd <semver> (phronesis)`` or ``ljos-policyd <semver> (host table)``
+``version``      print ``ljos-policyd <semver> (phronesis <version>)``
 ================ ========================================================================================
 
 A leading ``--`` after the verb is optional and is stripped.
@@ -209,9 +209,8 @@ A blank reason is the name alone, ``field-too-long``. The limits are
 ``src/internal.h``, and ``PHRONESIS_CAPNP_MAX_BODY`` in phronesis
 ``include/phronesis/supervisor.h``. phronesis 0.2.3 sets them to 131072,
 32768 and 524288 and writes the reason strings above. This binary names
-the code and keeps the reason. Release binaries link phronesis 0.2.5.
-A build without the library uses the host table and does not apply
-these limits.
+the code and keeps the reason. Every build links phronesis through the
+``phronesis-sys`` crate.
 
 Outbound mail
 =============
