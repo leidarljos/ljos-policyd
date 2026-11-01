@@ -7687,6 +7687,13 @@ impl Seat {
         let text = unsafe { std::ffi::CStr::from_ptr(reason.as_ptr()) }
             .to_string_lossy()
             .into_owned();
+        // The pack runs a line it warns about: `allow` with `warn: ID`.
+        if let Some(id) = text
+            .strip_prefix("warn: ")
+            .filter(|_| decision == Decision::Allow)
+        {
+            return open::warn_checked(id);
+        }
         let token = if decision == Decision::Allow {
             Cow::Borrowed("allow")
         } else if pack_load_failed(code) {
@@ -7724,6 +7731,13 @@ impl Seat {
         let roots = command_roots(&expanded, bound.root.clone());
         for (i, inner) in inner_commands_expanded(&expanded) {
             if inner.is_empty() || inner.as_slice() == argv {
+                continue;
+            }
+            // A command the line holds word for word, in the same
+            // directory, was judged with the rest of the line: a count
+            // next to a read is that count, not a read alone.
+            let same_root = roots.get(i).is_none_or(|r| *r == bound.root);
+            if same_root && argv.windows(inner.len()).any(|w| w == inner.as_slice()) {
                 continue;
             }
             let mut next = bound.clone();
@@ -9115,6 +9129,37 @@ fn git_dangerous(argv: &[String]) -> Option<GitHit> {
     }
 }
 
+/// Whether a git push on the line is a refusal rather than a warning: a
+/// lease push onto a guarded or unnamed branch, a force push that
+/// rewrites a default branch, or a delete of a default branch. `None`
+/// when the line holds no such push. The checkout's branch is a fact only
+/// the host has.
+pub(crate) fn push_is_hard(argv: &[String]) -> Option<bool> {
+    for cmd in commands(argv) {
+        let owned: Vec<String> = cmd.iter().map(|s| (*s).to_string()).collect();
+        let run = peeled(&owned);
+        if run.first().map(|w| base_of(w)) != Some("git") {
+            continue;
+        }
+        let Some((sub, rest)) = git_subcommand(run) else {
+            continue;
+        };
+        if sub != "push" {
+            continue;
+        }
+        if has_lease_push(run) {
+            return Some(lease_push_guarded(run));
+        }
+        if force_push(run) {
+            return Some(push_rewrites_default(run));
+        }
+        if push_delete(rest) {
+            return Some(delete_hits_default(rest));
+        }
+    }
+    None
+}
+
 /// A force or lease push whose remote side is `main`, `master`, or
 /// `develop`, a mirror, or a push that names no other branch while the
 /// checkout is on a default branch.
@@ -10480,14 +10525,17 @@ fn relax_find_for_pack(idx: &[usize], out: &mut [String]) {
 fn argv_for_pack(argv: &[String], bound: &Scratch, _moved: bool) -> Vec<String> {
     let mut out = argv.to_vec();
     // A variable this script assigns only to a fresh temp (`tmp=$(mktemp
-    // -d)`) is that temp: the pack reads it as a path under /tmp.
+    // -d)`) is that temp, and so is a name configure keeps as scratch
+    // (`conftest*`): the pack reads it as a path under /tmp.
     for w in out.iter_mut() {
         let semi = w.ends_with(';');
         let bare = unquote(w.trim_end_matches(';'))
             .trim_end_matches('/')
             .to_string();
         let temp = bare_var(&bare)
-            .is_some_and(|name| bound.vars.get(name).copied().flatten() == Some(Hold::Temp));
+            .is_some_and(|name| bound.vars.get(name).copied().flatten() == Some(Hold::Temp))
+            || configure_scratch(&bare)
+            || (bound.autoconf && autoconf_operand(&bare, bound));
         if temp {
             *w = if semi {
                 "/tmp/policyd-scratch;".into()
@@ -10510,14 +10558,19 @@ fn argv_for_pack(argv: &[String], bound: &Scratch, _moved: bool) -> Vec<String> 
                 }
             }
         }
-        if !matches!(
+        // A command on a link itself (rm, mv, ln, ls) is judged by the
+        // link, except one under /tmp: the temp exemption is for what the
+        // path holds, so such a link is named by its target.
+        let on_link = matches!(
             head,
             "rm" | "rmdir" | "unlink" | "mv" | "ln" | "readlink" | "ls" | "stat"
-        ) {
-            for &i in &idx {
-                if let Some(resolved) = link_resolved(&out[i]) {
-                    out[i] = resolved;
-                }
+        );
+        for &i in &idx {
+            if on_link && !under_tmp(unquote(out[i].trim_end_matches(';'))) {
+                continue;
+            }
+            if let Some(resolved) = link_resolved(&out[i]) {
+                out[i] = resolved;
             }
         }
     }

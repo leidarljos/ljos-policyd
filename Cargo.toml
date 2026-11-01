@@ -30,7 +30,7 @@ libc = "0.2"
 # phronesis itself, compiled from the crate's vendored C with its pack
 # embedded. The commit here moves to a crates.io version once the crate is
 # published; a git dependency keeps `cargo publish` from running.
-phronesis-sys = { git = "https://github.com/leidarljos/phronesis", rev = "163c8bdb5a82570419d293aaec7aad4416abd469" }
+phronesis-sys = { git = "https://github.com/leidarljos/phronesis", rev = "89a7874d72564523203559c1b4c31b2992370e59" }
 unicode-normalization = "=0.1.26"
 
 [package.metadata.binstall]

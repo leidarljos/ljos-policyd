@@ -436,9 +436,8 @@ fn annotate(checked: Checked, person: bool) -> Checked {
 pub(crate) fn soften(checked: Checked, argv: &[String]) -> Checked {
     let head = checked.token.split(':').next().unwrap_or("").trim();
     if checked.decision == Decision::Deny
-        && head == "git-force-push"
-        && !crate::push_rewrites_default(argv)
-        && argv.iter().any(|w| w == "push")
+        && matches!(head, "git-force-push" | "git-push-delete")
+        && crate::push_is_hard(argv) == Some(false)
     {
         return warn_checked(&checked.token);
     }
