@@ -1240,12 +1240,6 @@ pub fn head_name(dir: Option<&Path>) -> Option<String> {
     git_line(&["rev-parse", "--abbrev-ref", "HEAD"], dir)
 }
 
-/// The work tree that contains `cwd`, when `cwd` is inside one.
-#[must_use]
-pub fn work_tree(cwd: &Path) -> Option<PathBuf> {
-    git_line(&["rev-parse", "--show-toplevel"], Some(cwd)).map(PathBuf::from)
-}
-
 fn git_line(args: &[&str], dir: Option<&Path>) -> Option<String> {
     let key = format!(
         "{}|{}",
