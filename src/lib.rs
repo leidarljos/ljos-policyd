@@ -1,7 +1,6 @@
 //! Argv law. Typed verdict is Cap'n `PolicyDecision`.
 // tmp: the table's code stays dormant while the pack takes over its
 // cases; it goes, with this allowance, once the pack covers the suite.
-#![allow(dead_code)]
 //!
 //! Every line meets the host argv table built into this crate first. A
 //! phronesis build then hands the line, and every command the table found
