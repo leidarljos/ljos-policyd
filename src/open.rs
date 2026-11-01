@@ -1201,6 +1201,15 @@ fn head_sha(dir: Option<&Path>) -> Option<String> {
 /// The current branch name, or the branch of `dir` when `git -C` named one.
 #[must_use]
 pub fn head_name(dir: Option<&Path>) -> Option<String> {
+    // The crate's own tests were written on develop, and a bare force push
+    // is a deny only when the checkout sits on a default branch. Under
+    // test the checkout is read as develop whatever branch CI checked
+    // out, so the suite says the same thing on a feature branch. A test
+    // that names a directory reads that directory.
+    #[cfg(test)]
+    if dir.is_none() {
+        return Some("develop".to_string());
+    }
     git_line(&["rev-parse", "--abbrev-ref", "HEAD"], dir)
 }
 
