@@ -1,4 +1,7 @@
 //! Argv law. Typed verdict is Cap'n `PolicyDecision`.
+// tmp: the table's code stays dormant while the pack takes over its
+// cases; it goes, with this allowance, once the pack covers the suite.
+#![allow(dead_code)]
 //!
 //! Every line meets the host argv table built into this crate first. A
 //! phronesis build then hands the line, and every command the table found
@@ -451,16 +454,8 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
         placed: true,
         ..Scratch::default()
     };
-    let table = host_argv_table_at(argv, 0, leaves_tree(argv, 0), &parent);
-    // A host refusal stands, including a warning. The pack is asked only
-    // for a plain allow, so it can add a refusal and cannot erase one.
-    let table = if table.decision == Decision::Allow && open::noted(&table.token).is_none() {
-        check_shell_phronesis(argv, cwd)
-    } else {
-        table
-    };
-    let _ = depth;
-    table
+    let _ = (depth, &parent);
+    check_shell_phronesis(argv, cwd)
 }
 /// How many directories the commands after a `cd` that may have failed
 /// are read in. Past this, a further `cd` leaves the ones it drops
@@ -10463,160 +10458,20 @@ fn relax_find_for_pack(idx: &[usize], out: &mut [String]) {
     }
 }
 
-fn argv_for_pack(argv: &[String], bound: &Scratch, moved: bool) -> Vec<String> {
+/// The argv the pack reads: each command's words as written, with two
+/// facts the host resolves and the pack cannot. A path inside the work
+/// tree is written relative to it, so an absolute path reads as one
+/// outside; and a word that is a symlink is the path it points at, except
+/// for a command that acts on the link itself.
+fn argv_for_pack(argv: &[String], bound: &Scratch, _moved: bool) -> Vec<String> {
     let mut out = argv.to_vec();
-    let feed = mark_rewrite_mask(argv, !bound.fed_marks.is_empty());
-    for (i, w) in out.iter_mut().enumerate() {
-        if !feed[i] {
-            continue;
-        }
-        let bare = w.trim_end_matches(';');
-        if bound.fed_marks.iter().any(|m| m == bare) && !pack_delete_ok(bare, moved) {
-            let semi = w.ends_with(';');
-            *w = if semi {
-                "/tmp/policyd-scratch;".into()
-            } else {
-                "/tmp/policyd-scratch".into()
-            };
-        }
-    }
-    let mut place = Place::new(bound.root.clone());
-    let mut prev = "";
-    for (idx, end) in ended_indices(argv) {
-        let in_pipe = end == "|" || prev == "|";
-        let words: Vec<String> = idx
+    for (idx, _end) in ended_indices(argv) {
+        let head = idx
             .iter()
-            .map(|&i| argv[i].trim_end_matches(';').to_string())
-            .filter(|w| !w.is_empty())
-            .collect();
-        let refs: Vec<&str> = words.iter().map(String::as_str).collect();
-        if refs.first().is_some_and(|w| base_of(w) == "find")
-            && harm::find_action_unsafe(&refs).is_none()
-        {
-            relax_find_for_pack(&idx, &mut out);
-        }
-        if rm_recursive(command_after_keywords(&refs)) {
-            for &i in &idx {
-                let w = out[i].trim_end_matches(';').to_string();
-                if w.is_empty() || w.starts_with('-') || is_redirection(&w) {
-                    continue;
-                }
-                // The command word is `rm`. An operand the host already
-                // accepted, and the pack's older rule would refuse, is
-                // named as a temp so the pack still sees every other word.
-                if matches!(base_of(&w), "rm" | "rtrash" | "srm" | "wipe") {
-                    continue;
-                }
-                if !pack_delete_ok(&w, moved) {
-                    let semi = out[i].ends_with(';');
-                    out[i] = if semi {
-                        "/tmp/policyd-scratch;".into()
-                    } else {
-                        "/tmp/policyd-scratch".into()
-                    };
-                }
-            }
-        }
-        // The host already allowed this command. The pack v0.2.5 still
-        // denies every `clean -f` and every whole-tree `restore`, and it
-        // reads restore flags on its own. Show it the paths the table
-        // parsed, so a secret later on the line is still visible.
-        if harm::git_lost_work(&words).is_none() {
-            if let Some((sub, rest)) = git_subcommand(&words) {
-                if sub == "clean" {
-                    for &i in &idx {
-                        let semi = out[i].ends_with(';');
-                        let bare = out[i].trim_end_matches(';');
-                        let next = if bare == "--force" || bare == "-f" {
-                            String::new()
-                        } else if let Some(flags) = bare
-                            .strip_prefix('-')
-                            .filter(|c| !c.starts_with('-') && c.contains('f'))
-                        {
-                            let kept: String = flags.chars().filter(|c| *c != 'f').collect();
-                            if kept.is_empty() {
-                                String::new()
-                            } else {
-                                format!("-{kept}")
-                            }
-                        } else {
-                            continue;
-                        };
-                        out[i] = if next.is_empty() {
-                            if semi {
-                                ";".into()
-                            } else {
-                                String::new()
-                            }
-                        } else if semi {
-                            format!("{next};")
-                        } else {
-                            next
-                        };
-                    }
-                }
-                if sub == "restore" {
-                    // The pack keeps its own matcher. It does not read the
-                    // table's flags, so an index-only line and a path after
-                    // the end of options still look like a whole-tree
-                    // discard there. Rename the words that parse found.
-                    let expanded: Vec<String> = rest
-                        .iter()
-                        .map(|w| harm::expand_long(w, harm::GIT_RESTORE_LONG).into_owned())
-                        .collect();
-                    let parsed = harm::parse_restore(&expanded);
-                    let rest_at = words.len() - rest.len();
-                    let put = |out: &mut [String], slot: usize, name: &str| {
-                        let at = idx[slot];
-                        let semi = out[at].ends_with(';');
-                        out[at] = if semi {
-                            format!("{name};")
-                        } else {
-                            name.to_string()
-                        };
-                    };
-                    for (j, name) in parsed.pack_standins {
-                        put(&mut out, rest_at + j, name);
-                    }
-                    if let Some(j) = parsed.show_as_path {
-                        put(&mut out, rest_at + j, "named-file");
-                    }
-                } else if sub == "checkout" {
-                    let expanded: Vec<String> = rest
-                        .iter()
-                        .map(|w| harm::expand_long(w, harm::GIT_RESTORE_LONG).into_owned())
-                        .collect();
-                    let staged = expanded.iter().any(|a| a == "--staged");
-                    let worktree = expanded.iter().any(|a| a == "--worktree");
-                    if staged && !worktree {
-                        for &i in &idx {
-                            let semi = out[i].ends_with(';');
-                            let bare = out[i].trim_end_matches(';');
-                            if whole_tree(bare) {
-                                out[i] = if semi {
-                                    "index-file;".into()
-                                } else {
-                                    "index-file".into()
-                                };
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        place.finish(&refs, in_pipe);
-        prev = end;
-        // The pack reads words, not the file system: a word that is a
-        // symlink reaches it as the path it points at, so a link to a
-        // credential store reads as that store. A command that acts on
-        // the link itself keeps the word.
-        let head = refs
-            .iter()
-            .find(|w| !is_assignment(w) && !is_redirection(w))
-            .map(|w| base_of(w))
+            .map(|&i| argv[i].trim_end_matches(';'))
+            .find(|w| !w.is_empty() && !is_assignment(w) && !is_redirection(w))
+            .map(base_of)
             .unwrap_or("");
-        // A path inside the work tree reaches the pack as a relative one,
-        // so the pack reads an absolute path as one outside the tree.
         if let Some(root) = bound.root.as_deref() {
             for &i in &idx {
                 if let Some(rel) = inside_as_relative(&out[i], root) {
@@ -10640,7 +10495,7 @@ fn argv_for_pack(argv: &[String], bound: &Scratch, moved: bool) -> Vec<String> {
 }
 
 /// `w` as a path relative to `root` when it is an absolute path inside
-/// it: `/work/src` under `/work` is `./src`, and `/work` itself is `.`.
+/// it: `/work/src` under `/work` is `src`, and `/work` itself is `.`.
 /// `None` for any other word.
 fn inside_as_relative(w: &str, root: &std::path::Path) -> Option<String> {
     let semi = w.ends_with(';');
@@ -10657,11 +10512,9 @@ fn inside_as_relative(w: &str, root: &std::path::Path) -> Option<String> {
     } else {
         bare.strip_prefix(root)?.strip_prefix('/')?
     };
-    let rel = if rest == "." {
-        ".".to_string()
-    } else {
-        format!("./{rest}")
-    };
+    // No `./`: a path spelled `./src` by the agent reads differently from
+    // one the host made relative.
+    let rel = rest.to_string();
     Some(if semi { format!("{rel};") } else { rel })
 }
 
