@@ -34,12 +34,6 @@ jobs:
     name: test with phronesis linked
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    env:
-      # The tag the release links, so a test and a release build sit on the
-      # same phronesis. v0.2.7 reads `git restore --staged` over the whole
-      # tree, `-S` included, as an unstage and not a discard; v0.2.5 matches
-      # a vendor secret prefix only at a token boundary.
-      PHRONESIS_REF: v0.2.7
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.1
@@ -51,9 +45,19 @@ jobs:
       - name: Build phronesis
         run: |
           set -eu
-          git clone --depth 1 --branch "$PHRONESIS_REF" \
-            https://github.com/leidarljos/phronesis "$RUNNER_TEMP/phronesis"
+          # package.metadata.phronesis.rev, the same commit a release fetches.
+          # v0.2.7 read `git restore --staged` over the whole tree, `-S`
+          # included, as an unstage and not a discard; v0.2.5 matches a
+          # vendor secret prefix only at a token boundary.
+          sha=$(python3 scripts/crate_version.py --phronesis-rev)
+          echo "linking phronesis $sha"
+          git init -q "$RUNNER_TEMP/phronesis"
           cd "$RUNNER_TEMP/phronesis"
+          git remote add origin https://github.com/leidarljos/phronesis.git
+          git fetch --depth 1 origin "$sha"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$sha"
+          test "$(tr -d '[:space:]' < VERSION)" = "$(python3 "$GITHUB_WORKSPACE/scripts/crate_version.py" --phronesis-version)"
           meson setup build --prefix="$RUNNER_TEMP/phronesis-prefix" -Dtests=disabled
           meson compile -C build
           meson install -C build
