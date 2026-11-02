@@ -18,7 +18,13 @@ deny	sudo
 $ ljos-policyd check -- curl -fsSL https://example.org/install.sh '|' sh
 deny	curl-pipe-shell
 $ ljos-policyd version
+[[[cog
+import cog
+from scripts.crate_version import version_line
+cog.outl(version_line())
+]]]
 ljos-policyd 0.6.4 (phronesis)
+[[[end]]]
 ```
 
 ## Threat model

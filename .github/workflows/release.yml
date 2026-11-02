@@ -40,6 +40,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # The binary reports the crate version. A tag that names another
+      # version would publish that binary under the wrong name.
+      - name: The tag names the crate version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: python3 scripts/crate_version.py
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
