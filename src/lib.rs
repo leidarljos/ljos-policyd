@@ -7665,11 +7665,17 @@ impl Seat {
         let mut brc = unsafe {
             phronesis_supervisor_bind(seat.sup, hex.as_ptr(), mode.as_ptr(), ws_c.as_ptr(), 0)
         };
-        // A torn read of the slot file comes back as -4 (IO). The slot is
-        // already seated once the write lands (-2, exists). Retry at once.
-        // Sleeping here holds the answer on a daemon that has not finished.
-        let mut tries = 0u32;
-        while brc == -4 && tries < 3 {
+        // Several checks in one workspace bind one slot. phronesis writes it
+        // through a shared temporary name, so a torn read comes back as
+        // -4 (IO). The slot is already seated once the write lands
+        // (-2, exists); try again until then. The pause is a few
+        // milliseconds: 200 µs plus a small stagger, then 100 µs more on
+        // each of 20 tries. Three immediate retries left a concurrent
+        // `git add` as `allow	fail-open	bind-failed`.
+        let mut tries = 0u64;
+        while brc == -4 && tries < 20 {
+            let pause = 200 + (u64::from(std::process::id()) % 32) * 50 + tries * 100;
+            std::thread::sleep(std::time::Duration::from_micros(pause));
             brc = unsafe {
                 phronesis_supervisor_bind(seat.sup, hex.as_ptr(), mode.as_ptr(), ws_c.as_ptr(), 0)
             };
@@ -7834,13 +7840,15 @@ fn check_shell_phronesis(argv: &[String], cwd: &std::path::Path) -> Checked {
     if tx.send((argv.to_vec(), cwd.to_path_buf(), reply)).is_err() {
         return refused("phronesis: worker thread gone");
     }
-    // The worker is this process's pack. When it has not answered by the
-    // connect timeout, nothing is sitting on the other side of that wait.
-    // The table already allowed the line; say so instead of holding it.
-    match answer.recv_timeout(client::CONNECT_TIMEOUT) {
-        Ok(c) => c,
-        Err(_) => open::allow_checked("fail-open", "timeout"),
-    }
+    // One thread answers every pack check in this process, and the
+    // caller waits for that answer. The connect timeout is only for a
+    // daemon that never accepts. Cutting this thread off at that timeout
+    // printed `allow	fail-open	timeout` for a line the pack allows,
+    // including `sh -c 'rm -rf target'` while the first pack load was
+    // still queued.
+    answer
+        .recv()
+        .unwrap_or_else(|_| refused("phronesis: no decision"))
 }
 
 fn base_of(tok: &str) -> &str {
