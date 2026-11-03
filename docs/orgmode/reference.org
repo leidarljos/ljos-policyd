@@ -66,6 +66,7 @@ $ ljos-policyd check-mail
 usage: ljos-policyd check|exec|capnp|version -- argv...
 usage: ljos-policyd check-mail --config PATH [--argv [--] RECIPIENT...]
 usage: ljos-policyd replay [DENY_LOG]
+see the verb table in README.md
 $ echo $?
 2
 $ ljos-policyd replay /no/such-deny-log
