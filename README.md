@@ -215,7 +215,7 @@ $ ljos-policyd exec -- echo ran
 ran
 $ ljos-policyd replay deny.log
 was deny	git-force-push	now allow	warn	git-force-push	a force push rewrites a published branch	git push --force origin main
-1 of 1 refused lines would run now
+1 logged line: 1 still warn, 0 now allow
 ```
 <!-- [[[end]]] -->
 

@@ -258,3 +258,120 @@ fn replay_the_blocked_lines() {
     }
     let _ = std::fs::remove_dir_all(&scratch);
 }
+
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("policyd-replay-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Replay `log` with no user rules and no consent file from this machine.
+fn replay_log(dir: &Path, log: &str, extra: &[(&str, &str)]) -> (i32, String, String) {
+    let path = dir.join("deny.log");
+    std::fs::write(&path, log).unwrap();
+    let mut cmd = Command::new(bin());
+    cmd.current_dir(dir)
+        .args(["replay", path.to_str().unwrap()])
+        .env("HOME", dir)
+        .env("XDG_CONFIG_HOME", dir)
+        .env("XDG_STATE_HOME", dir)
+        .env_remove("LJOS_USER_ALLOW")
+        .env_remove("LJOS_CONSENT_FILE")
+        .env_remove("LJOS_POLICYD_DAEMON")
+        .env_remove("LJOS_POLICYD_DENY_LOG")
+        .env_remove("LJOS_POLICYD_FAULT");
+    for (key, value) in extra {
+        cmd.env(key, value);
+    }
+    let out = cmd.output().expect("replay");
+    (
+        out.status.code().unwrap_or(1),
+        String::from_utf8(out.stdout).expect("stdout"),
+        String::from_utf8(out.stderr).expect("stderr"),
+    )
+}
+
+#[test]
+fn replay_summary_splits_a_warning_from_a_plain_allow() {
+    let dir = scratch("summary");
+    let (code, stdout, stderr) = replay_log(
+        &dir,
+        "1700000000\tgit-force-push\tgit push --force origin main\n\
+         1700000001\tgit-force-push\tgit status\n",
+        &[],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let mut lines = stdout.lines();
+    let warned = lines.next().expect("warning row");
+    assert!(
+        warned.starts_with("was deny\tgit-force-push\tnow allow\twarn\t"),
+        "{warned}"
+    );
+    assert!(
+        warned.contains("a force push rewrites a published branch"),
+        "{warned}"
+    );
+    assert!(
+        warned.ends_with("\tgit push --force origin main"),
+        "{warned}"
+    );
+    assert_eq!(
+        lines.next().expect("allow row"),
+        "was deny\tgit-force-push\tnow allow\tgit status"
+    );
+    assert_eq!(
+        lines.next().expect("summary"),
+        "2 logged lines: 1 still warn, 1 now allow"
+    );
+    assert!(lines.next().is_none(), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn replay_summary_names_a_rewrite_and_a_user_rule() {
+    let dir = scratch("named");
+    std::fs::write(dir.join("pyproject.toml"), "[project]\nname = \"x\"\n").unwrap();
+    std::fs::write(dir.join("x.py"), "print(1)\n").unwrap();
+    let (code, stdout, stderr) = replay_log(
+        &dir,
+        "1700000000\tsudo\tsudo id\n\
+         1700000001\tgit-force-push\tgit status\n\
+         1700000002\tgit-force-push\tgit push --force origin main\n\
+         1700000003\tpython\tpython x.py\n",
+        &[("LJOS_USER_ALLOW", "git push --force origin main")],
+    );
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 5, "{stdout}");
+    assert!(
+        lines[0].starts_with("was deny\tsudo\tnow allow\twarn\t"),
+        "{}",
+        lines[0]
+    );
+    assert!(lines[0].ends_with("\tsudo id"), "{}", lines[0]);
+    assert_eq!(lines[1], "was deny\tgit-force-push\tnow allow\tgit status");
+    assert!(
+        lines[2].starts_with("was deny\tgit-force-push\tnow allow\tuser-rule\t"),
+        "{}",
+        lines[2]
+    );
+    assert!(
+        lines[2].ends_with("\tgit push --force origin main"),
+        "{}",
+        lines[2]
+    );
+    assert!(
+        lines[3].starts_with("was deny\tpython\tnow allow\trewrite\t"),
+        "{}",
+        lines[3]
+    );
+    assert!(lines[3].ends_with("\tpython x.py"), "{}", lines[3]);
+    assert_eq!(
+        lines[4],
+        "4 logged lines: 1 still warn, 1 now allow, 1 now rewrite, 1 now user-rule"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

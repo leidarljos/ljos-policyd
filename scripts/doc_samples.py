@@ -141,7 +141,7 @@ REPLAY = (
     "was deny\tgit-force-push\tnow allow\twarn\tgit-force-push\t"
     "a force push rewrites a published branch\t"
     "git push --force origin main\n"
-    "1 of 1 refused lines would run now\n"
+    "1 logged line: 1 still warn, 0 now allow\n"
 )
 
 

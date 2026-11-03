@@ -151,7 +151,22 @@ fn run() -> i32 {
                 eprintln!("replay: {}: {e}", path.display());
                 process::exit(2);
             });
-            let (mut seen, mut freed) = (0usize, 0usize);
+            let mut seen = 0usize;
+            let mut warn = 0usize;
+            let mut plain = 0usize;
+            // A warning still names a rule. A plain `allow` is silent.
+            // These are the other kinds `verdict_line` prints, in the
+            // order the summary names them, so a rewrite is not counted
+            // as a silent allow.
+            let mut kinds = [
+                ("rewrite", 0usize),
+                ("user-rule", 0usize),
+                ("consent", 0usize),
+                ("fail-open", 0usize),
+            ];
+            // A kind this build does not list, in the order the log first
+            // shows it, so the named counts still add up to the rows.
+            let mut extra: Vec<(String, usize)> = Vec::new();
             for row in text.lines().filter(|l| !l.trim().is_empty()) {
                 let mut fields = row.splitn(3, '\t');
                 let (Some(_when), Some(was), Some(line)) =
@@ -162,12 +177,44 @@ fn run() -> i32 {
                 seen += 1;
                 let argv = ljos_policyd::replay_argv(line);
                 let now = ljos_policyd::verdict_quiet(&argv);
-                if now.starts_with("allow") {
-                    freed += 1;
+                let kind = if now == "allow" {
+                    "allow"
+                } else if let Some(rest) = now.strip_prefix("allow\t") {
+                    rest.split('\t')
+                        .next()
+                        .filter(|kind| !kind.is_empty())
+                        .unwrap_or("allow")
+                } else {
+                    now.split('\t')
+                        .next()
+                        .filter(|kind| !kind.is_empty())
+                        .unwrap_or("other")
+                };
+                if kind == "warn" {
+                    warn += 1;
+                } else if kind == "allow" {
+                    plain += 1;
+                } else if let Some(slot) = kinds.iter_mut().find(|(name, _)| *name == kind) {
+                    slot.1 += 1;
+                } else if let Some(slot) = extra.iter_mut().find(|(name, _)| name == kind) {
+                    slot.1 += 1;
+                } else {
+                    extra.push((kind.to_string(), 1));
                 }
                 println!("was deny\t{was}\tnow {now}\t{line}");
             }
-            println!("{freed} of {seen} refused lines would run now");
+            // One row is "line". Zero and every larger count are "lines".
+            let noun = if seen == 1 { "line" } else { "lines" };
+            let mut parts = vec![format!("{warn} still warn"), format!("{plain} now allow")];
+            for (name, n) in kinds {
+                if n > 0 {
+                    parts.push(format!("{n} now {name}"));
+                }
+            }
+            for (name, n) in &extra {
+                parts.push(format!("{n} now {name}"));
+            }
+            println!("{seen} logged {noun}: {}", parts.join(", "));
         }
         "version" | "--version" => {
             println!(
