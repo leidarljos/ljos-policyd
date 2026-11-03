@@ -1654,11 +1654,16 @@ fn a_copy_into_a_directory_writes_its_name_there() {
 fn a_command_the_guard_does_not_know_may_write_any_script() {
     let root = startup_root("unknownw");
     std::fs::create_dir_all(root.join("target/debug")).unwrap();
-    // macOS keeps `true` at `/usr/bin/true`.
+    // macOS keeps `true` at `/usr/bin/true`. Fall back to `true` on PATH.
     let true_bin = ["/bin/true", "/usr/bin/true"]
         .into_iter()
-        .find(|p| std::path::Path::new(p).is_file())
-        .unwrap();
+        .map(std::path::PathBuf::from)
+        .chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .map(|dir| dir.join("true")),
+        )
+        .find(|p| p.is_file())
+        .expect("`true` on PATH");
     std::fs::copy(true_bin, root.join("target/debug/app")).unwrap();
     std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
     let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
