@@ -1,1 +1,1 @@
-The README verb table lists help, --help and -h.
+The README verb table now has a row for help and its flags.
