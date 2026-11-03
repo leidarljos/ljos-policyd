@@ -119,16 +119,11 @@ fn consent_file_status(path: &Path) -> ConsentFile {
     if mode & 0o022 != 0 {
         return ConsentFile::Ignored("group- or world-writable");
     }
-    if meta.uid() == current_uid() && mode & 0o200 != 0 {
+    // SAFETY: getuid reads no memory and, by POSIX, always succeeds.
+    if meta.uid() == unsafe { libc::getuid() } && mode & 0o200 != 0 {
         return ConsentFile::Ignored("writable by the current user");
     }
     ConsentFile::Ok
-}
-
-fn current_uid() -> u32 {
-    std::fs::metadata("/proc/self")
-        .map(|meta| meta.uid())
-        .unwrap_or(u32::MAX)
 }
 
 /// `allow\t<kind>\t<why>` as a checked value.
