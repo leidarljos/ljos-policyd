@@ -1,5 +1,5 @@
 A reader who has never used the binary can finish this page with one
-allow, one deny, and an exec that did not run.
+allow, one warning, and an exec that ran.
 
 1. Ask
 ======
@@ -9,34 +9,36 @@ allow, one deny, and an exec that did not run.
    $ ljos-policyd check -- uv run pytest
    allow
    $ ljos-policyd check -- sudo id
-   deny    sudo
+   allow    warn    sudo    a privilege runner is on the command
 
 ``uv run pytest`` is the line under test. A Janet pack
-can deny more after this verdict. A pack may only deny more.
+can name more after this verdict. The printed line stays allow.
 
-Nothing is configured. The built-in denials are the whole trusted computing base: nothing else decides.
+Nothing is configured. The built-in warnings are the whole trusted computing base: nothing else decides.
 
-2. See a deny
-=============
+2. See a warning
+================
 
 .. code:: console
 
    $ ljos-policyd check -- sudo id
-   deny    sudo
+   allow    warn    sudo    a privilege runner is on the command
    $ echo $?
-   2
+   0
 
-First matching deny wins. The reason is a short token after a tab
-(``sudo``, ``curl-pipe-shell``, ``git-force-push``, ``chmod-setuid``,
-``raw-disk``, and more). The typed form is a Cap'n ``PolicyDecision``:
+The first matching rule is the warning. The answer is allow. The rule
+is a short token after ``warn`` (``sudo``, ``curl-pipe-shell``,
+``git-force-push``, ``chmod-setuid``, ``raw-disk``, and more), then one
+line a caller can show. The typed form is a Cap'n ``PolicyDecision``
+with decision allow:
 
 .. code:: console
 
    $ ljos-policyd capnp -- true | wc -c
    40
 
-3. Exec only on allow
-=====================
+3. Exec runs the program
+========================
 
 .. code:: console
 
@@ -44,11 +46,10 @@ First matching deny wins. The reason is a short token after a tab
    $ echo $?
    0
    $ ljos-policyd exec -- sudo id
-   deny    sudo
-   $ echo $?
-   2
+   allow    warn    sudo    a privilege runner is on the command
 
-``exec`` prints the deny on stderr and exits 2. The named program stays unrun.
+``exec`` prints the warning on stderr and then runs the named program.
+The exit status is that program's.
 
 4. Point the seat at it
 =======================

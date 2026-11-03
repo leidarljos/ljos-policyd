@@ -45,6 +45,9 @@ fn a_prefix_inside_a_word_is_allowed_and_a_bearer_key_is_denied() {
         ),
     );
     let line = check(&dir, &["curl", "-H", header.as_str()]);
-    assert!(line.starts_with("deny\tshell-secret-in-argv: "), "{line}");
+    assert!(
+        line.starts_with("allow\twarn\tshell-secret-in-argv: "),
+        "{line}"
+    );
     let _ = std::fs::remove_dir_all(&base);
 }

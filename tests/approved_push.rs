@@ -146,8 +146,8 @@ fn approved_lease_pushes_follow_the_remote_head_and_consent() {
     );
     assert!(check(&eon_cwd, None).starts_with("allow\twarn\tgit-force-push"));
     assert!(check(&eon_origin, None).starts_with("allow"));
-    assert!(check(&policyd_push, None).starts_with("deny\tgit-force-push"));
-    assert!(check(&reach, None).starts_with("deny\tgit-force-push"));
+    assert!(check(&policyd_push, None).starts_with("allow\twarn\tgit-force-push"));
+    assert!(check(&reach, None).starts_with("allow\twarn\tgit-force-push"));
 
     let file = root.join("consent.json");
     consent(&file, "https://github.com/TheochemUI/eOn.git", "develop");
@@ -181,15 +181,15 @@ fn approved_lease_pushes_follow_the_remote_head_and_consent() {
     );
     seal(&only_eon);
     assert!(
-        check(&reach, Some(&only_eon)).starts_with("deny\tgit-force-push"),
+        check(&reach, Some(&only_eon)).starts_with("allow\twarn\tgit-force-push"),
         "eOn consent does not unlock the example app"
     );
-    assert!(check(&policyd_push, Some(&only_eon)).starts_with("deny\tgit-force-push"));
+    assert!(check(&policyd_push, Some(&only_eon)).starts_with("allow\twarn\tgit-force-push"));
 
     let only_reach = root.join("reach-only.json");
     consent(&only_reach, "https://github.com/example/app.git", "main");
     seal(&only_reach);
-    assert!(check(&policyd_push, Some(&only_reach)).starts_with("deny\tgit-force-push"));
+    assert!(check(&policyd_push, Some(&only_reach)).starts_with("allow\twarn\tgit-force-push"));
     assert!(check(&reach, Some(&only_reach)).starts_with("allow\tconsent\t"));
 
     let dev_push = words(&format!(
@@ -197,7 +197,7 @@ fn approved_lease_pushes_follow_the_remote_head_and_consent() {
         develop_default.display()
     ));
     assert!(
-        check(&dev_push, None).starts_with("deny\tgit-force-push"),
+        check(&dev_push, None).starts_with("allow\twarn\tgit-force-push"),
         "develop is the default when the remote HEAD says so"
     );
     let dev_consent = root.join("dev.json");
@@ -223,7 +223,7 @@ fn approved_lease_pushes_follow_the_remote_head_and_consent() {
         other.display()
     ));
     assert!(
-        check(&other_push, Some(&cwd_only)).starts_with("deny\tgit-force-push"),
+        check(&other_push, Some(&cwd_only)).starts_with("allow\twarn\tgit-force-push"),
         "cwd origin does not match a push whose -C names another repo"
     );
     let stray = py(&format!(
@@ -231,7 +231,7 @@ fn approved_lease_pushes_follow_the_remote_head_and_consent() {
         other.display()
     ));
     assert!(
-        check(&stray, Some(&cwd_only)).starts_with("deny\tgit-force-push"),
+        check(&stray, Some(&cwd_only)).starts_with("allow\twarn\tgit-force-push"),
         "a :// word that is not the remote does not match"
     );
     let sha = String::from_utf8(
@@ -263,7 +263,7 @@ fn approved_lease_pushes_follow_the_remote_head_and_consent() {
         Some("0123456789abcdef0123456789abcdef01234567"),
     );
     seal(&wrong);
-    assert!(check(&other_push, Some(&wrong)).starts_with("deny\tgit-force-push"));
+    assert!(check(&other_push, Some(&wrong)).starts_with("allow\twarn\tgit-force-push"));
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(eon_link);

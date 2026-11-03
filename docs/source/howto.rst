@@ -9,9 +9,10 @@ not required; argv after ``--`` is the line.
    $ ljos-policyd check -- git push origin main
    allow
    $ ljos-policyd check -- git push --force origin main
-   deny    git-force-push
+   allow    warn    git-force-push    a force push rewrites a published branch
 
-A deny is exit 2. The hook turns that into a blocked tool call.
+The answer is allow, with the rule and one warning. Exit status is 0.
+The hook can show the warning. It does not block the tool call.
 
 Run only if allowed
 ===================
@@ -20,8 +21,8 @@ Run only if allowed
 
    $ ljos-policyd exec -- uv run pytest
 
-Same verdict as ``check``. On allow, ``exec`` replaces itself with the
-named program. On deny it prints the verdict and exits 2.
+Same verdict as ``check``. ``exec`` prints a warning on stderr when a
+rule matches, then replaces itself with the named program.
 
 Name a binary that is not on PATH
 =================================
@@ -55,8 +56,9 @@ Pack rules are memory. The binary prints a verdict:
    $ ljos rule '*--force*' --verdict deny --why "Never force push."
    $ ljos policy -- git push --force
 
-``ljos policy`` prints the TCB verdict first, then the pack rule. First
-deny still wins. Edit a pack rule only when argv law itself changes.
+``ljos policy`` prints this verdict first, then the pack rule. This
+verdict is allow, with the rule and a warning when one matches. Edit a
+pack rule only when argv law itself changes.
 Do not write dates, ticket ids, or sitting notes into it.
 
 Emit the Cap'n verdict

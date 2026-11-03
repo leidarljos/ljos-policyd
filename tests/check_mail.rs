@@ -1,5 +1,5 @@
 //! check-mail reads a message on stdin and a config path, and prints JSON.
-//! An allow means this check found nothing to refuse.
+//! The verdict is allow. A reason names the rule and the warning.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -68,9 +68,9 @@ fn a_duplicate_from_and_a_lookalike_domain_are_refused() {
         &["check-mail", &format!("--config={}", conf.display())],
         message.as_bytes(),
     );
-    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(stdout.contains(r#""verdict":"deny""#), "{stdout}");
+    assert!(stdout.contains(r#""verdict":"allow""#), "{stdout}");
     assert!(stdout.contains("duplicate-from"), "{stdout}");
     assert!(stdout.contains("recipient-domain-denied"), "{stdout}");
     assert!(stdout.contains("to blocked.test"), "{stdout}");
@@ -93,7 +93,7 @@ fn a_missing_config_flag_is_usage() {
 }
 
 #[test]
-fn a_dead_domain_rule_exits_2_and_names_the_line() {
+fn a_dead_domain_rule_allows_and_names_the_line() {
     let conf = config(
         "#\ndomain *.example.test\n",
         "deny-domain example.test:25\n",
@@ -102,9 +102,9 @@ fn a_dead_domain_rule_exits_2_and_names_the_line() {
         &["check-mail", "--config", conf.to_str().unwrap()],
         b"From: mailseat@example.test\r\nTo: john@example.test\r\n",
     );
-    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(stdout.contains(r#""verdict":"deny""#), "{stdout}");
+    assert!(stdout.contains(r#""verdict":"allow""#), "{stdout}");
     assert!(stdout.contains("deny-file-invalid"), "{stdout}");
     assert!(stdout.contains("line 2"), "{stdout}");
     assert!(!stdout.contains("*.example.test"), "{stdout}");
@@ -118,15 +118,15 @@ fn a_dead_domain_rule_exits_2_and_names_the_line() {
 }
 
 #[test]
-fn an_unknown_deny_line_exits_2_and_names_the_line() {
+fn an_unknown_deny_line_allows_and_names_the_line() {
     let conf = config("#\nnope evil@example.test\n", "");
     let out = run(
         &["check-mail", "--config", conf.to_str().unwrap()],
         b"From: mailseat@example.test\r\n",
     );
-    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(stdout.contains(r#""verdict":"deny""#), "{stdout}");
+    assert!(stdout.contains(r#""verdict":"allow""#), "{stdout}");
     assert!(stdout.contains("deny-file-invalid"), "{stdout}");
     assert!(stdout.contains("line 2"), "{stdout}");
     assert!(!stdout.contains("nope"), "{stdout}");
@@ -140,14 +140,15 @@ fn an_unknown_deny_line_exits_2_and_names_the_line() {
 }
 
 #[test]
-fn a_bad_pack_law_line_exits_2_and_names_the_line() {
+fn a_bad_pack_law_line_allows_and_names_the_line() {
     let conf = config("", "#\nallow-domain blocked.test\n");
     let out = run(
         &["check-mail", "--config", conf.to_str().unwrap(), "--argv"],
         b"",
     );
-    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
     let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains(r#""verdict":"allow""#), "{stdout}");
     assert!(stdout.contains("pack-law-invalid"), "{stdout}");
     assert!(stdout.contains("line 2"), "{stdout}");
     assert!(!stdout.contains("allow-domain"), "{stdout}");
@@ -167,8 +168,9 @@ fn bytes_that_are_not_utf8_are_refused() {
         &["check-mail", "--config", conf.to_str().unwrap()],
         &[0xff, 0xfe],
     );
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains(r#""verdict":"allow""#), "{stdout}");
     assert!(stdout.contains("message-invalid"), "{stdout}");
     let _ = std::fs::remove_dir_all(conf.parent().unwrap());
 }

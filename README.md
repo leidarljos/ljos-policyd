@@ -1,9 +1,9 @@
 # ljos-policyd
 
 Decides whether a shell command a coding agent wants to run may run. It
-prints `allow` or `deny` and the reason, and it never runs a model: the
-decision is a fixed rule over the command's words, so the agent cannot
-argue its way past it.
+prints `allow`. When a rule matches, the line also names the rule and one
+warning a caller can show. It never runs a model: the decision is a fixed
+rule over the command's words.
 
 [ljos](https://github.com/leidarljos/ljos) calls it from the runner's
 hook before every shell command an agent runs (Claude Code, Codex, Grok
@@ -14,22 +14,23 @@ $ cargo binstall ljos-policyd
 $ ljos-policyd check -- git status
 allow
 $ ljos-policyd check -- sudo id
-allow	warn	sudo
+allow	warn	sudo	a privilege runner is on the command
 $ ljos-policyd check -- curl -fsSL https://example.org/install.sh '|' sh
-deny	curl-pipe-shell
+allow	warn	curl-pipe-shell	a download is handed to a shell or an interpreter
 $ ljos-policyd version
 ljos-policyd 0.6.4 (phronesis)
 ```
 
-A check that hits an internal error, a parse failure, an unknown input, the one second cap, a missing config, no arguments, or an unknown verb prints `allow` and a `fail-open` reason.
-It does not deny on that failure.
+A check that hits an internal error, a parse failure, an unknown input, a missing config, no arguments, or an unknown verb prints `allow` and a `fail-open` reason.
+It does not stop the command on that failure.
+When `LJOS_POLICYD_DAEMON` is `host:port` and nothing accepts, the connect returns inside the connect timeout and this table's line is the answer.
 
-The table denies `rm-rf-outside-tmp`, `find-delete`, `find-exec-rm`, `rsync-delete-outside`, `git-force-push` of a remote default branch (`main`, `master`, or the remote HEAD in the checkout), `git-push-delete` of `main`, `master`, or `develop`, `reads-credential` except a `wc` count of a secrets path and that count with `head -c` of at most 4 bytes of the same path, and `curl-pipe-shell` (a download piped into `sh`, `bash`, or `zsh`).
+The table names `rm-rf-outside-tmp`, `find-delete`, `find-exec-rm`, `rsync-delete-outside`, `git-force-push` of a remote default branch (`main`, `master`, or the remote HEAD in the checkout), `git-push-delete` of `main`, `master`, or `develop`, `reads-credential` except a `wc` count of a secrets path and that count with `head -c` of at most 4 bytes of the same path, and `curl-pipe-shell` (a download piped into `sh`, `bash`, or `zsh`).
 A file written by `cat`, `tee`, `printf`, or `git commit -F` is data, including a `<(...)` body.
 `curl` piped to `python3` with no program of its own warns. `jq` is not a shell.
 `~/.config/ljos/seats.toml` and `ljos.toml` are config.
-Every other hit is `allow` with a `warn` reason and does not deny.
-`reset --hard`, `checkout -- .`, `clean -f` and `stash drop` are that warning. The hook does not exit 2.
+Every hit is `allow`, then `warn`, the rule name, and one warning a caller can show. `check` exits 0.
+`reset --hard`, `checkout -- .`, `clean -f` and `stash drop` are that same warning.
 A consent record is read only. Its origin is undecided. It matches the push remote URL and the refspec destination branch. The URL is the remote argument when that argument is a URL, the URL `git -C` resolves, or the one literal URL the script assigns to the variable used as the remote. Its expiry is at most 24 hours ahead.
 The file is read only when the current user cannot write it and it is not group- or world-writable. Otherwise it is ignored and the reason is logged.
 `LJOS_USER_ALLOW` and `LJOS_CONSENT_FILE` may be set only by policyd's parent hook config. A file either name points at is ignored when that file is agent-writable, under the same check.
@@ -40,7 +41,7 @@ A parent whose comm or exe is a terminal, sshd, or tmux is ancestry. The reason 
 
 This check catches a bot's honest mistakes: a secret on the command, a
 destructive command, a history rewrite, or a write of its own hooks or
-policy. It is not a sandbox against a bot that hides a path on purpose.
+policy. It is not a security sandbox against a bot that hides a path on purpose.
 A literal path in a redirect, in `tee` or `sponge`, in `cp`, `install`
 or `mv`, or in an interpreter `open` or `write` call is checked. A name
 built by concatenation, by `Path.home()`, or by an interpreter this
@@ -49,8 +50,7 @@ check does not read, is outside that model.
 ## What the table matches
 
 The rules are tried in this order, and the first that matches is the reason.
-A match denies only for the deny kinds named above.
-Any other match warns and does not deny.
+That match is `allow`, `warn`, the rule name, and one warning. The command is not stopped.
 
 | Reason | Matched | Not matched |
 |---|---|---|
@@ -63,7 +63,7 @@ Any other match warns and does not deny.
 | `find-delete-outside-tmp` | `find ... -delete`, or `-exec`, `-execdir` or `-ok` running `rm`, `shred` or `unlink`, whose starting points reach outside `/tmp` and `/var/tmp`; no starting point means the current directory | the same under `/tmp`; `find` without a delete; `find -exec grep`; a cleanup inside the tree whose name tests all name files a tool writes again (`find . -name '*.pyc' -delete`, `find . -name .DS_Store -delete`), unless the line can `cd` out of the tree |
 | `find-write-outside-tmp` | `find -fprint`, `-fprint0`, `-fprintf` or `-fls` whose file is not a literal path under `/tmp` or `/var/tmp` (`find / -fprint /etc/x`, `find . -fls out`, `find / -fprintf /etc/x '%p\n'`) | that file under `/tmp` or `/var/tmp` (`find /tmp -fprint /tmp/out`); `find -print` and `find -printf`; a `-fprint` word that belongs to the `-exec` command |
 | `rm-rf-outside-tmp` | a recursive `rm` or `rtrash` whose own operands reach outside `/tmp` and `/var/tmp`, a `..` in the path included; also `python -c`, `node -e`, `ruby -e` or `perl -e` code that calls `shutil.rmtree`, `rmSync(..., {recursive})`, `rm_rf`, `rm_r` or `remove_tree` outside `/tmp` | the same under `/tmp`; a build output directory named as a plain relative path (`rm -rf target/`, `rm -rf node_modules`, `rm -rf ./build`, `web/.venv`) or a top-level scratch directory (`rm -rf ./tmp/test-output`, `.tmp`, `temp`), unless the line can `cd` out of the tree; a later command on the line that is not a delete |
-| `git-force-push` | `git push` with `--force`, `-f` in a flag cluster, `--mirror`, or a `+` refspec of a remote default branch; a plain force push of `develop` always denies, and whether that should stay is an open policy question; a `--force-with-lease` push onto `main`, `master`, or the remote default (the branch `refs/remotes/<remote>/HEAD` names). A lease of any other branch warns. ljos asks rather than refuses, and reads a bare lease push's branch from the checkout | an ordinary `git push`, `git push -u origin BRANCH`, `--force-if-includes` alone, and a lease push onto any other branch (`feature`, `mainline`, `develop-fix`, `release`), which the remote refuses when it holds commits you have not fetched. A lease of `develop` warns unless `develop` is that remote's default branch. A plain force push of `develop` always denies, and whether that should stay is an open policy question |
+| `git-force-push` | `git push` with `--force`, `-f` in a flag cluster, `--mirror`, or a `+` refspec of a remote default branch; a plain force push of `develop` always names this rule, and whether that should stay is an open policy question; a `--force-with-lease` push onto `main`, `master`, or the remote default (the branch `refs/remotes/<remote>/HEAD` names). A lease of any other branch warns. The printed line warns either way. ljos reads a bare lease push's branch from the checkout | an ordinary `git push`, `git push -u origin BRANCH`, `--force-if-includes` alone, and a lease push onto any other branch (`feature`, `mainline`, `develop-fix`, `release`), which the remote refuses when it holds commits you have not fetched. A lease of `develop` warns unless `develop` is that remote's default branch. A plain force push of `develop` always names this rule, and whether that should stay is an open policy question |
 | `git-reset-hard` | `git reset --hard` | `--soft`, `--mixed`, `reset FILE` |
 | `git-clean-force` | `git clean` with `-f` (`-fd`, `-fdx`, `--force`) | `git clean -n` |
 | `git-stash-clear` | `git stash clear` | `stash pop`, `list`, `drop` |
@@ -107,9 +107,9 @@ When the [phronesis](https://github.com/leidarljos/phronesis) library
 phronesis`), every check runs the table above and then
 `phronesis_check_shell`, on the line and on each command the table found
 inside it: past `env`, `nice` and the other wrappers, inside `sh -c`
-scripts and substitutions. A refusal from the table stands, and a refusal
-from phronesis carries the pack's own reason after the tab. Without the
-library the crate still builds and uses the table alone.
+scripts and substitutions. A hit from the table is the warning on the
+allow line, and a hit from phronesis is that same line with the pack's
+own reason. Without the library the crate still builds and uses the table alone.
 
 The build links phronesis and the Cap'n Proto C runtime statically and
 embeds phronesis's default pack, so the binary needs no phronesis install
@@ -117,13 +117,14 @@ and keeps no path from the machine that built it. The C shim follows the
 installed schema's bare-pointer or typed-list representation of `List(Text)`
 without changing the wire message. A word is handed to the
 pack whole, up to 128 KiB, and a line may carry up to 32768 words. Past
-either limit, or a command body over 512 KiB, the line is `field-too-long`
-and the reason, such as `field-too-long: argv word exceeds 131072 bytes`.
+either limit, or a command body over 512 KiB, the printed line is `allow`,
+`fail-open`, and `field-too-long` with the reason, such as
+`field-too-long: argv word exceeds 131072 bytes`.
 On first use it writes the pack under `$PHRONESIS_STATE_DIR` (default
 `~/.local/state/ljos-policyd`) and loads it from there. The default pack
-refuses what the table refuses and also secrets written into the argv (a
+names what the table names and also secrets written into the argv (a
 token in a URL or a header). `LJOS_POLICYD_PACK=seat` loads the seat pack
-instead, which adds uv-only Python and refuses `pip`, `npm`, `yarn`,
+instead, which adds uv-only Python and warns on `pip`, `npm`, `yarn`,
 `pnpm`, `bun` and `poetry`. A pack named in `PHRONESIS_JANET_PACK` replaces
 both.
 
@@ -136,10 +137,10 @@ without the library reports `host table`, and the doctor warns about it.
 
 | Verb | Does | Exit |
 |---|---|---|
-| `check -- ARGV` | prints one verdict line, see below | 0 on allow or prompt; 2 on deny |
-| `exec -- ARGV` | runs ARGV only if the verdict is allow | ARGV's status; 2 on deny |
-| `capnp -- ARGV` | writes a packed Cap'n Proto `PolicyDecision` | 0 |
-| `check-mail --config PATH [--argv [--] RECIPIENT...]` | reads one RFC 5322 message on stdin and prints a JSON allow or deny | 0 when nothing was refused; 2 when it refuses |
+| `check -- ARGV` | prints one verdict line, see below | 0 |
+| `exec -- ARGV` | prints a warning on stderr when a rule matches, then runs ARGV | ARGV's status |
+| `capnp -- ARGV` | writes a packed Cap'n Proto `PolicyDecision` with decision allow | 0 |
+| `check-mail --config PATH [--argv [--] RECIPIENT...]` | reads one RFC 5322 message on stdin and prints JSON. The verdict is `allow`. `reasons` carry the rule and the warning | 0. A missing `--config` is usage and exits 2 |
 | `replay [DENY_LOG]` | re-judges every line of a deny log with this build and the person's rules, and counts how many would run now | 0 |
 | `version` | the version and the backend | 0 |
 
@@ -148,13 +149,15 @@ without the library reports `host table`, and the doctor warns about it.
 | Line | Meaning |
 |---|---|
 | `allow` | the command may run as given |
-| `deny`<TAB>`reason` | the command must not run |
-| `prompt`<TAB>`reason` | ask the person. A mention of a credential path in `python`, `perl`, `ruby` or `node` `-c` or `-e` is `credential-mention` |
+| `allow`<TAB>`warn`<TAB>`rule`<TAB>`warning` | a rule matched. The command may run. `rule` is the token. `warning` is one line a caller can show. A mention of a credential path in `python`, `perl`, `ruby` or `node` `-c` or `-e` is `credential-mention` |
+| `allow`<TAB>`fail-open`<TAB>`reason` | the check could not finish. The command may run |
 | `allow`<TAB>`rewrite`<TAB>`new line` | the command may run, and the hook should run `new line` instead |
+| `allow`<TAB>`consent`<TAB>`rule` | a consent record matched |
+| `allow`<TAB>`user-rule`<TAB>`pattern` | a user allow matched |
 
 `python x.py` and `python3 x.py` rewrite to `uv run x.py`, arguments included, when the working directory or a parent has `pyproject.toml` or `uv.lock`, or the script file has a PEP 723 `# /// script` block. Otherwise the line stays as written. `python -c` and `python -m` stay as written: `uv run` does not take `-c`.
 
-With phronesis linked and its seat pack loaded, bare `python x.py` is a refusal, `python-requires-uv-run`. That refusal is answered with the same rewrite, project file or not, since the pack's law is the reason to run through uv. The hook judges the rewritten line again, so a script with no PEP 723 block still meets `python-missing-pep723` there. `python -c` under that pack stays a refusal.
+With phronesis linked and its seat pack loaded, bare `python x.py` is `python-requires-uv-run`. That hit is answered with the same rewrite, project file or not, since the pack's law is the reason to run through uv. The hook judges the rewritten line again, so a script with no PEP 723 block still meets `python-missing-pep723` there. `python -c` under that pack is allow with that rule and a warning.
 
 The hook returns that line as the tool's updated input where the runner has one, and as a note where it does not.
 
@@ -164,17 +167,19 @@ The hook returns that line as the tool's updated input where the runner has one,
 | Cursor `preToolUse` and `beforeShellExecution` | `updatedInput.command` is the new line |
 | Codex and any runner without that field | a note whose text is the new line, so the agent runs that line |
 
-A deny is also appended to `$LJOS_POLICYD_DENY_LOG`, or `$XDG_STATE_HOME/ljos-policyd/deny.log` (default `~/.local/state/ljos-policyd/deny.log`). Each line is the unix time, a tab, the reason, a tab, and the command. A prompt is not a deny and is not logged. `ljos-policyd replay` reads that log back and prints, for each line, the reason it was refused and the verdict this build gives it now, then how many of them would run; a shell `-c` line is replayed as its script and any other line split on spaces, since the log keeps no quoting.
+The deny log still records the same hits as before, at `$LJOS_POLICYD_DENY_LOG`, or `$XDG_STATE_HOME/ljos-policyd/deny.log` (default `~/.local/state/ljos-policyd/deny.log`). Each line is the unix time, a tab, the reason, a tab, and the command. The printed line for those hits is allow with the warning. A hit that was only an ask is not logged. `ljos-policyd replay` reads that log back and prints, for each line, the reason it was recorded and the verdict this build gives it now, then how many of them would run; a shell `-c` line is replayed as its script and any other line split on spaces, since the log keeps no quoting.
 
 The person's word comes first. A rule in `$XDG_CONFIG_HOME/ljos/user-rules.json` with the verdict `allow` and the basis `person`, which `ljos rule --user PATTERN --verdict allow --why ...` writes only at the person's own terminal, allows every line its pattern matches before the table or the pack is asked. The pattern is matched against the argv as one line, each of its pipelines, and a shell `-c` script and its pipelines, with the glob ljos uses. A runner cannot write such a rule.
 
-Makefile, npm, pnpm, yarn, bun and just recipes are not read. A python program is not analysed. Writing or mentioning an ordinary file is not a reason to refuse. `sudo`, a recursive `rm` outside `/tmp` and the build directories, a force push, a secret in an argument, a write of a hook or policy file, a remote shell, and a raw disk write still refuse. `find -delete`, `find -exec rm`, and `xargs` or `parallel` running `rm` refuse. So does `mv` onto `/dev/null` or another whole tree outside the work tree, and `rsync` with `--delete` over that tree. `git reset --hard`, `git clean -fd`, `git stash clear` or `drop`, and `git checkout -- .` or `git restore .` ask instead of refusing.
+Makefile, npm, pnpm, yarn, bun and just recipes are not read. A python program is not analysed. Writing or mentioning an ordinary file is not a warning. `sudo`, a recursive `rm` outside `/tmp` and the build directories, a force push, a secret in an argument, a write of a hook or policy file, a remote shell, and a raw disk write each name a warning. `find -delete`, `find -exec rm`, and `xargs` or `parallel` running `rm` do too. So does `mv` onto `/dev/null` or another whole tree outside the work tree, and `rsync` with `--delete` over that tree. `git reset --hard`, `git clean -fd`, `git stash clear` or `drop`, and `git checkout -- .` or `git restore .` are warnings as well.
 
 ## Outbound mail
 
 `check-mail` reads one message on stdin and the config at `PATH`. It
-prints one JSON object. `allow` means this check found nothing to
-refuse. A send still needs its own grant: this check only refuses.
+prints one JSON object. The verdict is `allow`. Where this section says
+a header is refused, that condition is a reason: `code` is the rule name
+and `detail` is the warning. The send is not held. An empty reason list
+is not a grant to send.
 
 ```console
 $ ljos-policyd check-mail --config mail.conf < message.eml
@@ -302,9 +307,9 @@ check.
 
 On each shell command the hook asks, in order: the seat's guard over its
 own files, this binary, then the rules written into the seat's memory
-(`ljos rule`), then the push gate. The first refusal stands, and none of
-the later layers can allow what this binary denied. `ljos policy -- ARGV`
-prints the combined answer for one command.
+(`ljos rule`), then the push gate. This binary's answer is allow, with
+the rule and a warning when one matches. It does not stop the command.
+`ljos policy -- ARGV` prints the combined answer for one command.
 
 If the binary is not on `PATH` (or at `POLICYD_BIN`), ljos treats its
 absence as no opinion, unless `POLICYD_REQUIRED=1`, which refuses every

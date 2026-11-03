@@ -1,27 +1,24 @@
 //! How a raw table hit is published.
 //!
-//! An internal error, a parse failure, an unknown input, a check that
-//! runs past one second, or a missing config allows and names the
-//! reason. A reversible hit warns. A deny stays for
-//! `rm-rf-outside-tmp`, `find-delete`, `find-exec-rm`,
+//! An internal error, a parse failure, an unknown input, or a missing
+//! config allows and names the reason. Every other hit is allow too.
+//! The line carries the rule name and one warning a caller can show.
+//! That includes `rm-rf-outside-tmp`, `find-delete`, `find-exec-rm`,
 //! `rsync-delete-outside`, `git-force-push` of a remote default branch,
 //! `git-push-delete` of `main`, `master`, or `develop`,
 //! `reads-credential`, and `curl-pipe-shell` (a download piped into
 //! `sh`, `bash`, or `zsh`). A download piped into `python3` warns. A
 //! history rewrite warns. A matching consent record, or a user allow the
-//! caller passed, turns a deny into an allow. Ancestry is named in the
+//! caller passed, turns a hit into that allow. Ancestry is named in the
 //! reason and does not change the verdict.
 
 use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::{Checked, Decision, PolicyReason};
-
-/// The cap on one judgment.
-pub const DEADLINE: Duration = Duration::from_secs(1);
 
 /// What the caller handed the check beside the argv.
 #[derive(Clone, Debug, Default)]
@@ -150,25 +147,15 @@ pub fn warn_checked(token: &str) -> Checked {
     allow_checked("warn", token)
 }
 
-/// Run `work` and allow when it panics or passes [`DEADLINE`].
+/// Run `work` on this thread. A panic allows and names the fault.
+/// There is no second thread to wait on.
 pub fn bounded<F>(work: F) -> Checked
 where
-    F: FnOnce() -> Checked + Send + 'static,
+    F: FnOnce() -> Checked,
 {
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    let spawned = std::thread::Builder::new()
-        .name("policyd-check".into())
-        .spawn(move || {
-            let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
-            let _ = tx.send(out);
-        });
-    if spawned.is_err() {
-        return allow_checked("fail-open", "internal error");
-    }
-    match rx.recv_timeout(DEADLINE) {
-        Ok(Ok(checked)) => checked,
-        Ok(Err(_)) => allow_checked("fail-open", "internal error"),
-        Err(_) => allow_checked("fail-open", "timeout"),
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        Ok(checked) => checked,
+        Err(_) => allow_checked("fail-open", "internal error"),
     }
 }
 
@@ -355,12 +342,86 @@ fn json_string_array(raw: &str) -> Option<Vec<String>> {
 #[must_use]
 pub fn line_of(checked: &Checked) -> String {
     if let Some((kind, rest)) = noted(&checked.token) {
+        if kind == "warn" {
+            return allow_annotation(rest);
+        }
         return format!("allow\t{kind}\t{}", one_piece(rest));
     }
     match checked.decision {
         Decision::Allow => "allow".to_string(),
-        Decision::Deny => format!("deny\t{}", one_piece(&checked.token)),
-        Decision::Prompt => format!("prompt\t{}", one_piece(&checked.token)),
+        Decision::Deny | Decision::Prompt => allow_annotation(&checked.token),
+    }
+}
+
+/// `allow`, a tab, `warn`, a tab, the rule name, a tab, one warning.
+///
+/// The rule name is the table's token, including a pack detail and an
+/// ancestry note. The warning is one line, so a caller can show it.
+#[must_use]
+pub fn allow_annotation(token: &str) -> String {
+    let shown = one_field(token);
+    let warning = one_field(&warning_for(&shown));
+    format!("allow\twarn\t{shown}\t{warning}")
+}
+
+fn one_field(text: &str) -> String {
+    one_piece(text).replace('\t', " ")
+}
+
+fn warning_for(token: &str) -> String {
+    let body = token.split(" ancestry=").next().unwrap_or(token).trim();
+    let name = body.split(": ").next().unwrap_or(body).trim();
+    let detail = body.split_once(": ").map(|(_, d)| d.trim()).unwrap_or("");
+    let sentence = sentence_for(name);
+    let sentence = if sentence.is_empty() {
+        name.replace('-', " ")
+    } else {
+        sentence.to_string()
+    };
+    if detail.is_empty() {
+        sentence
+    } else {
+        format!("{sentence}: {detail}")
+    }
+}
+
+/// The one line a caller shows for `name`. The words are the rule the
+/// README already states, shortened to a single line.
+fn sentence_for(name: &str) -> &'static str {
+    match name {
+        "sudo" => "a privilege runner is on the command",
+        "curl-pipe-shell" => "a download is handed to a shell or an interpreter",
+        "decoded-pipe-shell" => "a decoder's output is handed to a shell",
+        "rm-rf-outside-tmp" => "a recursive delete reaches outside /tmp and /var/tmp",
+        "find-delete" => "find -delete reaches outside /tmp and /var/tmp",
+        "find-exec-rm" => "find runs rm outside /tmp and /var/tmp",
+        "feeder-rm" => "a feeder runs rm",
+        "rsync-delete-outside" => "rsync --delete reaches outside the work tree",
+        "mv-tree-outside" => "mv replaces a tree outside the work tree",
+        "git-force-push" => "a force push rewrites a published branch",
+        "git-push-delete" => "a push deletes a remote branch",
+        "git-reset-hard" => "git reset --hard drops uncommitted work",
+        "git-clean-force" => "git clean -f deletes untracked files",
+        "git-stash-drop" => "git stash drop deletes a stash entry",
+        "git-stash-clear" => "git stash clear deletes every stash entry",
+        "git-discard-worktree" => "git checkout or restore discards the work tree",
+        "git-worktree-force-remove" => "git worktree remove --force deletes a work tree",
+        "git-branch-force-delete" => "git branch -D deletes a branch that may be unmerged",
+        "git-history-rewrite" => "a history rewrite changes published commits",
+        "git-update-ref-delete" => "git update-ref -d deletes a ref",
+        "git-reflog-expire" => "git reflog expire drops reachable history",
+        "raw-disk" => "a command writes a block device",
+        "credential-mention" => "a program names a credential path",
+        "exec-unresolved" => "find -exec names a command the line does not show",
+        "reads-credential" => "a command reads a credential file",
+        "seat-guard-path" => "a command writes a seat or policy file",
+        "shell-secret-in-argv" => "a secret is on the command line",
+        "path-outside-workspace" => "a path is outside the workspace",
+        "python-missing-pep723" => "a Python file has no PEP 723 script block",
+        "python-requires-uv-run" => "Python is not run through uv",
+        "python-dash-c" | "python-dash-c-denied" => "Python -c is not run through uv",
+        "chmod-setuid" => "chmod or install sets the setuid or setgid bit",
+        _ => "",
     }
 }
 
@@ -455,7 +516,7 @@ fn engine_fault(token: &str) -> bool {
         || lower.starts_with("field-too-long")
 }
 
-/// A deny the table is still allowed to print.
+/// A hit the deny log still records. Consent or a user allow clears it.
 #[must_use]
 pub fn irreversible(token: &str) -> bool {
     let head = token.split(':').next().unwrap_or(token).trim();
@@ -1210,6 +1271,35 @@ pub fn work_tree(cwd: &Path) -> Option<PathBuf> {
     git_line(&["rev-parse", "--show-toplevel"], Some(cwd)).map(PathBuf::from)
 }
 
+/// `git` can sit on an index lock. Past `limit` the lookup is the same
+/// as git having no line, and the answer is not held.
+///
+/// The 10 ms poll is how soon a finished git is noticed. It is short
+/// next to [`super::client::CONNECT_TIMEOUT`] and keeps the loop from
+/// spinning.
+fn output_within(cmd: &mut std::process::Command, limit: Duration) -> Option<std::process::Output> {
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if started.elapsed() >= limit => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => return None,
+        }
+    }
+}
+
 fn git_line(args: &[&str], dir: Option<&Path>) -> Option<String> {
     let key = format!(
         "{}|{}",
@@ -1225,9 +1315,7 @@ fn git_line(args: &[&str], dir: Option<&Path>) -> Option<String> {
         cmd.arg("-C").arg(dir);
     }
     cmd.args(args);
-    let text = cmd
-        .output()
-        .ok()
+    let text = output_within(&mut cmd, super::client::CONNECT_TIMEOUT)
         .filter(|out| out.status.success())
         .and_then(|out| String::from_utf8(out.stdout).ok())
         .map(|s| s.trim().to_string())
@@ -1362,16 +1450,6 @@ mod tests {
     fn a_panic_allows() {
         let checked = bounded(|| panic!("boom"));
         assert_eq!(line_of(&checked), "allow\tfail-open\tinternal error");
-    }
-
-    #[test]
-    fn a_slow_check_allows_at_one_second() {
-        let checked = bounded(|| {
-            std::thread::sleep(Duration::from_millis(1100));
-            allow_checked("allow", "late")
-        });
-        assert_eq!(line_of(&checked), "allow\tfail-open\ttimeout");
-        assert_eq!(DEADLINE, Duration::from_secs(1));
     }
 
     #[test]
@@ -1607,19 +1685,22 @@ mod tests {
                 ..Context::default()
             },
         );
-        assert!(bare.starts_with("deny\tgit-force-push"), "{bare}");
+        assert!(bare.starts_with("allow\twarn\tgit-force-push"), "{bare}");
         let hit = crate::verdict_with(&one, &ctx);
         assert!(hit.starts_with("allow\tconsent\t"), "{hit}");
         let unresolved = push_script(
             "u=not_a_url\nimport subprocess\nsubprocess.run([\"git\",\"push\",\"--force\",u,\"HEAD:refs/heads/main\"])",
         );
         let missed = crate::verdict_with(&unresolved, &ctx);
-        assert!(missed.starts_with("deny\tgit-force-push"), "{missed}");
+        assert!(
+            missed.starts_with("allow\twarn\tgit-force-push"),
+            "{missed}"
+        );
         let two = push_script(
             "u=\"https://github.com/example/app\"\nu=\"https://github.com/example/other\"\nimport subprocess\nsubprocess.run([\"git\",\"push\",\"--force\",u,\"HEAD:refs/heads/main\"])",
         );
         let both = crate::verdict_with(&two, &ctx);
-        assert!(both.starts_with("deny\tgit-force-push"), "{both}");
+        assert!(both.starts_with("allow\twarn\tgit-force-push"), "{both}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1631,13 +1712,16 @@ mod tests {
             ..Context::default()
         };
         let line = crate::verdict_with(&argv, &ctx);
-        assert!(line.starts_with("deny\trm-rf-outside-tmp"), "{line}");
+        assert!(line.starts_with("allow\twarn\trm-rf-outside-tmp"), "{line}");
         assert!(line.contains("ancestry=person"), "{line}");
         let ctx = Context {
             person_tty: Some(false),
             ..Context::default()
         };
-        assert_eq!(crate::verdict_with(&argv, &ctx), "deny\trm-rf-outside-tmp");
+        assert_eq!(
+            crate::verdict_with(&argv, &ctx),
+            allow_annotation("rm-rf-outside-tmp")
+        );
     }
 
     #[test]

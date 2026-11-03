@@ -1,5 +1,5 @@
 //! Argv law CLI. Typed verdict is Cap'n `PolicyDecision` (see lib).
-//! `check-mail` reads an RFC 5322 message on stdin and only refuses.
+//! `check-mail` reads an RFC 5322 message on stdin and prints allow.
 
 use std::env;
 use std::io::{self, Read, Write};
@@ -72,11 +72,9 @@ fn run() -> i32 {
             if config.is_some() {
                 ctx.config_path = config;
             }
+            probe_configured_daemon();
             let v = ljos_policyd::verdict_with(&argv, &ctx);
             println!("{v}");
-            if v.starts_with("deny") {
-                return 2;
-            }
             return 0;
         }
         "capnp" => {
@@ -88,16 +86,16 @@ fn run() -> i32 {
             if io::stdout().write_all(&bytes).is_err() {
                 return allow_open("io");
             }
-            if c.decision != ljos_policyd::policy_capnp::Decision::Allow {
-                return 2;
-            }
             return 0;
         }
         "exec" => {
             let v = verdict(&args);
+            if v.starts_with("allow\twarn\t") {
+                eprintln!("{v}");
+            }
             if !v.starts_with("allow") {
                 eprintln!("{v}");
-                process::exit(2);
+                return 0;
             }
             if args.is_empty() {
                 process::exit(0);
@@ -123,9 +121,6 @@ fn run() -> i32 {
             }
             let v = check_mail_argv(&buf, Path::new(&mail.config), &mail.recipients);
             println!("{}", v.json());
-            if v.is_refused() {
-                process::exit(2);
-            }
         }
         "replay" => {
             let path = args
@@ -221,6 +216,19 @@ fn user_allows(args: &[String]) -> (Vec<String>, Option<String>, Vec<String>) {
         return (rules, config, args[i..].to_vec());
     }
     (rules, config, Vec::new())
+}
+
+/// `LJOS_POLICYD_DAEMON=host:port` is optional. Nothing is read from the
+/// socket. When nothing accepts, [`ljos_policyd::probe_daemon`] returns
+/// inside the connect timeout and the table answers.
+fn probe_configured_daemon() {
+    let Ok(text) = env::var("LJOS_POLICYD_DAEMON") else {
+        return;
+    };
+    let Ok(addr) = text.parse() else {
+        return;
+    };
+    let _ = ljos_policyd::probe_daemon(addr);
 }
 
 struct MailArgs {

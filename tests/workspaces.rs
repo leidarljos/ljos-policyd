@@ -25,7 +25,7 @@ fn a_second_workspace_is_judged_like_the_first() {
         assert_eq!(check(&dir, &["git", "status"]), "allow", "{ws}");
         assert_eq!(
             check(&dir, &["git", "push", "--force", "origin", "main"]),
-            "deny\tgit-force-push",
+            ljos_policyd::allow_annotation("git-force-push"),
             "{ws}"
         );
     }
@@ -58,15 +58,22 @@ fn a_refusal_names_its_code_and_the_pack_reason() {
             .unwrap();
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     };
-    assert_eq!(check(&elsewhere, &["ls"]), "deny\tpath-outside-workspace");
+    assert_eq!(
+        check(&elsewhere, &["ls"]),
+        ljos_policyd::allow_annotation("path-outside-workspace")
+    );
     assert_eq!(check(&ws, &["ls", "/etc"]), "allow");
     let url = format!(
         "https://oauth2:{}{}@gitlab.example/x.git",
         "glpat-", "SecretTokenValue99"
     );
     let line = check(&ws, &["git", "push", url.as_str()]);
-    assert!(line.starts_with("deny\tshell-secret-in-argv: "), "{line}");
-    assert!(line.len() > "deny\tshell-secret-in-argv: ".len(), "{line}");
+    assert!(
+        line.starts_with("allow\twarn\tshell-secret-in-argv: "),
+        "{line}"
+    );
+    let rule = line.split('\t').nth(2).unwrap_or("");
+    assert!(rule.len() > "shell-secret-in-argv: ".len(), "{line}");
     let _ = std::fs::remove_dir_all(&base);
 }
 

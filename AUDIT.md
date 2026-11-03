@@ -14,7 +14,7 @@ lexer and the mail law are still the bulk of that. The rewrite lives in
 | `rm -rf` outside `/tmp` and the build directories | the lexer | A recursive force delete of `./src`, `/etc`, `~/` or a home. | KEEP |
 | Force push and history rewrite of published branches | the lexer | Force push, filter-branch, filter-repo, update-ref delete. | KEEP |
 | Secrets in argv and credential paths | `disk.rs` plus the reader | A token or a credential file on the command. | KEEP |
-| Inline `-c` or `-e` that names a credential path | `ask.rs` | `python3 -c "open('/home/u/.ssh/id_rsa')"` was a deny. | ASK `credential-mention` |
+| Inline `-c` or `-e` that names a credential path | `ask.rs` | `python3 -c "open('/home/u/.ssh/id_rsa')"` was a deny. | warn on allow, `credential-mention` |
 | Writes of hook and policy files | seat guard | Seat guard paths and the policyd config. | KEEP |
 | Mail law | `mail.rs` and `envelope.rs` | Outbound envelope for the send ballot. | KEEP |
 | Bash lexer (`sh -c`, `$cmd`, pipes, quotes) | most of `src/lib.rs` | The denies above have to see through a shell. | KEEP |
@@ -31,12 +31,13 @@ lexer and the mail law are still the bulk of that. The rewrite lives in
 | Brace expansion of a command | removed | `{push,-f}` turned into the command. | DELETE |
 | Unshown script guesses | removed | A pipe into a shell, a process substitution. | DELETE |
 | Writes outside the tree | removed | An ordinary file write. | DELETE |
-| Local git lost work | `harm.rs` | `reset --hard`, `clean -fd`, `stash clear` or `drop`, `checkout -- .`, `restore .`. | ASK |
-| Find delete and a feeder running rm | `harm.rs` | `find -delete`, `find -exec rm`, `xargs` or `parallel` running `rm`. | KEEP as a deny |
-| mv or rsync delete of an outside tree | `harm.rs` | A whole tree outside the work tree, including `/dev/null`. | KEEP as a deny |
+| Local git lost work | `harm.rs` | `reset --hard`, `clean -fd`, `stash clear` or `drop`, `checkout -- .`, `restore .`. | warn on allow |
+| Find delete and a feeder running rm | `harm.rs` | `find -delete`, `find -exec rm`, `xargs` or `parallel` running `rm`. | warn on allow |
+| mv or rsync delete of an outside tree | `harm.rs` | A whole tree outside the work tree, including `/dev/null`. | warn on allow |
 
-The deny list that remains is sudo, a recursive `rm` outside `/tmp` and the build directories, a force
+The rules that remain are sudo, a recursive `rm` outside `/tmp` and the build directories, a force
 push or a history rewrite of a published branch, a secret in argv, a write
-of a hook or policy file, remote exec, and raw disk. The mail check is
-unchanged. An inline program that names `~/.ssh`, `~/.gnupg`, `~/.aws`,
-`.env`, or another credential directory asks instead of denying.
+of a hook or policy file, remote exec, and raw disk. Each one is allow
+with the rule name and one warning. The mail check prints allow and keeps
+its reasons. An inline program that names `~/.ssh`, `~/.gnupg`, `~/.aws`,
+`.env`, or another credential directory warns with `credential-mention`.

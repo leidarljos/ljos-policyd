@@ -9,19 +9,22 @@ reads one RFC 5322 message on stdin. See "Outbound mail" below.
 ================ ========================================================================================
 Verb             Meaning
 ================ ========================================================================================
-``check``        print ``allow``, ``deny<TAB>reason``, ``prompt<TAB>reason`` or ``allow<TAB>rewrite<TAB>line``; exit 2 on deny
-``capnp``        write a packed Cap'n ``PolicyDecision`` to stdout; exit 2 on deny
-``exec``         same text verdict; on allow, run argv; on deny, print the verdict on stderr and exit 2
-``check-mail``   JSON ``allow`` or ``deny`` for one message on stdin; exit 2 when it refuses
+``check``        print ``allow``, or ``allow<TAB>warn<TAB>rule<TAB>warning``; exit 0
+``capnp``        write a packed Cap'n ``PolicyDecision`` with decision allow; exit 0
+``exec``         same text verdict; print a warning on stderr and run argv
+``check-mail``   JSON ``verdict`` ``allow``; ``reasons`` carry the rule and the warning; exit 0. A missing ``--config`` exits 2
 ``version``      print ``ljos-policyd <semver> (phronesis)`` or ``ljos-policyd <semver> (host table)``
 ================ ========================================================================================
 
 A leading ``--`` after the verb is optional and is stripped.
 
-Built-in denials
-================
+Built-in warnings
+=================
 
-First match wins. The head is the last path component of argv[0].
+First match wins. Where this page says a command is refused, the printed
+line is ``allow``. A rule hit is ``warn``, the rule, and one warning. A
+limit (``field-too-long``) is ``fail-open``. The command is not stopped.
+The head is the last path component of argv[0].
 Leading assignments, ``NAME=value`` or ``NAME+=value``, and runner words
 such as ``env``, ``nice`` and ``timeout`` come off first, as does the head
 of a ``case`` arm (``case $x in a)``, or ``b)`` after ``;;``). A ``trap``
@@ -216,8 +219,9 @@ these limits.
 Outbound mail
 =============
 
-``check-mail`` prints one JSON object and only refuses. ``allow`` means
-this check found nothing to refuse. A send still needs its own grant.
+``check-mail`` prints one JSON object. The verdict is ``allow``. Where
+this section says a message is refused, that condition is a reason. The
+send is not held. An empty reason list is not a grant to send.
 
 The message on stdin is the whole input. A caller must pass no
 recipient arguments to ``sendmail -t``: those addresses are not in
@@ -428,8 +432,8 @@ Exit statuses
 ===== ==================================================================================
 Code  Meaning
 ===== ==================================================================================
-0     allow, check-mail with nothing to refuse, or ``exec`` of a process that exited 0
-2     deny, a check-mail refusal, missing verb, or empty usage
+0     a check, capnp, check-mail, version, or ``exec`` of a process that exited 0
+2     check-mail without ``--config``, or replay with no log or an unreadable log
 127   ``exec`` could not spawn the program
 other ``exec`` of a process that exited with that code
 ===== ==================================================================================

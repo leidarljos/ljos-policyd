@@ -1,4 +1,4 @@
-//! The lines that blocked an approved edit, and the lines that still deny.
+//! The lines that blocked an approved edit, and the lines that still warn.
 
 use std::path::Path;
 use std::process::Command;
@@ -217,8 +217,9 @@ fn replay_the_blocked_lines() {
     let mut log = String::from("| case | verdict | decision |\n|---|---|---|\n");
     let mut raw = String::new();
     for row in &mut rows {
-        let decision = if row.line.starts_with("deny") {
-            "DENY"
+        let warned = row.line.starts_with("allow\twarn\t");
+        let decision = if warned {
+            "WARN"
         } else if allows(&row.line) {
             "ALLOW"
         } else {
@@ -229,8 +230,19 @@ fn replay_the_blocked_lines() {
             row.name, row.line, decision
         ));
         raw.push_str(&format!("# {}\n{}\n", row.name, row.line));
-        let denied = row.line.starts_with("deny");
-        assert_eq!(denied, row.want_deny, "{} -> {}", row.name, row.line);
+        assert!(
+            row.line.starts_with("allow"),
+            "{} -> {}",
+            row.name,
+            row.line
+        );
+        // A former deny is allow plus a warning. A former ask can be a
+        // warning too, so a row that was never denied may still warn.
+        if row.want_deny {
+            assert!(warned, "{} -> {}", row.name, row.line);
+            let warning = row.line.split('\t').nth(3).unwrap_or("");
+            assert!(!warning.is_empty(), "{} -> {}", row.name, row.line);
+        }
         if row.name.starts_with("user allow") {
             assert!(
                 row.line.starts_with("allow\tuser-rule\t"),

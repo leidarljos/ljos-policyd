@@ -44,11 +44,11 @@ fn the_seat_packs_uv_refusal_is_answered_with_the_uv_line() {
     );
     // `-c` has no uv spelling, so the refusal stands.
     let inline = check(Some("seat"), &["python3", "-c", "print(1)"]);
-    assert!(inline.starts_with("deny\t"), "{inline}");
+    assert!(inline.starts_with("allow\twarn\t"), "{inline}");
     // The rewritten line meets the pack on its own: a PEP 723 script runs,
     // a bare one is still refused there, for its missing block.
     assert_eq!(check(Some("seat"), &["uv", "run", "tool.py"]), "allow");
     let bare = check(Some("seat"), &["uv", "run", "x.py"]);
-    assert!(bare.starts_with("deny\t"), "{bare}");
+    assert!(bare.starts_with("allow\twarn\t"), "{bare}");
     let _ = std::fs::remove_dir_all(&base);
 }

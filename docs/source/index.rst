@@ -8,10 +8,10 @@
          <p class="vi-hero-tag">May this command line run?</p>
        </div>
      </div>
-     <p class="vi-hero-tagline">May this command line run? First deny wins.</p>
+     <p class="vi-hero-tagline">May this command line run? The answer is allow, with a warning when a rule matches.</p>
      <div class="vi-hero-pills">
        <span>check / exec / capnp</span>
-       <span>First deny wins</span>
+       <span>Allow, and show the warning</span>
        <span>uv first</span>
      </div>
      <div class="vi-hero-actions">
@@ -28,9 +28,9 @@ First minute
    $ ljos-policyd check -- uv run pytest
    allow
    $ ljos-policyd check -- sudo id
-   deny    sudo
+   allow    warn    sudo    a privilege runner is on the command
 
-Typed verdict is Cap'n PolicyDecision (phronesis; Ali Akber Saifee / indynull, HaoZeke). A Janet pack can deny more. A pack may only deny more.
+Typed verdict is Cap'n PolicyDecision (phronesis; Ali Akber Saifee / indynull, HaoZeke). A Janet pack can name more. The printed line is still allow, with that rule and one warning.
 
 .. code:: janet
 
@@ -49,7 +49,7 @@ Install
    $ ljos-policyd check -- uv run pytest
    allow
 
-``exec`` runs the line only if the verdict is allow. A deny exits 2.
+``exec`` prints a warning on stderr when a rule matches, then runs the line. Exit status is the program's.
 
 The :doc:`tutorial <getting-started>` is the same walk with ``exec`` and ``POLICYD_BIN``.
 

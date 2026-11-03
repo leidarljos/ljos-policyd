@@ -19,16 +19,29 @@ fn check(dir: &std::path::Path, state: &std::path::Path, argv: &[&str]) -> Strin
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// `deny` with nothing after the tab, or the old stand-in for an empty
-/// phronesis reason.
+/// A warn line with an empty rule or an empty warning, or a fail-open
+/// that names nothing or only `phronesis`. A plain `allow` is fine.
 #[cfg(has_phronesis)]
 fn empty_reason_denial(line: &str) -> bool {
-    if line == "deny" || line == "deny\tphronesis" {
+    let mut fields = line.split('\t');
+    let Some(head) = fields.next() else {
+        return true;
+    };
+    if head != "allow" {
         return true;
     }
-    match line.split_once('\t') {
-        Some(("deny", reason)) => reason.is_empty(),
-        _ => false,
+    match fields.next() {
+        None => false,
+        Some("warn") => {
+            let rule = fields.next().unwrap_or("");
+            let warning = fields.next().unwrap_or("");
+            rule.is_empty() || warning.is_empty()
+        }
+        Some("fail-open") => {
+            let reason = fields.next().unwrap_or("");
+            reason.is_empty() || reason == "phronesis"
+        }
+        Some(_) => false,
     }
 }
 

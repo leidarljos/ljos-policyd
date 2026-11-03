@@ -43,16 +43,19 @@ fn a_fault_env_on_an_allowed_command_stays_an_allow() {
 fn a_lost_work_prompt_is_a_warning_for_the_hook() {
     let (code, stdout, _) = run(&["check", "--", "git", "reset", "--hard"], None);
     assert_eq!(code, 0);
-    assert_eq!(stdout, "allow\twarn\tgit-reset-hard");
+    assert_eq!(stdout, ljos_policyd::allow_annotation("git-reset-hard"));
     let (code, stdout, _) = run(&["check", "--", "git", "checkout", "--", "."], None);
     assert_eq!(code, 0);
-    assert_eq!(stdout, "allow\twarn\tgit-discard-worktree");
+    assert_eq!(
+        stdout,
+        ljos_policyd::allow_annotation("git-discard-worktree")
+    );
     let (code, stdout, _) = run(&["check", "--", "git", "clean", "-fd"], None);
     assert_eq!(code, 0);
-    assert_eq!(stdout, "allow\twarn\tgit-clean-force");
+    assert_eq!(stdout, ljos_policyd::allow_annotation("git-clean-force"));
     let (code, stdout, _) = run(&["check", "--", "git", "stash", "drop"], None);
     assert_eq!(code, 0);
-    assert_eq!(stdout, "allow\twarn\tgit-stash-drop");
+    assert_eq!(stdout, ljos_policyd::allow_annotation("git-stash-drop"));
 
     let capnp = Command::new(bin())
         .args(["capnp", "--", "git", "reset", "--hard"])
@@ -96,8 +99,11 @@ fn a_lost_work_prompt_is_a_warning_for_the_hook() {
 #[test]
 fn the_fault_env_does_not_open_the_binary() {
     let (code, stdout, _) = run(&["check", "--", "rm", "-rf", "/srv/x"], Some("log_deny"));
-    assert_eq!(code, 2, "{stdout}");
-    assert!(stdout.starts_with("deny\trm-rf-outside-tmp"), "{stdout}");
+    assert_eq!(code, 0, "{stdout}");
+    assert!(
+        stdout.starts_with("allow\twarn\trm-rf-outside-tmp"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -106,8 +112,11 @@ fn a_comment_quote_does_not_fail_open() {
         &["check", "--", "bash", "-c", "rm -rf /srv/x # don't"],
         None,
     );
-    assert_eq!(code, 2, "{stdout}");
-    assert!(stdout.starts_with("deny\trm-rf-outside-tmp"), "{stdout}");
+    assert_eq!(code, 0, "{stdout}");
+    assert!(
+        stdout.starts_with("allow\twarn\trm-rf-outside-tmp"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -118,8 +127,11 @@ fn config_inside_the_command_is_not_a_policyd_flag() {
         ],
         None,
     );
-    assert_eq!(code, 2, "{stdout}");
-    assert!(stdout.starts_with("deny\trm-rf-outside-tmp"), "{stdout}");
+    assert_eq!(code, 0, "{stdout}");
+    assert!(
+        stdout.starts_with("allow\twarn\trm-rf-outside-tmp"),
+        "{stdout}"
+    );
     let (code, stdout, _) = run(
         &[
             "check",

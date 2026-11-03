@@ -1,8 +1,9 @@
 //! Outbound envelope check.
 //!
-//! The check only refuses. An empty reason list means `From` is the
-//! configured identity and neither the deny file nor the pack-law file
-//! named a header this check watches. It is not a grant to send.
+//! The printed verdict is `allow`. `reasons` name the rule and the
+//! warning. An empty reason list means `From` is the configured identity
+//! and neither the deny file nor the pack-law file named a header this
+//! check watches. It is not a grant to send.
 
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -43,9 +44,10 @@ impl MailVerdict {
         !self.reasons.is_empty()
     }
 
-    /// One JSON object. `allow` means this check found nothing to refuse.
+    /// One JSON object. The verdict is `allow`. `reasons` are the rule
+    /// name and the warning, so a caller can show them. The send is not held.
     pub fn json(&self) -> String {
-        let verdict = if self.is_refused() { "deny" } else { "allow" };
+        let verdict = "allow";
         let mut out = format!("{{\"verdict\":\"{verdict}\",\"reasons\":[");
         for (i, reason) in self.reasons.iter().enumerate() {
             if i > 0 {

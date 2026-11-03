@@ -3,27 +3,30 @@ Why a binary and not a prompt
 
 A model that is asked "may this run?" will sometimes say yes. The
 gate reads argv. This crate is that process: argv in, a one-line
-verdict out. The harness hook calls it. A Janet pack can deny more
+verdict out. The harness hook calls it. A Janet pack can name more
 after this verdict.
 
 A model cannot be the mediator. An agent that can talk its way past
 the check is the threat, and indirect prompt injection shows that
 instructions carried in data change what a model permits (Greshake et
-al., doi:10.48550/arXiv.2302.12173). No matching rule in this table is
-an allow. This table judges the argv it is given. Saltzer and
-Schroeder would deny in that case
+al., doi:10.48550/arXiv.2302.12173). Every answer this table prints is
+allow. A matching rule adds the rule name and one warning for the
+caller to show. It does not stop the command. This is not a security
+boundary. Saltzer and
+Schroeder would deny when the case is uncertain
 (`Saltzer and Schroeder, 1975 <https://doi.org/10.1109/PROC.1975.9939>`__).
 This table does not. The fail-closed switch is
-``POLICYD_REQUIRED=1``, and it covers a missing binary. The next layer
-may deny more. It cannot allow what this table refused.
+``POLICYD_REQUIRED=1``, and it covers a missing binary. That switch
+belongs to the seat, not to a verdict of this table.
 
-First deny wins
-===============
+The first match is the warning
+==============================
 
 The built-in list is the argv TCB from phronesis (Ali Akber Saifee /
 indynull, HaoZeke; MIT): privilege runners, remote-exec, recursive
 delete off tmp, force-push, setuid, raw disk. A later pack rule can
-deny more. A pack may only deny more. ``python -c`` is
+name more. The printed line stays allow, with that rule and one
+warning. ``python -c`` is
 allow: this hook sits on a general agent shell, not a uv-only
 product seat.
 
