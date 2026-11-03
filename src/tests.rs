@@ -118,6 +118,45 @@ fn a_long_argument_that_carries_a_secret_is_still_refused() {
     }
 }
 
+/// A command four shells in is still the delete. One shell past
+/// [`MAX_DEPTH`] is not read. The line is allow, and the label names
+/// the stop.
+#[test]
+fn a_command_past_the_depth_cap_is_allowed_with_a_label() {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    let wrap = |levels: usize| {
+        let mut script = "rm -rf /home/u".to_string();
+        for _ in 0..levels {
+            script = format!("sh -c {}", quote(&script));
+        }
+        script
+    };
+    let inside = v(&["sh", "-c", &wrap(3)]);
+    assert!(
+        inside.starts_with("allow\twarn\trm-rf-outside-tmp"),
+        "inside the cap: {inside}"
+    );
+    assert_eq!(
+        v(&["sh", "-c", &wrap(4)]),
+        allow_annotation("nesting-unread"),
+        "past the cap"
+    );
+}
+
+/// A bare brace of 33 words is not read. The line is allow and the
+/// label names the cap. Thirty-two words, a quoted brace, and an
+/// argv word are the command as written.
+#[test]
+fn a_wide_bare_brace_is_allowed_with_a_label() {
+    assert_eq!(
+        v(&["bash", "-c", "echo {1..33}"]),
+        allow_annotation("brace-cap")
+    );
+    assert_eq!(v(&["bash", "-c", "echo {1..32}"]), "allow");
+    assert_eq!(v(&["bash", "-c", "echo '{1..40}'"]), "allow");
+    assert_eq!(v(&["echo", "{1..40}"]), "allow");
+}
+
 /// A few hundred paths, and a few thousand, are an ordinary command.
 /// The brace cap is how wide one expansion may grow, not how many
 /// words the line already has.
