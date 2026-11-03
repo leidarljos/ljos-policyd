@@ -25,10 +25,12 @@ jobs:
       # copy of it. cogapp 3.6.0 is the release this check was written
       # against, so a later cog does not change what counts as a match.
       - run: python -m pip install -q cogapp==3.6.0
+      # grep, not rg: the runner image has no rg. The flags skip what rg
+      # skips in a checkout: hidden paths and binary files.
       - name: Version copies
         run: |
           set -eu
-          mapfile -t files < <(rg -l '\[\[\[cog')
+          mapfile -t files < <(grep -rlI --exclude='.*' --exclude-dir='.*' '\[\[\[cog')
           test "${#files[@]}" -gt 0
           cog --check --diff "${files[@]}"
       # Draft only: the notes are printed and CHANGELOG.md is not written.

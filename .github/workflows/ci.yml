@@ -21,12 +21,12 @@ jobs:
     # The ubuntu test job allows 20 minutes for this suite plus fmt and
     # clippy. This job is cargo test only, so the same bound holds.
     timeout-minutes: 20
-    env:
+    steps:
       # A prefix with no libphronesis.a. build.rs then does not ask
       # pkg-config, so the job stays the host table even if the runner
-      # image later ships phronesis.
-      PHRONESIS_DIR: ${{ runner.temp }}/no-phronesis
-    steps:
+      # image later ships phronesis. Job env cannot read the runner
+      # context, so a step sets it.
+      - run: echo "PHRONESIS_DIR=$RUNNER_TEMP/no-phronesis" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.99.1
       - name: The binary reports the host table
