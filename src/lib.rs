@@ -239,10 +239,14 @@ fn check_with_logged(argv: &[String], ctx: &open::Context, log: bool) -> Checked
         let wrote = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             log_deny(&logged, checked.token.as_ref())
         }));
-        match wrote {
-            Err(_) => return open::allow_checked("fail-open", "log_deny"),
-            Ok(Err(_)) => return open::allow_checked("fail-open", "io"),
-            Ok(Ok(())) => {}
+        let failed = match wrote {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(_) => Some("internal error".to_string()),
+        };
+        if let Some(why) = failed {
+            let path = deny_log_path().unwrap_or_default();
+            eprintln!("deny log not written: {}: {why}", path.display());
         }
     }
     checked

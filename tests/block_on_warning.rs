@@ -210,6 +210,24 @@ fn a_plain_command_stays_allow_when_the_setting_is_on() {
 }
 
 #[test]
+fn an_unwritable_deny_log_does_not_hide_the_warning_from_the_setting() {
+    let path = config("log", "block-on-warning true\n");
+    let mut cmd = check(None, &["rm", "-rf", "/srv/x"]);
+    cmd.env("LJOS_POLICYD_DENY_LOG", "/dev/null/deny.log");
+    let (code, warned, _) = run(cmd);
+    assert_eq!(code, Some(0), "{warned}");
+    let hit = warned.strip_prefix("allow\twarn\t").expect(&warned);
+    let mut cmd = check(Some(&path), &["rm", "-rf", "/srv/x"]);
+    cmd.env("LJOS_POLICYD_DENY_LOG", "/dev/null/deny.log");
+    let (code, denied, _) = run(cmd);
+    assert_eq!(
+        (code, denied.as_str()),
+        (Some(2), format!("deny\t{hit}").as_str())
+    );
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
 fn a_fail_open_stays_allow_when_the_setting_is_on() {
     let path = config("gone", "block-on-warning true\n");
     assert_eq!(run(check(Some(&path), &["sudo", "id"])).0, Some(2));
@@ -315,15 +333,5 @@ fn the_setting_still_allows_on_a_missing_daemon() {
     cmd.env("LJOS_POLICYD_DAEMON", closed.to_string());
     let (code, line, _) = run(cmd);
     assert_eq!((code, line.as_str()), (Some(0), "allow\n"));
-    let _ = std::fs::remove_dir_all(path.parent().unwrap());
-}
-
-#[test]
-fn the_setting_still_allows_when_the_deny_log_cannot_be_written() {
-    let path = config("error", "block-on-warning true\n");
-    let mut cmd = check(Some(&path), &["rm", "-rf", "/srv/x"]);
-    cmd.env("LJOS_POLICYD_DENY_LOG", "/dev/null/deny.log");
-    let (code, line, _) = run(cmd);
-    assert_eq!((code, line.as_str()), (Some(0), "allow\tfail-open\tio\n"));
     let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
