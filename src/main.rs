@@ -46,15 +46,29 @@ fn allow_open(reason: &str) -> i32 {
 }
 
 /// `LJOS_POLICYD_FAULT` is read only while this binary is built for its
-/// own tests. The release binary does not read it.
+/// own tests. The release binary does not read it. A debug build also
+/// reads the site when `LJOS_POLICYD_FAULT_INJECT` is `1`, so the exec
+/// suite can panic one site and watch the process.
 fn entry_fault(site: &str) {
-    #[cfg(test)]
-    if std::env::var("LJOS_POLICYD_FAULT").ok().as_deref() == Some(site) {
+    if fault_site_armed(site) {
         panic!("fault {site}");
     }
-    #[cfg(not(test))]
+}
+
+fn fault_site_armed(site: &str) -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("LJOS_POLICYD_FAULT").ok().as_deref() == Some(site)
+    }
+    #[cfg(all(not(test), debug_assertions))]
+    {
+        std::env::var("LJOS_POLICYD_FAULT_INJECT").as_deref() == Ok("1")
+            && std::env::var("LJOS_POLICYD_FAULT").ok().as_deref() == Some(site)
+    }
+    #[cfg(not(any(test, debug_assertions)))]
     {
         let _ = site;
+        false
     }
 }
 
@@ -103,37 +117,7 @@ fn run() -> i32 {
             }
             return 0;
         }
-        "exec" => {
-            let (rules, config, argv) =
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| user_allows(&args)))
-                {
-                    Ok(parsed) => parsed,
-                    Err(_) => return allow_open("user_allows"),
-                };
-            let mut ctx = ljos_policyd::Context::from_env();
-            ctx.user_allow.extend(rules);
-            // The file is read only for the setting. A missing file stays a
-            // warning, and the command still runs. `check` fail-opens that case.
-            let v = ljos_policyd::verdict_with(&argv, &ctx);
-            if v.starts_with("allow\twarn\t") {
-                eprintln!("{v}");
-                if config.as_deref().is_some_and(blocks_on_warning) {
-                    eprintln!("exec: not run because block-on-warning is on");
-                    return DENIED;
-                }
-            }
-            if argv.is_empty() {
-                process::exit(0);
-            }
-            let status = Command::new(&argv[0])
-                .args(&argv[1..])
-                .status()
-                .unwrap_or_else(|e| {
-                    eprintln!("exec: {e}");
-                    process::exit(127);
-                });
-            process::exit(status.code().unwrap_or(127));
-        }
+        "exec" => return exec_verb(&args),
         "check-mail" => {
             let Some(mail) = mail_args(&args) else {
                 usage();
@@ -240,6 +224,47 @@ fn run() -> i32 {
     0
 }
 
+/// Run ARGV. A panic while reading policyd's own flags prints the
+/// fail-open line on stderr and still runs the argv after those flags.
+/// Stdout belongs to the command.
+fn exec_verb(args: &[String]) -> i32 {
+    let (rules, config, argv) =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| user_allows(args))) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                eprintln!("allow\tfail-open\tuser_allows");
+                let (_, _, argv) = leading_flags(args);
+                return run_command(&argv);
+            }
+        };
+    let mut ctx = ljos_policyd::Context::from_env();
+    ctx.user_allow.extend(rules);
+    // The file is read only for the setting. A missing file stays a
+    // warning, and the command still runs. `check` fail-opens that case.
+    let v = ljos_policyd::verdict_with(&argv, &ctx);
+    if v.starts_with("allow\twarn\t") {
+        eprintln!("{v}");
+        if config.as_deref().is_some_and(blocks_on_warning) {
+            eprintln!("exec: not run because block-on-warning is on");
+            return DENIED;
+        }
+    }
+    run_command(&argv)
+}
+
+fn run_command(argv: &[String]) -> i32 {
+    if argv.is_empty() {
+        return 0;
+    }
+    match Command::new(&argv[0]).args(&argv[1..]).status() {
+        Ok(status) => status.code().unwrap_or(127),
+        Err(e) => {
+            eprintln!("exec: {e}");
+            127
+        }
+    }
+}
+
 /// `--user-allow PATTERN` and `--config PATH` are policyd's own flags,
 /// and only when they lead the command. A `--` ends those flags. Nothing
 /// after it, and no `--` inside the command, is read as a policyd flag.
@@ -248,6 +273,10 @@ fn run() -> i32 {
 fn user_allows(args: &[String]) -> (Vec<String>, Option<String>, Vec<String>) {
     entry_fault("user_allows");
     ljos_policyd::fault("user_allows");
+    leading_flags(args)
+}
+
+fn leading_flags(args: &[String]) -> (Vec<String>, Option<String>, Vec<String>) {
     let mut rules = Vec::new();
     let mut config = None;
     let mut i = 0;
