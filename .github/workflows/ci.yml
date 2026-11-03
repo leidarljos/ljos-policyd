@@ -31,4 +31,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.1
       - name: The binary reports the host table
         run: cargo run --locked --quiet -- version | tee /dev/stderr | grep -q '(host table)'
-      - run: cargo test --locked
+      - name: Tests do not write the developer deny log
+        run: scripts/check-deny-log-stays-out.sh

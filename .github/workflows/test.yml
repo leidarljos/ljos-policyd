@@ -50,7 +50,8 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - name: Tests do not write the developer deny log
+        run: scripts/check-deny-log-stays-out.sh
 
   phronesis:
     name: test with phronesis linked
@@ -84,7 +85,8 @@ jobs:
           meson install -C build
           echo "PHRONESIS_DIR=$RUNNER_TEMP/phronesis-prefix" >> "$GITHUB_ENV"
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - name: Tests do not write the developer deny log
+        run: scripts/check-deny-log-stays-out.sh
         env:
           PHRONESIS_STATE_DIR: ${{ runner.temp }}/policyd-state
       - name: Static link, phronesis backend
