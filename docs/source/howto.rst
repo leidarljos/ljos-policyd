@@ -14,6 +14,25 @@ not required; argv after ``--`` is the line.
 The answer is allow, with the rule and one warning. Exit status is 0.
 The hook can show the warning. It does not block the tool call.
 
+Make a warning block
+====================
+
+.. code:: console
+
+   $ echo 'block-on-warning true' > policyd.conf
+   $ ljos-policyd check --config policyd.conf -- git push --force origin main
+   deny    git-force-push  a force push rewrites a published branch
+   $ echo $?
+   2
+
+This is off unless you turn it on. With the line
+``block-on-warning true`` in the file ``--config`` names, a line that
+would warn prints ``deny`` with the same rule and warning, and ``check``
+exits 2. Without that line, a warning stays allow.
+A check that fails open is still allow with the setting on: an
+error, a missing config file, and a daemon that is missing or does
+not answer.
+
 Run only if allowed
 ===================
 

@@ -18,7 +18,7 @@ reads one RFC 5322 message on stdin. See "Outbound mail" below.
 
 | Verb | Meaning |
 |---+---|
-| =check= | print one =allow= line; exit 0 |
+| =check= | print one =allow= line; exit 0. With =block-on-warning true= in the =--config= file, a line that would warn prints =deny<TAB>rule<TAB>warning=; exit 2 |
 | =capnp= | write a packed Cap'n =PolicyDecision= with decision allow; exit 0 |
 | =exec= | print a warning on stderr when a rule matches, then run argv. The exit status is the program's |
 | =check-mail= | JSON =verdict= =allow=; =reasons= carry the rule; exit 0. A missing =--config= exits 2 |
@@ -347,7 +347,7 @@ These are not read by this binary. They are how =ljos= finds it.
 | Code | Meaning |
 |---+---|
 | 0 | a check, capnp, check-mail, version, or =exec= of a process that exited 0 |
-| 2 | check-mail without =--config=, or replay with no log or an unreadable log |
+| 2 | a =check= that printed =deny=, check-mail without =--config=, or replay with no log or an unreadable log |
 | 127 | =exec= could not spawn the program |
 | other | =exec= of a process that exited with that code |
 

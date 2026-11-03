@@ -74,6 +74,12 @@ fn run() -> i32 {
             }
             probe_configured_daemon();
             let v = ljos_policyd::verdict_with(&argv, &ctx);
+            if let Some(hit) = v.strip_prefix("allow\twarn\t") {
+                if ctx.config_path.as_deref().is_some_and(blocks_on_warning) {
+                    println!("deny\t{hit}");
+                    return DENIED;
+                }
+            }
             println!("{v}");
             return 0;
         }
@@ -216,6 +222,27 @@ fn user_allows(args: &[String]) -> (Vec<String>, Option<String>, Vec<String>) {
         return (rules, config, args[i..].to_vec());
     }
     (rules, config, Vec::new())
+}
+
+/// The exit status of a `deny` line. Claude Code blocks a tool call
+/// whose hook exits 2.
+const DENIED: i32 = 2;
+
+/// A `block-on-warning true` line in the `--config` file. The last such
+/// line wins. A file that cannot be read, another value, or no line
+/// leaves every warning an allow.
+fn blocks_on_warning(path: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    text.lines()
+        .rev()
+        .find_map(|line| {
+            let mut words = line.split_whitespace();
+            (words.next() == Some("block-on-warning"))
+                .then(|| words.next() == Some("true") && words.next().is_none())
+        })
+        .unwrap_or(false)
 }
 
 /// `LJOS_POLICYD_DAEMON=host:port` is optional. Nothing is read from the

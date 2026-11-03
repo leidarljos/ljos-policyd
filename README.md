@@ -167,7 +167,7 @@ ljos-policyd 0.7.0 (host table)
 
 | Verb | Does | Exit |
 |---|---|---|
-| `check -- ARGV` | prints one verdict line, see below | 0 |
+| `check -- ARGV` | prints one verdict line, see below | 0, or 2 for a `deny` line |
 | `exec -- ARGV` | prints a warning on stderr when a rule matches, then runs ARGV | ARGV's status |
 | `capnp -- ARGV` | writes a packed Cap'n Proto `PolicyDecision` with decision allow | 0 |
 | `check-mail --config PATH [--argv [--] RECIPIENT...]` | reads one RFC 5322 message on stdin and prints JSON. The verdict is `allow`. `reasons` carry the rule and the warning | 0. A missing `--config` is usage and exits 2 |
@@ -184,6 +184,9 @@ ljos-policyd 0.7.0 (host table)
 | `allow`<TAB>`rewrite`<TAB>`new line` | the command may run, and the hook should run `new line` instead |
 | `allow`<TAB>`consent`<TAB>`rule` | a consent record matched |
 | `allow`<TAB>`user-rule`<TAB>`pattern` | a user allow matched |
+| `deny`<TAB>`rule`<TAB>`warning` | a rule matched and block-on-warning is on. The command should not run |
+
+A warning blocks only when you ask for it. Put the line `block-on-warning true` in the file `check --config PATH` names. A line that would warn then prints `deny` with the same rule and warning, and `check` exits 2. It is off by default: without that line, a warning stays allow. A check that fails open is still allow with the setting on: an error, a missing config file, and a daemon that is missing or does not answer. `exec`, `capnp` and `check-mail` do not read it.
 
 `python x.py` and `python3 x.py` rewrite to `uv run x.py`, arguments included, when the working directory or a parent has `pyproject.toml` or `uv.lock`, or the script file has a PEP 723 `# /// script` block. Otherwise the line stays as written. `python -c` stays as written: `uv run` does not take `-c`. When that tree asks for uv, `python -m` becomes `uv run -m`.
 

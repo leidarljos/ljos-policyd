@@ -6,15 +6,15 @@ Command line
 ``ljos-policyd check-mail --config PATH [--argv [--] RECIPIENT...]``
 reads one RFC 5322 message on stdin. See "Outbound mail" below.
 
-============== ==============================================================================================================
+============== =================================================================================================================================================================================================
 Verb           Meaning
-============== ==============================================================================================================
-``check``      print ``allow``, or ``allow<TAB>warn<TAB>rule<TAB>warning``; exit 0
+============== =================================================================================================================================================================================================
+``check``      print ``allow``, or ``allow<TAB>warn<TAB>rule<TAB>warning``; exit 0. With ``block-on-warning true`` in the ``--config`` file, a line that would warn prints ``deny<TAB>rule<TAB>warning``; exit 2
 ``capnp``      write a packed Cap'n ``PolicyDecision`` with decision allow; exit 0
 ``exec``       same text verdict; print a warning on stderr and run argv
 ``check-mail`` JSON ``verdict`` ``allow``; ``reasons`` carry the rule and the warning; exit 0. A missing ``--config`` exits 2
 ``version``    print ``ljos-policyd <semver> (phronesis)`` or ``ljos-policyd <semver> (host table)``
-============== ==============================================================================================================
+============== =================================================================================================================================================================================================
 
 A leading ``--`` after the verb is optional and is stripped.
 
@@ -421,14 +421,14 @@ Variable             Meaning
 Exit statuses
 =============
 
-===== ===========================================================================
+===== ==============================================================================================================
 Code  Meaning
-===== ===========================================================================
+===== ==============================================================================================================
 0     a check, capnp, check-mail, version, or ``exec`` of a process that exited 0
-2     check-mail without ``--config``, or replay with no log or an unreadable log
+2     a ``check`` that printed ``deny``, check-mail without ``--config``, or replay with no log or an unreadable log
 127   ``exec`` could not spawn the program
 other ``exec`` of a process that exited with that code
-===== ===========================================================================
+===== ==============================================================================================================
 
 What this crate is
 ==================

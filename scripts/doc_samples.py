@@ -118,6 +118,10 @@ WARN_FORCE = (
     "allow\twarn\tgit-force-push\t"
     "a force push rewrites a published branch\n"
 )
+DENY_FORCE = (
+    "deny\tgit-force-push\t"
+    "a force push rewrites a published branch\n"
+)
 WARN_CRED = (
     "allow\twarn\tcredential-mention\t"
     "a program names a credential path\n"
@@ -279,6 +283,21 @@ def howto_check(cog):
     _fence(cog, True)
     _run(cog, ["check", "--", "git", "push", "origin", "main"], ALLOW)
     _run(cog, ["check", "--", "git", "push", "--force", "origin", "main"], WARN_FORCE, code=0)
+    _end(cog, True)
+
+
+def howto_block(cog):
+    root = Path(tempfile.mkdtemp())
+    (root / "policyd.conf").write_text("block-on-warning true\n")
+    _fence(cog, True)
+    cog.outl("$ echo 'block-on-warning true' > policyd.conf")
+    _run(
+        cog,
+        ["check", "--config", "policyd.conf", "--", "git", "push", "--force", "origin", "main"],
+        DENY_FORCE,
+        code=2,
+        cwd=root,
+    )
     _end(cog, True)
 
 
