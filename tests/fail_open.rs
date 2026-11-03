@@ -149,7 +149,7 @@ fn config_inside_the_command_is_not_a_policyd_flag() {
 }
 
 #[test]
-fn the_binary_allows_on_parse_a_missing_rules_file_and_io() {
+fn the_binary_allows_on_parse_a_missing_rules_file() {
     let (code, stdout, _) = run(&["check", "--", "bash", "-c", "rm -rf '/srv"], None);
     assert_eq!(code, 0, "{stdout}");
     assert_eq!(stdout, "allow\tfail-open\tparse failure");
@@ -185,6 +185,36 @@ fn an_unwritable_deny_log_keeps_the_warning() {
         stderr.starts_with("deny log not written: /dev/null/deny.log: "),
         "{stderr}"
     );
+}
+
+#[test]
+fn a_missing_deny_log_path_is_named_in_the_error_line() {
+    for (name, deny_log) in [("unset", None), ("empty", Some(""))] {
+        let mut cmd = Command::new(bin());
+        cmd.env_remove("HOME");
+        cmd.env_remove("XDG_STATE_HOME");
+        match deny_log {
+            Some(value) => {
+                cmd.env("LJOS_POLICYD_DENY_LOG", value);
+            }
+            None => {
+                cmd.env_remove("LJOS_POLICYD_DENY_LOG");
+            }
+        }
+        cmd.args(["check", "--", "rm", "-rf", "/srv/x"]);
+        let out = cmd.output().expect("run policyd");
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        assert_eq!(out.status.code(), Some(0), "{name} {stdout} {stderr}");
+        assert!(
+            stdout.starts_with("allow\twarn\trm-rf-outside-tmp"),
+            "{name} {stdout}"
+        );
+        assert_eq!(
+            stderr, "deny log not written: <no path>: no log path is set",
+            "{name}"
+        );
+    }
 }
 
 #[test]

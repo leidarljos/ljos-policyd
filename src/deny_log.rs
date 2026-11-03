@@ -61,8 +61,11 @@ pub fn replay_argv(line: &str) -> Vec<String> {
 
 pub(crate) fn log_deny(argv: &[String], token: &str) -> std::io::Result<()> {
     open::fault("log_deny");
-    let Some(path) = deny_log_path() else {
-        return Ok(());
+    // A missing path and an empty one are not places a deny can be
+    // appended. Returning success hid that, and opening "" printed a
+    // blank path. The error is the words the standard error line shows.
+    let Some(path) = deny_log_path().filter(|p| !p.as_os_str().is_empty()) else {
+        return Err(std::io::Error::other("no log path is set"));
     };
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
