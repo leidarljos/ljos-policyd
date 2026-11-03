@@ -1,11 +1,13 @@
 #!/bin/sh
 # Run the suite with a fresh XDG_STATE_HOME and fail if that directory
 # or the home state directory gained a deny log. HOME stays the real
-# home. A fresh HOME left XDG_CONFIG_HOME set, so process_xdg watched
-# that config directory while the tests wrote under the new home.
-# Any fresh HOME must also set or unset XDG_CONFIG_HOME and
-# XDG_DATA_HOME. The files are checked after cargo exits, so the
-# assertion sits outside the test process.
+# home. The test moved HOME while XDG_CONFIG_HOME stayed set, so
+# process_xdg watched a different config dir. The failing row is
+# ~/.config/ljos, not $ENV{HOME}/.secrets, and the plain test job
+# failed too, not only the phronesis build. Any fresh HOME must also
+# set or unset XDG_CONFIG_HOME and XDG_DATA_HOME. The files are
+# checked after cargo exits, so the assertion sits outside the
+# test process.
 set -eu
 xdg=$(mktemp -d)
 home_log="${HOME}/.local/state/ljos-policyd/deny.log"
