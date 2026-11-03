@@ -53,15 +53,29 @@ fn allow_open(reason: &str) -> i32 {
 }
 
 /// `LJOS_POLICYD_FAULT` is read only while this binary is built for its
-/// own tests. The release binary does not read it.
+/// own tests. The release binary does not read it. A debug build also
+/// reads the site when `LJOS_POLICYD_FAULT_INJECT` is `1`, so the exec
+/// suite can panic one site and watch the process.
 fn entry_fault(site: &str) {
-    #[cfg(test)]
-    if std::env::var("LJOS_POLICYD_FAULT").ok().as_deref() == Some(site) {
+    if fault_site_armed(site) {
         panic!("fault {site}");
     }
-    #[cfg(not(test))]
+}
+
+fn fault_site_armed(site: &str) -> bool {
+    #[cfg(test)]
+    {
+        std::env::var("LJOS_POLICYD_FAULT").ok().as_deref() == Some(site)
+    }
+    #[cfg(all(not(test), debug_assertions))]
+    {
+        std::env::var("LJOS_POLICYD_FAULT_INJECT").as_deref() == Ok("1")
+            && std::env::var("LJOS_POLICYD_FAULT").ok().as_deref() == Some(site)
+    }
+    #[cfg(not(any(test, debug_assertions)))]
     {
         let _ = site;
+        false
     }
 }
 

@@ -178,6 +178,47 @@ fn exec_does_not_run_when_block_on_warning_is_on() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A panic while reading policyd's own flags prints the fail-open line
+/// on stderr and runs the argv after those flags. The debug binary
+/// panics at that site when both fault variables are set.
+#[test]
+fn exec_runs_when_user_allows_panics() {
+    let dir = scratch("fault");
+    let marker = dir.join("ran.txt");
+    let exec = Command::new(bin())
+        .env("LJOS_POLICYD_FAULT_INJECT", "1")
+        .env("LJOS_POLICYD_FAULT", "user_allows")
+        .args([
+            "exec",
+            "--user-allow",
+            "rm -rf /srv/x",
+            "--",
+            "sh",
+            "-c",
+            "echo ran > \"$1\"; exit 3",
+            "sh",
+            marker.to_str().expect("marker path"),
+        ])
+        .output()
+        .expect("run policyd");
+    let stdout = String::from_utf8_lossy(&exec.stdout);
+    let stderr = String::from_utf8_lossy(&exec.stderr);
+    assert_eq!(
+        exec.status.code(),
+        Some(3),
+        "stdout {stdout} stderr {stderr}"
+    );
+    assert_eq!(stdout, "", "{stdout}");
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == "allow\tfail-open\tuser_allows"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&marker).expect("marker"), "ran\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn assert_stash_empty(dir: &Path) {
     let after = git(dir, &["stash", "list"]);
     let cleared = String::from_utf8_lossy(&after.stdout);
