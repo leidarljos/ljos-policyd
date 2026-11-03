@@ -18,6 +18,19 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Draft only: the notes are printed and CHANGELOG.md is not written.
+      # towncrier 26.9.0 fails this when a fragment name is not a configured
+      # type, because towncrier.toml sets ignore. The version is the crate's;
+      # this tree is not a Python package towncrier can read.
+      - name: Changelog draft
+        run: |
+          set -eu
+          python -m pip install -q 'towncrier==26.9.0'
+          version=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')
+          python -m towncrier build --draft --version "$version"
       - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: rustfmt, clippy

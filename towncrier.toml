@@ -6,6 +6,10 @@ start_string = "<!-- towncrier release notes start -->\n"
 title_format = "## {version} ({project_date})"
 issue_format = "[#{issue}](https://github.com/leidarljos/ljos-policyd/pull/{issue})"
 underlines = ["", "", ""]
+# towncrier build fails a fragment whose name is not a configured type
+# only when ignore is set. Unset, that file is dropped and the draft
+# still succeeds. .gitkeep is ignored either way.
+ignore = []
 
 [[tool.towncrier.type]]
 directory = "feature"
