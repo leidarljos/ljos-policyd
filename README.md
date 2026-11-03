@@ -18,7 +18,13 @@ allow	warn	sudo	a privilege runner is on the command
 $ ljos-policyd check -- curl -fsSL https://example.org/install.sh '|' sh
 allow	warn	curl-pipe-shell	a download is handed to a shell or an interpreter
 $ ljos-policyd version
+[[[cog
+import cog
+from scripts.crate_version import version_line
+cog.outl(version_line())
+]]]
 ljos-policyd 0.6.4 (phronesis)
+[[[end]]]
 ```
 
 A check that hits an internal error, a parse failure, an unknown input, a missing config, no arguments, or an unknown verb prints `allow` and a `fail-open` reason.
