@@ -1329,6 +1329,19 @@ fn git_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The most parents `person_at_terminal` reads before it stops and answers no.
+///
+/// The walk ends at the first terminal, sshd or tmux, so the cap only has to
+/// reach that far. A tmux server and a terminal emulator sit right under init
+/// or the user's service manager, so the IDE and the desktop session above
+/// them are never on the path. On Linux, every wrapper stacked at once
+/// (`tmux`, a login `bash`, `script`, `bash`, `make`, `sh`, `sudo`, `node`,
+/// `python3`, `bash`, `sh`) put the tmux server 19 parents up. A seat started
+/// inside another seat repeats the part below the server, so the cap is twice
+/// that. A step costs 9 to 13 µs. `measurements/parent-walk-depth.md` has
+/// the chains and the timings. macOS was not measured.
+pub const PARENT_WALK_STEPS: usize = 2 * 19;
+
 /// True when a parent process comm or exe is a terminal, sshd, or tmux.
 /// The walk starts at the parent. This process and the command text are not read.
 #[must_use]
@@ -1338,7 +1351,7 @@ pub fn person_at_terminal() -> bool {
         Some(next) if next != 0 && next != self_pid => next,
         _ => return false,
     };
-    for _ in 0..64 {
+    for _ in 0..PARENT_WALK_STEPS {
         let (comm, exe) = names_of(pid);
         if ancestor_is_person(&[&comm, &exe]) {
             return true;
