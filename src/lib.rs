@@ -47,10 +47,7 @@ pub use client::{probe_daemon, CONNECT_TIMEOUT};
 
 pub use deny_log::{deny_log_path, replay_argv, set_thread_deny_log};
 
-pub use open::{
-    allow_annotation, default_consent_path, fault, judge_bytes, missing_tool, Context,
-    PARENT_WALK_STEPS,
-};
+pub use open::{allow_annotation, default_consent_path, fault, judge_bytes, missing_tool, Context};
 
 pub use seat::{code_name, token_for};
 

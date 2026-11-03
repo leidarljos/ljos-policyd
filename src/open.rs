@@ -1329,24 +1329,15 @@ fn git_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// What a walk that finds no terminal may add to one check.
-/// The slowest check in the release build already moves by up to 1.2 ms between runs (`measurements/check-latency.md`).
-/// A walk inside that budget adds no more than a check varies by on its own.
-const PARENT_WALK_BUDGET_NS: usize = 1_200_000;
-
-/// What reading one parent costs on Linux, rounded up to a whole µs so the cap stays inside the budget.
-/// The median and interquartile range of the runs are in `measurements/parent-walk-depth.md`.
-/// macOS was not measured.
-const PARENT_WALK_STEP_NS: usize = 9_000;
-
-/// The most parents `person_at_terminal` reads.
-/// The walk stops sooner at init, at a missing parent, or at a pid it already read.
-/// Seats can nest to any depth in ljos, so the cap comes from time.
-/// Past it the verdict is unchanged; only `ancestry=person` is missing.
-pub const PARENT_WALK_STEPS: usize = PARENT_WALK_BUDGET_NS / PARENT_WALK_STEP_NS;
-
 /// True when a parent process comm or exe is a terminal, sshd, or tmux.
-/// The walk starts at the parent. This process and the command text are not read.
+/// The walk starts at the parent.
+/// This process and the command text are not read.
+///
+/// The walk has no step cap.
+/// It stops at init, at a parent it cannot read, or at a pid it read before.
+/// Each step reads a pid that was alive when read and that the walk has not read.
+/// So a walk reads at most as many parents as there are pids, and it always ends.
+/// What a step costs is in `measurements/parent-walk-depth.md`.
 #[must_use]
 pub fn person_at_terminal() -> bool {
     let self_pid = std::process::id();
@@ -1355,10 +1346,7 @@ pub fn person_at_terminal() -> bool {
         _ => return false,
     };
     let mut seen = HashSet::new();
-    for _ in 0..PARENT_WALK_STEPS {
-        if !seen.insert(pid) {
-            break;
-        }
+    while seen.insert(pid) {
         let (comm, exe) = names_of(pid);
         if ancestor_is_person(&[&comm, &exe]) {
             return true;

@@ -44,10 +44,10 @@ A parent whose comm or exe is a terminal, sshd, or tmux is ancestry.
 The reason names it.
 The verdict does not change.
 The command text is not that check.
-The walk reads up to 133 parents, which is a 1.2 ms budget divided by the cost of one step on Linux.
-Past that the verdict is unchanged and only `ancestry=person` is missing.
+The walk reads every parent up to init and has no step cap.
+A parent it cannot read also ends the walk, and so does a pid it has already read.
 macOS chains and step cost were not measured.
-`measurements/parent-walk-depth.md` has the runs.
+`measurements/parent-walk-depth.md` has what one step costs on Linux.
 
 ## Threat model
 
