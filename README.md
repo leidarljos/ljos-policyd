@@ -161,7 +161,7 @@ without the library reports `host table`, and the doctor warns about it.
 | `allow`<TAB>`consent`<TAB>`rule` | a consent record matched |
 | `allow`<TAB>`user-rule`<TAB>`pattern` | a user allow matched |
 
-`python x.py` and `python3 x.py` rewrite to `uv run x.py`, arguments included, when the working directory or a parent has `pyproject.toml` or `uv.lock`, or the script file has a PEP 723 `# /// script` block. Otherwise the line stays as written. `python -c` and `python -m` stay as written: `uv run` does not take `-c`.
+`python x.py` and `python3 x.py` rewrite to `uv run x.py`, arguments included, when the working directory or a parent has `pyproject.toml` or `uv.lock`, or the script file has a PEP 723 `# /// script` block. Otherwise the line stays as written. `python -c` stays as written: `uv run` does not take `-c`. When that tree asks for uv, `python -m` becomes `uv run -m`.
 
 With phronesis linked and its seat pack loaded, bare `python x.py` is `python-requires-uv-run`. That hit is answered with the same rewrite, project file or not, since the pack's law is the reason to run through uv. The hook judges the rewritten line again, so a script with no PEP 723 block still meets `python-missing-pep723` there. `python -c` under that pack is allow with that rule and a warning.
 

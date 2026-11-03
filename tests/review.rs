@@ -493,6 +493,9 @@ fn rewrite_only_when_python_is_the_command() {
 
 #[test]
 fn a_mention_of_an_example_file_is_not_a_credential() {
+    // Another test may be inside a project. `python -c` is noted there,
+    // and the directory is process-wide.
+    let _guard = cwd_lock().lock().unwrap();
     assert_eq!(line(&["python", "-c", "print('.env.example')"]), "allow");
     assert_eq!(
         line(&["python", "-c", "print('.secrets.example')"]),
@@ -557,6 +560,9 @@ fn shell_positionals_are_bound_before_the_script() {
 
 #[test]
 fn sponge_writes_a_hook_and_a_mention_does_not() {
+    // Another test may be inside a project. `python -c` is noted there,
+    // and the directory is process-wide.
+    let _guard = cwd_lock().lock().unwrap();
     let home = std::env::var("HOME").unwrap_or_else(|_| "/home/ubuntu".into());
     let hooks = format!("{home}/.cursor/hooks.json");
     assert!(
