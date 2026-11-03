@@ -38,8 +38,7 @@ as ``git-branch-delete``, and so does every other rule that used to deny.
 command. ``capnp`` and ``check-mail`` do not read the line.
 Without that line, a warning stays allow.
 A check that fails open is still allow with the setting on: an
-error, a missing config file, and a daemon that is missing or does
-not answer.
+error, or a missing config file. ``LJOS_POLICYD_DAEMON`` is not read.
 
 Run the program
 ===============
