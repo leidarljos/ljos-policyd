@@ -1,5 +1,5 @@
 //! A hit that used to stop the command is allow, with the rule and one warning.
-//! A daemon that never accepts does not hold the answer past the connect timeout.
+//! `LJOS_POLICYD_DAEMON` is not read, so a set address does not hold the answer.
 
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -64,8 +64,12 @@ fn a_check_under_tmux_names_a_person() {
 
 #[test]
 fn a_missing_daemon_is_not_waited_out() {
-    // 192.0.2.1 is TEST-NET-1 (RFC 5737). A 400 ms socket timeout returned
-    // at 400 ms on this host, so this connect is the timeout, not a miss.
+    // 192.0.2.1 is TEST-NET-1 (RFC 5737) and does not answer. The old
+    // connect waited 300 ms there: a 400 ms socket timeout returned at
+    // 400 ms on the host that set that limit, and a return under 200 ms
+    // was too fast to be that wait. Policyd does not read the variable,
+    // so this check is the table. The bound stays 100 ms under the old
+    // 300 ms, and a connect that still waited that timeout cannot pass.
     let started = Instant::now();
     let out = Command::new(bin())
         .args(["check", "--", "true"])
@@ -76,13 +80,9 @@ fn a_missing_daemon_is_not_waited_out() {
     assert!(out.status.success(), "{out:?}");
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert_eq!(stdout.trim(), "allow");
-    assert!(
-        elapsed >= Duration::from_millis(200),
-        "the connect did not run: {elapsed:?}"
-    );
-    let cap = ljos_policyd::CONNECT_TIMEOUT + Duration::from_millis(400);
+    let cap = Duration::from_millis(200);
     assert!(
         elapsed < cap,
-        "waited {elapsed:?}, longer than the connect timeout plus startup ({cap:?})"
+        "waited {elapsed:?}; a table check finishes under {cap:?}"
     );
 }

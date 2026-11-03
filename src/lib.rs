@@ -14,7 +14,6 @@ pub mod util_capnp;
 pub mod policy_capnp;
 
 mod ask;
-mod client;
 mod credential;
 mod delete;
 mod deny_log;
@@ -42,8 +41,6 @@ mod table;
 mod words;
 mod wrappers;
 mod writes;
-
-pub use client::{probe_daemon, CONNECT_TIMEOUT};
 
 pub use deny_log::{deny_log_path, replay_argv, set_thread_deny_log};
 

@@ -28,7 +28,7 @@ allow	warn	curl-pipe-shell	a download is handed to a shell or an interpreter
 
 A check that hits an internal error, a parse failure, an unknown input, a missing config, no arguments, or an unknown verb prints `allow` and a `fail-open` reason.
 It does not stop the command on that failure.
-When `LJOS_POLICYD_DAEMON` is `host:port` and nothing accepts, the connect returns inside the connect timeout and this table's line is the answer. The pack in this process is not cut off at that timeout: the caller waits for its answer.
+`LJOS_POLICYD_DAEMON` is not read. The table in this process is the answer. The pack in this process is not cut off: the caller waits for its answer.
 
 Every hit is `allow`, then `warn`, the rule name, and one warning a caller can show. `check` exits 0.
 The table below is the match list. A setuid mode, a recursive `chmod` or `chown`, `git reflog expire`, and `find -fprint` are not rules.
