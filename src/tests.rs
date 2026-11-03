@@ -659,7 +659,7 @@ fn a_write_does_not_take_the_fast_path() {
     }
     let root = startup_root("fastwrite");
     std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
-    let at = |s: &str| check_shell_in(&shell_words(s), &root, 0);
+    let at = |s: &str| check_shell_in(&shell_words(s), &root);
     for s in [
         "echo 'git push -f origin' > ok.sh; source ok.sh",
         "printf 'git push -f origin\\n' > ok.sh; source ok.sh",
@@ -727,7 +727,7 @@ fn a_quoted_brace_is_not_expanded() {
     let at = |line: &str| {
         let argv = ["bash", "-c", line].map(String::from);
         start_line(&argv);
-        check_shell_in(&argv, &root, 0)
+        check_shell_in(&argv, &root)
     };
     let wide = "{a:1,b:2,c:3,d:4,e:5,f:6} + {g:1,h:2,i:3,j:4,k:5,l:6}";
     for line in [
@@ -1238,7 +1238,7 @@ fn assert_everyday_allowed(dir: &std::path::Path) {
         "./configure && make",
         "echo x > out.txt; cat out.txt",
     ] {
-        let c = check_shell_in(&shell_words(line), dir, 0);
+        let c = check_shell_in(&shell_words(line), dir);
         assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
     }
 }
@@ -1342,7 +1342,7 @@ fn a_script_copied_or_linked_earlier_is_refused() {
     let root = startup_root("copied");
     std::fs::create_dir_all(root.join("sub")).unwrap();
     std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
-    let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+    let at = |line: &str| check_shell_in(&shell_words(line), &root);
     for line in [
         "cp evil/force.sh ok.sh; source ok.sh",
         "cp evil/force.sh sub && source sub/force.sh",
@@ -1373,7 +1373,7 @@ fn a_script_copied_or_linked_earlier_is_refused() {
 fn a_script_edited_in_place_earlier_is_refused() {
     let root = startup_root("sedi");
     std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
-    let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+    let at = |line: &str| check_shell_in(&shell_words(line), &root);
     for line in [
         "sed -i 's/echo ok/git push -f/' ok.sh; . ok.sh",
         "sed -e 's/echo ok/git push -f/' -i.bak ok.sh; bash ok.sh",
@@ -1547,7 +1547,7 @@ fn a_delete_through_a_bind_mount_lands_on_the_host() {
 fn a_redirection_ampersand_to_a_file_writes_it() {
     let root = startup_root("dupwrite");
     std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
-    let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+    let at = |line: &str| check_shell_in(&shell_words(line), &root);
     for line in [
         "echo 'git push -f' >&x.sh; sh x.sh",
         "echo 'git push -f' >& ok.sh; source ok.sh",
@@ -1577,7 +1577,7 @@ fn dd_install_and_perl_in_place_write_their_files() {
     let root = startup_root("ddinstall");
     std::fs::create_dir_all(root.join("bin")).unwrap();
     std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
-    let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+    let at = |line: &str| check_shell_in(&shell_words(line), &root);
     for line in [
         "dd if=evil/force.sh of=ok.sh; sh ok.sh",
         "dd status=none of=ok.sh < evil/force.sh && source ok.sh",
@@ -1610,7 +1610,7 @@ fn a_copy_into_a_directory_writes_its_name_there() {
     std::fs::write(root.join("configure"), "echo configured\n").unwrap();
     std::fs::write(root.join("config.mk"), "CC = cc\n").unwrap();
     std::fs::write(root.join("bin/run.sh"), "echo ok\n").unwrap();
-    let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+    let at = |line: &str| check_shell_in(&shell_words(line), &root);
     for line in [
         "cp config.mk . && sh ./configure",
         "cp config.mk bin && sh bin/run.sh",
@@ -1647,7 +1647,7 @@ fn a_command_the_guard_does_not_know_may_write_any_script() {
         .expect("`true` on PATH");
     std::fs::copy(truth, root.join("target/debug/app")).unwrap();
     std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
-    let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+    let at = |line: &str| check_shell_in(&shell_words(line), &root);
     for line in [
         "rsync -a evil/ . ; sh ok.sh",
         "tar xf a.tar; sh ok.sh",
@@ -1689,7 +1689,7 @@ fn a_command_the_guard_does_not_know_may_write_any_script() {
 fn a_write_in_a_loop_substitution_or_enclosing_command_counts() {
     let root = startup_root("looporder");
     std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
-    let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+    let at = |line: &str| check_shell_in(&shell_words(line), &root);
     for line in [
         "for i in 1 2; do sh ok.sh; cp evil/force.sh ok.sh; done",
         "while true; do source ok.sh; cat evil/force.sh > ok.sh; done",
@@ -1722,7 +1722,7 @@ fn a_write_in_a_loop_substitution_or_enclosing_command_counts() {
 fn a_script_the_line_spells_out_is_judged_on_its_text() {
     let root = startup_root("spelled");
     std::fs::create_dir_all(root.join("build")).unwrap();
-    let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+    let at = |line: &str| check_shell_in(&shell_words(line), &root);
     for line in [
         "echo 'echo ok' > build/run.sh && sh build/run.sh",
         "printf 'echo %s\\n' ok > build/run.sh; bash build/run.sh",
@@ -1840,7 +1840,7 @@ fn a_printf_conversion_only_bash_reads_hides_nothing() {
         "printf 'print(1)\\n%n\\nimport os\\nos.system(\"rm -rf /\")\\n' > ljos-stdin.py && python3 ljos-stdin.py",
         "printf 'print(1)\\n%q\\nimport os\\nos.system(\"rm -rf /\")\\n' > ljos-stdin.py && python3 ljos-stdin.py",
     ] {
-        let c = check_shell_in(&shell_words(line), &root, 0);
+        let c = check_shell_in(&shell_words(line), &root);
         assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
     }
     for fmt in ["%Q", "%n", "%5Q"] {
@@ -1852,7 +1852,7 @@ fn a_printf_conversion_only_bash_reads_hides_nothing() {
 fn a_quoted_glob_or_newline_is_text() {
     let root = startup_root("quotedglob");
     std::fs::create_dir_all(root.join("build")).unwrap();
-    let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+    let at = |line: &str| check_shell_in(&shell_words(line), &root);
     for line in [
         "echo 'ls *.txt' > build/run.sh && sh build/run.sh",
         "echo \"ls [ab]?.txt\" > build/run.sh && sh build/run.sh",
@@ -1935,7 +1935,7 @@ fn pyopts17_refused(text: &str, root: &std::path::Path) -> Vec<usize> {
         .filter(|(_, (line, argvs))| {
             let mut refused = false;
             for argv in std::iter::once(shell_words(line)).chain(argvs.iter().cloned()) {
-                let c = check_shell_in(&argv, root, 0);
+                let c = check_shell_in(&argv, root);
                 assert_named_verdict(&c, &argv);
                 if c.decision != Decision::Allow {
                     refused = true;
@@ -2011,7 +2011,7 @@ fn python_lines_from_the_pyopts17_review() {
     let mut mentioned = 0;
     for (line, argvs) in &risky_set {
         for argv in std::iter::once(shell_words(line)).chain(argvs.iter().cloned()) {
-            let c = check_shell_in(&argv, &root, 0);
+            let c = check_shell_in(&argv, &root);
             assert_named_verdict(&c, &argv);
         }
         if !line.contains("id_rsa") {
@@ -2020,7 +2020,7 @@ fn python_lines_from_the_pyopts17_review() {
         mentioned += 1;
         if line.contains(".ssh") && line.contains("python3 -c") && line.contains("open") {
             let argv = shell_words(line);
-            let c = check_shell_in(&argv, &root, 0);
+            let c = check_shell_in(&argv, &root);
             assert_eq!(
                 printed_verdict(&c),
                 allow_annotation("credential-mention"),
@@ -2089,7 +2089,7 @@ fn policydpy2_allowed(text: &str, root: &std::path::Path) -> Vec<String> {
     let mut out = Vec::new();
     for (is_program, n, body) in policydpy2_set(text) {
         for (shape, argv) in policydpy2_shapes(&body, is_program).iter().enumerate() {
-            let c = check_shell_in(argv, root, 0);
+            let c = check_shell_in(argv, root);
             assert_named_verdict(&c, argv);
             if c.decision == Decision::Allow {
                 out.push(format!("{n}/{shape}"));
@@ -2155,7 +2155,7 @@ fn everyday_programs_and_lines_are_allowed() {
 fn an_rm_that_does_not_run_does_not_clear_the_file() {
     use std::os::unix::fs::PermissionsExt;
     let root = startup_root("rmclear");
-    let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+    let at = |line: &str| check_shell_in(&shell_words(line), &root);
     let write = |body: &str| {
         let p = root.join("s.sh");
         std::fs::write(&p, body).unwrap();
@@ -2192,7 +2192,7 @@ fn an_rm_that_does_not_run_does_not_clear_the_file() {
 fn a_quote_in_a_heredoc_does_not_hide_the_next_command() {
     let root = startup_root("heredocquote");
     std::fs::write(root.join("Makefile"), "all:\n\techo ok\n").unwrap();
-    let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+    let at = |line: &str| check_shell_in(&shell_words(line), &root);
     for line in [
         "cat <<EOF\necho 'unclosed\nEOF\ngit push -f origin\n",
         "cat <<'EOF'\necho 'unclosed\nEOF\ngit push -f origin\n",
@@ -2232,7 +2232,7 @@ fn a_bar_between_case_patterns_is_not_a_pipeline() {
     std::fs::create_dir_all(root.join("safe")).unwrap();
     std::fs::write(root.join("safe/Makefile"), "all:\n\techo ok\n").unwrap();
     std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
-    let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+    let at = |line: &str| check_shell_in(&shell_words(line), &root);
     for line in [
         "case $x in a | sh | b) echo ok;; esac",
         "case $x in ./ | .// | /usr/*) echo ok;; esac; make -C safe",
@@ -2268,7 +2268,7 @@ fn a_leading_redirection_is_not_the_command() {
     let root = startup_root("leadredir");
     std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
     std::fs::write(root.join("configure"), "#!/bin/sh\necho ok\n").unwrap();
-    let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+    let at = |line: &str| check_shell_in(&shell_words(line), &root);
     for line in [
         ">conftest.c echo ok; sh ./ok.sh",
         "2>/dev/null echo ok; sh ./configure",
@@ -2292,7 +2292,7 @@ fn a_leading_redirection_is_not_the_command() {
 fn a_glob_in_the_command_word_writes_nothing() {
     let root = startup_root("globcmd");
     std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
-    let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+    let at = |line: &str| check_shell_in(&shell_words(line), &root);
     for line in [
         "/usr/bin/foo*; sh ./ok.sh",
         "/usr/bin/foo?; sh ./ok.sh",
@@ -2313,7 +2313,7 @@ fn a_glob_in_the_command_word_writes_nothing() {
 fn hostname_print_emulate_and_setopt_write_nothing() {
     let root = startup_root("nowrite");
     std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
-    let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+    let at = |line: &str| check_shell_in(&shell_words(line), &root);
     for line in [
         "hostname; sh ./ok.sh",
         "print -r -- hi; sh ./ok.sh",
@@ -2335,7 +2335,7 @@ fn hostname_print_emulate_and_setopt_write_nothing() {
 fn a_configure_scratch_redirection_is_not_an_unshown_script() {
     let root = startup_root("confredir");
     std::fs::write(root.join("configure"), "#!/bin/sh\necho ok\n").unwrap();
-    let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+    let at = |line: &str| check_shell_in(&shell_words(line), &root);
     for line in [
         "echo 'int x;' >conftest.$ac_ext; sh ./configure",
         "echo 'int x;' >'conftest.$ac_ext'; sh ./configure",
@@ -2419,7 +2419,7 @@ fn a_seat_guard_path_is_not_written_through_a_link() {
 #[test]
 fn stderr_and_fd_redirections_stay_allowed() {
     let root = startup_root("fd-redir");
-    let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
+    let at = |line: &str| check_shell_in(&shell_words(line), &root);
     for line in [
         "echo x >/dev/stderr",
         "printf ok | tee /dev/stderr >/dev/null",
@@ -2439,7 +2439,7 @@ fn a_quoted_here_document_a_runner_takes_is_read() {
     let at = |line: &str| {
         SPELLED.with(|s| s.borrow_mut().clear());
         let argv = ["bash", "-c", line].map(String::from);
-        check_shell_in(&argv, &root, 0)
+        check_shell_in(&argv, &root)
     };
     let fed = |head: &str| {
         format!(
@@ -2481,7 +2481,7 @@ fn a_credential_read_by_any_reader_is_refused() {
     let at = |line: &str| {
         SPELLED.with(|s| s.borrow_mut().clear());
         let argv = ["bash", "-c", line].map(String::from);
-        check_shell_in(&argv, &root, 0)
+        check_shell_in(&argv, &root)
     };
     for line in [
         "cat ~/.secrets/x",
@@ -2584,7 +2584,7 @@ fn a_runner_fed_stdin_takes_a_script() {
     let at = |line: &str| {
         SPELLED.with(|s| s.borrow_mut().clear());
         let argv = ["bash", "-c", line].map(String::from);
-        check_shell_in(&argv, &root, 0)
+        check_shell_in(&argv, &root)
     };
     let runners = [
         "docker run -i img sh",
@@ -2635,7 +2635,7 @@ fn an_sftp_batch_shell_line_is_read() {
         SPELLED.with(|s| s.borrow_mut().clear());
         let line = format!("sftp -b - host <<'EOF'\n{body}\nEOF");
         let argv = ["bash", "-c", &line].map(String::from);
-        check_shell_in(&argv, &root, 0)
+        check_shell_in(&argv, &root)
     };
     let read = "reads-credential: cat with ~/.secrets/t";
     for (body, token) in [
@@ -2661,7 +2661,7 @@ fn a_for_over_literal_words_places_its_name() {
     let root = startup_root("forwords");
     let at = |line: &str| {
         let argv = ["bash", "-c", line].map(String::from);
-        check_shell_in(&argv, &root, 0)
+        check_shell_in(&argv, &root)
     };
     for line in [
         "for c in a.md b.md; do printf x > \"$c\"; done; sh foo/x.sh",
