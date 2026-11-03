@@ -1270,11 +1270,12 @@ pub fn work_tree(cwd: &Path) -> Option<PathBuf> {
 
 /// How long one `git` lookup may run before it counts as no line.
 ///
-/// The limit is the old connect timeout. A refused loopback port returns
-/// at once. `192.0.2.1` (TEST-NET-1, RFC 5737) does not answer: a 400 ms
-/// socket timeout returned at 400 ms on this host. 300 ms is long enough
-/// to tell those apart and shorter than the old one-second judgment wait,
-/// so the lookup cannot hold the answer for that second.
+/// The bound is 300 ms. `measurements/parent-walk-depth.md` times one
+/// finished `git` as most of an 11.6 ms check. `measurements/check-latency.md`
+/// gives a check no time budget. No measurement in the repo derives 300 ms
+/// from git: nothing times `git rev-parse` while it waits on an index lock.
+/// Git does not set the bound. It is the previous limit, and a lookup still
+/// stops there.
 const GIT_LOOKUP_LIMIT: Duration = Duration::from_millis(300);
 
 /// `git` can sit on an index lock. Past `limit` the lookup is the same

@@ -32,8 +32,7 @@ This is off unless you turn it on. With the line
 would warn prints ``deny`` with the same rule and warning, and ``check``
 exits 2. Without that line, a warning stays allow.
 A check that fails open is still allow with the setting on: an
-error, a missing config file, and a daemon that is missing or does
-not answer.
+error, or a missing config file. ``LJOS_POLICYD_DAEMON`` is not read.
 
 Run the program
 ===============
