@@ -96,8 +96,8 @@ fn the_setting_still_allows_on_a_missing_config_and_a_timeout() {
     );
 
     let path = config("daemon", "block-on-warning true\n");
-    // 192.0.2.1 is TEST-NET-1 (RFC 5737). Nothing there accepts, so the
-    // connect runs to its timeout.
+    // 192.0.2.1 is TEST-NET-1 (RFC 5737). Policyd does not read
+    // LJOS_POLICYD_DAEMON, so a blackhole and a closed port both allow.
     let mut cmd = check(Some(&path), &["true"]);
     cmd.env("LJOS_POLICYD_DAEMON", "192.0.2.1:81");
     assert_eq!(run(cmd), allowed("allow"));

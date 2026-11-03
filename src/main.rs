@@ -82,7 +82,6 @@ fn run() -> i32 {
             if config.is_some() {
                 ctx.config_path = config;
             }
-            probe_configured_daemon();
             let v = ljos_policyd::verdict_with(&argv, &ctx);
             if let Some(hit) = v.strip_prefix("allow\twarn\t") {
                 if ctx.config_path.as_deref().is_some_and(blocks_on_warning) {
@@ -303,19 +302,6 @@ fn blocks_on_warning(path: &str) -> bool {
                 .then(|| words.next() == Some("true") && words.next().is_none())
         })
         .unwrap_or(false)
-}
-
-/// `LJOS_POLICYD_DAEMON=host:port` is optional. Nothing is read from the
-/// socket. When nothing accepts, [`ljos_policyd::probe_daemon`] returns
-/// inside the connect timeout and the table answers.
-fn probe_configured_daemon() {
-    let Ok(text) = env::var("LJOS_POLICYD_DAEMON") else {
-        return;
-    };
-    let Ok(addr) = text.parse() else {
-        return;
-    };
-    let _ = ljos_policyd::probe_daemon(addr);
 }
 
 struct MailArgs {

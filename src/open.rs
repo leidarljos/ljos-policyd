@@ -1268,12 +1268,20 @@ pub fn work_tree(cwd: &Path) -> Option<PathBuf> {
     git_line(&["rev-parse", "--show-toplevel"], Some(cwd)).map(PathBuf::from)
 }
 
+/// How long one `git` lookup may run before it counts as no line.
+///
+/// The limit is the old connect timeout. A refused loopback port returns
+/// at once. `192.0.2.1` (TEST-NET-1, RFC 5737) does not answer: a 400 ms
+/// socket timeout returned at 400 ms on this host. 300 ms is long enough
+/// to tell those apart and shorter than the old one-second judgment wait,
+/// so the lookup cannot hold the answer for that second.
+const GIT_LOOKUP_LIMIT: Duration = Duration::from_millis(300);
+
 /// `git` can sit on an index lock. Past `limit` the lookup is the same
 /// as git having no line, and the answer is not held.
 ///
 /// The 10 ms poll is how soon a finished git is noticed. It is short
-/// next to [`super::client::CONNECT_TIMEOUT`] and keeps the loop from
-/// spinning.
+/// next to [`GIT_LOOKUP_LIMIT`] and keeps the loop from spinning.
 fn output_within(cmd: &mut std::process::Command, limit: Duration) -> Option<std::process::Output> {
     use std::process::Stdio;
     let mut child = cmd
@@ -1312,7 +1320,7 @@ fn git_line(args: &[&str], dir: Option<&Path>) -> Option<String> {
         cmd.arg("-C").arg(dir);
     }
     cmd.args(args);
-    let text = output_within(&mut cmd, super::client::CONNECT_TIMEOUT)
+    let text = output_within(&mut cmd, GIT_LOOKUP_LIMIT)
         .filter(|out| out.status.success())
         .and_then(|out| String::from_utf8(out.stdout).ok())
         .map(|s| s.trim().to_string())
