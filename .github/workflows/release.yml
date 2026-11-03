@@ -102,7 +102,7 @@ jobs:
           cd "$RUNNER_TEMP"
           export PHRONESIS_STATE_DIR="$RUNNER_TEMP/policyd-state"
           "$GITHUB_WORKSPACE/$bin" check -- npm test
-          ! "$GITHUB_WORKSPACE/$bin" check -- git push --force origin main
+          "$GITHUB_WORKSPACE/$bin" check -- git push --force origin main | grep -q "$(printf '^allow\twarn\tgit-force-push\t')"
       - run: |
           set -eu
           name="ljos-policyd-${GITHUB_REF_NAME}-${{ matrix.target }}"
