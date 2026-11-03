@@ -15,10 +15,20 @@ use ljos_policyd::{check_mail_argv, check_shell, encode_decision, MAIL_MESSAGE_M
 /// The same status is already the usage error for a missing config.
 const BLOCKED: i32 = 2;
 
+/// The usage lines. `help` prints them on stdout. A bad `check-mail`
+/// call prints them on stderr. The last line points at the verb table
+/// in the README.
+fn usage_text() -> &'static str {
+    "\
+usage: ljos-policyd check|exec|capnp|version -- argv...
+usage: ljos-policyd check-mail --config PATH [--argv [--] RECIPIENT...]
+usage: ljos-policyd replay [DENY_LOG]
+see the verb table in README.md
+"
+}
+
 fn usage() {
-    eprintln!("usage: ljos-policyd check|exec|capnp|version -- argv...");
-    eprintln!("usage: ljos-policyd check-mail --config PATH [--argv [--] RECIPIENT...]");
-    eprintln!("usage: ljos-policyd replay [DENY_LOG]");
+    eprint!("{}", usage_text());
 }
 
 fn main() {
@@ -152,6 +162,9 @@ fn run() -> i32 {
                 env!("CARGO_PKG_VERSION"),
                 ljos_policyd::BACKEND
             );
+        }
+        "help" | "--help" | "-h" => {
+            print!("{}", usage_text());
         }
         _ => return allow_open("unknown verb"),
     }
