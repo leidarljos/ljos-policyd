@@ -55,9 +55,48 @@ fn lexical(p: &Path) -> PathBuf {
 
 /// `p` as the kernel opens it: the longest part that exists is read
 /// from the disk, with each link followed before a `..` after it, and
-/// the rest as spelled.
+/// the rest as spelled. A path that stayed inside `/tmp` or `/var/tmp`
+/// keeps that prefix when the kernel opens the directory through a
+/// different one, so a check for the spelled name still sees it.
 pub(crate) fn on_disk(p: &Path) -> PathBuf {
-    on_disk_at(p, 0)
+    spell_tmp(on_disk_at(p, 0))
+}
+
+/// Spelled temp directory and the path the kernel opens for it, when
+/// those two differ.
+///
+/// macOS ships `/tmp` as a symlink to `/private/tmp` and `/var/tmp` as a
+/// symlink to `/private/var/tmp`. Following that symlink would make a
+/// path that never left the temp directory fail a check for the spelled
+/// prefix. The pairs are read once: [`on_disk`] runs for every placed
+/// path, and these two mounts do not move while the process is up. Where
+/// the spelled path and the opened path are the same, the list is empty.
+fn tmp_aliases() -> &'static [(PathBuf, PathBuf)] {
+    use std::sync::OnceLock;
+    static ALIASES: OnceLock<Vec<(PathBuf, PathBuf)>> = OnceLock::new();
+    ALIASES
+        .get_or_init(|| {
+            ["/tmp", "/var/tmp"]
+                .into_iter()
+                .filter_map(|spelled| {
+                    let spelled = PathBuf::from(spelled);
+                    let opened = std::fs::canonicalize(&spelled).ok()?;
+                    (opened != spelled).then_some((spelled, opened))
+                })
+                .collect()
+        })
+        .as_slice()
+}
+
+/// `opened` with a temp prefix spelled as `/tmp` or `/var/tmp` when the
+/// path stayed inside that directory.
+fn spell_tmp(opened: PathBuf) -> PathBuf {
+    for (spelled, root) in tmp_aliases() {
+        if let Ok(rest) = opened.strip_prefix(root) {
+            return spelled.join(rest);
+        }
+    }
+    opened
 }
 
 fn on_disk_at(p: &Path, depth: usize) -> PathBuf {

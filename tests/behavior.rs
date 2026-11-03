@@ -184,6 +184,23 @@ fn shell(line: &str) -> Vec<String> {
     vec!["bash".into(), "-c".into(), line.into()]
 }
 
+/// A recursive delete under `/tmp` or `/var/tmp` stays allowed when the
+/// kernel opens that directory through a symlink. macOS binds `/tmp` to
+/// `/private/tmp` and `/var/tmp` to `/private/var/tmp`.
+#[test]
+fn a_delete_under_tmp_stays_allowed_when_the_directory_is_a_symlink() {
+    for root in ["/tmp", "/var/tmp"] {
+        let opened = std::fs::canonicalize(root).unwrap();
+        let line = format!("rm -rf {root}/policyd-scratch");
+        assert_eq!(
+            verdict(&words(&line)),
+            "allow",
+            "{line} (opens as {})",
+            opened.display()
+        );
+    }
+}
+
 #[test]
 fn read_only_xargs_lines_are_allowed() {
     for line in [

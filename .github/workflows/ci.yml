@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (host table)
+    # The release builds aarch64-apple-darwin on macos-latest. This job
+    # runs the default build there, with phronesis not linked.
+    runs-on: macos-latest
+    # The ubuntu test job allows 20 minutes for this suite plus fmt and
+    # clippy. This job is cargo test only, so the same bound holds.
+    timeout-minutes: 20
+    env:
+      # A prefix with no libphronesis.a. build.rs then does not ask
+      # pkg-config, so the job stays the host table even if the runner
+      # image later ships phronesis.
+      PHRONESIS_DIR: ${{ runner.temp }}/no-phronesis
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - name: The binary reports the host table
+        run: cargo run --locked --quiet -- version | tee /dev/stderr | grep -q '(host table)'
+      - run: cargo test --locked
