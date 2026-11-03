@@ -129,6 +129,8 @@ fn verdict_line(argv: &[String], d: &Checked) -> String {
         }
         return format!("allow\t{kind}\t{}", one_line(rest));
     }
+    let shell = one_word_shell_line(argv);
+    let argv = shell.as_ref();
     match d.decision {
         Decision::Allow => match rewrite::rewrite_command(argv) {
             Some(line) => format!("allow\trewrite\t{line}"),
@@ -194,6 +196,31 @@ pub fn check_with(argv: &[String], ctx: &open::Context) -> Checked {
     check_with_logged(argv, ctx, true)
 }
 
+/// A one-word argv whose word holds whitespace or a shell operator is a
+/// command line passed whole. No program has that name, so it is judged
+/// as `sh -c` of the word. Any other argv is the program and its
+/// arguments: a sentence passed as one argument of a longer line stays
+/// that argument.
+fn one_word_shell_line(argv: &[String]) -> Cow<'_, [String]> {
+    let [word] = argv else {
+        return Cow::Borrowed(argv);
+    };
+    if !word_holds_shell_syntax(word) {
+        return Cow::Borrowed(argv);
+    }
+    Cow::Owned(vec!["sh".to_string(), "-c".to_string(), word.clone()])
+}
+
+/// Whitespace, or a POSIX control or redirection operator.
+///
+/// The shell lexer splits on whitespace and on `;`, `|` and `&`. `<` and
+/// `>` redirect, and `(` `)` group a command. `{` and `}` are reserved
+/// words, so a brace in one argument is not a shell line by itself.
+fn word_holds_shell_syntax(word: &str) -> bool {
+    word.chars()
+        .any(|c| c.is_whitespace() || matches!(c, '&' | ';' | '|' | '(' | ')' | '<' | '>'))
+}
+
 fn check_with_logged(argv: &[String], ctx: &open::Context, log: bool) -> Checked {
     if let Some(rule) = person::allows(argv) {
         return Checked {
@@ -208,18 +235,22 @@ fn check_with_logged(argv: &[String], ctx: &open::Context, log: bool) -> Checked
         Ok(Some(why)) => return open::allow_checked("fail-open", why),
         Ok(None) => {}
     }
-    let parsed =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| open::script_unparsed(argv)));
+    // The caller's argv stays what the deny log records. The judgment
+    // reads a one-word shell line as `sh -c` of that word.
+    let shell = one_word_shell_line(argv);
+    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        open::script_unparsed(shell.as_ref())
+    }));
     match parsed {
         Err(_) => return open::allow_checked("fail-open", "script_unparsed"),
         Ok(true) => return open::allow_checked("fail-open", "parse failure"),
         Ok(false) => {}
     }
-    let owned = argv.to_vec();
-    let logged = owned.clone();
+    let logged = argv.to_vec();
+    let shell = shell.into_owned();
     let ctx = ctx.clone();
     let checked = open::bounded(move || {
-        let owned = elide_c_scripts(&owned);
+        let owned = elide_c_scripts(&shell);
         let cwd = std::env::current_dir().unwrap_or_default();
         SPELLED.with(|s| s.borrow_mut().clear());
         start_line(&owned);
