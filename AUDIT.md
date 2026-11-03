@@ -6,8 +6,8 @@ from scripts.doc_samples import audit_lines
 audit_lines(cog)
 ]]] -->
 Counted with `wc -l`.
-Rust outside the generated Cap'n schema is 25207 lines.
-Generated schema is 9409 lines. `src/lib.rs` is 459 lines.
+Rust outside the generated Cap'n schema is 25248 lines.
+Generated schema is 9409 lines. `src/lib.rs` is 490 lines.
 <!-- [[[end]]] -->
 The bash lexer lives in `src/words.rs` (quotes), `src/shells.rs`
 (`sh -c`), `src/pipeline.rs` (pipes) and `src/names.rs` (`$cmd`).

@@ -175,7 +175,7 @@ ljos-policyd 0.7.0 (host table)
 | Verb | Does | Exit |
 |---|---|---|
 | `check -- ARGV` | prints one verdict line, see below | 0, or 2 for a `deny` line |
-| `exec -- ARGV` | prints a warning on stderr when a rule matches, then runs ARGV | ARGV's status |
+| `exec -- ARGV` | prints a warning on stderr when a rule matches, then runs ARGV. `block-on-warning true` in `--config` prints the warning and `exec: not run because block-on-warning is on`, and does not run ARGV | ARGV's status, or 2 when that setting stops the command |
 | `capnp -- ARGV` | writes a packed Cap'n Proto `PolicyDecision` with decision allow | 0 |
 | `check-mail --config PATH [--argv [--] RECIPIENT...]` | reads one RFC 5322 message on stdin and prints JSON. The verdict is `allow`. `reasons` carry the rule and the warning | 0. A missing `--config` is usage and exits 2 |
 | `replay [DENY_LOG]` | re-judges every line of a deny log with this build and the person's rules, and counts how many would run now | 0 when the log can be read. 2 when there is no log or it cannot be read |
@@ -195,7 +195,7 @@ An argv of one word that holds whitespace or a shell operator is read as a shell
 | `allow`<TAB>`user-rule`<TAB>`pattern` | a user allow matched |
 | `deny`<TAB>`rule`<TAB>`warning` | a rule matched and block-on-warning is on. The command should not run |
 
-A warning blocks only when you ask for it. Put the line `block-on-warning true` in the file `check --config PATH` names. A line that would warn then prints `deny` with the same rule and warning, and `check` exits 2. It is off by default: without that line, a warning stays allow. A check that fails open is still allow with the setting on: an error, a missing config file, and a daemon that is missing or does not answer. `exec`, `capnp` and `check-mail` do not read it.
+A warning blocks only when you ask for it. Put the line `block-on-warning true` in the file `--config PATH` names. It is off by default: without that line, a warning stays allow. For `check`, a line that would warn then prints `deny` with the same rule and warning, and `check` exits 2. For `exec`, the warning is printed on stderr, then `exec: not run because block-on-warning is on`, and the command is not run; the exit status is 2. A check that fails open is still allow with the setting on: an error, a missing config file, and a daemon that is missing or does not answer. `capnp` and `check-mail` do not read it.
 
 `python x.py` and `python3 x.py` rewrite to `uv run x.py`, arguments included, when the working directory or a parent has `pyproject.toml` or `uv.lock`, or the script file has a PEP 723 `# /// script` block. Otherwise the line stays as written. `python -c` stays as written: `uv run` does not take `-c`. When that tree asks for uv, `python -m` becomes `uv run -m`.
 

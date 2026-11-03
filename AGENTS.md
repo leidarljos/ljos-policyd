@@ -6,7 +6,7 @@
 
 The rule is the table's token, including a pack detail and an ancestry note. The warning is one line, so a caller can show it. Exit status is 0.
 
-`exec` prints that warning on stderr and then runs the command. `capnp` writes decision allow, and puts `warn`, the rule, and the warning in the reason. `check-mail` prints `{"verdict":"allow",...}`. Each reason's code is the rule name and its detail is the warning. A missing `--config` is still a usage error and exits 2.
+`exec` prints that warning on stderr and then runs the command. `block-on-warning true` in `--config` prints the warning, prints `exec: not run because block-on-warning is on`, and exits 2 without running the command. `capnp` writes decision allow, and puts `warn`, the rule, and the warning in the reason. `check-mail` prints `{"verdict":"allow",...}`. Each reason's code is the rule name and its detail is the warning. A missing `--config` is still a usage error and exits 2.
 
 `LJOS_POLICYD_DAEMON` is not read. The table in this process is the answer.
 

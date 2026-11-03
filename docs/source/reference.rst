@@ -3,7 +3,7 @@ Command line
 
 ``ljos-policyd check|exec|capnp|check-mail|replay|version``
 
-On ``check``, ``--user-allow PATTERN`` and ``--config PATH`` are this binary's
+On ``check`` and ``exec``, ``--user-allow PATTERN`` and ``--config PATH`` are this binary's
 flags, and only when they come before the command. A ``--`` ends them.
 Nothing after it is read as a flag. A leading ``--`` after the verb is
 optional and is stripped.
@@ -13,16 +13,16 @@ reads one RFC 5322 message on stdin. See "Outbound mail" below.
 
 ``replay [DENY_LOG]`` re-judges every row of a deny log.
 
-============== ==============================================================================================================================================================
+============== ===================================================================================================================================================================================================================================================
 Verb           Meaning
-============== ==============================================================================================================================================================
+============== ===================================================================================================================================================================================================================================================
 ``check``      print one ``allow`` line; exit 0. With ``block-on-warning true`` in the ``--config`` file, a line that would warn prints ``deny<TAB>rule<TAB>warning``; exit 2
 ``capnp``      write a packed Cap'n ``PolicyDecision`` with decision allow; exit 0
-``exec``       print a warning on stderr when a rule matches, then run argv. The exit status is the program's
+``exec``       print a warning on stderr when a rule matches, then run argv. The exit status is the program's. With ``block-on-warning true`` in ``--config``, print the warning and ``exec: not run because block-on-warning is on``, and do not run argv; exit 2
 ``check-mail`` JSON ``verdict`` ``allow``; ``reasons`` carry the rule; exit 0. A missing ``--config`` exits 2
 ``replay``     one line per log row, then a count; exit 0. No log, or a log that cannot be read, exits 2
 ``version``    ``ljos-policyd <semver> (phronesis)`` or ``ljos-policyd <semver> (host table)``. ``--version`` prints the same line
-============== ==============================================================================================================================================================
+============== ===================================================================================================================================================================================================================================================
 
 Samples
 =======
@@ -349,14 +349,14 @@ Variable             Meaning
 Exit statuses
 =============
 
-===== ==============================================================================================================
+===== ===========================================================================================================================================================================
 Code  Meaning
-===== ==============================================================================================================
+===== ===========================================================================================================================================================================
 0     a check, capnp, check-mail, version, or ``exec`` of a process that exited 0
-2     a ``check`` that printed ``deny``, check-mail without ``--config``, or replay with no log or an unreadable log
+2     a ``check`` that printed ``deny``, an ``exec`` that did not run because block-on-warning is on, check-mail without ``--config``, or replay with no log or an unreadable log
 127   ``exec`` could not spawn the program
 other ``exec`` of a process that exited with that code
-===== ==============================================================================================================
+===== ===========================================================================================================================================================================
 
 What this crate is
 ==================

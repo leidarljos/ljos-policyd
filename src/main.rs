@@ -6,7 +6,7 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{self, Command};
 
-use ljos_policyd::{check_mail_argv, check_shell, encode_decision, verdict, MAIL_MESSAGE_MAX};
+use ljos_policyd::{check_mail_argv, check_shell, encode_decision, MAIL_MESSAGE_MAX};
 
 /// The usage lines. `help` prints them on stdout. A bad `check-mail`
 /// call prints them on stderr. The last line points at the verb table
@@ -104,19 +104,29 @@ fn run() -> i32 {
             return 0;
         }
         "exec" => {
-            let v = verdict(&args);
+            let (rules, config, argv) =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| user_allows(&args)))
+                {
+                    Ok(parsed) => parsed,
+                    Err(_) => return allow_open("user_allows"),
+                };
+            let mut ctx = ljos_policyd::Context::from_env();
+            ctx.user_allow.extend(rules);
+            // The file is read only for the setting. A missing file stays a
+            // warning, and the command still runs. `check` fail-opens that case.
+            let v = ljos_policyd::verdict_with(&argv, &ctx);
             if v.starts_with("allow\twarn\t") {
                 eprintln!("{v}");
+                if config.as_deref().is_some_and(blocks_on_warning) {
+                    eprintln!("exec: not run because block-on-warning is on");
+                    return DENIED;
+                }
             }
-            if !v.starts_with("allow") {
-                eprintln!("{v}");
-                return 0;
-            }
-            if args.is_empty() {
+            if argv.is_empty() {
                 process::exit(0);
             }
-            let status = Command::new(&args[0])
-                .args(&args[1..])
+            let status = Command::new(&argv[0])
+                .args(&argv[1..])
                 .status()
                 .unwrap_or_else(|e| {
                     eprintln!("exec: {e}");
