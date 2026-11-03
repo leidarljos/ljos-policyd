@@ -2356,6 +2356,18 @@ fn a_configure_scratch_redirection_is_not_an_unshown_script() {
     }
 }
 
+/// The ljos config directory the seat guard watches. `$XDG_CONFIG_HOME`
+/// when that is set, otherwise `$HOME/.config`. A trailing slash and
+/// `.` or `..` come off, the same way the guard reads the variable, so
+/// a caller whose config home is not `$HOME/.config` still hits it.
+fn seat_config_dir(home: &str) -> String {
+    match std::env::var("XDG_CONFIG_HOME") {
+        Ok(v) if !v.is_empty() => lexical_norm(&v),
+        _ if !home.is_empty() => format!("{home}/.config"),
+        _ => String::new(),
+    }
+}
+
 /// A link under `/tmp` that an earlier line made to a seat directory
 /// is followed on the disk, so a write through it is a write to the
 /// seat file. So is a link the same line makes with `ln`. A write
@@ -2371,10 +2383,11 @@ fn a_seat_guard_path_is_not_written_through_a_link() {
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(base.join("plain")).unwrap();
     let b = base.display().to_string();
+    let ljos = format!("{}/ljos", seat_config_dir(&home));
     for (name, to) in [
         ("c", format!("{home}/.cursor")),
         ("h", home.clone()),
-        ("l", format!("{home}/.config/ljos")),
+        ("l", ljos),
         ("g", format!("{home}/.gitconfig")),
         ("ok", format!("{b}/plain")),
     ] {
@@ -2570,7 +2583,13 @@ fn a_credential_read_by_any_reader_is_refused() {
         let c = at(line);
         assert_eq!(c.decision, Decision::Allow, "{line}: {}", c.token);
     }
-    let c = at("cp /tmp/src ~/.config/ljos");
+    let cfg = seat_config_dir(&std::env::var("HOME").unwrap_or_default());
+    let ljos = if cfg.is_empty() {
+        "~/.config/ljos".to_string()
+    } else {
+        format!("{cfg}/ljos")
+    };
+    let c = at(&format!("cp /tmp/src {ljos}"));
     assert!(c.token.contains("seat-guard-path:"), "{}", c.token);
     let _ = std::fs::remove_dir_all(&root);
 }
