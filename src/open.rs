@@ -1339,10 +1339,7 @@ pub fn person_at_terminal() -> bool {
         _ => return false,
     };
     for _ in 0..64 {
-        let comm = read_proc(&format!("/proc/{pid}/comm")).unwrap_or_default();
-        let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let (comm, exe) = names_of(pid);
         if ancestor_is_person(&[&comm, &exe]) {
             return true;
         }
@@ -1405,18 +1402,34 @@ fn term_name(name: &str) -> bool {
         "hyper",
         "tabby",
         "st",
+        // Terminal.app and iTerm2, cased as macOS reports the comm and the
+        // last part of the exe path.
+        "Terminal",
+        "iTerm2",
     ];
     NAMES
         .iter()
         .any(|known| name == *known || (name.len() >= 15 && known.starts_with(name)))
 }
 
+/// The comm and the exe path of `pid`, each empty when it cannot be read.
+#[cfg(not(target_os = "macos"))]
+fn names_of(pid: u32) -> (String, String) {
+    let comm = read_proc(&format!("/proc/{pid}/comm")).unwrap_or_default();
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    (comm, exe)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn read_proc(path: &str) -> Option<String> {
     std::fs::read(path)
         .ok()
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 
+#[cfg(not(target_os = "macos"))]
 fn ppid(pid: u32) -> Option<u32> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     for line in text.lines() {
@@ -1425,6 +1438,59 @@ fn ppid(pid: u32) -> Option<u32> {
         }
     }
     None
+}
+
+/// macOS has no /proc. libproc gives the short record and the path of a
+/// process of any user, so the walk passes a root `login` or `sshd`.
+#[cfg(target_os = "macos")]
+fn short_info(pid: u32) -> Option<libc::proc_bsdshortinfo> {
+    let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+    // SAFETY: an all-zero proc_bsdshortinfo is valid, and proc_pidinfo
+    // writes at most `size` bytes into it.
+    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    let got = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        )
+    };
+    (got == size).then_some(info)
+}
+
+#[cfg(target_os = "macos")]
+fn ppid(pid: u32) -> Option<u32> {
+    short_info(pid).map(|info| info.pbsi_ppid)
+}
+
+/// The comm and the exe path of `pid`, each empty when it cannot be read.
+#[cfg(target_os = "macos")]
+fn names_of(pid: u32) -> (String, String) {
+    let comm = short_info(pid)
+        .map(|info| {
+            let bytes: Vec<u8> = info
+                .pbsi_comm
+                .iter()
+                .take_while(|&&c| c != 0)
+                .map(|&c| c as u8)
+                .collect();
+            String::from_utf8_lossy(&bytes).into_owned()
+        })
+        .unwrap_or_default();
+    let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: proc_pidpath writes at most `path.len()` bytes and returns
+    // the length of the path, or 0 when it cannot be read.
+    let len = unsafe {
+        libc::proc_pidpath(
+            pid as libc::c_int,
+            path.as_mut_ptr().cast(),
+            path.len() as u32,
+        )
+    };
+    path.truncate(usize::try_from(len).unwrap_or(0));
+    (comm, String::from_utf8_lossy(&path).into_owned())
 }
 
 /// The binary is not there, or the config the caller named is not there.
@@ -1507,6 +1573,19 @@ mod tests {
         assert!(!ancestor_is_person(&["bash", "node", "pod-daemon"]));
         assert!(!ancestor_is_person(&["rm -rf /srv/x # tmux"]));
         assert!(!ancestor_is_person(&["cat ~/.ssh/id_ed25519; echo foot"]));
+    }
+
+    #[test]
+    fn terminal_app_and_iterm2_are_a_person() {
+        for name in [
+            "Terminal",
+            "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal",
+            "iTerm2",
+            "/Applications/iTerm.app/Contents/MacOS/iTerm2",
+        ] {
+            assert!(ancestor_is_person(&[name]), "{name}");
+        }
+        assert!(!ancestor_is_person(&["-zsh", "login"]));
     }
 
     fn seal(path: &std::path::Path, mode: u32) {

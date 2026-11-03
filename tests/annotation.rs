@@ -30,6 +30,39 @@ fn a_former_deny_is_allow_with_the_rule_and_a_warning() {
 }
 
 #[test]
+fn a_check_under_tmux_names_a_person() {
+    let dir = std::env::temp_dir().join(format!("policyd-tmux-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let bash = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|d| d.join("bash"))
+        .find(|p| p.is_file())
+        .expect("`bash` on PATH");
+    // A shell under the name tmux is a parent the walk names. The `exit`
+    // after the check keeps bash from exec'ing policyd in its own place.
+    let tmux = dir.join("tmux");
+    std::fs::copy(bash, &tmux).unwrap();
+    let out = Command::new(&tmux)
+        .args([
+            "-c",
+            "\"$1\" check -- rm -rf /srv/x; exit $?",
+            "tmux",
+            bin(),
+        ])
+        .env_remove("LJOS_POLICYD_DAEMON")
+        .env("LJOS_POLICYD_DENY_LOG", dir.join("deny.log"))
+        .output()
+        .expect("run policyd under tmux");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(out.status.success(), "{out:?}");
+    let line = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        line.starts_with("allow\twarn\trm-rf-outside-tmp ancestry=person\t"),
+        "{line}"
+    );
+}
+
+#[test]
 fn a_missing_daemon_is_not_waited_out() {
     // 192.0.2.1 is TEST-NET-1 (RFC 5737). A 400 ms socket timeout returned
     // at 400 ms on this host, so this connect is the timeout, not a miss.
