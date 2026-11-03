@@ -12,7 +12,7 @@
 //! caller passed, turns a hit into that allow. Ancestry is named in the
 //! reason and does not change the verdict.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -1329,18 +1329,21 @@ fn git_cache() -> &'static Mutex<HashMap<String, Option<String>>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The most parents `person_at_terminal` reads before it stops and answers no.
-///
-/// The walk ends at the first terminal, sshd or tmux, so the cap only has to
-/// reach that far. A tmux server and a terminal emulator sit right under init
-/// or the user's service manager, so the IDE and the desktop session above
-/// them are never on the path. On Linux, every wrapper stacked at once
-/// (`tmux`, a login `bash`, `script`, `bash`, `make`, `sh`, `sudo`, `node`,
-/// `python3`, `bash`, `sh`) put the tmux server 19 parents up. A seat started
-/// inside another seat repeats the part below the server, so the cap is twice
-/// that. A step costs 9 to 13 µs. `measurements/parent-walk-depth.md` has
-/// the chains and the timings. macOS was not measured.
-pub const PARENT_WALK_STEPS: usize = 2 * 19;
+/// What a walk that finds no terminal may add to one check.
+/// The slowest check in the release build already moves by up to 1.2 ms between runs (`measurements/check-latency.md`).
+/// A walk inside that budget adds no more than a check varies by on its own.
+const PARENT_WALK_BUDGET_NS: usize = 1_200_000;
+
+/// What reading one parent costs on Linux, rounded up to a whole µs so the cap stays inside the budget.
+/// The median and interquartile range of the runs are in `measurements/parent-walk-depth.md`.
+/// macOS was not measured.
+const PARENT_WALK_STEP_NS: usize = 9_000;
+
+/// The most parents `person_at_terminal` reads.
+/// The walk stops sooner at init, at a missing parent, or at a pid it already read.
+/// Seats can nest to any depth in ljos, so the cap comes from time.
+/// Past it the verdict is unchanged; only `ancestry=person` is missing.
+pub const PARENT_WALK_STEPS: usize = PARENT_WALK_BUDGET_NS / PARENT_WALK_STEP_NS;
 
 /// True when a parent process comm or exe is a terminal, sshd, or tmux.
 /// The walk starts at the parent. This process and the command text are not read.
@@ -1351,18 +1354,19 @@ pub fn person_at_terminal() -> bool {
         Some(next) if next != 0 && next != self_pid => next,
         _ => return false,
     };
+    let mut seen = HashSet::new();
     for _ in 0..PARENT_WALK_STEPS {
+        if !seen.insert(pid) {
+            break;
+        }
         let (comm, exe) = names_of(pid);
         if ancestor_is_person(&[&comm, &exe]) {
             return true;
         }
-        let Some(next) = ppid(pid) else {
-            break;
-        };
-        if next == 0 || next == pid {
-            break;
+        match ppid(pid) {
+            Some(next) if next != 0 => pid = next,
+            _ => break,
         }
-        pid = next;
     }
     false
 }

@@ -40,7 +40,14 @@ A consent record is read only. Its origin is undecided. It matches the push remo
 The file is read only when the current user cannot write it and it is not group- or world-writable. Otherwise it is ignored and the reason is logged.
 `LJOS_USER_ALLOW` and `LJOS_CONSENT_FILE` may be set only by policyd's parent hook config. A file either name points at is ignored when that file is agent-writable, under the same check.
 `--user-allow` and `--config` are policyd's own flags, and only when they come before the command. `--user-allow` replaces an irreversible hit with `allow`, `user-rule`, and the pattern. It does not clear a warning such as `sudo`. A missing `--config` file prints `allow`, `fail-open`, and `missing config`, and the command is not judged.
-A parent whose comm or exe is a terminal, sshd, or tmux is ancestry. The reason names it. The verdict does not change. The command text is not that check.
+A parent whose comm or exe is a terminal, sshd, or tmux is ancestry.
+The reason names it.
+The verdict does not change.
+The command text is not that check.
+The walk reads up to 133 parents, which is a 1.2 ms budget divided by the cost of one step on Linux.
+Past that the verdict is unchanged and only `ancestry=person` is missing.
+macOS chains and step cost were not measured.
+`measurements/parent-walk-depth.md` has the runs.
 
 ## Threat model
 
