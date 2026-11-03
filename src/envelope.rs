@@ -3527,20 +3527,38 @@ pair left right
         );
     }
 
-    /// Every scalar is placed in a local part and judged by
-    /// `check_mail_bytes` against one deny file, `address
-    /// other@example.test`. An allow is only a letter, number,
-    /// punctuation or symbol in the general category. That category
-    /// comes from ICU, not from `local_closed`. A surrogate is not a
-    /// scalar, so the UTF-8 decoder refuses those bytes.
+    /// A scalar in a local part is refused, or its general category is
+    /// a letter, number, punctuation or symbol. That category comes
+    /// from ICU, not from `local_closed`. The deny file is `address
+    /// other@example.test`, so a scalar the skeleton removes still
+    /// refuses: the local part becomes `other`.
+    ///
+    /// `check_mail_bytes` used to judge all 1,112,064 scalars. On an
+    /// 8-core Intel Xeon (Linux 6.12) that debug test took a median of
+    /// 152.17 s over 6 runs, interleaved with the run after this change.
+    /// The samples sat in the code-point inversion-list search,
+    /// in Unicode normalization and in the case fold: the local-part
+    /// judgment, repeated once per scalar. The closed set reads the
+    /// general category and whether the scalar is default-ignorable or
+    /// a noncharacter. A run also ends where the Unicode script
+    /// changes, so each script is judged at a boundary. Those four stay
+    /// constant on a contiguous run, and the first and last scalar of
+    /// the run stand for it. Every distinct category and every distinct
+    /// script is therefore judged at least once. Interior scalars of a
+    /// run are not placed in a message. The two documented folds are judged
+    /// too: the closed set skips them. A surrogate is not a scalar.
+    /// Every surrogate is still an ill-formed UTF-8 sequence, and the
+    /// decoder refuses each one.
     #[test]
     fn every_code_point_in_a_local_part_is_refused_or_visible() {
-        use icu_properties::props::GeneralCategoryGroup;
+        use icu_properties::props::{GeneralCategoryGroup, Script};
         let visible = GeneralCategoryGroup::Letter
             .union(GeneralCategoryGroup::Number)
             .union(GeneralCategoryGroup::Punctuation)
             .union(GeneralCategoryGroup::Symbol);
+        let (scalars, categories, scripts) = local_part_boundary_scalars();
         let category = CodePointMapData::<GeneralCategory>::new();
+        let script = CodePointMapData::<Script>::new();
         let dir = std::env::temp_dir().join(format!("policyd-cps-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -3561,13 +3579,12 @@ pair left right
             "deny file did not load: {:?}",
             allowed.reasons.iter().map(|r| r.code).collect::<Vec<_>>()
         );
+        let mut judged_categories = std::collections::BTreeSet::new();
+        let mut judged_scripts = std::collections::BTreeSet::new();
         let mut msg = String::new();
-        for cp in 0..=0x10FFFF {
-            let Some(ch) = char::from_u32(cp) else {
-                let v = check_mail_bytes(&surrogate_message(cp), &conf);
-                assert_eq!(v.reasons[0].code, "message-invalid", "U+{cp:04X}");
-                continue;
-            };
+        for ch in scalars {
+            judged_categories.insert(category.get(ch));
+            judged_scripts.insert(script.get(ch));
             msg.clear();
             msg.push_str("From: mailseat@example.test\r\nTo: ");
             // Quote when the atom parser would not keep the character, so
@@ -3590,12 +3607,68 @@ pair left right
                 continue;
             }
             let cat = category.get(ch);
+            let cp = u32::from(ch);
             assert!(
                 visible.contains(cat),
                 "U+{cp:04X} {cat:?} accepted and not denied"
             );
         }
+        assert_eq!(judged_categories, categories);
+        assert_eq!(judged_scripts, scripts);
+        // U+D800 through U+DFFF. `char::from_u32` has no surrogate, and
+        // each value encodes as the same kind of three-byte sequence.
+        for cp in 0xD800..=0xDFFF {
+            let v = check_mail_bytes(&surrogate_message(cp), &conf);
+            assert_eq!(v.reasons[0].code, "message-invalid", "U+{cp:04X}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// First and last scalar of every run where the general category,
+    /// the script, default-ignorable and noncharacter stay the same.
+    /// U+200B and U+2800 are the documented local-part folds.
+    fn local_part_boundary_scalars() -> (
+        Vec<char>,
+        std::collections::BTreeSet<GeneralCategory>,
+        std::collections::BTreeSet<icu_properties::props::Script>,
+    ) {
+        use icu_properties::props::{DefaultIgnorableCodePoint, NoncharacterCodePoint, Script};
+        let category = CodePointMapData::<GeneralCategory>::new();
+        let script = CodePointMapData::<Script>::new();
+        let ignorable = CodePointSetData::new::<DefaultIgnorableCodePoint>();
+        let noncharacter = CodePointSetData::new::<NoncharacterCodePoint>();
+        let mut chosen = std::collections::BTreeSet::new();
+        let mut categories = std::collections::BTreeSet::new();
+        let mut scripts = std::collections::BTreeSet::new();
+        let mut prev: Option<(char, GeneralCategory, Script, bool, bool)> = None;
+        for cp in 0..=0x10FFFF {
+            let Some(ch) = char::from_u32(cp) else {
+                continue;
+            };
+            let key = (
+                category.get(ch),
+                script.get(ch),
+                ignorable.contains(ch),
+                noncharacter.contains(ch),
+            );
+            categories.insert(key.0);
+            scripts.insert(key.1);
+            if let Some((prev_ch, pc, ps, pi, pn)) = prev {
+                if (pc, ps, pi, pn) != key {
+                    chosen.insert(prev_ch);
+                    chosen.insert(ch);
+                }
+            } else {
+                chosen.insert(ch);
+            }
+            prev = Some((ch, key.0, key.1, key.2, key.3));
+        }
+        if let Some((ch, _, _, _, _)) = prev {
+            chosen.insert(ch);
+        }
+        chosen.insert('\u{200B}');
+        chosen.insert('\u{2800}');
+        (chosen.into_iter().collect(), categories, scripts)
     }
 
     /// The same shape `is_atext` keeps in an unquoted local part, plus
