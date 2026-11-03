@@ -86,7 +86,7 @@ It gives the count of parents, then their names, nearest first.
 The last line stacks nine wrappers.
 They are `script`, `bash`, `make`, `sh`, `sudo`, `node`, `python3`, `bash` and `sh`.
 Its tmux server is parent 13.
-The chain of an agent CLI, its hook runner and `ljos hook` was not measured here.
+The chain of a coding CLI, its hook runner and `ljos hook` was not measured here.
 The nested seat test in `tests/parent_walk.rs` builds that chain.
 It nests seats as deep as the cap allows.
 
