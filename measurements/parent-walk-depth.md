@@ -1,75 +1,116 @@
 # Parent walk depth
 
-`PARENT_WALK_STEPS` in `src/open.rs` is how many parents a check reads, looking for a terminal, sshd or tmux, before it stops.
-This file is where its value comes from.
+`PARENT_WALK_STEPS` in `src/open.rs` caps how many parents a check reads.
+The walk looks for a terminal, sshd or tmux.
+This file is where the cap comes from.
 
-Machine: Intel(R) Xeon(R) Processor, 8 cores, Linux 6.12, Ubuntu 24.04.
-Code: commit 8c315430e84f0f0fc93f881beeeca946d8b8637f, with the cap first at 64 and then at `PARENT_WALK_STEPS`, built with rustc 1.99.1, host table.
-The chains and the timings were measured on Linux only. macOS was not measured.
+## The cap
 
-## How deep a terminal sits
+The walk stops at init.
+It also stops at a missing parent or at a pid it read before.
+Seats can nest to any depth in ljos.
+So no chain depth bounds the walk, and time sets the cap instead.
 
-Each line is a process run in a tmux session, with its parents listed from the nearest one up to init.
-The number is how many parents it has.
-The script that prints them is at the end.
+The budget is 1.2 ms for a walk that finds no terminal.
+`measurements/check-latency.md` times the release build.
+Its slowest check moved by up to 1.2 ms between runs.
+A walk inside that budget adds no more than a check already varies by.
 
-    3: bash tmux: server tini
-    4: sh bash tmux: server tini
-    4: script bash tmux: server tini
-    5: sh make bash tmux: server tini
-    6: sh sudo sudo bash tmux: server tini
-    6: sh sh node bash tmux: server tini
-    4: python3 bash tmux: server tini
+One step costs 8.68 µs here, the median of 8 runs below.
+The code rounds that up to 9 µs, so the cap stays inside the budget.
+The cap is 1.2 ms divided by 9 µs, which is 133 parents.
+At the median cost, a walk of 133 steps takes 1.15 ms.
 
-The tmux server forks away from the terminal that started it, so its parent is init, or the user's service manager on a desktop.
-Whatever started tmux, such as an IDE terminal or a desktop session, is not on the walk's path.
-The walk stops at the first terminal, sshd or tmux, so the cap only has to reach that far.
+Past the cap the verdict is unchanged.
+Only `ancestry=person` is missing.
 
-With every wrapper on this machine stacked in one chain, a `script` running `bash` running `make`, then `sh`, `sudo`, `node`, `python3`, `bash` and `sh`, the tmux server is parent 19:
+## Machine and code
 
-    20: sh l5.sh bash python3 l4.sh sh node l3.sh sh sudo sudo l2.sh sh sh make bash script bash tmux: server tini
+Machine: `Intel(R) Xeon(R) Processor`, 8 cores, Linux 6.12, Ubuntu 24.04.
+Init on this machine is tini.
+Code: the commit 'Derive the parent walk cap from a latency budget'.
+It was built with rustc 1.99.1 and the host table.
+The cap 38 rows are the commit 'Give the parent walk cap a measured basis', built the same way.
 
-A seat started inside another seat, for example from that seat's hook, repeats the part of the chain below the tmux server.
-So the cap is twice the deepest chain: 2 × 19 = 38.
-A check whose terminal is further up than that does not get `ancestry=person`. It still answers as before.
+macOS was not measured.
+Its chains may differ from Linux, under Terminal.app, iTerm2 or a tmux that launchd starts.
+It reads parents through libproc, so its step cost may differ too.
 
 ## What a step costs
 
-Each row is 1000 `ljos-policyd check -- rm -rf /srv/x` runs spawned one after another from python3 in `/tmp`.
-In the shallow row python3 has 4 parents, so the walk reads 5 parents and reaches init.
-The nested row runs under 100 more shells, so the walk reads parents until it reaches the cap.
-Every check spawns a process and loads the table, so each time is mostly fixed cost. Only the difference between the rows is the walk.
-Three runs of each pair, p50 in ms:
+A run times 1000 checks of `ljos-policyd check -- rm -rf /srv/x`.
+python3 spawns them one after another in `/tmp`.
+The run then times 1000 more under the 101 extra shells of `nest.sh 100`.
+Every check spawns a process and loads the table.
+That fixed cost is the same in both rows.
+So the difference of the two p50 times is the walk.
 
-| cap | shallow | nested | difference | extra steps | µs per step |
-|---:|---:|---:|---:|---:|---:|
-| 64 | 11.59 | 12.09 | 0.50 | 59 | 8.5 |
-| 64 | 11.51 | 12.06 | 0.55 | 59 | 9.3 |
-| 64 | 11.56 | 12.06 | 0.50 | 59 | 8.5 |
-| 38 | 11.60 | 11.88 | 0.28 | 33 | 8.5 |
-| 38 | 11.55 | 11.88 | 0.33 | 33 | 10.0 |
-| 38 | 11.56 | 11.98 | 0.42 | 33 | 12.7 |
+Neither chain has a terminal, sshd or tmux in it.
+The shallow walk reads 7 parents and reaches init.
+With the cap at 133, the nested walk reads 108 parents.
+The cap 38 build stops it at 38.
+A depth of 100 stays under the new cap.
+It puts 0.89 ms of walk between the rows.
+That is about 30 times the 0.03 ms interquartile range of the shallow row.
 
-At 38 steps, a walk that finds no terminal costs about 0.3 to 0.4 ms. With the cap at 64, it cost about 0.5 ms.
+Each step cost in the table is the median of 8 runs, with the interquartile range after it.
+The quartiles of those runs are `statistics.quantiles` with the inclusive method.
+
+| cap | shallow p50 ms | nested p50 ms | µs per step |
+|---:|---:|---:|---:|
+| 38 | 11.59 (11.58 to 11.60) | 11.89 (11.87 to 11.90) | 9.75 (9.45 to 10.30) |
+| 133 | 11.59 (11.59 to 11.62) | 12.48 (12.47 to 12.49) | 8.68 (8.68 to 8.74) |
+
+The cap 38 rows spread wider, because that walk adds 31 steps and not 101.
+The cap 38 build also has no set of read pids.
+The per-run rows are in `parent-walk/runs-cap38.csv` and `parent-walk/runs-cap133.csv`.
+
+## Where a terminal sits
+
+These chains were not used to set the cap.
+They show how deep common wrappers put a tmux server.
+Each line comes from `chain.sh` in a tmux session.
+It gives the count of parents, then their names, nearest first.
+
+```text
+3: bash tmux: server tini
+4: nest.sh bash tmux: server tini
+4: script bash tmux: server tini
+5: make stack.sh bash tmux: server tini
+5: sudo sudo bash tmux: server tini
+4: node bash tmux: server tini
+4: python3 bash tmux: server tini
+14: sh bash python3 node sudo sudo sh make stack.sh bash script bash tmux: server tini
+```
+
+The last line stacks nine wrappers.
+They are `script`, `bash`, `make`, `sh`, `sudo`, `node`, `python3`, `bash` and `sh`.
+Its tmux server is parent 13.
+The chain of an agent CLI, its hook runner and `ljos hook` was not measured here.
+The nested seat test in `tests/parent_walk.rs` builds that chain.
+It nests seats as deep as the cap allows.
 
 ## Reproduce
 
-`chain.sh` prints the parents of the process that runs it:
+The scripts are in `measurements/parent-walk/`.
+Start the timings from a plain shell.
+No terminal, sshd or tmux may sit among its parents:
 
-    #!/bin/sh
-    p=$PPID n=0 line=
-    while [ -n "$p" ] && [ "$p" != 0 ]; do
-      n=$((n+1)); line="$line $(cat /proc/$p/comm)"
-      p=$(awk '/^PPid:/{print $2}' /proc/$p/status)
-    done
-    echo "$n:$line"
+```sh
+cargo build --release
+M=$PWD/measurements/parent-walk
+B=$PWD/target/release/ljos-policyd
+cd /tmp
+$M/run.sh "$B" 133 8 100 1000 > runs-cap133.csv
+python3 $M/summary.py runs-cap133.csv
+```
 
-`nest.sh N CMD...` runs CMD under N more shells:
+The timings take the cap of that build as the second argument of `run.sh`.
+It only sets the step count of a walk that hits the cap.
 
-    #!/bin/sh
-    n=$1; shift
-    if [ "$n" -gt 0 ]; then "$0" $((n-1)) "$@"; exit $?; fi
-    "$@"
+For a chain line, run `chain.sh` or `stack.sh` from bash in a tmux session:
 
-The timings came from `nest.sh 100 python3 time_check.py target/release/ljos-policyd 1000` and from the same python3 line without `nest.sh`.
-`time_check.py` runs the check N times with `LJOS_POLICYD_DAEMON` unset and prints nearest-rank percentiles.
+```sh
+W="script bash make sh sudo node python3 bash sh"
+tmux new-session -d "bash -lc '$M/stack.sh $W >> /tmp/chains.txt'"
+```
