@@ -28,30 +28,37 @@
 
 * First minute
 
+# [[[cog
+# import cog
+# from scripts.doc_samples import index_first
+# index_first(cog)
+# ]]]
 #+begin_src console
 $ ljos-policyd check -- uv run pytest
 allow
 $ ljos-policyd check -- sudo id
 allow	warn	sudo	a privilege runner is on the command
 #+end_src
+# [[[end]]]
 
 Typed verdict is Cap'n PolicyDecision (phronesis; Ali Akber Saifee / indynull, HaoZeke). A Janet pack can name more. The printed line is still allow, with that rule and one warning.
-
-#+begin_src janet
-(defn check [argv]
-  (when (has-prefix? (get argv 0) "sudo")
-    (deny "sudo")))
-#+end_src
 
 The seat composes that pack after this verdict: =ljos policy -- uv run pytest=.
 
 * Install
 
+Install with =cargo binstall ljos-policyd=.
+
+# [[[cog
+# import cog
+# from scripts.doc_samples import index_install
+# index_install(cog)
+# ]]]
 #+begin_src console
-$ cargo binstall ljos-policyd
 $ ljos-policyd check -- uv run pytest
 allow
 #+end_src
+# [[[end]]]
 
 =exec= prints a warning on stderr when a rule matches, then runs the line. Exit status is the program's.
 

@@ -9,38 +9,37 @@ rule over the command's words.
 hook before every shell command an agent runs (Claude Code, Codex, Grok
 Build, agy, opencode). You can call it yourself.
 
+Install with `cargo binstall ljos-policyd`. The lines below are this binary.
+
+<!-- [[[cog
+import cog
+from scripts.doc_samples import readme_opening
+readme_opening(cog)
+]]] -->
 ```console
-$ cargo binstall ljos-policyd
 $ ljos-policyd check -- git status
 allow
 $ ljos-policyd check -- sudo id
 allow	warn	sudo	a privilege runner is on the command
 $ ljos-policyd check -- curl -fsSL https://example.org/install.sh '|' sh
 allow	warn	curl-pipe-shell	a download is handed to a shell or an interpreter
-$ ljos-policyd version
-[[[cog
-import cog
-from scripts.crate_version import version_line
-cog.outl(version_line())
-]]]
-ljos-policyd 0.7.0 (phronesis)
-[[[end]]]
 ```
+<!-- [[[end]]] -->
 
 A check that hits an internal error, a parse failure, an unknown input, a missing config, no arguments, or an unknown verb prints `allow` and a `fail-open` reason.
 It does not stop the command on that failure.
-When `LJOS_POLICYD_DAEMON` is `host:port` and nothing accepts, the connect returns inside the connect timeout and this table's line is the answer.
+When `LJOS_POLICYD_DAEMON` is `host:port` and nothing accepts, the connect returns inside the connect timeout and this table's line is the answer. The pack in this process is not cut off at that timeout: the caller waits for its answer.
 
-The table names `rm-rf-outside-tmp`, `find-delete`, `find-exec-rm`, `rsync-delete-outside`, `git-force-push` of a remote default branch (`main`, `master`, or the remote HEAD in the checkout), `git-push-delete` of `main`, `master`, or `develop`, `reads-credential` except a `wc` count of a secrets path and that count with `head -c` of at most 4 bytes of the same path, and `curl-pipe-shell` (a download piped into `sh`, `bash`, or `zsh`).
+Every hit is `allow`, then `warn`, the rule name, and one warning a caller can show. `check` exits 0.
+The table below is the match list. A setuid mode, a recursive `chmod` or `chown`, `git reflog expire`, and `find -fprint` are not rules.
 A file written by `cat`, `tee`, `printf`, or `git commit -F` is data, including a `<(...)` body.
 `curl` piped to `python3` with no program of its own warns. `jq` is not a shell.
 `~/.config/ljos/seats.toml` and `ljos.toml` are config.
-Every hit is `allow`, then `warn`, the rule name, and one warning a caller can show. `check` exits 0.
 `reset --hard`, `checkout -- .`, `clean -f` and `stash drop` are that same warning.
 A consent record is read only. Its origin is undecided. It matches the push remote URL and the refspec destination branch. The URL is the remote argument when that argument is a URL, the URL `git -C` resolves, or the one literal URL the script assigns to the variable used as the remote. Its expiry is at most 24 hours ahead.
 The file is read only when the current user cannot write it and it is not group- or world-writable. Otherwise it is ignored and the reason is logged.
 `LJOS_USER_ALLOW` and `LJOS_CONSENT_FILE` may be set only by policyd's parent hook config. A file either name points at is ignored when that file is agent-writable, under the same check.
-`--user-allow` and `--config` are policyd's own flags, and only when they come before the command.
+`--user-allow` and `--config` are policyd's own flags, and only when they come before the command. `--user-allow` replaces an irreversible hit with `allow`, `user-rule`, and the pattern. It does not clear a warning such as `sudo`. A missing `--config` file prints `allow`, `fail-open`, and `missing config`, and the command is not judged.
 A parent whose comm or exe is a terminal, sshd, or tmux is ancestry. The reason names it. The verdict does not change. The command text is not that check.
 
 ## Threat model
@@ -63,21 +62,21 @@ That match is `allow`, `warn`, the rule name, and one warning. The command is no
 | `sudo` | a privilege runner as any word: `sudo`, `doas`, `su`, `pkexec`, `run0` | a sentence that only mentions one, passed as one quoted word |
 | `curl-pipe-shell` | a download piped into `sh`, `bash`, or `zsh`, directly or through a later stage (`curl URL \| sh`, `wget -qO- URL \| bash`, `curl URL \| tee f \| sh`); a shell, `source`, `.`, `eval` or an interpreter running a download (`bash <(curl ...)`, `source <(curl ...)`, `sh -c "$(curl ...)"`, `bash -c 'curl ... \| sh'`); a file a fetch on the line writes and a later command runs, including a redirection or `tee` (`curl -o i.sh URL && sh i.sh`, `curl URL > i.sh && sh i.sh`, `curl URL \| tee i.sh && ./i.sh`, `wget URL/i.sh && ./i.sh`). A download piped into `python3` with no program of its own (`curl URL \| python3`, `\| python3 -`, `\| python3 /dev/stdin`) is the same reason as a warning | `git fetch` followed by `bash build.sh`; a search pattern naming both; `curl URL \| jq`; `\| python3 -m json.tool`, `\| python3 parse.py` or `\| python3 -W ignore parse.py`; `curl -o FILE URL` or `curl URL > FILE` that nothing on the line runs; `echo hi \| tee run.sh && sh run.sh` |
 | `decoded-pipe-shell` | a decoder's output piped into a shell (`echo ... \| base64 -d \| sh`, `xxd -r ... \| sh`, `zcat x.gz \| bash`), or a shell running a decoder (`bash -c "$(base64 -d f)"`, `sh <(base64 -d f)`) | decoding to a file or into `grep` |
-| `chmod-setuid` | setting the setuid or setgid bit with `chmod` or `install -m`: an octal mode whose leading digit holds 4 or 2 (`4755`, `04755`, `2775`), or a clause that adds `s` (`u+s`, `g+s`, `+s`); an inline program that passes such a mode to `chmod` (`os.chmod(path, 0o4755)`, `chmodSync(path, 0o2755)`, `File.chmod(04755, path)`, `chmod 04755`) | other modes (`0755`, `1777`, `+x`, `u-s`, `os.chmod(path, 0o755)`, `chmod 0755`) |
 | `raw-disk` | `mkfs` on a device, `dd of=` a block device, `wipefs -a`, `sgdisk`, `sfdisk`, `fdisk`, `parted`, `blkdiscard`, `mkswap` or `shred` on a block device, `cryptsetup luksFormat`, `badblocks -w`, a `>` redirection into a block device | `mkfs` on an image file, `dd` to a file or `/dev/null`, the listing forms (`fdisk -l`, `parted print`, `sfdisk --dump`, `wipefs` without `-a`) |
-| `recursive-chmod-chown` | a recursive `chmod`, `chown`, `chgrp` or `setfacl` from `/`, a home directory or a system tree (`/etc`, `/usr`, `/var`, ...), or a recursive `chmod` to `000`, `a-rwx`, `777` or `o+w` outside `/tmp` | `chmod -R u+w target`, `chown -R $USER ./build`, `chmod -R 700 ~/.ssh` |
-| `find-delete-outside-tmp` | `find ... -delete`, or `-exec`, `-execdir` or `-ok` running `rm`, `shred` or `unlink`, whose starting points reach outside `/tmp` and `/var/tmp`; no starting point means the current directory | the same under `/tmp`; `find` without a delete; `find -exec grep`; a cleanup inside the tree whose name tests all name files a tool writes again (`find . -name '*.pyc' -delete`, `find . -name .DS_Store -delete`), unless the line can `cd` out of the tree |
-| `find-write-outside-tmp` | `find -fprint`, `-fprint0`, `-fprintf` or `-fls` whose file is not a literal path under `/tmp` or `/var/tmp` (`find / -fprint /etc/x`, `find . -fls out`, `find / -fprintf /etc/x '%p\n'`) | that file under `/tmp` or `/var/tmp` (`find /tmp -fprint /tmp/out`); `find -print` and `find -printf`; a `-fprint` word that belongs to the `-exec` command |
+| `find-delete` | `find -delete` whose start is outside the work tree. `/tmp`, `/var/tmp` and `/home` all print this warning. The warning text says outside `/tmp` for each of them | `find` without `-delete`; `find -exec grep`; a name-filtered delete inside the work tree (`find . -name '*.pyc' -delete`) |
+| `find-exec-rm` | `find -exec`, `-execdir` or `-ok` running `rm`, `shred` or `unlink` outside the work tree | `find -exec grep` |
+| `exec-unresolved` | `find -exec`, `-execdir`, `-ok` or `-okdir` whose command word is empty, is `{}`, or is still a `$` name | `find -exec echo` |
+| `feeder-rm` | `xargs` or `parallel` running `rm` | `xargs` running `wc` |
 | `rm-rf-outside-tmp` | a recursive `rm` or `rtrash` whose own operands reach outside `/tmp` and `/var/tmp`, a `..` in the path included; also `python -c`, `node -e`, `ruby -e` or `perl -e` code that calls `shutil.rmtree`, `rmSync(..., {recursive})`, `rm_rf`, `rm_r` or `remove_tree` outside `/tmp` | the same under `/tmp`; a build output directory named as a plain relative path (`rm -rf target/`, `rm -rf node_modules`, `rm -rf ./build`, `web/.venv`) or a top-level scratch directory (`rm -rf ./tmp/test-output`, `.tmp`, `temp`), unless the line can `cd` out of the tree; a later command on the line that is not a delete |
-| `git-force-push` | `git push` with `--force`, `-f` in a flag cluster, `--mirror`, or a `+` refspec of a remote default branch; a plain force push of `develop` always names this rule, and whether that should stay is an open policy question; a `--force-with-lease` push onto `main`, `master`, or the remote default (the branch `refs/remotes/<remote>/HEAD` names). A lease of any other branch warns. The printed line warns either way. ljos reads a bare lease push's branch from the checkout | an ordinary `git push`, `git push -u origin BRANCH`, `--force-if-includes` alone, and a lease push onto any other branch (`feature`, `mainline`, `develop-fix`, `release`), which the remote refuses when it holds commits you have not fetched. A lease of `develop` warns unless `develop` is that remote's default branch. A plain force push of `develop` always names this rule, and whether that should stay is an open policy question |
+| `git-force-push` | `git push --force`, `-f` in a short cluster, `--mirror`, a `+` refspec (`+main`, `+feature`, `+develop`), or `--force-with-lease` of any branch, including `feature` and `develop`. The printed line is the same warning for each | an ordinary `git push`, `git push -u origin BRANCH`, `--force-if-includes` alone, `--no-force-with-lease` |
 | `git-reset-hard` | `git reset --hard` | `--soft`, `--mixed`, `reset FILE` |
 | `git-clean-force` | `git clean` with `-f` (`-fd`, `-fdx`, `--force`) | `git clean -n` |
-| `git-stash-clear` | `git stash clear` | `stash pop`, `list`, `drop` |
+| `git-stash-clear` | `git stash clear` | `stash pop`, `stash list` |
+| `git-stash-drop` | `git stash drop` | `stash pop`, `stash list` |
 | `git-discard-worktree` | `git checkout -- .` or `git checkout .`, `git restore .` or `:/`, and `git restore` with no path | `checkout BRANCH`, `checkout -- FILE`, `restore FILE`, `restore --patch` |
 | `git-push-delete` | `git push --delete`, `-d` in a flag cluster, or a refspec with an empty source (`:main`, `:refs/tags/v1.0`) | `push origin main:main`, `push --dry-run` |
 | `git-branch-force-delete` | `git branch -D`, `--delete --force` | `branch -d`, which refuses an unmerged branch |
-| `git-reflog-expire` | `git reflog expire` with `--expire=now` or `=all`, `git reflog delete` | `reflog expire` with a date, `reflog show` |
-| `git-history-rewrite` | `git filter-branch`, `git filter-repo` | `git rebase` |
+| `git-history-rewrite` | `git filter-branch`, `git filter-repo` | `git rebase`, `git reflog expire`, `git reflog delete`, `git reflog show` |
 | `git-update-ref-delete` | `git update-ref -d` | `update-ref REF VALUE` |
 | `git-worktree-force-remove` | `git worktree remove --force` | `worktree remove` without `--force`, which refuses a dirty tree |
 
@@ -136,8 +135,33 @@ both.
 
 `ljos-policyd version` names the backend in parentheses, and
 `ljos doctor` shows it in its policy row. The binaries on the GitHub
-release are built with phronesis and report `phronesis`. A source build
+release are built with phronesis and report `phronesis`.
+
+<!-- [[[cog
+import cog
+from scripts.doc_samples import readme_release_version
+readme_release_version(cog)
+]]] -->
+```console
+$ ljos-policyd version
+ljos-policyd 0.7.0 (phronesis)
+```
+<!-- [[[end]]] -->
+
+A source build
 without the library reports `host table`, and the doctor warns about it.
+The sample is the binary this tree just built.
+
+<!-- [[[cog
+import cog
+from scripts.doc_samples import readme_host_version
+readme_host_version(cog)
+]]] -->
+```console
+$ ljos-policyd version
+ljos-policyd 0.7.0 (host table)
+```
+<!-- [[[end]]] -->
 
 ## Verbs and exit status
 
@@ -147,7 +171,7 @@ without the library reports `host table`, and the doctor warns about it.
 | `exec -- ARGV` | prints a warning on stderr when a rule matches, then runs ARGV | ARGV's status |
 | `capnp -- ARGV` | writes a packed Cap'n Proto `PolicyDecision` with decision allow | 0 |
 | `check-mail --config PATH [--argv [--] RECIPIENT...]` | reads one RFC 5322 message on stdin and prints JSON. The verdict is `allow`. `reasons` carry the rule and the warning | 0. A missing `--config` is usage and exits 2 |
-| `replay [DENY_LOG]` | re-judges every line of a deny log with this build and the person's rules, and counts how many would run now | 0 |
+| `replay [DENY_LOG]` | re-judges every line of a deny log with this build and the person's rules, and counts how many would run now | 0 when the log can be read. 2 when there is no log or it cannot be read |
 | `version` | the version and the backend | 0 |
 
 `check` prints one line, fields separated by a tab:
@@ -163,6 +187,30 @@ without the library reports `host table`, and the doctor warns about it.
 
 `python x.py` and `python3 x.py` rewrite to `uv run x.py`, arguments included, when the working directory or a parent has `pyproject.toml` or `uv.lock`, or the script file has a PEP 723 `# /// script` block. Otherwise the line stays as written. `python -c` stays as written: `uv run` does not take `-c`. When that tree asks for uv, `python -m` becomes `uv run -m`.
 
+<!-- [[[cog
+import cog
+from scripts.doc_samples import readme_rewrite
+readme_rewrite(cog)
+]]] -->
+```console
+$ # no project file
+$ ljos-policyd check -- python x.py
+allow
+$ # pyproject.toml in the working directory
+$ ljos-policyd check -- python x.py
+allow	rewrite	uv run x.py
+$ ljos-policyd check --user-allow 'rm -rf /home*' -- rm -rf /home
+allow	user-rule	rm -rf /home*
+$ ljos-policyd exec -- echo ran
+ran
+$ ljos-policyd replay deny.log
+was deny	git-force-push	now allow	warn	git-force-push	a force push rewrites a published branch	git push --force origin main
+1 of 1 refused lines would run now
+```
+<!-- [[[end]]] -->
+
+The first `python x.py` has no project file. The second is run in a directory with `pyproject.toml`.
+
 With phronesis linked and its seat pack loaded, bare `python x.py` is `python-requires-uv-run`. That hit is answered with the same rewrite, project file or not, since the pack's law is the reason to run through uv. The hook judges the rewritten line again, so a script with no PEP 723 block still meets `python-missing-pep723` there. `python -c` under that pack is allow with that rule and a warning.
 
 The hook returns that line as the tool's updated input where the runner has one, and as a note where it does not.
@@ -173,11 +221,11 @@ The hook returns that line as the tool's updated input where the runner has one,
 | Cursor `preToolUse` and `beforeShellExecution` | `updatedInput.command` is the new line |
 | Codex and any runner without that field | a note whose text is the new line, so the agent runs that line |
 
-The deny log still records the same hits as before, at `$LJOS_POLICYD_DENY_LOG`, or `$XDG_STATE_HOME/ljos-policyd/deny.log` (default `~/.local/state/ljos-policyd/deny.log`). Each line is the unix time, a tab, the reason, a tab, and the command. The printed line for those hits is allow with the warning. A hit that was only an ask is not logged. `ljos-policyd replay` reads that log back and prints, for each line, the reason it was recorded and the verdict this build gives it now, then how many of them would run; a shell `-c` line is replayed as its script and any other line split on spaces, since the log keeps no quoting.
+The deny log records an irreversible hit, at `$LJOS_POLICYD_DENY_LOG`, or `$XDG_STATE_HOME/ljos-policyd/deny.log` (default `~/.local/state/ljos-policyd/deny.log`). Each line is the unix time, a tab, the reason, a tab, and the command. The printed line for those hits is allow with the warning. Logged hits include a force or a `+` refspec of `main`, `master`, or `develop`, a lease of `main` or `master` (a lease of `develop` only when that name is the remote HEAD), a `find -delete` outside `/tmp` and `/var/tmp`, a download piped into a shell, and `cat` of a credential file. A force, a `+` refspec, or a lease of `feature`, a `find -delete` under `/tmp` or `/var/tmp`, a `wc` count of a credential file, `sudo`, a credential mention, and `git reset --hard` print a warning and are not logged. `ljos-policyd replay` reads that log back and prints, for each line, `was deny`, the reason it was recorded, `now`, and the verdict this build gives it, then how many of them would run. A shell `-c` line is replayed as its script and any other line is split on spaces, since the log keeps no quoting.
 
-The person's word comes first. A rule in `$XDG_CONFIG_HOME/ljos/user-rules.json` with the verdict `allow` and the basis `person`, which `ljos rule --user PATTERN --verdict allow --why ...` writes only at the person's own terminal, allows every line its pattern matches before the table or the pack is asked. The pattern is matched against the argv as one line, each of its pipelines, and a shell `-c` script and its pipelines, with the glob ljos uses. A runner cannot write such a rule.
+The person's word comes first. A rule in `$XDG_CONFIG_HOME/ljos/user-rules.json` with the verdict `allow` and the basis `person`, which `ljos rule --user PATTERN --verdict allow --why ...` writes only at the person's own terminal, prints `allow` for every line its pattern matches. The table and the pack are not run. The pattern is matched against the argv as one line, each of its pipelines, and a shell `-c` script and its pipelines, with the glob ljos uses. A runner cannot write such a rule.
 
-Makefile, npm, pnpm, yarn, bun and just recipes are not read. A python program is not analysed. Writing or mentioning an ordinary file is not a warning. `sudo`, a recursive `rm` outside `/tmp` and the build directories, a force push, a secret in an argument, a write of a hook or policy file, a remote shell, and a raw disk write each name a warning. `find -delete`, `find -exec rm`, and `xargs` or `parallel` running `rm` do too. So does `mv` onto `/dev/null` or another whole tree outside the work tree, and `rsync` with `--delete` over that tree. `git reset --hard`, `git clean -fd`, `git stash clear` or `drop`, and `git checkout -- .` or `git restore .` are warnings as well.
+Makefile, npm, pnpm, yarn, bun and just recipes are not read. A python program is not analysed. Writing or mentioning an ordinary file is not a warning. `sudo`, a recursive `rm` outside `/tmp` and the build directories, a force push, a secret in an argument, a write of a hook or policy file (`seat-guard-path`), a remote shell, and a raw disk write each name a warning. `find -delete`, `find -exec rm`, and `xargs` or `parallel` running `rm` do too. So does `mv` onto `/dev/null` or another whole tree outside the work tree, and `rsync` with `--delete` over that tree. `git reset --hard`, `git clean -fd`, `git stash clear` or `drop`, and `git checkout -- .` or `git restore .` are warnings as well.
 
 ## Outbound mail
 
@@ -187,10 +235,18 @@ a header is refused, that condition is a reason: `code` is the rule name
 and `detail` is the warning. The send is not held. An empty reason list
 is not a grant to send.
 
+<!-- [[[cog
+import cog
+from scripts.doc_samples import readme_mail
+readme_mail(cog)
+]]] -->
 ```console
 $ ljos-policyd check-mail --config mail.conf < message.eml
 {"verdict":"allow","reasons":[]}
+$ ljos-policyd check-mail --config mail.conf < blocked.eml
+{"verdict":"allow","reasons":[{"code":"recipient-domain-denied","detail":"to blocked.test"}]}
 ```
+<!-- [[[end]]] -->
 
 The message on stdin is the whole input. `sendmail -t recipient`
 adds that recipient to the ones in the headers, and this check

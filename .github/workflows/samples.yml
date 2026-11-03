@@ -1,0 +1,29 @@
+name: samples
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  samples:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Host table. The version sample prints "(host table)".
+      # A release binary prints "(phronesis)" and is described beside that sample.
+      - run: cargo build --locked
+      - run: python -m pip install -q 'cogapp==3.6.0'
+      - name: cog --check
+        run: cog --check README.md AUDIT.md docs/orgmode/*.org

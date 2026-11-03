@@ -1,71 +1,78 @@
 #+title: How-to
-#+description: Check a line from a hook, run it only when allowed, and fail closed when the binary is missing.
+#+description: Check a line from a hook, run it, and see the warning on stderr.
 #+options: toc:nil num:nil
 
 * Check a line from a hook
 
-The harness hook should call the binary, not ask the model. Pipe is
+The harness hook should call the binary, not the model. Pipe is
 not required; argv after =--= is the line.
 
+# [[[cog
+# import cog
+# from scripts.doc_samples import howto_check
+# howto_check(cog)
+# ]]]
 #+begin_src console
 $ ljos-policyd check -- git push origin main
 allow
 $ ljos-policyd check -- git push --force origin main
 allow	warn	git-force-push	a force push rewrites a published branch
+$ echo $?
+0
 #+end_src
+# [[[end]]]
 
 The answer is allow, with the rule and one warning. Exit status is 0.
 The hook can show the warning. It does not block the tool call.
 
-* Run only if allowed
+* Run the program
 
+# [[[cog
+# import cog
+# from scripts.doc_samples import howto_exec
+# howto_exec(cog)
+# ]]]
 #+begin_src console
-$ ljos-policyd exec -- uv run pytest
+$ ljos-policyd exec -- echo ran
+ran
 #+end_src
+# [[[end]]]
 
 Same verdict as =check=. =exec= prints a warning on stderr when a rule
 matches, then replaces itself with the named program.
 
 * Name a binary that is not on PATH
 
-#+begin_src console
-$ export POLICYD_BIN=$HOME/.local/bin/ljos-policyd
-$ ljos policy -- rm -rf /tmp/scratch
-#+end_src
-
 =ljos= looks at =POLICYD_BIN= first, then =PATH=. Doctor names the
-row either way.
+row either way. Those are the seat's commands. This binary does not
+read =POLICYD_BIN=.
 
-* Fail closed
+* A missing binary
 
-#+begin_src console
-$ POLICYD_REQUIRED=1 ljos policy -- ls
-#+end_src
-
-Without this, a missing binary is reported and the line is not
-denied. With it, absence is a deny. Use it on a seat that must not
-run unchecked argv.
+Without =POLICYD_REQUIRED=1=, a missing binary is reported and the
+line still runs. With it, the seat refuses every command until the
+binary is installed. The switch belongs to the seat. This process
+is not the one that prints that refusal.
 
 * Write pack rules beside the TCB
 
-Pack rules are memory. The binary prints a verdict:
-
-#+begin_src console
-$ ljos rule '*--force*' --verdict deny --why "Never force push."
-$ ljos policy -- git push --force
-#+end_src
-
-=ljos policy= prints this verdict first, then the pack rule. This
-verdict is allow, with the rule and a warning when one matches. Edit a
-pack rule only when argv law itself changes.
+Pack rules are memory. This binary prints a verdict, and that verdict
+is allow, with the rule and a warning when one matches. Edit a pack
+rule only when argv law itself changes.
 Do not write dates, ticket ids, or sitting notes into it.
 
 * Emit the Cap'n verdict
 
+# [[[cog
+# import cog
+# from scripts.doc_samples import howto_capnp
+# howto_capnp(cog)
+# ]]]
 #+begin_src console
 $ ljos-policyd capnp -- true | wc -c
-40
+48
 #+end_src
+# [[[end]]]
 
 The hook still reads the text line from =check=. Libraries read the
 packed =PolicyDecision=.
