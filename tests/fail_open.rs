@@ -166,14 +166,25 @@ fn the_binary_allows_on_parse_a_missing_rules_file_and_io() {
     );
     assert_eq!(code, 0, "{stdout}");
     assert_eq!(stdout, "allow\tfail-open\tmissing config");
+}
 
+#[test]
+fn an_unwritable_deny_log_keeps_the_warning() {
     let mut cmd = Command::new(bin());
     cmd.env("LJOS_POLICYD_DENY_LOG", "/dev/null/deny.log");
     cmd.args(["check", "--", "rm", "-rf", "/srv/x"]);
     let out = cmd.output().expect("run policyd");
     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
     assert_eq!(out.status.code(), Some(0), "{stdout}");
-    assert_eq!(stdout, "allow\tfail-open\tio");
+    assert!(
+        stdout.starts_with("allow\twarn\trm-rf-outside-tmp"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.starts_with("deny log not written: /dev/null/deny.log: "),
+        "{stderr}"
+    );
 }
 
 #[test]

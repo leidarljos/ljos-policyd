@@ -72,6 +72,20 @@ fn the_setting_denies_the_same_line_with_the_same_rule() {
 }
 
 #[test]
+fn an_unwritable_deny_log_does_not_hide_the_warning_from_the_setting() {
+    let path = config("log", "block-on-warning true\n");
+    let mut cmd = check(None, &["rm", "-rf", "/srv/x"]);
+    cmd.env("LJOS_POLICYD_DENY_LOG", "/dev/null/deny.log");
+    let (code, warned) = run(cmd);
+    assert_eq!(code, Some(0), "{warned}");
+    let hit = warned.strip_prefix("allow\twarn\t").expect(&warned);
+    let mut cmd = check(Some(&path), &["rm", "-rf", "/srv/x"]);
+    cmd.env("LJOS_POLICYD_DENY_LOG", "/dev/null/deny.log");
+    assert_eq!(run(cmd), (Some(2), format!("deny\t{hit}")));
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
 fn the_setting_still_allows_on_a_missing_config_and_a_timeout() {
     let path = config("gone", "block-on-warning true\n");
     assert_eq!(run(check(Some(&path), SUDO)).0, Some(2));
@@ -100,9 +114,6 @@ fn the_setting_still_allows_on_a_missing_config_and_a_timeout() {
 #[test]
 fn the_setting_still_allows_when_the_check_fails_open() {
     let path = config("error", "block-on-warning true\n");
-    let mut cmd = check(Some(&path), &["rm", "-rf", "/srv/x"]);
-    cmd.env("LJOS_POLICYD_DENY_LOG", "/dev/null/deny.log");
-    assert_eq!(run(cmd), allowed("allow\tfail-open\tio"));
     assert_eq!(
         run(check(Some(&path), &["bash", "-c", "rm -rf '/srv"])),
         allowed("allow\tfail-open\tparse failure")

@@ -1810,13 +1810,25 @@ mod tests {
         for (site, argv) in [
             ("config_gap", vec!["true".into()]),
             ("script_unparsed", vec!["true".into()]),
-            ("log_deny", vec!["rm".into(), "-rf".into(), "/srv/x".into()]),
         ] {
             FAULT_SITE.with(|slot| slot.set(Some(site)));
             let line = crate::verdict(&argv);
             FAULT_SITE.with(|slot| slot.set(None));
             assert_eq!(line, format!("allow\tfail-open\t{site}"), "{site}");
         }
+    }
+
+    #[test]
+    fn a_deny_log_fault_keeps_the_warning() {
+        let argv = ["rm".into(), "-rf".into(), "/srv/x".into()];
+        let ctx = Context {
+            person_tty: Some(false),
+            ..Context::default()
+        };
+        FAULT_SITE.with(|slot| slot.set(Some("log_deny")));
+        let line = crate::verdict_with(&argv, &ctx);
+        FAULT_SITE.with(|slot| slot.set(None));
+        assert_eq!(line, allow_annotation("rm-rf-outside-tmp"));
     }
 
     #[test]
