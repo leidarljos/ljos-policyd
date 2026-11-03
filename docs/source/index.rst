@@ -32,20 +32,15 @@ First minute
 
 Typed verdict is Cap'n PolicyDecision (phronesis; Ali Akber Saifee / indynull, HaoZeke). A Janet pack can name more. The printed line is still allow, with that rule and one warning.
 
-.. code:: janet
-
-   (defn check [argv]
-     (when (has-prefix? (get argv 0) "sudo")
-       (deny "sudo")))
-
 The seat composes that pack after this verdict: ``ljos policy -- uv run pytest``.
 
 Install
 =======
 
+Install with ``cargo binstall ljos-policyd``.
+
 .. code:: console
 
-   $ cargo binstall ljos-policyd
    $ ljos-policyd check -- uv run pytest
    allow
 

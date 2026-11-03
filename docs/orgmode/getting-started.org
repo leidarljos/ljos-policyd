@@ -63,7 +63,7 @@ $ ljos-policyd exec -- echo ran
 ran
 $ echo $?
 0
-$ ljos-policyd exec -- find /tmp -name nosuch-policyd-doc -delete
+$ ljos-policyd exec -- find /tmp/ljos-policyd-doc-sample -name nosuch-policyd-doc -delete
 allow	warn	find-delete	find -delete reaches outside /tmp and /var/tmp
 $ echo $?
 0
