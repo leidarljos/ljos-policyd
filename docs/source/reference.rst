@@ -3,7 +3,7 @@ Command line
 
 ``ljos-policyd check|exec|capnp|check-mail|replay|version``
 
-On ``check``, ``--user-allow PATTERN`` and ``--config PATH`` are this binary's
+On ``check`` and ``exec``, ``--user-allow PATTERN`` and ``--config PATH`` are this binary's
 flags, and only when they come before the command. A ``--`` ends them.
 Nothing after it is read as a flag. A leading ``--`` after the verb is
 optional and is stripped.
