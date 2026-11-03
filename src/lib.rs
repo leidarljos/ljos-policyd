@@ -273,8 +273,12 @@ fn check_with_logged(argv: &[String], ctx: &open::Context, log: bool) -> Checked
             Err(_) => Some("internal error".to_string()),
         };
         if let Some(why) = failed {
-            let path = deny_log_path().unwrap_or_default();
-            eprintln!("deny log not written: {}: {why}", path.display());
+            // A missing path displays as nothing, so the line would read
+            // "deny log not written: : ...". Name that no path is set.
+            match deny_log_path().filter(|p| !p.as_os_str().is_empty()) {
+                Some(path) => eprintln!("deny log not written: {}: {why}", path.display()),
+                None => eprintln!("deny log not written: <no path>: {why}"),
+            }
         }
     }
     checked
