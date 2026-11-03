@@ -20,6 +20,10 @@ path = "src/lib.rs"
 name = "ljos-policyd"
 path = "src/main.rs"
 
+[[bench]]
+name = "check_latency"
+harness = false
+
 [dependencies]
 capnp = "0.27"
 icu_casemap = "=2.4.0"
