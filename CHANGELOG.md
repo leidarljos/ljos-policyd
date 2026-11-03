@@ -2,6 +2,53 @@
 
 <!-- towncrier release notes start -->
 
+## 0.7.0 (2026-11-03)
+
+### Fixes
+
+- A check that used to deny or ask now prints allow, the rule name, and a one-line warning.
+  It no longer waits out a missing daemon.
+- A linked pack finishes its answer. A queued check no longer prints allow, fail-open, and timeout while that pack is still working.
+  Concurrent checks in one workspace stay allow. They no longer print allow, fail-open, and bind-failed.
+- A uv rewrite keeps the program.
+  `python -m` stays a module, and `pip install -r` and `-e` stay that install.
+  Flags and here-documents stay with the interpreter that reads them.
+  A form uv cannot spell is the original line plus a note.
+- On macOS, `rm -rf` under /tmp or /var/tmp is allowed when the path stays inside that directory.
+- Policyd now reads a quoted here-document body as data, as bash does.
+  A note written with `cat` or `git commit -F` allows with no warning.
+  Inside an unquoted body, bash still runs `$(...)`, backticks and `<(...)` even after a `#` or a quote, and policyd judges each one.
+  A process substitution outside a here-document gets the verdict of the command it runs.
+  A download saved with `curl -o` or `wget` and then run by a shell gets the same warning as a pipe into `sh`.
+  A pipe from `curl` into `python3` only warns, and a pipe into `jq` allows.
+  Reading `seats.toml` or `ljos.toml` counts as config, not as a credential read.
+  Policyd only reads a consent record and never writes one.
+  Policyd prints `allow consent` with no warning when a record's push URL and destination branch match the push.
+  A record that expires more than 24 hours ahead, or has already expired, is ignored.
+  A lost-work prompt warns and no longer exits 2.
+  A fault, an empty argument list or an unknown verb allows.
+- When policyd hits an error or finds no config, it allows the call and names the reason.
+  Removing a tree outside the temporary directory, `find -delete`, `find -exec rm`, `rsync --delete` outside the tree, a force-push, deleting a remote default branch, reading a credential file, and piping a download into a shell each allow with a warning and add a line to the deny log.
+  A `wc` count of a secrets path warns.
+  That count with `head -c` of at most 4 bytes of the same path warns too.
+  A longer `head -c`, `head -n`, plain `head`, `cat`, `tail`, `cp` or `base64` of that path warns and adds a line to the deny log.
+  A history rewrite now warns, and so does every other hit.
+  For a hit the deny log records, a matching consent record or a user allow prints `allow consent` or `allow user-rule` in place of the warning, and the deny log gets no line.
+  Policyd names the process ancestry in the reason, but ancestry never changes the verdict.
+
+### Documentation
+
+- The reference matches its org source again.
+  It drops three sentences that were edited only into the rst.
+
+### Miscellaneous
+
+- CI builds the towncrier draft and fails on a fragment name that is not a configured type.
+- CI fails when a version copy in a cog block was not regenerated from Cargo.toml.
+- `cargo bench --bench check_latency` times `ljos-policyd check` on the 4008 fixture command lines, and `measurements/check-latency.md` keeps the table.
+- `src/lib.rs` is split into modules by concern, with the public API and every verdict unchanged.
+
+
 ## 0.6.4 (2026-10-31)
 
 ### Fixes

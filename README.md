@@ -23,7 +23,7 @@ import cog
 from scripts.crate_version import version_line
 cog.outl(version_line())
 ]]]
-ljos-policyd 0.6.4 (phronesis)
+ljos-policyd 0.7.0 (phronesis)
 [[[end]]]
 ```
 
