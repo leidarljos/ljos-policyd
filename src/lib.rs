@@ -260,7 +260,7 @@ fn check_with_logged(argv: &[String], ctx: &open::Context, log: bool) -> Checked
             slot.extend(owned.iter().filter(|w| w.contains(['$', '`'])).cloned());
         });
         bump_spell_gen();
-        let raw = check_shell_in(&owned, &cwd, 0);
+        let raw = check_shell_in(&owned, &cwd);
         open::publish(&owned, raw, &ctx)
     });
     if log && checked.decision == Decision::Deny {
@@ -345,9 +345,7 @@ fn braced(w: &str, bare: bool) {
     });
 }
 
-/// The text of the literal here-document closed by `delim` whose body
-/// split into `words`. Only where every body read this check with those
-/// words was literal, and all of them were written alike.
+/// Bump [`SPELL_GEN`] so a reused command judgment is valid only for the map it was made under.
 fn bump_spell_gen() {
     SPELL_GEN.with(|g| g.set(g.get().wrapping_add(1)));
 }
@@ -373,9 +371,8 @@ fn spelled(w: &str, quoted: bool) {
     }
 }
 
-/// How many runner levels deep (`make a` whose recipe runs `npm run b`)
-/// script targets are read before the line is judged as written.
-fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Checked {
+/// The table, then phronesis on a plain allow, then the cap label.
+fn check_shell_in(argv: &[String], cwd: &std::path::Path) -> Checked {
     clear_cap_label();
     let parent = Scratch {
         root: Some(cwd.to_path_buf()),
@@ -392,7 +389,6 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
     } else {
         table
     };
-    let _ = depth;
     with_cap_label(table)
 }
 
