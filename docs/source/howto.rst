@@ -22,6 +22,10 @@ Ask a warning to block
    $ echo 'block-on-warning true' > policyd.conf
    $ ljos-policyd check --config policyd.conf -- git branch -D gone
    deny    git-branch-delete   git branch -d or -D deletes a local branch
+   $ ljos-policyd check --config policyd.conf -- git push --force origin main
+   deny    git-force-push  a force push rewrites a published branch
+   $ echo $?
+   2
 
 ``block-on-warning true`` in the file ``--config`` names makes a warning
 block. It is off by default. ``git branch -d`` and ``git branch -D`` warn
@@ -30,6 +34,10 @@ as ``git-branch-delete``, and so does every other rule that used to deny.
 ``exec`` prints the warning and
 ``exec: not run because block-on-warning is on``, and does not run the
 command. ``capnp`` and ``check-mail`` do not read the line.
+Without that line, a warning stays allow.
+A check that fails open is still allow with the setting on: an
+error, a missing config file, and a daemon that is missing or does
+not answer.
 
 Run only if allowed
 ===================

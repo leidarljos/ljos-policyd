@@ -1,5 +1,6 @@
 //! A warning allows the command. `block-on-warning true` in `--config`
 //! prints `deny` with the same rule and warning, and `exec` does not run.
+//! Every fail-open line stays allow.
 //! `git branch -d` and `git branch -D` are `git-branch-delete`. Every
 //! other host-table deny rule is the same pair of lines.
 
@@ -295,4 +296,34 @@ fn capnp_stays_allow_for_a_warned_command() {
     );
     let reason = decision.get_reason().unwrap().to_str().unwrap();
     assert!(reason.starts_with("warn\tgit-branch-delete"), "{reason}");
+}
+
+#[test]
+fn the_setting_still_allows_on_a_missing_daemon() {
+    let path = config("daemon", "block-on-warning true\n");
+    // 192.0.2.1 is TEST-NET-1 (RFC 5737). Nothing there accepts, so the
+    // connect runs to its timeout.
+    let mut cmd = check(Some(&path), &["true"]);
+    cmd.env("LJOS_POLICYD_DAEMON", "192.0.2.1:81");
+    let (code, line, _) = run(cmd);
+    assert_eq!((code, line.as_str()), (Some(0), "allow\n"));
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let mut cmd = check(Some(&path), &["true"]);
+    cmd.env("LJOS_POLICYD_DAEMON", closed.to_string());
+    let (code, line, _) = run(cmd);
+    assert_eq!((code, line.as_str()), (Some(0), "allow\n"));
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+}
+
+#[test]
+fn the_setting_still_allows_when_the_deny_log_cannot_be_written() {
+    let path = config("error", "block-on-warning true\n");
+    let mut cmd = check(Some(&path), &["rm", "-rf", "/srv/x"]);
+    cmd.env("LJOS_POLICYD_DENY_LOG", "/dev/null/deny.log");
+    let (code, line, _) = run(cmd);
+    assert_eq!((code, line.as_str()), (Some(0), "allow\tfail-open\tio\n"));
+    let _ = std::fs::remove_dir_all(path.parent().unwrap());
 }
