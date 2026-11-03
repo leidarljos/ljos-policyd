@@ -9,7 +9,7 @@ not required; argv after ``--`` is the line.
    $ ljos-policyd check -- git push origin main
    allow
    $ ljos-policyd check -- git push --force origin main
-   allow    warn    git-force-push    a force push rewrites a published branch
+   allow   warn    git-force-push  a force push rewrites a published branch
 
 The answer is allow, with the rule and one warning. Exit status is 0.
 The hook can show the warning. It does not block the tool call.
@@ -21,8 +21,8 @@ Run only if allowed
 
    $ ljos-policyd exec -- uv run pytest
 
-Same verdict as ``check``. ``exec`` prints a warning on stderr when a
-rule matches, then replaces itself with the named program.
+Same verdict as ``check``. ``exec`` prints a warning on stderr when a rule
+matches, then replaces itself with the named program.
 
 Name a binary that is not on PATH
 =================================

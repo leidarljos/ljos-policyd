@@ -6,15 +6,15 @@ Command line
 ``ljos-policyd check-mail --config PATH [--argv [--] RECIPIENT...]``
 reads one RFC 5322 message on stdin. See "Outbound mail" below.
 
-================ ========================================================================================
-Verb             Meaning
-================ ========================================================================================
-``check``        print ``allow``, or ``allow<TAB>warn<TAB>rule<TAB>warning``; exit 0
-``capnp``        write a packed Cap'n ``PolicyDecision`` with decision allow; exit 0
-``exec``         same text verdict; print a warning on stderr and run argv
-``check-mail``   JSON ``verdict`` ``allow``; ``reasons`` carry the rule and the warning; exit 0. A missing ``--config`` exits 2
-``version``      print ``ljos-policyd <semver> (phronesis)`` or ``ljos-policyd <semver> (host table)``
-================ ========================================================================================
+============== ==============================================================================================================
+Verb           Meaning
+============== ==============================================================================================================
+``check``      print ``allow``, or ``allow<TAB>warn<TAB>rule<TAB>warning``; exit 0
+``capnp``      write a packed Cap'n ``PolicyDecision`` with decision allow; exit 0
+``exec``       same text verdict; print a warning on stderr and run argv
+``check-mail`` JSON ``verdict`` ``allow``; ``reasons`` carry the rule and the warning; exit 0. A missing ``--config`` exits 2
+``version``    print ``ljos-policyd <semver> (phronesis)`` or ``ljos-policyd <semver> (host table)``
+============== ==============================================================================================================
 
 A leading ``--`` after the verb is optional and is stripped.
 
@@ -49,13 +49,6 @@ Token                 Cap'n PolicyReason       When
 ===================== ======================== ============================
 
 Anything else is ``allow``. ``python -c`` is allow. Schema: ``schema/policy.capnp``.
-
-``python x.py`` is ``allow<TAB>rewrite<TAB>uv run x.py`` when the tree has
-``pyproject.toml`` or ``uv.lock``, or the script carries a PEP 723 block.
-Under the phronesis seat pack, whose law refuses bare python as
-``python-requires-uv-run``, the same rewrite answers that refusal with no
-project file asked for. The hook judges the new line again. ``-c`` and
-``-m`` have no uv spelling and keep the refusal.
 
 Task runners
 ============
@@ -134,8 +127,7 @@ a runner after the ``cd`` is refused. A word that only names it
 (``grep CDPATH``, ``env CDPATH=dir cmd``) changes nothing.
 
 ``HOME`` is followed the same way: a bare ``cd`` enters the one set in
-front of it (``HOME=dir cd``) or earlier on the line (``export HOME=dir;
-cd``), and ``~`` expands from the one set before the command, as do
+front of it (``HOME=dir cd``) or earlier on the line (``export HOME=dir; cd``), and ``~`` expands from the one set before the command, as do
 ``$HOME`` and ``${HOME}`` at the head of a path. A ``HOME``
 that may hold either of two values, or one the line does not show
 (``HOME=$(mktemp -d) cd``), leaves the runner after the ``cd`` refused.
@@ -219,9 +211,9 @@ these limits.
 Outbound mail
 =============
 
-``check-mail`` prints one JSON object. The verdict is ``allow``. Where
-this section says a message is refused, that condition is a reason. The
-send is not held. An empty reason list is not a grant to send.
+``check-mail`` prints one JSON object. The verdict is ``allow``. Where this
+section says a message is refused, that condition is a reason. The send
+is not held. An empty reason list is not a grant to send.
 
 The message on stdin is the whole input. A caller must pass no
 recipient arguments to ``sendmail -t``: those addresses are not in
@@ -247,13 +239,13 @@ at a ``domain``) and of a domain named by the pack-law file.
 ``Sender``, ``Errors-To`` and ``Return-Path``, when present, must
 be the identity under the same rule as ``From``. An empty
 ``Return-Path`` is not that address. Any ``Resent-*`` header is a refusal, and so is
-any ``Apparently-To``. ``To``, ``Cc`` and ``Bcc`` are refused
-when the mailbox is an ``address`` line in the deny file, and
-when the domain or a parent of it is named by the deny file or by
-a ``deny-domain`` line in the pack-law file. An ``address`` line
-is that mailbox, not the whole domain. It also covers that local
+any ``Apparently-To``. ``To``, ``Cc`` and ``Bcc`` are refused when
+the mailbox is an ``address`` line in the deny file, and when the
+domain or a parent of it is named by the deny file or by a
+``deny-domain`` line in the pack-law file. An ``address`` line is
+that mailbox, not the whole domain. It also covers that local
 part, one ``subaddress`` separator, and anything after the
-separator. The separators are the ``subaddress`` line, or ``+-=``
+separator. The separators are the ``subaddress`` line, or ``+-``
 when the line is omitted. ``.``, ``@``, ``%`` and ``!`` are not
 separators. An ``address`` rule is also compared by skeleton:
 NFD, combining marks removed, case folded twice, combining marks
@@ -321,50 +313,50 @@ or ``deny-domain`` value has to be a hostname after IDNA. A star,
 a colon, a slash, an at-sign, whitespace, or anything else that
 is not a hostname refuses the file. So does a domain a
 recipient cannot have, such as an all-numeric one, in a
-``domain``, ``deny-domain`` or ``address`` value. The detail is
-the line number and not the value. A wildcard is not how to name
+``domain``, ``deny-domain`` or ``address`` value. The detail is the
+line number and not the value. A wildcard is not how to name
 subdomains: ``domain example.test`` already covers
 ``a.example.test``. An ``address`` value with a star, or with a
 character a parsed recipient cannot carry, is refused the same
 way. ``From`` is
-not matched this way. A domain literal (an
-address at ``@[ ... ]``) in a watched header is a refusal. So is
-a domain that is not a hostname after IDNA, such as one with an
-underscore, a ``!`` or a ``+``, a label that starts or ends with a
-hyphen, a label over 63 characters or a name over 253: no rule
-could name it. An
+not matched this way. A domain literal (an address
+at ``@[ ... ]``) in a watched header is a refusal. So is a domain
+that is not a hostname after IDNA, such as one with an underscore,
+a ``!`` or a ``+``, a label that starts or ends with a hyphen, a label
+over 63 characters or a name over 253: no rule could name it. An
 all-numeric domain is a refusal, judged after IDNA. That
-includes a dotted quad, a shorter form ``inet_aton`` accepts,
-a hex label (``0x``) and a label with a leading zero. U+3002
-or U+FF61 between the numbers is still that address. A
-source route (``<@host:mailbox>``) is a refusal. ``@``, ``%`` or
-``!`` in a local part is a refusal, quoted or not, including a
-backslash escape inside the quotes. A local part that NFKC
-changes into ASCII punctuation, such as a fullwidth ``@``,
-``%``, ``!`` or ``+``, is a refusal. A local part that contains a
-default ignorable code point, a noncharacter, an unassigned or
-private-use code point, a format or control character, or a space
-separator is a refusal. A zero-width space or a braille blank is
-still removed before the address is compared. A recipient domain, or a domain on a
-header checked against the deny file, is refused when one label
-mixes Latin with Cyrillic or Greek after NFKC and IDNA.
+includes a dotted quad, a shorter form ``inet_aton`` accepts, a
+hex label (``0x``) and a label with a leading zero. U+3002 or
+U+FF61 between the numbers is still that address. A source route
+(``<@host:mailbox>``) is a refusal. ``@``, ``%`` or ``!`` in a local
+part is a refusal, quoted or not, including a backslash escape
+inside the quotes. A local part that NFKC changes into ASCII
+punctuation, such as a fullwidth ``@``, ``%``, ``!`` or ``+``, is a
+refusal. A local part that contains a default ignorable code point,
+a noncharacter, an unassigned or private-use code point, a format
+or control character, or a space separator is a refusal. A
+zero-width space or a braille blank is still removed before the
+address is compared.
+A recipient domain, or a domain on a header checked against the
+deny file, is refused when one label mixes Latin with Cyrillic or
+Greek after NFKC and IDNA.
 
 A deny-file domain compares a fullwidth spelling and the punycode
 form as the same domain. A homoglyph that NFKC and IDNA leave alone
 does not, and a label wholly in Cyrillic or Greek is not mapped to
 the Latin it looks like. Case is folded as the address skeleton
 folds it, so ß is ss and ı and İ are i, and a character a reader
-skips is removed before that comparison. ``From`` is not compared that way. ``handle``, ``term`` and ``pair`` may share the deny file
-and are ignored here. A pack-law line that would allow a domain refuses
+skips is removed before that comparison. ``From`` is not compared that way. ``handle``, ``term`` and ``pair`` may share the deny file and
+are ignored here. A pack-law line that would allow a domain refuses
 the file. The detail of ``deny-file-invalid`` and ``pack-law-invalid``
 is the line number, not the value. A message over 1 MiB, a control character in the header
 block, U+0085, U+2028 or U+2029 in that block, a header line over
 998 octets, a header block that mixes CRLF and a bare LF, or a
 config that cannot be read is a refusal.
 
-======================================== ======================================================
+======================================== ================================================================================================================================
 Code                                     When
-======================================== ======================================================
+======================================== ================================================================================================================================
 ``from-missing``                         no From
 ``duplicate-from``                       more than one From
 ``from-not-identity``                    From is not the configured identity
@@ -393,7 +385,7 @@ Code                                     When
 ``mail-reply-to-denied``                 Mail-Reply-To names a deny-file identity
 ``mail-reply-to-unparsed``               Mail-Reply-To does not parse
 ``apparently-to``                        an Apparently-To header is present
-``resent-header``                        a Resent-* header is present
+``resent-header``                        a Resent-\* header is present
 ``mixed-script``                         a label mixes Latin with Cyrillic or Greek
 ``recipient-address-denied``             To, Cc or Bcc names a deny-file address
 ``recipient-domain-denied``              To, Cc or Bcc is at a denied domain
@@ -412,7 +404,7 @@ Code                                     When
 ``deny-file-invalid``                    a deny-file line is not a known kind, a domain is not a hostname, or an address skeleton is empty. The detail is the line number
 ``pack-law-unreadable``                  the pack-law file cannot be read
 ``pack-law-invalid``                     a pack-law line is not deny-domain, or the domain is not a hostname. The detail is the line number
-======================================== ======================================================
+======================================== ================================================================================================================================
 
 Environment the seat reads
 ==========================
@@ -429,19 +421,19 @@ Variable             Meaning
 Exit statuses
 =============
 
-===== ==================================================================================
+===== ===========================================================================
 Code  Meaning
-===== ==================================================================================
+===== ===========================================================================
 0     a check, capnp, check-mail, version, or ``exec`` of a process that exited 0
 2     check-mail without ``--config``, or replay with no log or an unreadable log
 127   ``exec`` could not spawn the program
 other ``exec`` of a process that exited with that code
-===== ==================================================================================
+===== ===========================================================================
 
 What this crate is
 ==================
 
--  Remember and Prefer stay in packset.
--  A check is the argv verdict. Pack rules stay in packset.
--  ``ljos policy`` prints the line and composes this verdict with pack
-   rules.
+- Remember and Prefer stay in packset.
+- A check is the argv verdict. Pack rules stay in packset.
+- ``ljos policy`` prints the line and composes this verdict with pack
+  rules.

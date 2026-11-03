@@ -29,7 +29,13 @@ if [[ "$exporter" == "emacs" ]]; then
   emacs --batch -l docs/export.el
 else
   shopt -s nullglob
-  files=("$ORG_DIR"/*.org)
+  # Pandoc's org reader splits a shell assignment inside =verbatim= and
+  # turns word_word into a subscript. Guard those, export, then put the
+  # characters back. The guarded copies are not the org sources.
+  guarded="$(mktemp -d)"
+  trap 'rm -rf "$guarded"' EXIT
+  python3 docs/scripts/pandoc_org.py guard "$ORG_DIR" "$guarded"
+  files=("$guarded"/*.org)
   if ((${#files[@]} == 0)); then
     echo "error: no org files in $ORG_DIR" >&2
     exit 1
@@ -46,6 +52,7 @@ else
     pandoc -f org -t rst --wrap=preserve --columns=400 -o "$OUT_DIR/${base}.rst" "$org"
     echo "  wrote $OUT_DIR/${base}.rst"
   done
+  python3 docs/scripts/pandoc_org.py unguard "$OUT_DIR"
 fi
 
 python3 docs/scripts/fix_doc_links.py

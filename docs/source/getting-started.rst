@@ -9,7 +9,7 @@ allow, one warning, and an exec that ran.
    $ ljos-policyd check -- uv run pytest
    allow
    $ ljos-policyd check -- sudo id
-   allow    warn    sudo    a privilege runner is on the command
+   allow   warn    sudo    a privilege runner is on the command
 
 ``uv run pytest`` is the line under test. A Janet pack
 can name more after this verdict. The printed line stays allow.
@@ -22,15 +22,15 @@ Nothing is configured. The built-in warnings are the whole trusted computing bas
 .. code:: console
 
    $ ljos-policyd check -- sudo id
-   allow    warn    sudo    a privilege runner is on the command
+   allow   warn    sudo    a privilege runner is on the command
    $ echo $?
    0
 
 The first matching rule is the warning. The answer is allow. The rule
 is a short token after ``warn`` (``sudo``, ``curl-pipe-shell``,
-``git-force-push``, ``chmod-setuid``, ``raw-disk``, and more), then one
-line a caller can show. The typed form is a Cap'n ``PolicyDecision``
-with decision allow:
+``git-force-push``, ``chmod-setuid``, ``raw-disk``, and more), then one line
+a caller can show. The typed form is a Cap'n ``PolicyDecision`` with
+decision allow:
 
 .. code:: console
 
@@ -46,7 +46,7 @@ with decision allow:
    $ echo $?
    0
    $ ljos-policyd exec -- sudo id
-   allow    warn    sudo    a privilege runner is on the command
+   allow   warn    sudo    a privilege runner is on the command
 
 ``exec`` prints the warning on stderr and then runs the named program.
 The exit status is that program's.
