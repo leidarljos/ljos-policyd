@@ -180,6 +180,7 @@ ljos-policyd 0.7.0 (host table)
 | `check-mail --config PATH [--argv [--] RECIPIENT...]` | reads one RFC 5322 message on stdin and prints JSON. The verdict is `allow`. `reasons` carry the rule and the warning | 0. A missing `--config` is usage and exits 2 |
 | `replay [DENY_LOG]` | re-judges every line of a deny log with this build and the person's rules, and counts how many would run now | 0 when the log can be read. 2 when there is no log or it cannot be read |
 | `version` | the version and the backend | 0 |
+| `help`, `--help`, `-h` | prints the usage lines | 0 |
 
 An argv of one word that holds whitespace or a shell operator is read as a shell line, the same as `sh -c` of that word, and any other argv is the program and its arguments.
 
