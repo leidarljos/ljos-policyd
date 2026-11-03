@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -267,12 +268,37 @@ def getting_started_capnp(cog):
     _end(cog, True)
 
 
+# `find /tmp -delete` also walks directories the runner cannot read.
+# Those lines are find's, not the rule. This directory is empty, so the
+# warning is the only stderr on every machine.
+SAMPLE_FIND_DIR = "/tmp/ljos-policyd-doc-sample"
+
+
+def _prepare_find_dir():
+    root = Path(SAMPLE_FIND_DIR)
+    if root.is_symlink() or not root.is_dir():
+        if root.exists() or root.is_symlink():
+            root.unlink()
+    else:
+        shutil.rmtree(root)
+    root.mkdir()
+
+
 def getting_started_exec(cog):
+    _prepare_find_dir()
     _fence(cog, True)
     _run(cog, ["exec", "--", "echo", "ran"], "ran\n", code=0)
     _run(
         cog,
-        ["exec", "--", "find", "/tmp", "-name", "nosuch-policyd-doc", "-delete"],
+        [
+            "exec",
+            "--",
+            "find",
+            SAMPLE_FIND_DIR,
+            "-name",
+            "nosuch-policyd-doc",
+            "-delete",
+        ],
         stderr=WARN_FIND,
         code=0,
     )

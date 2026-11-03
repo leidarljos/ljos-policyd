@@ -22,9 +22,10 @@ belongs to the seat, not to a verdict of this table.
 The first match is the warning
 ==============================
 
-The built-in list is the argv TCB from phronesis (Ali Akber Saifee /
-indynull, HaoZeke; MIT): privilege runners, remote-exec, recursive
-delete off tmp, force-push, setuid, raw disk. A later pack rule can
+The built-in warnings are privilege runners, remote-exec, recursive
+delete off tmp, force-push, and raw disk. A setuid mode is not one of
+them. The list comes from the phronesis argv TCB (Ali Akber Saifee /
+indynull, HaoZeke; MIT). A later pack rule can
 name more. The printed line stays allow, with that rule and one
 warning. ``python -c`` is
 allow: this hook sits on a general agent shell, not a uv-only
@@ -44,7 +45,8 @@ A missing binary leaves the line open
 A seat without the binary still sits. Doctor names the row. The
 hook and ``ljos policy`` print the line and any pack rule. Setting
 ``POLICYD_REQUIRED=1`` is the fail-closed seat: then a missing binary
-is a deny. That switch belongs to the operator.
+is the seat's refusal. This binary is not running, so it prints
+nothing. That switch belongs to the operator.
 
 A check is the argv verdict
 ===========================

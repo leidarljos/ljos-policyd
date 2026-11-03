@@ -27,12 +27,14 @@ jobs:
       - run: python -m pip install -q cogapp==3.6.0
       # grep, not rg: the runner image has no rg. The flags skip what rg
       # skips in a checkout: hidden paths and binary files.
+      # PYTHONPATH is the checkout. cog inserts the directory of the first
+      # file, and a docs page listed first cannot import scripts.
       - name: Version copies
         run: |
           set -eu
           mapfile -t files < <(grep -rlI --exclude='.*' --exclude-dir='.*' '\[\[\[cog')
           test "${#files[@]}" -gt 0
-          cog --check --diff "${files[@]}"
+          PYTHONPATH=. cog --check --diff "${files[@]}"
       # Draft only: the notes are printed and CHANGELOG.md is not written.
       # towncrier 26.9.0 fails this when a fragment name is not a configured
       # type, because towncrier.toml sets ignore. The version is the crate's;
