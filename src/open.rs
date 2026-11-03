@@ -421,6 +421,8 @@ fn sentence_for(name: &str) -> &'static str {
         "python-requires-uv-run" => "Python is not run through uv",
         "python-dash-c" | "python-dash-c-denied" => "Python -c is not run through uv",
         "chmod-setuid" => "chmod or install sets the setuid or setgid bit",
+        "nesting-unread" => "a nested command past the depth cap was not read",
+        "brace-cap" => "a brace wider than the cap was not read",
         _ => "",
     }
 }

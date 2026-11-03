@@ -274,6 +274,12 @@ thread_local! {
     /// passed as it is. Bash brace-expands only a word with a bare `{`.
     static BRACED: std::cell::RefCell<std::collections::HashMap<String, bool>> =
         std::cell::RefCell::default();
+    /// Set when a cap stops the walk. Applied once the check has a plain
+    /// allow, so a real hit is not replaced by the label.
+    static CAP_LABEL: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    /// Set when a brace recognizer stops at [`words::BRACE_CAP`], then read by
+    /// the caller that still has the word.
+    static BRACE_OVER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// A here-document body as [`HEREDOC_RAW`] keeps it.
@@ -334,6 +340,7 @@ fn spelled(w: &str, quoted: bool) {
 /// How many runner levels deep (`make a` whose recipe runs `npm run b`)
 /// script targets are read before the line is judged as written.
 fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Checked {
+    clear_cap_label();
     let parent = Scratch {
         root: Some(cwd.to_path_buf()),
         work: Some(cwd.to_path_buf()),
@@ -350,7 +357,48 @@ fn check_shell_in(argv: &[String], cwd: &std::path::Path, depth: usize) -> Check
         table
     };
     let _ = depth;
-    table
+    with_cap_label(table)
+}
+
+fn clear_cap_label() {
+    CAP_LABEL.with(|s| s.set(None));
+    BRACE_OVER.with(|s| s.set(false));
+}
+
+pub(crate) fn note_cap_label(label: &'static str) {
+    CAP_LABEL.with(|s| {
+        if s.get().is_none() {
+            s.set(Some(label));
+        }
+    });
+}
+
+/// A plain allow becomes `label` when a cap stopped the walk. A hit
+/// already on the line stays: the cap is not a refusal and it does not
+/// hide one.
+fn with_cap_label(checked: Checked) -> Checked {
+    let label = CAP_LABEL.with(|s| s.replace(None));
+    match label {
+        Some(label)
+            if checked.decision == Decision::Allow && open::noted(&checked.token).is_none() =>
+        {
+            open::warn_checked(label)
+        }
+        _ => checked,
+    }
+}
+
+pub(crate) fn mark_brace_over() {
+    BRACE_OVER.with(|s| s.set(true));
+}
+
+pub(crate) fn take_brace_over() -> bool {
+    BRACE_OVER.with(|s| s.replace(false))
+}
+
+/// `word` had a `{` outside quotes, so the shell would expand it.
+pub(crate) fn bare_brace_word(word: &str) -> bool {
+    BRACED.with(|s| s.borrow().get(word).copied().unwrap_or(false))
 }
 
 /// The typed decision is allow. A warn line keeps the rule and the warning

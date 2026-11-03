@@ -2,21 +2,25 @@
 //! constructs, and comments.
 
 use super::{
-    heredoc_fed_to_sftp, heredoc_read_as_text, heredoc_runs_script, phase, sftp_batch_lines,
-    shell_words, MAX_DEPTH,
+    heredoc_fed_to_sftp, heredoc_read_as_text, heredoc_runs_script, note_cap_label, phase,
+    sftp_batch_lines, shell_words, MAX_DEPTH,
 };
 
 /// A script and every line it runs inside itself, outermost first: the
 /// body of each `$(...)`, backtick pair, `<(...)`, `>(...)` and `( ... )`
-/// subshell, read the same way down to [`MAX_DEPTH`] levels. Nothing in
+/// subshell, read the same way down to [`MAX_DEPTH`] levels. A body past
+/// that is not read, and the label is `nesting-unread`. Nothing in
 /// single quotes runs, and an escaped `$` is a dollar sign.
 pub(crate) fn script_lines(script: &str, depth: usize) -> Vec<String> {
     let _span = phase::enter(phase::SUBST);
     let mut out = vec![script.to_string()];
+    let inner = substitutions(script);
     if depth < MAX_DEPTH {
-        for body in substitutions(script) {
+        for body in inner {
             out.extend(script_lines(&body, depth + 1));
         }
+    } else if !inner.is_empty() {
+        note_cap_label("nesting-unread");
     }
     out
 }

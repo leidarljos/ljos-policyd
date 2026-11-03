@@ -6,14 +6,21 @@ use std::borrow::Cow;
 use super::{
     ask, base_of, brace_expands, command_roots, commands, credential_read, decoded_exec,
     deletes_a_root_tree, disk, ended_commands, expand_aliases, git_dangerous, harm, hidden_moves,
-    inner_commands_expanded, interpreter_rmtree, is_assignment, is_privilege, is_redirection,
-    lexical_norm, open, peel_cd_command_word, phase, piece_base, python_pipe, quoted_body,
-    raw_disk, recursive_delete_off_tmp, remote_exec, runs_fresh, seat_guard_denial, under_tmp,
-    unquote, unresolved, unwrap_wrappers, writes_block_device, Checked, CredRead, Decision, GitHit,
-    PolicyReason, Scratch, DECODERS, DISK_WRITERS, FETCHERS, SHELLS, TRASHERS,
+    inner_commands, inner_commands_expanded, interpreter_rmtree, is_assignment, is_privilege,
+    is_redirection, lexical_norm, note_cap_label, open, peel_cd_command_word, phase, piece_base,
+    python_pipe, quoted_body, raw_disk, recursive_delete_off_tmp, remote_exec, runs_fresh,
+    seat_guard_denial, under_tmp, unquote, unresolved, unwrap_wrappers, writes_block_device,
+    Checked, CredRead, Decision, GitHit, PolicyReason, Scratch, DECODERS, DISK_WRITERS, FETCHERS,
+    SHELLS, TRASHERS,
 };
 
-/// How deep `sh -c` scripts nest before the table stops reading them.
+/// How many steps the walk reads past the line.
+///
+/// The line is step 0. Each nested script, substitution or `find
+/// -exec` payload is one more step. A command at step 4 is judged,
+/// so four nested `sh -c` calls still show the command they run.
+/// The next step is not read. The line stays allow, and the label
+/// is `nesting-unread`.
 pub(crate) const MAX_DEPTH: usize = 4;
 
 /// Programs the deny rules do not read. A second command, a substitution,
@@ -140,20 +147,26 @@ fn host_argv_table_run(argv: &[String], depth: usize, moved: bool, parent: &Scra
     if own.decision != Decision::Allow {
         return own;
     }
+    // Past the cap the inner command is not read. The line stays the
+    // allow already decided, and the label names the stop.
+    if depth >= MAX_DEPTH {
+        if unwalked_line(argv) {
+            note_cap_label("nesting-unread");
+        }
+        return own;
+    }
     let mut warned = open::noted(&own.token).is_some().then(|| own.clone());
-    if depth < MAX_DEPTH {
-        if let Some(c) = find_exec_line(argv, depth, moved, &bound) {
-            if c.decision != Decision::Allow {
-                return c;
-            }
-            if warned.is_none() {
-                warned = Some(c);
-            }
+    if let Some(c) = find_exec_line(argv, depth, moved, &bound) {
+        if c.decision != Decision::Allow {
+            return c;
+        }
+        if warned.is_none() {
+            warned = Some(c);
         }
     }
     // A later command runs where `cd` left it. Judging the `rm` on its
     // own from the starting directory would see the wrong parent.
-    if depth < MAX_DEPTH {
+    {
         let span = phase::enter(phase::INNER);
         let expanded = expand_aliases(argv);
         let roots = command_roots(&expanded, bound.root.clone());
@@ -180,6 +193,17 @@ fn host_argv_table_run(argv: &[String], depth: usize, moved: bool, parent: &Scra
         }
     }
     warned.unwrap_or(own)
+}
+
+/// A command the walk would open and does not, once [`MAX_DEPTH`] is
+/// spent. The line's own words are not that command.
+fn unwalked_line(argv: &[String]) -> bool {
+    if !find_payloads(argv).is_empty() {
+        return true;
+    }
+    inner_commands(argv)
+        .iter()
+        .any(|inner| inner.as_slice() != argv)
 }
 
 /// Each `find -exec`, `-execdir`, `-ok` and `-okdir` payload is a command

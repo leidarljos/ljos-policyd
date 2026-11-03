@@ -1,13 +1,21 @@
 //! Shell words: the lexer, its quotes and escapes, and brace expansion.
 
 use super::{
-    braced, closed_word, heredoc_name, heredoc_operator, is_name, nested_end, opens_nested, phase,
-    spelled, take_heredoc_bodies, EXPANDS,
+    bare_brace_word, braced, closed_word, heredoc_name, heredoc_operator, is_name, mark_brace_over,
+    nested_end, note_cap_label, opens_nested, phase, spelled, take_brace_over, take_heredoc_bodies,
+    EXPANDS,
 };
 
-/// How many words one brace expansion may produce. Past this the
-/// command is not the one the line shows.
-const BRACE_CAP: usize = 32;
+/// Alternatives built while recognizing one brace.
+///
+/// Bash expands a bare brace before the command runs. The table does
+/// not turn that brace into the command. It only tells a brace from a
+/// literal word, and building the alternatives is that check.
+/// Thirty-two covers a short list (`{push,-f}`, a handful of names)
+/// and stops `{1..100000}` from allocating the whole range. A bare
+/// brace wider than this is not read. The command stays allow, and
+/// the label is `brace-cap`.
+pub(crate) const BRACE_CAP: usize = 32;
 
 /// Whether `word` is a bash brace expansion (`{a,b}`, `{1..3}`), not a
 /// parameter expansion (`${name}`) and not a lone `{`.
@@ -71,8 +79,15 @@ fn brace_at(word: &str, chars: &[(usize, char)], open: usize) -> Result<Option<B
                     let start = chars[open].0;
                     let end = chars.get(j + 1).map_or(word.len(), |(p, _)| *p);
                     let body = &word[chars[open].0 + '{'.len_utf8()..chars[j].0];
-                    let Some(alts) = brace_alts(body)? else {
-                        return Ok(None);
+                    let alts = match brace_alts(body) {
+                        Ok(Some(alts)) => alts,
+                        Ok(None) => return Ok(None),
+                        Err(()) => {
+                            if take_brace_over() && bare_brace_word(word) {
+                                note_cap_label("brace-cap");
+                            }
+                            return Err(());
+                        }
                     };
                     return Ok(Some(BraceHit { start, end, alts }));
                 }
@@ -105,6 +120,7 @@ fn brace_alts(body: &str) -> Result<Option<Vec<String>>, ()> {
         }
         alts.push(cur);
         if alts.len() > BRACE_CAP {
+            mark_brace_over();
             return Err(());
         }
         return Ok(Some(alts));
@@ -158,6 +174,7 @@ fn num_range(raw_a: &str, raw_b: &str, start: i64, end: i64, step: i64) -> Resul
     let mut out = Vec::new();
     loop {
         if out.len() >= BRACE_CAP {
+            mark_brace_over();
             return Err(());
         }
         if width == 0 {
@@ -190,6 +207,7 @@ fn char_range(a: char, b: char, step: i64) -> Result<Vec<String>, ()> {
     let mut out = Vec::new();
     loop {
         if out.len() >= BRACE_CAP {
+            mark_brace_over();
             return Err(());
         }
         out.push(char::from_u32(n as u32).ok_or(())?.to_string());

@@ -210,6 +210,14 @@ mod json {
         (at == bytes.len()).then_some(value)
     }
 
+    /// Nested values this parser will read.
+    ///
+    /// A rules file is one array of objects, two or three levels deep.
+    /// The parser recurses, so a bound keeps a broken file off the
+    /// stack. Sixty-four nested values is not a rules file, and it is
+    /// small enough that this recursion cannot exhaust the stack. A
+    /// deeper file does not parse, so it clears no line. The check
+    /// still answers.
     const MAX_DEPTH: usize = 64;
 
     fn skip_ws(b: &[u8], at: &mut usize) {
@@ -439,5 +447,34 @@ mod tests {
         }
         let deep = "[".repeat(100) + &"]".repeat(100);
         assert_eq!(json::parse(&deep), None);
+    }
+
+    /// A rules file at the depth cap still clears its line. One level
+    /// past it parses as nothing, so the line is not cleared.
+    #[test]
+    fn a_rules_file_past_the_depth_cap_clears_nothing() {
+        let dir = std::env::temp_dir().join(format!("policyd-person-depth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("user-rules.json");
+        let rule = |pad: usize| {
+            let mut extra = "null".to_string();
+            for _ in 0..pad {
+                extra = format!("[{extra}]");
+            }
+            format!(
+                r#"[{{"id":"r1","text":"t","author":"a","reason":"r","pattern":"echo hi","verdict":"allow","basis":"person","pad":{extra}}}]"#
+            )
+        };
+        // The top array is depth 0, the object is depth 1, and the
+        // innermost null sits at depth 2 + pad. 64 is read. 65 is not.
+        std::fs::write(&file, rule(62)).unwrap();
+        assert_eq!(
+            allows_from(&file, &words("echo hi")).map(|hit| hit.id),
+            Some("r1".to_string())
+        );
+        std::fs::write(&file, rule(63)).unwrap();
+        assert!(allows_from(&file, &words("echo hi")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

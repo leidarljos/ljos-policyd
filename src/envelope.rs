@@ -18,7 +18,15 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::mail::{self, Header, Mailbox, Message, MessageFault};
 
-/// A message longer than this is refused before it is parsed.
+/// Bytes read from one message, and from one config file.
+///
+/// RFC 5321 section 4.5.3.1.7 requires a server to accept 64 KiB.
+/// 1 MiB is sixteen times that, so a message of the required minimum
+/// is read whole. A longer message stays allow. When the header block
+/// ends inside this many bytes, that block is judged and the size is
+/// the label `message-too-large`. When it does not, the label is the
+/// whole answer: a cut header is not an envelope. A config file uses
+/// the same bound. Past it, the file is the existing unreadable label.
 pub const MAIL_MESSAGE_MAX: usize = 1024 * 1024;
 
 pub struct MailReason {
@@ -102,11 +110,42 @@ pub fn check_mail_argv(message: &[u8], config_path: &Path, recipients: &[String]
 
 fn check_mail_inner(message: &[u8], config_path: &Path, recipients: &[String]) -> MailVerdict {
     if message.len() > MAIL_MESSAGE_MAX {
+        let prefix = &message[..MAIL_MESSAGE_MAX];
+        if let Some(head) = closed_header(prefix) {
+            let mut verdict = judge_mail(head, config_path, recipients);
+            verdict.reasons.push(reason(
+                "message-too-large",
+                format!("message exceeds {MAIL_MESSAGE_MAX} bytes"),
+            ));
+            return verdict;
+        }
         return MailVerdict::refusal(
             "message-too-large",
             format!("message exceeds {MAIL_MESSAGE_MAX} bytes"),
         );
     }
+    judge_mail(message, config_path, recipients)
+}
+
+/// The header block when a blank line ends it inside `message`.
+/// The body after that line is not part of the envelope.
+fn closed_header(message: &[u8]) -> Option<&[u8]> {
+    let crlf = find_bytes(message, b"\r\n\r\n");
+    let lf = find_bytes(message, b"\n\n");
+    let end = match (crlf, lf) {
+        (Some(i), Some(j)) if j < i => j + 2,
+        (Some(i), _) => i + 4,
+        (None, Some(j)) => j + 2,
+        (None, None) => return None,
+    };
+    Some(&message[..end])
+}
+
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+fn judge_mail(message: &[u8], config_path: &Path, recipients: &[String]) -> MailVerdict {
     let Ok(text) = std::str::from_utf8(message) else {
         return MailVerdict::refusal("message-invalid", "message is not utf-8");
     };
@@ -875,8 +914,16 @@ fn address_denied(addr: &NormAddr, config: &Config) -> bool {
 /// Characters a provider may ignore or cut on in a local part.
 const TRANSPARENT: &[char] = &['.', '_', '-', '+', '='];
 
-/// Shorter than this, an address rule does not use the skeleton prefix.
-/// An empty skeleton is refused at load: `starts_with("")` is true.
+/// Shortest local-part skeleton that may match by prefix.
+///
+/// The skeleton drops `.`, `_`, `-`, `+` and `=`. An empty one makes
+/// `starts_with("")` true for every local part, so that line rejects
+/// the deny file. One or two characters left (`j`, `jo`) are a real
+/// mailbox and stay on exact and subaddress matching: a prefix of
+/// that length would cover most names at the domain. Three is the
+/// first length at which a prefix is the rule. The extra names it
+/// covers (`john` also matches `johnny`) are the over-block this
+/// check accepts.
 const MIN_SKELETON: usize = 3;
 
 /// NFD, nonspacing marks (Mn) and enclosing marks (Me) removed, case
@@ -3770,6 +3817,28 @@ pair left right
         let v = check_mail_bytes(&[0xff, 0xfe], &dir.join("mail.conf"));
         assert_eq!(v.reasons[0].code, "message-invalid");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A body past the cap does not hide a recipient. The header block
+    /// is judged, the verdict is allow, and the size is a label. A
+    /// message of exactly the cap is judged and not labeled.
+    #[test]
+    fn a_long_body_keeps_the_header_and_labels_the_size() {
+        let head = format!("From: {IDENTITY}\r\nTo: a@blocked.test\r\n\r\n");
+        let raw = format!("{head}{}", "x".repeat(MAIL_MESSAGE_MAX));
+        assert!(raw.len() > MAIL_MESSAGE_MAX);
+        let v = verdict(&raw, "domain blocked.test\n", "");
+        assert!(v.json().contains("\"verdict\":\"allow\""));
+        assert_eq!(
+            v.reasons.iter().map(|r| r.code).collect::<Vec<_>>(),
+            vec!["recipient-domain-denied", "message-too-large"]
+        );
+        let fit = format!("{head}{}", "y".repeat(MAIL_MESSAGE_MAX - head.len()));
+        assert_eq!(fit.len(), MAIL_MESSAGE_MAX);
+        assert_eq!(
+            codes(&fit, "domain blocked.test\n", ""),
+            vec!["recipient-domain-denied"]
+        );
     }
 
     /// ICU properties, `unicode-normalization` and the case mapping are
