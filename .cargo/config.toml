@@ -1,0 +1,12 @@
+# Cargo sets this for every process it runs, including `cargo test` and
+# `cargo run`. A deny from the suite, or from `cargo run`, is appended
+# under the build directory instead of the developer's deny log.
+# `force` replaces a path already exported in the shell, so that log
+# stays free of test lines. `relative` anchors the path at the package
+# root, the parent of this `.cargo` directory.
+# The installed binary does not read this file. With the variable unset
+# it still uses `$XDG_STATE_HOME/ljos-policyd/deny.log`, or
+# `~/.local/state/ljos-policyd/deny.log`.
+
+[env]
+LJOS_POLICYD_DENY_LOG = { value = "target/test-deny.log", relative = true, force = true }

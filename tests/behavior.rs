@@ -147,9 +147,16 @@ fn a_deny_is_appended_to_the_deny_log() {
     let _env = DENY_LOG_ENV.lock().unwrap_or_else(|e| e.into_inner());
     let path = std::env::temp_dir().join(format!("policyd-deny-{}-b.log", std::process::id()));
     let _ = std::fs::remove_file(&path);
+    let previous = std::env::var_os("LJOS_POLICYD_DENY_LOG");
     std::env::set_var("LJOS_POLICYD_DENY_LOG", &path);
     let v = verdict(&words("rm -rf /srv/x"));
-    std::env::remove_var("LJOS_POLICYD_DENY_LOG");
+    // Clearing the variable sent every later deny in this process to the
+    // developer log. Put the previous path back, including the one Cargo
+    // set for the suite.
+    match &previous {
+        Some(value) => std::env::set_var("LJOS_POLICYD_DENY_LOG", value),
+        None => std::env::remove_var("LJOS_POLICYD_DENY_LOG"),
+    }
     assert_eq!(v, ljos_policyd::allow_annotation("rm-rf-outside-tmp"));
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(text.contains("rm-rf-outside-tmp"), "{text}");
