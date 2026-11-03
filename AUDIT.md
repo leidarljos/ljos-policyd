@@ -1,9 +1,17 @@
 # policyd rule families
 
-Counted with `wc -l` on `367ba392`, an Intel Xeon, 8 cores.
-Rust outside the generated Cap'n schema is 23761 lines.
-Generated schema is 9409 lines. `src/lib.rs` is 14190 lines. The bash
-lexer and the mail law are still the bulk of that. The rewrite lives in
+<!-- [[[cog
+import cog
+from scripts.doc_samples import audit_lines
+audit_lines(cog)
+]]] -->
+Counted with `wc -l`.
+Rust outside the generated Cap'n schema is 25207 lines.
+Generated schema is 9409 lines. `src/lib.rs` is 459 lines.
+<!-- [[[end]]] -->
+The bash lexer lives in `src/words.rs` (quotes), `src/shells.rs`
+(`sh -c`), `src/pipeline.rs` (pipes) and `src/names.rs` (`$cmd`).
+The mail law is `src/mail.rs` and `src/envelope.rs`. The rewrite lives in
 `src/rewrite.rs`. A credential path named from `python`, `perl`, `ruby`
 or `node` `-c` or `-e` is handled in `src/ask.rs` and prints a warning.
 
@@ -38,7 +46,7 @@ allow
 | Inline `-c` or `-e` that names a credential path | `ask.rs` | `python3 -c "open('/home/u/.ssh/id_rsa')"` was a deny. | warn on allow, `credential-mention` |
 | Writes of hook and policy files | seat guard | Seat guard paths and the policyd config. | warn on allow, `seat-guard-path` |
 | Mail law | `mail.rs` and `envelope.rs` | Outbound envelope for the send ballot. | verdict `allow`; reasons keep their codes |
-| Bash lexer (`sh -c`, `$cmd`, pipes, quotes) | most of `src/lib.rs` | The warnings above have to see through a shell. | KEEP |
+| Bash lexer (`sh -c`, `$cmd`, pipes, quotes) | `words.rs`, `shells.rs`, `pipeline.rs`, `names.rs` | The warnings above have to see through a shell. | KEEP |
 | uv rewrite | `rewrite.rs` | `python x.py` becomes `uv run x.py` when uv fits. | `allow`, `rewrite`, the new line |
 | Written then run | removed | A script the line writes and then runs. | DELETE |
 | Python static analysis | removed | Inline python, including a mention of a hook path. | DELETE |

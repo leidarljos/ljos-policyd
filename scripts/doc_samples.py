@@ -136,6 +136,7 @@ USAGE = (
     "usage: ljos-policyd check|exec|capnp|version -- argv...\n"
     "usage: ljos-policyd check-mail --config PATH [--argv [--] RECIPIENT...]\n"
     "usage: ljos-policyd replay [DENY_LOG]\n"
+    "see the verb table in README.md\n"
 )
 REPLAY = (
     "was deny\tgit-force-push\tnow allow\twarn\tgit-force-push\t"
@@ -238,6 +239,22 @@ def readme_mail(cog):
     cog.outl("$ ljos-policyd check-mail --config mail.conf < blocked.eml")
     cog.out(blocked_out)
     _end(cog, False)
+
+
+def audit_lines(cog):
+    # `wc -l` counts newline bytes, so a file with no final newline does not gain a line.
+    def wc(files):
+        text = subprocess.check_output(["wc", "-l", *files], text=True)
+        return int(text.splitlines()[-1].split()[0])
+
+    outside = subprocess.check_output(
+        ["find", "src", "-name", "*.rs", "!", "-path", "src/schema/*"], text=True
+    ).split()
+    schema = subprocess.check_output(["find", "src/schema", "-name", "*.rs"], text=True).split()
+    lib = wc(["src/lib.rs"])
+    cog.outl("Counted with `wc -l`.")
+    cog.outl(f"Rust outside the generated Cap'n schema is {wc(outside)} lines.")
+    cog.outl(f"Generated schema is {wc(schema)} lines. `src/lib.rs` is {lib} lines.")
 
 
 def audit(cog):
