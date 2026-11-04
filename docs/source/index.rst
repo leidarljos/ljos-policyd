@@ -49,7 +49,7 @@ Install
    $ ljos-policyd check -- uv run pytest
    allow
 
-``exec`` prints a warning on stderr when a rule matches, then runs the line. Exit status is the program's.
+``exec`` prints a warning on stderr when a rule matches, then runs the line. Exit status is the program's. ``block-on-warning true`` in ``--config`` prints the warning and does not run the line.
 
 The :doc:`tutorial <getting-started>` is the same walk with ``exec`` and ``POLICYD_BIN``.
 

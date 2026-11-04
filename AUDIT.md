@@ -31,7 +31,7 @@ lexer and the mail law are still the bulk of that. The rewrite lives in
 | Brace expansion of a command | removed | `{push,-f}` turned into the command. | DELETE |
 | Unshown script guesses | removed | A pipe into a shell, a process substitution. | DELETE |
 | Writes outside the tree | removed | An ordinary file write. | DELETE |
-| Local git lost work | `harm.rs` | `reset --hard`, `clean -fd`, `stash clear` or `drop`, `checkout -- .`, `restore .`. | warn on allow |
+| Local git lost work | `harm.rs` | `reset --hard`, `clean -fd`, `stash clear` or `drop`, `checkout -- .`, `restore .`, `branch -d` or `-D`. | warn on allow |
 | Find delete and a feeder running rm | `harm.rs` | `find -delete`, `find -exec rm`, `xargs` or `parallel` running `rm`. | warn on allow |
 | mv or rsync delete of an outside tree | `harm.rs` | A whole tree outside the work tree, including `/dev/null`. | warn on allow |
 

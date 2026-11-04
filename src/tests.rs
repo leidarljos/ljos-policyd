@@ -802,6 +802,17 @@ fn git_calls_that_drop_uncommitted_work() {
             &["git", "push", "origin", ":refs/tags/v1.0"],
             "git-push-delete",
         ),
+        (&["git", "branch", "-d", "topic"], "git-branch-delete"),
+        (&["git", "branch", "-D", "gone"], "git-branch-delete"),
+        (&["git", "branch", "--delete", "topic"], "git-branch-delete"),
+        (
+            &["git", "branch", "--delete", "--force", "topic"],
+            "git-branch-delete",
+        ),
+        (
+            &["git", "-C", "repo", "branch", "-d", "topic"],
+            "git-branch-delete",
+        ),
     ] {
         assert_eq!(v(argv), allow_annotation(token), "{argv:?}");
     }
@@ -832,8 +843,9 @@ fn git_calls_that_drop_uncommitted_work() {
         &["git", "restore", "src/a.rs"],
         &["git", "restore", "-s", "HEAD~1", "src/a.rs"],
         &["git", "restore", "--patch"],
-        &["git", "branch", "-d", "topic"],
-        &["git", "branch", "--delete", "topic"],
+        &["git", "branch"],
+        &["git", "branch", "-m", "old", "new"],
+        &["git", "branch", "-c", "old", "new"],
         &["git", "reflog", "expire", "--expire=90.days.ago"],
         &["git", "reflog", "show"],
         &["git", "update-ref", "refs/heads/x", "HEAD"],

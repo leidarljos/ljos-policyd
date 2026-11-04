@@ -75,7 +75,7 @@ That match is `allow`, `warn`, the rule name, and one warning. The command is no
 | `git-stash-clear` | `git stash clear` | `stash pop`, `list`, `drop` |
 | `git-discard-worktree` | `git checkout -- .` or `git checkout .`, `git restore .` or `:/`, and `git restore` with no path | `checkout BRANCH`, `checkout -- FILE`, `restore FILE`, `restore --patch` |
 | `git-push-delete` | `git push --delete`, `-d` in a flag cluster, or a refspec with an empty source (`:main`, `:refs/tags/v1.0`) | `push origin main:main`, `push --dry-run` |
-| `git-branch-force-delete` | `git branch -D`, `--delete --force` | `branch -d`, which refuses an unmerged branch |
+| `git-branch-delete` | `git branch -d`, `git branch -D`, `--delete`, `--delete --force` | `git branch` that lists, renames, or copies (`branch`, `branch -m`, `branch -c`) |
 | `git-reflog-expire` | `git reflog expire` with `--expire=now` or `=all`, `git reflog delete` | `reflog expire` with a date, `reflog show` |
 | `git-history-rewrite` | `git filter-branch`, `git filter-repo` | `git rebase` |
 | `git-update-ref-delete` | `git update-ref -d` | `update-ref REF VALUE` |
@@ -143,8 +143,8 @@ without the library reports `host table`, and the doctor warns about it.
 
 | Verb | Does | Exit |
 |---|---|---|
-| `check -- ARGV` | prints one verdict line, see below | 0 |
-| `exec -- ARGV` | prints a warning on stderr when a rule matches, then runs ARGV | ARGV's status |
+| `check -- ARGV` | prints one verdict line, see below. `block-on-warning true` in `--config` prints `deny` for a warning and exits 2 | 0, or 2 when that setting blocks |
+| `exec -- ARGV` | prints a warning on stderr when a rule matches, then runs ARGV. `block-on-warning true` in `--config` prints the warning and `exec: not run because block-on-warning is on`, and does not run ARGV | ARGV's status, or 2 when that setting stops the command |
 | `capnp -- ARGV` | writes a packed Cap'n Proto `PolicyDecision` with decision allow | 0 |
 | `check-mail --config PATH [--argv [--] RECIPIENT...]` | reads one RFC 5322 message on stdin and prints JSON. The verdict is `allow`. `reasons` carry the rule and the warning | 0. A missing `--config` is usage and exits 2 |
 | `replay [DENY_LOG]` | re-judges every line of a deny log with this build and the person's rules, and counts how many would run now | 0 |
@@ -156,10 +156,13 @@ without the library reports `host table`, and the doctor warns about it.
 |---|---|
 | `allow` | the command may run as given |
 | `allow`<TAB>`warn`<TAB>`rule`<TAB>`warning` | a rule matched. The command may run. `rule` is the token. `warning` is one line a caller can show. A mention of a credential path in `python`, `perl`, `ruby` or `node` `-c` or `-e` is `credential-mention` |
+| `deny`<TAB>`rule`<TAB>`warning` | a rule matched and `block-on-warning` is on. The command should not run |
 | `allow`<TAB>`fail-open`<TAB>`reason` | the check could not finish. The command may run |
 | `allow`<TAB>`rewrite`<TAB>`new line` | the command may run, and the hook should run `new line` instead |
 | `allow`<TAB>`consent`<TAB>`rule` | a consent record matched |
 | `allow`<TAB>`user-rule`<TAB>`pattern` | a user allow matched |
+
+A warning blocks only when you ask for it. Put `block-on-warning true` in the file `--config PATH` names. It is off by default: without that line, a warning stays allow and the command runs. The last `block-on-warning` line in the file wins. For `check`, a line that would warn then prints `deny` with the same rule and warning, and `check` exits 2. For `exec`, the warning is printed on stderr, then `exec: not run because block-on-warning is on`, and the command is not run. A check that fails open is still allow with the setting on, including a missing config file. `capnp` and `check-mail` do not read `block-on-warning`.
 
 `python x.py` and `python3 x.py` rewrite to `uv run x.py`, arguments included, when the working directory or a parent has `pyproject.toml` or `uv.lock`, or the script file has a PEP 723 `# /// script` block. Otherwise the line stays as written. `python -c` stays as written: `uv run` does not take `-c`. When that tree asks for uv, `python -m` becomes `uv run -m`.
 
@@ -314,7 +317,8 @@ check.
 On each shell command the hook asks, in order: the seat's guard over its
 own files, this binary, then the rules written into the seat's memory
 (`ljos rule`), then the push gate. This binary's answer is allow, with
-the rule and a warning when one matches. It does not stop the command.
+the rule and a warning when one matches. It does not stop the command
+unless `block-on-warning true` is in the `--config` file.
 `ljos policy -- ARGV` prints the combined answer for one command.
 
 If the binary is not on `PATH` (or at `POLICYD_BIN`), ljos treats its

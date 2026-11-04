@@ -2,6 +2,16 @@
 
 <!-- towncrier release notes start -->
 
+## Unreleased
+
+### Fixes
+
+- `git branch -d` and `git branch -D` warn as `git-branch-delete`. A local branch delete is not stopped.
+
+### Features
+
+- A `block-on-warning true` line in the `--config` file makes a warning print `deny` and exit 2. It is off by default. `exec` then prints the warning and does not run the command. `capnp` and `check-mail` do not read the line.
+
 ## 0.7.0 (2026-11-03)
 
 ### Fixes

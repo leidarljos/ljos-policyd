@@ -202,7 +202,7 @@ pub(crate) fn git_lost_work(argv: &[String]) -> Option<&'static str> {
         "worktree" if rest.first() == Some(&"remove") && (has("--force") || short('f')) => {
             Some("git-worktree-force-remove")
         }
-        "branch" if branch_force_delete(&rest) => Some("git-branch-force-delete"),
+        "branch" if branch_delete(&rest) => Some("git-branch-delete"),
         _ => None,
     }
 }
@@ -219,20 +219,18 @@ fn explicit_worktree(rest: &[String]) -> bool {
     })
 }
 
-/// `git branch -D`, or `--delete` together with `--force`.
-fn branch_force_delete(rest: &[&str]) -> bool {
-    let short_d = rest
-        .iter()
-        .any(|a| a.len() > 1 && a.starts_with('-') && !a.starts_with("--") && a.contains('D'));
-    let delete = rest
-        .iter()
-        .any(|a| *a == "--delete" || a.starts_with("--delete="));
-    let force = rest.iter().any(|a| {
-        *a == "--force"
-            || *a == "-f"
-            || (a.len() > 1 && a.starts_with('-') && !a.starts_with("--") && a[1..].contains('f'))
-    });
-    short_d || (delete && force)
+/// A local branch delete: `git branch -d`, `git branch -D`, or
+/// `--delete`. `-d` still refuses an unmerged branch in git itself.
+/// `-D` does not. Both drop a local ref, so both warn.
+fn branch_delete(rest: &[&str]) -> bool {
+    rest.iter().any(|a| {
+        *a == "--delete"
+            || a.starts_with("--delete=")
+            || (a.len() > 1
+                && a.starts_with('-')
+                && !a.starts_with("--")
+                && a[1..].chars().any(|c| c == 'd' || c == 'D'))
+    })
 }
 
 /// `clean -fd` and `clean -fdx`: force and directories, in one cluster

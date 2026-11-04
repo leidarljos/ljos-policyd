@@ -631,7 +631,7 @@ fn a_process_substitution_runs_and_a_quoted_heredoc_does_not() {
     );
     let branch = verdict(&shell("git branch -D topic"));
     assert!(
-        branch.starts_with("allow\twarn\tgit-branch-force-delete"),
+        branch.starts_with("allow\twarn\tgit-branch-delete"),
         "{branch}"
     );
     let restore = verdict(&shell("git restore --worktree=true f.txt"));

@@ -6,7 +6,14 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{self, Command};
 
-use ljos_policyd::{check_mail_argv, check_shell, encode_decision, verdict, MAIL_MESSAGE_MAX};
+use ljos_policyd::{check_mail_argv, check_shell, encode_decision, MAIL_MESSAGE_MAX};
+
+/// Exit status when a warning blocks, and when `check-mail` or `replay`
+/// is used wrong.
+///
+/// Claude Code treats a hook exit of 2 as a block of that tool call.
+/// The same status is already the usage error for a missing config.
+const BLOCKED: i32 = 2;
 
 fn usage() {
     eprintln!("usage: ljos-policyd check|exec|capnp|version -- argv...");
@@ -74,6 +81,12 @@ fn run() -> i32 {
             }
             probe_configured_daemon();
             let v = ljos_policyd::verdict_with(&argv, &ctx);
+            if let Some(hit) = v.strip_prefix("allow\twarn\t") {
+                if ctx.config_path.as_deref().is_some_and(blocks_on_warning) {
+                    println!("deny\t{hit}");
+                    return BLOCKED;
+                }
+            }
             println!("{v}");
             return 0;
         }
@@ -88,27 +101,7 @@ fn run() -> i32 {
             }
             return 0;
         }
-        "exec" => {
-            let v = verdict(&args);
-            if v.starts_with("allow\twarn\t") {
-                eprintln!("{v}");
-            }
-            if !v.starts_with("allow") {
-                eprintln!("{v}");
-                return 0;
-            }
-            if args.is_empty() {
-                process::exit(0);
-            }
-            let status = Command::new(&args[0])
-                .args(&args[1..])
-                .status()
-                .unwrap_or_else(|e| {
-                    eprintln!("exec: {e}");
-                    process::exit(127);
-                });
-            process::exit(status.code().unwrap_or(127));
-        }
+        "exec" => return exec_verb(&args),
         "check-mail" => {
             let Some(mail) = mail_args(&args) else {
                 usage();
@@ -165,6 +158,47 @@ fn run() -> i32 {
     0
 }
 
+/// Run ARGV. A panic while reading policyd's own flags prints the
+/// fail-open line on stderr and still runs the argv after those flags.
+/// Stdout belongs to the command.
+fn exec_verb(args: &[String]) -> i32 {
+    let (rules, config, argv) =
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| user_allows(args))) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                eprintln!("allow\tfail-open\tuser_allows");
+                let (_, _, argv) = leading_flags(args);
+                return run_command(&argv);
+            }
+        };
+    let mut ctx = ljos_policyd::Context::from_env();
+    ctx.user_allow.extend(rules);
+    // The file is read only for the setting. A missing file stays a
+    // warning, and the command still runs. `check` fail-opens that case.
+    let v = ljos_policyd::verdict_with(&argv, &ctx);
+    if let Some(hit) = v.strip_prefix("allow\twarn\t") {
+        eprintln!("allow\twarn\t{hit}");
+        if config.as_deref().is_some_and(blocks_on_warning) {
+            eprintln!("exec: not run because block-on-warning is on");
+            return BLOCKED;
+        }
+    }
+    run_command(&argv)
+}
+
+fn run_command(argv: &[String]) -> i32 {
+    if argv.is_empty() {
+        return 0;
+    }
+    match Command::new(&argv[0]).args(&argv[1..]).status() {
+        Ok(status) => status.code().unwrap_or(127),
+        Err(e) => {
+            eprintln!("exec: {e}");
+            127
+        }
+    }
+}
+
 /// `--user-allow PATTERN` and `--config PATH` are policyd's own flags,
 /// and only when they lead the command. A `--` ends those flags. Nothing
 /// after it, and no `--` inside the command, is read as a policyd flag.
@@ -173,6 +207,10 @@ fn run() -> i32 {
 fn user_allows(args: &[String]) -> (Vec<String>, Option<String>, Vec<String>) {
     entry_fault("user_allows");
     ljos_policyd::fault("user_allows");
+    leading_flags(args)
+}
+
+fn leading_flags(args: &[String]) -> (Vec<String>, Option<String>, Vec<String>) {
     let mut rules = Vec::new();
     let mut config = None;
     let mut i = 0;
@@ -216,6 +254,23 @@ fn user_allows(args: &[String]) -> (Vec<String>, Option<String>, Vec<String>) {
         return (rules, config, args[i..].to_vec());
     }
     (rules, config, Vec::new())
+}
+
+/// A `block-on-warning true` line in the `--config` file. The last such
+/// line wins, so a later `false` turns the setting off. A file that
+/// cannot be read, another value, or no line leaves every warning an allow.
+fn blocks_on_warning(path: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    text.lines()
+        .rev()
+        .find_map(|line| {
+            let mut words = line.split_whitespace();
+            (words.next() == Some("block-on-warning"))
+                .then(|| words.next() == Some("true") && words.next().is_none())
+        })
+        .unwrap_or(false)
 }
 
 /// `LJOS_POLICYD_DAEMON=host:port` is optional. Nothing is read from the

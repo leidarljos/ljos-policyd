@@ -13,8 +13,10 @@ A model cannot be the mediator. An agent that can talk its way past
 the check is the threat, and indirect prompt injection shows that
 instructions carried in data change what a model permits (Greshake et
 al., doi:10.48550/arXiv.2302.12173). Every answer this table prints is
-allow. A matching rule adds the rule name and one warning for the
-caller to show. It does not stop the command. This is not a security
+allow, unless the config asks a warning to block. A matching rule
+adds the rule name and one warning for the caller to show. It does
+not stop the command unless the file =--config= names contains
+=block-on-warning true=. This is not a security
 boundary. Saltzer and
 Schroeder would deny when the case is uncertain
 ([[https://doi.org/10.1109/PROC.1975.9939][Saltzer and Schroeder, 1975]]).

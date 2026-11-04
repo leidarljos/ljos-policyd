@@ -212,7 +212,7 @@ fn push_delete(rest: &[String]) -> bool {
 
 /// A git call that throws away work no commit holds: a force push, a
 /// remote ref delete, `reset --hard` (or `--merge`/`--keep` are fine),
-/// `clean` with `-f`, `stash clear`, `branch -D`, `reflog expire`
+/// `clean` with `-f`, `stash clear`, `branch -d` or `-D`, `reflog expire`
 /// to now, `filter-branch`, `update-ref -d`, `worktree remove --force`,
 /// `checkout` of the whole tree, or `restore` of the whole tree or with no
 /// path at all. An alias given with `-c alias.NAME=...` is judged as what

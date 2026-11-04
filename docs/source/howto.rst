@@ -14,6 +14,23 @@ not required; argv after ``--`` is the line.
 The answer is allow, with the rule and one warning. Exit status is 0.
 The hook can show the warning. It does not block the tool call.
 
+Ask a warning to block
+======================
+
+.. code:: console
+
+   $ echo 'block-on-warning true' > policyd.conf
+   $ ljos-policyd check --config policyd.conf -- git branch -D gone
+   deny    git-branch-delete   git branch -d or -D deletes a local branch
+
+``block-on-warning true`` in the file ``--config`` names makes a warning
+block. It is off by default. ``git branch -d`` and ``git branch -D`` warn
+as ``git-branch-delete``, and so does every other rule that used to deny.
+``check`` then prints ``deny`` with the same rule and warning, and exits 2.
+``exec`` prints the warning and
+``exec: not run because block-on-warning is on``, and does not run the
+command. ``capnp`` and ``check-mail`` do not read the line.
+
 Run only if allowed
 ===================
 

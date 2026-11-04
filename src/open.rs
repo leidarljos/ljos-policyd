@@ -406,7 +406,7 @@ fn sentence_for(name: &str) -> &'static str {
         "git-stash-clear" => "git stash clear deletes every stash entry",
         "git-discard-worktree" => "git checkout or restore discards the work tree",
         "git-worktree-force-remove" => "git worktree remove --force deletes a work tree",
-        "git-branch-force-delete" => "git branch -D deletes a branch that may be unmerged",
+        "git-branch-delete" => "git branch -d or -D deletes a local branch",
         "git-history-rewrite" => "a history rewrite changes published commits",
         "git-update-ref-delete" => "git update-ref -d deletes a ref",
         "git-reflog-expire" => "git reflog expire drops reachable history",
@@ -499,7 +499,7 @@ fn lost_work(token: &str) -> bool {
             | "git-stash-clear"
             | "git-discard-worktree"
             | "git-worktree-force-remove"
-            | "git-branch-force-delete"
+            | "git-branch-delete"
     )
 }
 
