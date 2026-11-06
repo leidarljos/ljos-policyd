@@ -897,7 +897,10 @@ fn a_multi_call_binary_runs_its_applet() {
 fn tmp_links_are_judged_by_their_on_disk_target() {
     use std::os::unix::fs::symlink;
 
-    let base = std::env::temp_dir().join(format!("policyd-under-tmp-{}", std::process::id()));
+    // The spelled directory is `/tmp`. `temp_dir` on macOS is
+    // `/var/folders/...`, which this rule treats as outside `/tmp`.
+    let base =
+        std::path::Path::new("/tmp").join(format!("policyd-under-tmp-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     let plain = base.join("plain-path");
     let linked = base.join("home-link");
@@ -1612,7 +1615,12 @@ fn a_copy_into_a_directory_writes_its_name_there() {
 fn a_command_the_guard_does_not_know_may_write_any_script() {
     let root = startup_root("unknownw");
     std::fs::create_dir_all(root.join("target/debug")).unwrap();
-    std::fs::copy("/bin/true", root.join("target/debug/app")).unwrap();
+    // macOS keeps `true` at `/usr/bin/true`.
+    let true_bin = ["/bin/true", "/usr/bin/true"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).is_file())
+        .unwrap();
+    std::fs::copy(true_bin, root.join("target/debug/app")).unwrap();
     std::fs::write(root.join("ok.sh"), "echo ok\n").unwrap();
     let at = |line: &str| check_shell_in(&shell_words(line), &root, 0);
     for line in [

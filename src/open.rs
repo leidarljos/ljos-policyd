@@ -125,10 +125,12 @@ fn consent_file_status(path: &Path) -> ConsentFile {
     ConsentFile::Ok
 }
 
+/// The effective user. `/proc/self` is that user on Linux and does not
+/// exist on macOS, where the missing lookup treated every owner as
+/// someone else and read an owner-writable consent file.
 fn current_uid() -> u32 {
-    std::fs::metadata("/proc/self")
-        .map(|meta| meta.uid())
-        .unwrap_or(u32::MAX)
+    // SAFETY: geteuid only reads the process credential.
+    unsafe { libc::geteuid() }
 }
 
 /// `allow\t<kind>\t<why>` as a checked value.
