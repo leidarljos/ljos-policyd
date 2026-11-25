@@ -232,6 +232,8 @@ fn mentions_config_curlrc(low: &str) -> bool {
 }
 
 /// `seats.toml` and `ljos.toml` under `~/.config/ljos`. A glob of that directory is a credential read.
+/// A credential part has to be a whole path part, so a checkout named
+/// `.ssh-notes` or `my_curlrc-guard` above the config does not count.
 fn ljos_config_file(low: &str) -> bool {
     if !low.contains(".config/ljos") {
         return false;
@@ -242,13 +244,16 @@ fn ljos_config_file(low: &str) -> bool {
     if !named {
         return false;
     }
+    let parts: Vec<&str> = trimmed.split('/').collect();
+    if parts.iter().any(|p| CREDENTIAL_PARTS.contains(p)) || config_curlrc(&parts) {
+        return false;
+    }
     let rest = low
         .replace(".config/ljos/", " ")
         .replace(".config/ljos", " ");
-    !CREDENTIAL_PARTS.iter().any(|p| rest.contains(p))
-        && !CREDENTIAL_PATHS
-            .iter()
-            .any(|c| *c != ".config/ljos/" && rest.contains(c))
+    !CREDENTIAL_PATHS
+        .iter()
+        .any(|c| *c != ".config/ljos/" && rest.contains(c))
 }
 
 /// Whether inline program text mentions a credential path. A part has to
