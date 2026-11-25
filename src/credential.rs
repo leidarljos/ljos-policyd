@@ -396,9 +396,217 @@ fn credential_named(w: &str) -> bool {
         .is_some_and(|p| disk::names_credential_path(&p.to_string_lossy()))
 }
 
+/// How a reader that takes a pattern, a script or a filter spells its
+/// options. The first operand is that pattern unless an option gave it.
+/// Short options are letters, long options are spelled with `--`.
+struct PatternSyntax {
+    /// Short options whose value is the rest of the word or the next word.
+    short_value: &'static str,
+    /// Short options whose value is only the rest of the word, as in
+    /// `sed -i.bak`.
+    short_tail: &'static str,
+    /// Long options that take the next word unless written `--opt=value`.
+    long_value: &'static [&'static str],
+    /// Long options that take two words, as in `jq --arg name value`.
+    long_pair: &'static [&'static str],
+    /// Options whose value is a file the program opens, so that value is a
+    /// read. For `--slurpfile` and `--rawfile` it is the second word.
+    short_file: &'static str,
+    long_file: &'static [&'static str],
+    /// Options that give the pattern, so no operand is one.
+    short_pattern: &'static str,
+    long_pattern: &'static [&'static str],
+}
+
+const GREP: PatternSyntax = PatternSyntax {
+    short_value: "ABCDdefm",
+    short_tail: "",
+    long_value: &[
+        "--regexp",
+        "--file",
+        "--after-context",
+        "--before-context",
+        "--context",
+        "--max-count",
+        "--devices",
+        "--directories",
+        "--binary-files",
+        "--label",
+        "--include",
+        "--exclude",
+        "--exclude-dir",
+        "--exclude-from",
+        "--group-separator",
+    ],
+    long_pair: &[],
+    short_file: "f",
+    long_file: &["--file", "--exclude-from"],
+    short_pattern: "ef",
+    long_pattern: &["--regexp", "--file"],
+};
+
+const SED: PatternSyntax = PatternSyntax {
+    short_value: "efl",
+    short_tail: "i",
+    long_value: &["--expression", "--file", "--line-length"],
+    long_pair: &[],
+    short_file: "f",
+    long_file: &["--file"],
+    short_pattern: "ef",
+    long_pattern: &["--expression", "--file"],
+};
+
+const AWK: PatternSyntax = PatternSyntax {
+    short_value: "efvEFilW",
+    short_tail: "",
+    long_value: &[
+        "--file",
+        "--exec",
+        "--source",
+        "--assign",
+        "--field-separator",
+        "--include",
+        "--load",
+    ],
+    long_pair: &[],
+    short_file: "fEi",
+    long_file: &["--file", "--exec", "--include"],
+    short_pattern: "efE",
+    long_pattern: &["--source", "--file", "--exec"],
+};
+
+/// jq, and both yq programs: the jq wrapper and mikefarah yq 4.
+const JQ: PatternSyntax = PatternSyntax {
+    short_value: "fLIopw",
+    short_tail: "",
+    long_value: &[
+        "--from-file",
+        "--indent",
+        "--library-path",
+        "--output-format",
+        "--input-format",
+    ],
+    long_pair: &["--arg", "--argjson", "--slurpfile", "--rawfile"],
+    short_file: "f",
+    long_file: &["--from-file", "--slurpfile", "--rawfile"],
+    short_pattern: "f",
+    long_pattern: &["--from-file"],
+};
+
+/// The files a grep, sed, awk, jq or yq call reads. The pattern, script
+/// or filter is not one, nor is an option's value, except a file the
+/// program reads patterns, a script or data from. `None` for any other
+/// program. mikefarah yq 4 reads a lone operand as a file when it names
+/// one, so a lone word with a `/` or on the disk stays a read.
+fn pattern_reader_sources<'a>(head: &str, args: &[&'a str]) -> Option<Vec<&'a str>> {
+    let syntax = match head {
+        "grep" | "egrep" | "fgrep" => &GREP,
+        "sed" => &SED,
+        "awk" | "gawk" => &AWK,
+        "jq" | "yq" => &JQ,
+        _ => return None,
+    };
+    let mut reads: Vec<&'a str> = Vec::new();
+    let mut operands: Vec<&'a str> = Vec::new();
+    let mut given = false;
+    let mut opts = true;
+    let mut i = 0;
+    let next = |i: &mut usize| {
+        *i += 1;
+        args.get(*i - 1).copied()
+    };
+    while i < args.len() {
+        let w = args[i];
+        i += 1;
+        if is_redirection(w) || (i > 1 && bare_redirection(args[i - 2])) {
+            continue;
+        }
+        let bare = w.trim_matches(['"', '\'']);
+        if !opts || bare == "-" || !bare.starts_with('-') {
+            operands.push(w);
+            continue;
+        }
+        if bare == "--" {
+            opts = false;
+            continue;
+        }
+        if bare.starts_with("--") {
+            let (name, attached) = match bare.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (bare, None),
+            };
+            given |= syntax.long_pattern.contains(&name);
+            let value = if syntax.long_pair.contains(&name) {
+                i += 1;
+                next(&mut i)
+            } else if syntax.long_value.contains(&name) {
+                attached.or_else(|| next(&mut i))
+            } else {
+                None
+            };
+            if let Some(v) = value.filter(|_| syntax.long_file.contains(&name)) {
+                reads.push(v);
+            }
+            continue;
+        }
+        for (k, c) in bare.char_indices().skip(1) {
+            if syntax.short_tail.contains(c) {
+                break;
+            }
+            if !syntax.short_value.contains(c) {
+                continue;
+            }
+            given |= syntax.short_pattern.contains(c);
+            let rest = &bare[k + c.len_utf8()..];
+            let value = if rest.is_empty() {
+                next(&mut i)
+            } else {
+                Some(rest)
+            };
+            if let Some(v) = value.filter(|_| syntax.short_file.contains(c)) {
+                reads.push(v);
+            }
+            break;
+        }
+    }
+    if !given {
+        let subcommand = |w: &&str| {
+            matches!(
+                w.trim_matches(['"', '\'']),
+                "eval" | "e" | "eval-all" | "ea"
+            )
+        };
+        if head == "yq" && operands.first().is_some_and(subcommand) {
+            operands.remove(0);
+        }
+        let lone_file = head == "yq"
+            && operands.len() == 1
+            && operands.iter().any(|w| {
+                let w = w.trim_matches(['"', '\'']);
+                w.contains('/') || std::path::Path::new(w).exists()
+            });
+        if !operands.is_empty() && !lone_file {
+            operands.remove(0);
+        }
+    }
+    reads.extend(operands);
+    Some(reads)
+}
+
+/// A redirection with its target in the next word, such as `>` or `2>`.
+fn bare_redirection(w: &str) -> bool {
+    is_redirection(w)
+        && redirection_body(w)
+            .trim_start_matches(['<', '>', '&', '|'])
+            .is_empty()
+}
+
 /// The words of a [`FILE_READERS`] call that name what it reads. The
 /// place a copy, an archive or `dd` writes to is left to the write checks.
 fn read_sources<'a>(head: &str, args: &[&'a str]) -> Vec<&'a str> {
+    if let Some(out) = pattern_reader_sources(head, args) {
+        return out;
+    }
     let mut out: Vec<&'a str> = Vec::new();
     let mut skip_next = false;
     for (i, w) in args.iter().copied().enumerate() {

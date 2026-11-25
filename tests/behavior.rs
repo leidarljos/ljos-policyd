@@ -459,6 +459,77 @@ fn a_curlrc_in_the_resolved_xdg_config_home_is_a_credential_read() {
     assert_eq!(other, "allow");
 }
 
+/// The pattern of grep, the script of sed or awk, and the filter of jq
+/// or yq is text to match, not a file. The files they read still warn.
+#[test]
+fn a_search_pattern_is_not_a_credential_read() {
+    for line in [
+        "grep -rn '.netrc' src/",
+        "grep -rn '.curlrc' src/",
+        "grep -rn .netrc src/",
+        "grep -e .netrc -e .curlrc src/",
+        "grep --regexp=.ssh src/",
+        "grep --regexp .ssh src/",
+        "grep -E -A 2 '.netrc' src/",
+        "grep -rnA2 .netrc src/",
+        "grep -rn .netrc src > notes/hits.txt",
+        "egrep '.netrc|.curlrc' src",
+        "fgrep .pgpass docs",
+        "grep -rn 'curlrc' src/",
+        "grep -e curlrc src/",
+        "sed -n '/.netrc/p' README.md",
+        "sed -n '/curlrc/p' README.md",
+        "sed -e 's/.netrc/x/' src/disk.rs",
+        "sed 's/curlrc/netrc/g' docs/x.md",
+        "awk '/.netrc/' README.md",
+        "awk '/curlrc/' README.md",
+        "gawk -F: '/.aws/ {print $1}' README.md",
+        "jq '.ssh' package.json",
+        "jq --arg k .aws '.[$k]' x.json",
+        "yq '.aws' config.yaml",
+        "yq eval '.kube' x.yaml",
+        "yq '.aws'",
+    ] {
+        assert_eq!(verdict(&shell(line)), "allow", "{line}");
+    }
+    for line in [
+        "grep x ~/.netrc",
+        "grep x ~/.curlrc",
+        "grep -e x ~/.netrc",
+        "grep -A 3 x ~/.netrc",
+        "grep -- -x ~/.netrc",
+        "grep -f ~/.netrc src/",
+        "grep --file=~/.netrc src/",
+        "grep -rn x src 2>/dev/null ~/.netrc",
+        "grep -rn x src 2> /dev/null ~/.curlrc",
+        "egrep x ~/.ssh/id_rsa",
+        "sed -n p ~/.netrc",
+        "sed -e p ~/.curlrc",
+        "sed -i.bak s/a/b/ ~/.netrc",
+        "awk 1 ~/.netrc",
+        "awk -f prog.awk ~/.curlrc",
+        "gawk -F: '{print $1}' ~/.pgpass",
+        "jq . ~/.docker/config.json",
+        "jq -n --rawfile t ~/.netrc '$t'",
+        "yq ~/.kube/config",
+        "yq e '.users' ~/.kube/config",
+    ] {
+        let got = verdict(&shell(line));
+        assert!(
+            got.starts_with("allow\twarn\treads-credential"),
+            "{line}: {got}"
+        );
+    }
+    for line in ["grep x ~/.netrc", "grep x ~/.curlrc"] {
+        let got = verdict(&words(line));
+        assert!(
+            got.starts_with("allow\twarn\treads-credential"),
+            "argv {line}: {got}"
+        );
+    }
+    assert_eq!(verdict(&words("grep -rn .netrc src/")), "allow");
+}
+
 fn restore_argv(argv: &[&str]) -> Vec<String> {
     argv.iter().map(|w| (*w).to_string()).collect()
 }
