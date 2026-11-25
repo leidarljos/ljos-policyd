@@ -21,7 +21,27 @@ pub(crate) const CREDENTIAL_PARTS: &[&str] = &[
     ".pgpass",
     ".vault-token",
     ".secrets",
+    // The curl config, which can carry `user`, `oauth2-bearer` or an
+    // `Authorization` header. With CURLRC_DIRS these are every name curl
+    // 7.x to 8.23.0 reads by default (src/tool_parsecfg.c,
+    // src/tool_homedir.c, then src/tool_findfile.c in curl/curl):
+    // `.curlrc` in $HOME; the passwd home, %APPDATA% and
+    // %USERPROFILE%\Application Data from 7.11.0 (8be602cdf); $CURL_HOME and
+    // the curl.exe directory from 7.14.0 (78882e464); $XDG_CONFIG_HOME from
+    // 7.73.0 (4be1f8dc0) to 8.9.1; %USERPROFILE% from 7.81.0 (2be1aa619);
+    // and the working directory when no home was found, 7.9.6 to 7.65.3.
+    // `_curlrc` in those places on Windows, and on MS-DOS from 7.10.6
+    // (d5043133e), the only name there before 7.66.0. From 7.66.0
+    // (862393243) it is a second choice after `.curlrc`, on Windows only.
+    ".curlrc",
+    "_curlrc",
 ];
+
+/// Directories curl reads `curlrc`, with no dot, from: `$CURL_HOME/.config`
+/// and `$HOME/.config` from 7.82.0 (764e4f066), and `$XDG_CONFIG_HOME` from
+/// 8.10.0 (26e9d3a89). The bare name elsewhere is a fixture, a doc or a
+/// search word, not a file curl opens.
+const CURLRC_DIRS: &[&str] = &[".config", "$xdg_config_home", "${xdg_config_home}"];
 
 /// Longer credential paths, matched as a substring of a spelled path.
 pub(crate) const CREDENTIAL_PATHS: &[&str] = &[
@@ -164,9 +184,51 @@ pub(crate) fn names_credential_path(s: &str) -> bool {
     }
     let parts: Vec<&str> = low.split('/').collect();
     parts.iter().any(|p| CREDENTIAL_PARTS.contains(p))
+        || config_curlrc(&parts)
         || CREDENTIAL_PATHS.iter().any(|c| low.contains(c))
         || low.ends_with(".config/ljos")
         || (low.starts_with("/proc/") && low.ends_with("/environ"))
+}
+
+/// `$XDG_CONFIG_HOME` as this process has it, lowercased like the path it
+/// is held against. Unset or empty is `None`.
+fn xdg_config_home() -> Option<String> {
+    let v = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|v| !v.is_empty())?;
+    Some(super::lexical_norm(
+        &v.to_ascii_lowercase().replace('\\', "/"),
+    ))
+}
+
+/// A `curlrc` part right under one of [`CURLRC_DIRS`], or under the
+/// resolved `$XDG_CONFIG_HOME`. `parts` is a lowercased path split on `/`.
+/// `${XDG_CONFIG_HOME:-$HOME/.config}/curlrc` puts `.config}` before it.
+fn config_curlrc(parts: &[&str]) -> bool {
+    let xdg = xdg_config_home();
+    (1..parts.len()).any(|i| {
+        let dir = parts[i - 1].trim_matches(['"', '\'']);
+        parts[i] == "curlrc"
+            && (CURLRC_DIRS.contains(&dir)
+                || dir == ".config}"
+                || xdg
+                    .as_deref()
+                    .is_some_and(|x| super::lexical_norm(&parts[..i].join("/")) == x))
+    })
+}
+
+/// Inline program text that names a dotless `curlrc` in a directory curl
+/// reads it from. A program that reads `XDG_CONFIG_HOME` and names
+/// `curlrc` builds that path itself.
+fn mentions_config_curlrc(low: &str) -> bool {
+    if !low.contains("curlrc") {
+        return false;
+    }
+    CURLRC_DIRS
+        .iter()
+        .any(|d| path_mention(low, &format!("{d}/curlrc")))
+        || xdg_config_home().is_some_and(|x| path_mention(low, &format!("{x}/curlrc")))
+        || (low.contains("xdg_config_home") && path_mention(low, "curlrc"))
 }
 
 /// `seats.toml` and `ljos.toml` under `~/.config/ljos`. A glob of that directory is a credential read.
@@ -202,7 +264,7 @@ pub(crate) fn mentions_credential(code: &str) -> bool {
     if low.contains("/proc/") && low.contains("/environ") {
         return true;
     }
-    CREDENTIAL_PARTS.iter().any(|part| path_mention(&low, part))
+    CREDENTIAL_PARTS.iter().any(|part| path_mention(&low, part)) || mentions_config_curlrc(&low)
 }
 
 /// The text names `seats.toml` or `ljos.toml` and no other credential path.
@@ -219,6 +281,7 @@ fn ljos_config_mention(low: &str) -> bool {
         .replace(".config/ljos/", " ")
         .replace(".config/ljos", " ");
     !(CREDENTIAL_PARTS.iter().any(|p| path_mention(&rest, p))
+        || mentions_config_curlrc(&rest)
         || CREDENTIAL_PATHS.iter().any(|c| rest.contains(c))
         || (rest.contains("/proc/") && rest.contains("/environ")))
 }
