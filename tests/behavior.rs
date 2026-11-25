@@ -530,6 +530,35 @@ fn a_search_pattern_is_not_a_credential_read() {
     assert_eq!(verdict(&words("grep -rn .netrc src/")), "allow");
 }
 
+/// `seats.toml` and `ljos.toml` are config. A directory above them whose
+/// name only contains a credential name is not a credential directory.
+#[test]
+fn a_seats_file_under_a_look_alike_directory_is_allowed() {
+    for path in [
+        "/home/u/curlrc-guard/.config/ljos/seats.toml",
+        "/home/u/my_curlrc-guard/.config/ljos/seats.toml",
+        "/home/u/x.curlrc.d/.config/ljos/ljos.toml",
+        "/home/u/netrc-guard/.config/ljos/seats.toml",
+        "/home/u/x.netrc.d/.config/ljos/seats.toml",
+        "/home/u/.ssh-notes/.config/ljos/ljos.toml",
+        "/srv/.secrets-scan/.config/ljos/seats.toml",
+    ] {
+        assert_eq!(verdict(&["cat".into(), path.into()]), "allow", "{path}");
+    }
+    for path in [
+        "/home/u/.ssh/.config/ljos/seats.toml",
+        "/home/u/.curlrc/.config/ljos/seats.toml",
+        "/home/u/.config/curlrc/.config/ljos/seats.toml",
+        "/home/u/.config/ljos/other.json",
+    ] {
+        let got = verdict(&["cat".into(), path.into()]);
+        assert!(
+            got.starts_with("allow\twarn\treads-credential"),
+            "{path}: {got}"
+        );
+    }
+}
+
 fn restore_argv(argv: &[&str]) -> Vec<String> {
     argv.iter().map(|w| (*w).to_string()).collect()
 }
