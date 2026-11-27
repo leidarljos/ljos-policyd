@@ -97,7 +97,7 @@ rule names: =sudo=, =curl-pipe-shell=, =decoded-pipe-shell=,
 =rsync-delete-outside=, =mv-tree-outside=, =git-force-push=,
 =git-push-delete=, =git-reset-hard=, =git-clean-force=,
 =git-stash-drop=, =git-stash-clear=, =git-discard-worktree=,
-=git-worktree-force-remove=, =git-branch-force-delete=,
+=git-worktree-force-remove=, =git-branch-delete=,
 =git-history-rewrite=, =git-update-ref-delete=, =raw-disk=,
 =reads-credential=, =credential-mention=, =seat-guard-path=, and
 =exec-unresolved=.

@@ -24,7 +24,7 @@ Verb           Meaning
 ``version``    print ``ljos-policyd <semver> (phronesis)`` or ``ljos-policyd <semver> (host table)``. ``--version`` prints the same line
 ============== ===================================================================================================================================================================================================================================================
 Samples
-=======
+========
 
 These lines are this binary. A release build prints ``phronesis`` in the
 version parentheses. A source build without the library prints ``host table``.
@@ -90,7 +90,7 @@ rule names: ``sudo``, ``curl-pipe-shell``, ``decoded-pipe-shell``,
 ``rsync-delete-outside``, ``mv-tree-outside``, ``git-force-push``,
 ``git-push-delete``, ``git-reset-hard``, ``git-clean-force``,
 ``git-stash-drop``, ``git-stash-clear``, ``git-discard-worktree``,
-``git-worktree-force-remove``, ``git-branch-force-delete``,
+``git-worktree-force-remove``, ``git-branch-delete``,
 ``git-history-rewrite``, ``git-update-ref-delete``, ``raw-disk``,
 ``reads-credential``, ``credential-mention``, ``seat-guard-path``, and
 ``exec-unresolved``.

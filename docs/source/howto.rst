@@ -40,8 +40,8 @@ Without that line, a warning stays allow.
 A check that fails open is still allow with the setting on: an
 error, or a missing config file. ``LJOS_POLICYD_DAEMON`` is not read.
 
-Run the program
-===============
+Run only if allowed
+===================
 
 .. code:: console
 

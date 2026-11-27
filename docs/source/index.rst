@@ -35,7 +35,7 @@ Typed verdict is Cap'n PolicyDecision (phronesis; Ali Akber Saifee / indynull, H
 The seat composes that pack after this verdict: ``ljos policy -- uv run pytest``.
 
 Install
-=======
+========
 
 Install with ``cargo binstall ljos-policyd``.
 

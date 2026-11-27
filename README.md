@@ -83,7 +83,7 @@ That match is `allow`, `warn`, the rule name, and one warning. The command is no
 | `git-discard-worktree` | `git checkout -- .` or `git checkout .`, `git restore .` or `:/`, and `git restore` with no path | `checkout BRANCH`, `checkout -- FILE`, `restore FILE`, `restore --patch` |
 | `git-push-delete` | `git push --delete`, `-d` in a flag cluster, or a refspec with an empty source (`:main`, `:refs/tags/v1.0`) | `push origin main:main`, `push --dry-run` |
 | `git-branch-delete` | `git branch -d`, `git branch -D`, `--delete`, `--delete --force` | `git branch` that lists, renames, or copies (`branch`, `branch -m`, `branch -c`) |
-| `git-reflog-expire` | `git reflog expire` with `--expire=now` or `=all`, `git reflog delete` | `reflog expire` with a date, `reflog show` |
+| `git-reflog-expire` | none; this token is not returned | `git reflog expire --expire=now`, `--expire=all`, a date, `git reflog delete`, `reflog show` print `allow` |
 | `git-history-rewrite` | `git filter-branch`, `git filter-repo` | `git rebase` |
 | `git-update-ref-delete` | `git update-ref -d` | `update-ref REF VALUE` |
 | `git-worktree-force-remove` | `git worktree remove --force` | `worktree remove` without `--force`, which refuses a dirty tree |
@@ -197,7 +197,7 @@ An argv of one word that holds whitespace or a shell operator is read as a shell
 | `allow`<TAB>`consent`<TAB>`rule` | a consent record matched |
 | `allow`<TAB>`user-rule`<TAB>`pattern` | a user allow matched |
 
-A warning blocks only when you ask for it. Put `block-on-warning true` in the file `--config PATH` names. It is off by default: without that line, a warning stays allow and the command runs. The last `block-on-warning` line in the file wins. For `check`, a line that would warn then prints `deny` with the same rule and warning, and `check` exits 2. For `exec`, the warning is printed on stderr, then `exec: not run because block-on-warning is on`, and the command is not run; the exit status is 2. A check that fails open is still allow with the setting on: an error, or a missing config file. `LJOS_POLICYD_DAEMON` is not read. `capnp` and `check-mail` do not read `block-on-warning`.>>>>>>> c90c2c4 (docs: name block-on-warning where capnp and check-mail skip it)
+A warning blocks only when you ask for it. Put `block-on-warning true` in the file `--config PATH` names. It is off by default: without that line, a warning stays allow and the command runs. The last `block-on-warning` line in the file wins. For `check`, a line that would warn then prints `deny` with the same rule and warning, and `check` exits 2. For `exec`, the warning is printed on stderr, then `exec: not run because block-on-warning is on`, and the command is not run; the exit status is 2. A check that fails open is still allow with the setting on: an error, or a missing config file. `LJOS_POLICYD_DAEMON` is not read. `capnp` and `check-mail` do not read `block-on-warning`.
 
 `python x.py` and `python3 x.py` rewrite to `uv run x.py`, arguments included, when the working directory or a parent has `pyproject.toml` or `uv.lock`, or the script file has a PEP 723 `# /// script` block. Otherwise the line stays as written. `python -c` stays as written: `uv run` does not take `-c`. When that tree asks for uv, `python -m` becomes `uv run -m`.
 
